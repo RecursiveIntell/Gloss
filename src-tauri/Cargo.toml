@@ -1,0 +1,67 @@
+[package]
+name = "gloss"
+version = "1.0.0"
+description = "A local-first NotebookLM alternative"
+authors = ["sikmindz"]
+edition = "2021"
+
+[lib]
+name = "gloss_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# === Local libraries ===
+llm-pipeline = { path = "../../Libraries/LLM-Pipeline" }
+# agent-graph used in Phase 2+ for map-reduce
+# agent-graph = { path = "../../Libraries/agent-graph" }
+tauri-queue = { path = "../../Libraries/Tauri-Queue" }
+
+# === Tauri ===
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-opener = "2"
+
+# === Async ===
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# === Serialization ===
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# === HTTP (for Ollama provider) ===
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+
+# === Embeddings + Reranking ===
+fastembed = "4"
+
+# === Vector search ===
+usearch = "2"
+
+# === Database ===
+rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+
+# === Text processing ===
+unicode-segmentation = "1"
+
+# === Utilities ===
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+directories = "5"
+async-trait = "0.1"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -9,6 +9,8 @@ import type {
   ModelRecord,
   Provider,
   SourceContent,
+  NotebookStats,
+  QueueStatus,
 } from "./types";
 
 // === Notebooks ===
@@ -23,6 +25,10 @@ export async function createNotebook(name: string): Promise<string> {
 
 export async function deleteNotebook(id: string): Promise<void> {
   return invoke("delete_notebook", { id });
+}
+
+export async function setActiveNotebook(notebookId: string | null): Promise<void> {
+  return invoke("set_active_notebook", { notebookId });
 }
 
 // === Sources ===
@@ -65,6 +71,19 @@ export async function getSourceContent(
   sourceId: string
 ): Promise<SourceContent> {
   return invoke("get_source_content", { notebookId, sourceId });
+}
+
+export async function retrySourceIngestion(
+  notebookId: string,
+  sourceId: string
+): Promise<void> {
+  return invoke("retry_source_ingestion", { notebookId, sourceId });
+}
+
+export async function getNotebookStats(
+  notebookId: string
+): Promise<NotebookStats> {
+  return invoke("get_notebook_stats", { notebookId });
 }
 
 // === Chat ===
@@ -204,4 +223,24 @@ export async function updateSetting(
   value: string
 ): Promise<void> {
   return invoke("update_setting", { key, value });
+}
+
+// === Jobs ===
+
+export async function regenerateMissingSummaries(
+  notebookId: string
+): Promise<number> {
+  return invoke("regenerate_missing_summaries", { notebookId });
+}
+
+export async function pauseSummaries(): Promise<void> {
+  return invoke("pause_summaries");
+}
+
+export async function resumeSummaries(): Promise<void> {
+  return invoke("resume_summaries");
+}
+
+export async function getQueueStatus(): Promise<QueueStatus> {
+  return invoke("get_queue_status");
 }

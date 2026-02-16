@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { useSourceStore } from "../../stores/sourceStore";
 import { open } from "@tauri-apps/plugin-dialog";
+import type { Source } from "../../lib/types";
 import {
   FileText,
   Upload,
@@ -12,6 +13,9 @@ import {
   Trash2,
   CheckSquare,
   Square,
+  ChevronRight,
+  RefreshCw,
+  AlertCircle,
 } from "lucide-react";
 
 interface SourcesPanelProps {
@@ -19,18 +23,14 @@ interface SourcesPanelProps {
 }
 
 const SUPPORTED_EXTENSIONS = [
-  // Text & markdown
   "txt", "md", "markdown", "rst",
-  // Code
   "py", "js", "jsx", "ts", "tsx", "rs", "go", "java", "c", "cpp", "cc", "cxx",
   "h", "hpp", "cs", "rb", "php", "swift", "kt", "kts", "scala", "lua", "r",
   "sql", "sh", "bash", "zsh", "css", "scss", "sass", "html", "htm", "xml",
   "json", "yaml", "yml", "toml", "ini", "cfg", "conf", "vue", "svelte",
   "dart", "ex", "exs", "zig", "nim", "pl", "pm", "proto", "graphql", "gql",
   "tf", "hcl", "dockerfile", "makefile",
-  // Images
   "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tiff", "tif",
-  // Video
   "mp4", "webm", "mov", "avi", "mkv",
 ];
 
@@ -49,21 +49,38 @@ function sourceIcon(sourceType: string) {
   }
 }
 
+function groupSources(sources: Source[]): Map<string, Source[]> {
+  const groups = new Map<string, Source[]>();
+  for (const source of sources) {
+    const parts = source.title.split("/");
+    const group = parts.length > 1 ? parts[0] : "(ungrouped)";
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group)!.push(source);
+  }
+  return groups;
+}
+
 export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   const {
     sources,
     selectedSourceIds,
     toggleSource,
+    toggleGroup,
     selectAll,
     selectNone,
     addSourceFile,
     addSourceFolder,
     deleteSource,
     addSourcePaste,
+    retrySource,
   } = useSourceStore();
   const [showPaste, setShowPaste] = useState(false);
   const [pasteTitle, setPasteTitle] = useState("");
   const [pasteText, setPasteText] = useState("");
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+
+  const groups = useMemo(() => groupSources(sources), [sources]);
+  const hasGroups = groups.size > 1 || (groups.size === 1 && !groups.has("(ungrouped)"));
 
   const handleFileUpload = async () => {
     const selected = await open({
@@ -108,7 +125,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     }
   };
 
-  const statusNote = (source: { source_type: string; status: string }) => {
+  const statusNote = (source: Source) => {
     if (
       (source.source_type === "image" || source.source_type === "video") &&
       source.status === "pending"
@@ -117,6 +134,69 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     }
     return "";
   };
+
+  const displayTitle = (source: Source) => {
+    // If grouped, show path after the group prefix
+    if (hasGroups) {
+      const parts = source.title.split("/");
+      return parts.length > 1 ? parts.slice(1).join("/") : source.title;
+    }
+    return source.title;
+  };
+
+  const renderSourceCard = (source: Source) => (
+    <div
+      key={source.id}
+      className="group flex items-center gap-2 px-2 py-1.5 rounded hover:bg-bg-tertiary"
+    >
+      <button
+        onClick={() => toggleSource(source.id)}
+        className="shrink-0"
+      >
+        {selectedSourceIds.has(source.id) ? (
+          <CheckSquare className="w-4 h-4 text-accent" />
+        ) : (
+          <Square className="w-4 h-4 text-text-muted" />
+        )}
+      </button>
+      {sourceIcon(source.source_type)}
+      <div className="flex-1 min-w-0">
+        <p className="text-xs text-text truncate" title={source.title}>
+          {displayTitle(source)}
+        </p>
+        <p className="text-[10px] text-text-muted">
+          <span className={statusColor(source.status)}>
+            {source.status}
+          </span>
+          {source.word_count ? ` \u00B7 ${source.word_count} words` : ""}
+          {statusNote(source)}
+          {source.status === "error" && source.error_message && (
+            <span title={source.error_message}>
+              {" "}<AlertCircle className="w-3 h-3 inline text-error" />
+            </span>
+          )}
+          {!source.summary && source.status === "ready" && (
+            <span className="text-warning"> \u00B7 no summary</span>
+          )}
+        </p>
+      </div>
+      {source.status === "error" && (
+        <button
+          onClick={() => retrySource(notebookId, source.id)}
+          className="p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent"
+          title="Retry ingestion"
+        >
+          <RefreshCw className="w-3 h-3" />
+        </button>
+      )}
+      <button
+        onClick={() => deleteSource(notebookId, source.id)}
+        className="hidden group-hover:block p-0.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
+      >
+        <Trash2 className="w-3 h-3" />
+      </button>
+    </div>
+  );
 
   return (
     <div className="flex flex-col h-full">
@@ -152,6 +232,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             <button onClick={selectNone} className="hover:text-text">
               None
             </button>
+            <span className="ml-auto">{sources.length} sources</span>
           </div>
         )}
       </div>
@@ -182,40 +263,53 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
       )}
 
       <div className="flex-1 overflow-y-auto p-1">
-        {sources.map((source) => (
-          <div
-            key={source.id}
-            className="group flex items-center gap-2 px-2 py-1.5 rounded hover:bg-bg-tertiary"
-          >
-            <button
-              onClick={() => toggleSource(source.id)}
-              className="shrink-0"
-            >
-              {selectedSourceIds.has(source.id) ? (
-                <CheckSquare className="w-4 h-4 text-accent" />
-              ) : (
-                <Square className="w-4 h-4 text-text-muted" />
-              )}
-            </button>
-            {sourceIcon(source.source_type)}
-            <div className="flex-1 min-w-0">
-              <p className="text-xs text-text truncate">{source.title}</p>
-              <p className="text-[10px] text-text-muted">
-                <span className={statusColor(source.status)}>
-                  {source.status}
-                </span>
-                {source.word_count ? ` \u00B7 ${source.word_count} words` : ""}
-                {statusNote(source)}
-              </p>
-            </div>
-            <button
-              onClick={() => deleteSource(notebookId, source.id)}
-              className="hidden group-hover:block p-0.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
-            >
-              <Trash2 className="w-3 h-3" />
-            </button>
-          </div>
-        ))}
+        {hasGroups ? (
+          Array.from(groups.entries()).map(([group, groupSources]) => {
+            const isCollapsed = collapsed[group] ?? false;
+            const allSelected = groupSources.every(s => selectedSourceIds.has(s.id));
+            return (
+              <div key={group}>
+                <button
+                  onClick={() =>
+                    setCollapsed((c) => ({ ...c, [group]: !c[group] }))
+                  }
+                  className="flex items-center gap-1.5 w-full px-2 py-1 text-xs font-medium text-text-muted hover:text-text"
+                >
+                  <ChevronRight
+                    className={`w-3 h-3 transition-transform ${
+                      !isCollapsed ? "rotate-90" : ""
+                    }`}
+                  />
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleGroup(group);
+                    }}
+                    className="shrink-0"
+                  >
+                    {allSelected ? (
+                      <CheckSquare className="w-3.5 h-3.5 text-accent" />
+                    ) : (
+                      <Square className="w-3.5 h-3.5 text-text-muted" />
+                    )}
+                  </button>
+                  <FolderOpen className="w-3 h-3" />
+                  <span className="truncate">{group}</span>
+                  <span className="text-[10px] text-text-muted ml-auto shrink-0">
+                    {groupSources.length}
+                  </span>
+                </button>
+                {!isCollapsed && (
+                  <div className="pl-4">
+                    {groupSources.map(renderSourceCard)}
+                  </div>
+                )}
+              </div>
+            );
+          })
+        ) : (
+          sources.map(renderSourceCard)
+        )}
 
         {sources.length === 0 && (
           <p className="text-xs text-text-muted text-center mt-4 px-2">

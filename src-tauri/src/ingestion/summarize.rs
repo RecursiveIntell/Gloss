@@ -33,6 +33,7 @@ pub async fn summarize_source(
         max_tokens: 512,
         temperature: 0.3,
         stream: false,
+        num_ctx: Some(8192),
     };
 
     let mut stream = provider.chat(request).await?;
@@ -83,6 +84,7 @@ pub async fn generate_suggested_questions(
         max_tokens: 256,
         temperature: 0.7,
         stream: false,
+        num_ctx: Some(8192),
     };
 
     let mut stream = provider.chat(request).await?;

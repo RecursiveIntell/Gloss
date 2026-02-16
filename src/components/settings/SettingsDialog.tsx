@@ -8,6 +8,7 @@ import {
   Loader2,
   Server,
   Cpu,
+  BookOpen,
 } from "lucide-react";
 
 interface SettingsDialogProps {
@@ -78,6 +79,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const handleSelectModel = async (modelId: string) => {
     setActiveModel(modelId);
     await updateSetting("default_model", modelId);
+  };
+
+  const handleSelectSummaryModel = async (modelId: string) => {
+    await updateSetting("summary_model", modelId);
   };
 
   const handleBackdropClick = (e: React.MouseEvent) => {
@@ -227,6 +232,33 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 ))}
               </div>
             )}
+          </section>
+
+          {/* Summary Model Section */}
+          <section>
+            <div className="flex items-center gap-2 mb-3">
+              <BookOpen className="w-4 h-4 text-text-secondary" />
+              <h3 className="text-xs font-semibold text-text uppercase tracking-wide">
+                Summary Model
+              </h3>
+            </div>
+            <p className="text-xs text-text-muted mb-2">
+              Model used for generating source summaries. A smaller, faster model
+              works well here since summaries run in the background.
+            </p>
+            <select
+              value={settings["summary_model"] || ""}
+              onChange={(e) => handleSelectSummaryModel(e.target.value)}
+              className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+            >
+              <option value="">Same as chat model ({activeModel})</option>
+              {models.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.display_name}
+                  {model.parameter_size ? ` (${model.parameter_size})` : ""}
+                </option>
+              ))}
+            </select>
           </section>
         </div>
       </div>

@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useSourceStore } from "../../stores/sourceStore";
-import { Send, Plus, MessageSquare, Loader2 } from "lucide-react";
+import { Send, Plus, MessageSquare, Loader2, AlertCircle } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 
 interface ChatPanelProps {
@@ -16,6 +16,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     messages,
     isStreaming,
     streamingContent,
+    streamingError,
     sendMessage,
     createConversation,
     setActiveConversation,
@@ -154,6 +155,15 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           <div className="flex justify-start">
             <div className="rounded-lg px-3 py-2 bg-bg-tertiary">
               <Loader2 className="w-4 h-4 text-text-muted animate-spin" />
+            </div>
+          </div>
+        )}
+
+        {streamingError && (
+          <div className="flex justify-start">
+            <div className="max-w-[80%] rounded-lg px-3 py-2 text-sm bg-error/10 border border-error/30 text-error flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+              <span>{streamingError}</span>
             </div>
           </div>
         )}

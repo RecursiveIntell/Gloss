@@ -10,6 +10,17 @@ pub struct SearchResult {
     pub score: f64,
 }
 
+/// Compute dynamic top-K based on notebook source count.
+pub fn compute_top_k(source_count: usize) -> usize {
+    match source_count {
+        0..=5 => 4,
+        6..=20 => 6,
+        21..=50 => 8,
+        51..=100 => 10,
+        _ => 12,
+    }
+}
+
 /// Perform hybrid search: HNSW semantic + FTS5 keyword, fused with RRF.
 pub fn hybrid_search(
     query: &str,
@@ -19,7 +30,8 @@ pub fn hybrid_search(
     selected_source_ids: &[String],
     top_k: usize,
 ) -> Result<Vec<SearchResult>, GlossError> {
-    let k_per_source = 20;
+    // Scale the pre-rerank pool proportionally to top_k
+    let k_per_source = (top_k * 5).max(20);
 
     // 1. Semantic search via HNSW
     let query_embedding = embedder.embed_one(query)?;

@@ -12,8 +12,14 @@ mod state;
 mod studio;
 
 use state::AppState;
+use std::sync::Arc;
+use std::time::Duration;
 use tauri::Manager;
+use tauri_queue::{QueueConfig, QueueEventEmitter, QueueManager, TauriEventEmitter};
 use tracing_subscriber::EnvFilter;
+
+/// Idle duration (seconds) after which auto-summarization kicks in.
+const IDLE_AUTO_SUMMARIZE_SECS: u64 = 600; // 10 minutes
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -33,19 +39,49 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
             let state = AppState::initialize(&app_handle)?;
+
+            // Initialize job queue with persistent SQLite storage
+            let config = QueueConfig::builder()
+                .with_db_path(state.data_dir.join("queue.db"))
+                .with_poll_interval(Duration::from_secs(3))
+                .build();
+            let queue = QueueManager::new(config)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            let event_emitter = TauriEventEmitter::arc(app_handle.clone());
+
+            // Don't use queue.spawn() — we drive the loop ourselves so we can
+            // check active_chats before processing each job. This prevents
+            // starting a summary while chat is active (Ollama serializes requests).
+            let queue = Arc::new(queue);
+
             app.manage(state);
+            app.manage(Arc::clone(&queue));
+
+            // Spawn custom job processing loop on Tauri's async runtime
+            let q = Arc::clone(&queue);
+            tauri::async_runtime::spawn(async move {
+                summary_job_loop(q, event_emitter, app_handle).await;
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::notebooks::list_notebooks,
             commands::notebooks::create_notebook,
             commands::notebooks::delete_notebook,
+            commands::notebooks::set_active_notebook,
             commands::sources::list_sources,
             commands::sources::add_source_file,
             commands::sources::add_source_folder,
             commands::sources::add_source_paste,
             commands::sources::delete_source,
             commands::sources::get_source_content,
+            commands::sources::retry_source_ingestion,
+            commands::sources::get_notebook_stats,
+            commands::sources::regenerate_missing_summaries,
+            commands::sources::pause_summaries,
+            commands::sources::resume_summaries,
+            commands::sources::get_queue_status,
             commands::chat::list_conversations,
             commands::chat::create_conversation,
             commands::chat::delete_conversation,
@@ -68,4 +104,140 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Custom job processing loop that enforces all scheduling contracts:
+///
+/// 1. **No summaries before notebook selection** — idles when active_notebook_id is None.
+/// 2. **Chat grace window** — does not start a summary within 15s of the last user message.
+/// 3. **Single-flight LLM gate** — acquires `llm_gate` semaphore before LLM work,
+///    so chat (which also acquires it) naturally serializes with summaries.
+/// 4. **Notebook switching** — validates job notebook_id + epoch before executing.
+/// 5. **Manual pause** — respects `summary_paused` flag.
+async fn summary_job_loop(
+    queue: Arc<QueueManager>,
+    emitter: Arc<dyn QueueEventEmitter>,
+    handle: tauri::AppHandle,
+) {
+    // Brief delay to let the app finish startup
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    tracing::info!("Summary job loop started");
+
+    loop {
+        let state = handle.state::<AppState>();
+
+        // 1. No summaries before notebook selection
+        let active_nb = state.get_active_notebook_id();
+        if active_nb.is_none() {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+
+        // 2. Manual pause
+        if state.summary_paused.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+
+        // 3. Chat grace window — don't start a new summary within 15s of last user message
+        if state.is_in_chat_grace() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+
+        // 4. Acquire LLM gate before processing (ensures no concurrent GPU inference).
+        //    We acquire here so that if chat arrives while we wait, the chat will
+        //    also try to acquire and one will block. The semaphore enforces ordering.
+        let permit = state.llm_gate.acquire().await;
+        let permit = match permit {
+            Ok(p) => p,
+            Err(_) => {
+                // Semaphore closed — app is shutting down
+                tracing::info!("LLM gate closed, summary loop exiting");
+                return;
+            }
+        };
+
+        // Re-check conditions after acquiring the permit (chat may have arrived
+        // while we were waiting, or notebook may have changed).
+        if state.summary_paused.load(std::sync::atomic::Ordering::SeqCst)
+            || state.is_in_chat_grace()
+            || state.get_active_notebook_id().is_none()
+        {
+            drop(permit);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+
+        // Snapshot epoch before processing
+        let epoch_before = state.get_active_epoch();
+
+        let job_result = tokio::time::timeout(
+            Duration::from_secs(180),
+            queue.process_one::<jobs::GlossJob>(&emitter),
+        ).await;
+
+        match job_result {
+            Err(_timeout) => {
+                tracing::error!("Summary job timed out after 180s — releasing LLM gate");
+                drop(permit);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Ok(Ok(Some(job))) => {
+                // Validate that the job was for the active notebook + epoch
+                let epoch_after = state.get_active_epoch();
+                if epoch_after != epoch_before {
+                    tracing::debug!(
+                        job_id = %job.job_id,
+                        "Notebook changed during summary job (epoch {} -> {}), result may be stale",
+                        epoch_before, epoch_after
+                    );
+                }
+
+                if job.success {
+                    tracing::debug!(job_id = %job.job_id, "Summary job completed");
+                } else {
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        error = ?job.error,
+                        "Summary job failed"
+                    );
+                }
+                drop(permit);
+                // Cool-down between jobs to prevent GPU thermal throttling / CUDA errors
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            Ok(Ok(None)) => {
+                drop(permit);
+
+                // No pending jobs — check if we should auto-queue missing summaries.
+                // Triggers when user has been idle for 10+ minutes.
+                let idle_secs = state.idle_seconds();
+                if idle_secs >= IDLE_AUTO_SUMMARIZE_SECS {
+                    if let Some(ref nb_id) = active_nb {
+                        let queued = commands::sources::auto_queue_notebook_summaries(
+                            &state, &queue, nb_id,
+                        );
+                        if queued > 0 {
+                            tracing::info!(
+                                idle_secs,
+                                queued,
+                                "Auto-queued summaries after idle period"
+                            );
+                            // Process immediately instead of sleeping
+                            continue;
+                        }
+                    }
+                }
+
+                // Poll less frequently when idle
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Job processing error: {}", e);
+                drop(permit);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
 }

@@ -120,6 +120,15 @@ impl HnswIndex {
         Ok(Self { index, next_label })
     }
 
+    /// Remove a vector from the index by key. Best-effort — some index
+    /// configurations may not support removal.
+    pub fn remove(&mut self, key: u64) -> Result<(), GlossError> {
+        self.index.remove(key).map_err(|e| {
+            GlossError::Embedding(format!("HNSW remove failed: {}", e))
+        })?;
+        Ok(())
+    }
+
     /// Get the number of vectors in the index.
     pub fn size(&self) -> usize {
         self.index.size()

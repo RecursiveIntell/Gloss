@@ -9,6 +9,7 @@ interface ChatStore {
   isStreaming: boolean;
   streamingContent: string;
   streamingMessageId: string | null;
+  streamingError: string | null;
   suggestedQuestions: string[];
   loadConversations: (notebookId: string) => Promise<void>;
   createConversation: (notebookId: string) => Promise<string>;
@@ -17,7 +18,9 @@ interface ChatStore {
   loadMessages: (notebookId: string, conversationId: string) => Promise<void>;
   sendMessage: (notebookId: string, query: string, selectedSourceIds: string[], model: string) => Promise<void>;
   appendToken: (messageId: string, token: string) => void;
-  finalizeMessage: (messageId: string, content: string) => void;
+  finalizeMessage: (messageId: string) => void;
+  setStreamingError: (messageId: string, error: string) => void;
+  resetForNotebookSwitch: () => void;
   loadSuggestedQuestions: (notebookId: string) => Promise<void>;
 }
 
@@ -28,6 +31,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   isStreaming: false,
   streamingContent: '',
   streamingMessageId: null,
+  streamingError: null,
   suggestedQuestions: [],
 
   loadConversations: async (notebookId) => {
@@ -84,6 +88,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       messages: [...state.messages, userMsg],
       isStreaming: true,
       streamingContent: '',
+      streamingError: null,
     }));
 
     try {
@@ -101,14 +106,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
-  appendToken: (_messageId, token) => {
+  appendToken: (messageId, token) => {
+    // Guard: ignore tokens from a stale streaming session
+    const { streamingMessageId } = get();
+    if (streamingMessageId && streamingMessageId !== messageId) return;
     set((state) => ({
       streamingContent: state.streamingContent + token,
     }));
   },
 
-  finalizeMessage: (messageId, content) => {
-    const finalContent = content || get().streamingContent;
+  finalizeMessage: (messageId) => {
+    // Guard: ignore finalize for a stale message
+    const { streamingMessageId } = get();
+    if (streamingMessageId && streamingMessageId !== messageId) return;
+    const finalContent = get().streamingContent;
     const { activeConversationId } = get();
     const assistantMsg: Message = {
       id: messageId,
@@ -122,7 +133,32 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       isStreaming: false,
       streamingContent: '',
       streamingMessageId: null,
+      streamingError: null,
     }));
+  },
+
+  setStreamingError: (messageId, error) => {
+    const { streamingMessageId } = get();
+    if (streamingMessageId && streamingMessageId !== messageId) return;
+    set({
+      streamingError: error,
+      isStreaming: false,
+      streamingContent: '',
+      streamingMessageId: null,
+    });
+  },
+
+  resetForNotebookSwitch: () => {
+    set({
+      conversations: [],
+      activeConversationId: null,
+      messages: [],
+      isStreaming: false,
+      streamingContent: '',
+      streamingMessageId: null,
+      streamingError: null,
+      suggestedQuestions: [],
+    });
   },
 
   loadSuggestedQuestions: async (notebookId) => {

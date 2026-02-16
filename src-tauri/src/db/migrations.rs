@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 
 const APP_SCHEMA_VERSION: i32 = 1;
-const NOTEBOOK_SCHEMA_VERSION: i32 = 1;
+const NOTEBOOK_SCHEMA_VERSION: i32 = 2;
 
 /// Apply pragmas for performance and correctness.
 pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
@@ -201,6 +201,7 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
 
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_embedding_id ON chunks(embedding_id);
             CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_sources_status ON sources(status);
             CREATE INDEX IF NOT EXISTS idx_sources_hash ON sources(file_hash);
@@ -216,6 +217,14 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
              INSERT OR IGNORE INTO notebook_config (key, value) VALUES ('output_language', 'en');",
         )?;
 
+        set_schema_version(conn, 1)?;
+    }
+
+    if version < 2 {
+        // Add embedding_id index for HNSW lookups (hot path for chunk retrieval)
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_embedding_id ON chunks(embedding_id);",
+        )?;
         set_schema_version(conn, NOTEBOOK_SCHEMA_VERSION)?;
     }
 

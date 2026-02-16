@@ -128,3 +128,37 @@ export interface SourceStatusPayload {
   status: string;
   error_message?: string;
 }
+
+export interface NotebookStats {
+  source_count: number;
+  ready_count: number;
+  error_count: number;
+  missing_summaries: number;
+  chunk_count: number;
+  sources_with_chunks: number;
+  total_words: number;
+}
+
+export interface EmbeddingModelPayload {
+  state: "downloading" | "ready";
+  message: string;
+}
+
+export interface JobCompletedPayload {
+  jobId: string;
+  output: string | null;
+}
+
+export interface ChatErrorPayload {
+  conversation_id: string;
+  message_id: string;
+  error: string;
+}
+
+export interface QueueStatus {
+  paused: boolean;
+  pending: number;
+  processing: number;
+  completed: number;
+  failed: number;
+}

@@ -56,6 +56,8 @@ pub struct ChatRequest {
     pub max_tokens: u32,
     pub temperature: f32,
     pub stream: bool,
+    /// Ollama num_ctx: total context window size. When None, Ollama uses model default.
+    pub num_ctx: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

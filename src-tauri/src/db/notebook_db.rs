@@ -81,6 +81,17 @@ pub struct Note {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotebookStats {
+    pub source_count: u32,
+    pub ready_count: u32,
+    pub error_count: u32,
+    pub missing_summaries: u32,
+    pub chunk_count: u32,
+    pub sources_with_chunks: u32,
+    pub total_words: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudioOutput {
     pub id: String,
     pub output_type: String,
@@ -105,13 +116,13 @@ impl NotebookDb {
 
     // -- Sources --
 
-    /// List all sources.
+    /// List all sources (without content_text — use get_source for full content).
     pub fn list_sources(&self) -> Result<Vec<Source>, GlossError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, source_type, title, original_filename, file_hash, url, file_path,
-                    content_text, word_count, metadata, summary, summary_model,
+                    word_count, metadata, summary, summary_model,
                     status, error_message, selected, created_at, updated_at
-             FROM sources ORDER BY created_at DESC",
+             FROM sources ORDER BY title ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Source {
@@ -122,16 +133,16 @@ impl NotebookDb {
                 file_hash: row.get(4)?,
                 url: row.get(5)?,
                 file_path: row.get(6)?,
-                content_text: row.get(7)?,
-                word_count: row.get(8)?,
-                metadata: row.get(9)?,
-                summary: row.get(10)?,
-                summary_model: row.get(11)?,
-                status: row.get(12)?,
-                error_message: row.get(13)?,
-                selected: row.get(14)?,
-                created_at: row.get(15)?,
-                updated_at: row.get(16)?,
+                content_text: None, // Excluded — too large for listing
+                word_count: row.get(7)?,
+                metadata: row.get(8)?,
+                summary: row.get(9)?,
+                summary_model: row.get(10)?,
+                status: row.get(11)?,
+                error_message: row.get(12)?,
+                selected: row.get(13)?,
+                created_at: row.get(14)?,
+                updated_at: row.get(15)?,
             })
         })?;
         let mut sources = Vec::new();
@@ -736,6 +747,90 @@ impl NotebookDb {
             ids.push(row?);
         }
         Ok(ids)
+    }
+
+    /// List sources that need summaries (ready but no summary).
+    pub fn list_sources_needing_summary(&self) -> Result<Vec<Source>, GlossError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_type, title, original_filename, file_hash, url, file_path,
+                    content_text, word_count, metadata, summary, summary_model,
+                    status, error_message, selected, created_at, updated_at
+             FROM sources WHERE status = 'ready' AND summary IS NULL
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Source {
+                id: row.get(0)?,
+                source_type: row.get(1)?,
+                title: row.get(2)?,
+                original_filename: row.get(3)?,
+                file_hash: row.get(4)?,
+                url: row.get(5)?,
+                file_path: row.get(6)?,
+                content_text: row.get(7)?,
+                word_count: row.get(8)?,
+                metadata: row.get(9)?,
+                summary: row.get(10)?,
+                summary_model: row.get(11)?,
+                status: row.get(12)?,
+                error_message: row.get(13)?,
+                selected: row.get(14)?,
+                created_at: row.get(15)?,
+                updated_at: row.get(16)?,
+            })
+        })?;
+        let mut sources = Vec::new();
+        for row in rows {
+            sources.push(row?);
+        }
+        Ok(sources)
+    }
+
+    /// Get all embedding IDs for a source's chunks (for HNSW cleanup before deletion).
+    pub fn get_embedding_ids_for_source(&self, source_id: &str) -> Result<Vec<u64>, GlossError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT embedding_id FROM chunks WHERE source_id = ? AND embedding_id IS NOT NULL",
+        )?;
+        let ids = stmt
+            .query_map(rusqlite::params![source_id], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .map(|id| id as u64)
+            .collect();
+        Ok(ids)
+    }
+
+    /// Delete all chunks for a source.
+    pub fn delete_chunks_for_source(&self, source_id: &str) -> Result<(), GlossError> {
+        self.conn
+            .execute("DELETE FROM chunks WHERE source_id = ?1", [source_id])?;
+        Ok(())
+    }
+
+    /// Get notebook-level statistics.
+    pub fn get_stats(&self) -> Result<NotebookStats, GlossError> {
+        let stats = self.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM sources) as source_count,
+                (SELECT COUNT(*) FROM sources WHERE status = 'ready') as ready_count,
+                (SELECT COUNT(*) FROM sources WHERE status = 'error') as error_count,
+                (SELECT COUNT(*) FROM sources WHERE summary IS NULL AND status = 'ready') as missing_summaries,
+                (SELECT COUNT(*) FROM chunks) as chunk_count,
+                (SELECT COUNT(DISTINCT source_id) FROM chunks) as sources_with_chunks,
+                (SELECT COALESCE(SUM(word_count), 0) FROM sources) as total_words",
+            [],
+            |row| {
+                Ok(NotebookStats {
+                    source_count: row.get(0)?,
+                    ready_count: row.get(1)?,
+                    error_count: row.get(2)?,
+                    missing_summaries: row.get(3)?,
+                    chunk_count: row.get(4)?,
+                    sources_with_chunks: row.get(5)?,
+                    total_words: row.get(6)?,
+                })
+            },
+        )?;
+        Ok(stats)
     }
 
     /// Get all summaries for selected sources.

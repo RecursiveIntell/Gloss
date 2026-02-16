@@ -14,7 +14,11 @@ impl OllamaProvider {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 }
@@ -99,14 +103,19 @@ impl LlmProvider for OllamaProvider {
             }));
         }
 
+        let mut options = serde_json::json!({
+            "temperature": request.temperature,
+            "num_predict": request.max_tokens,
+        });
+        if let Some(num_ctx) = request.num_ctx {
+            options["num_ctx"] = serde_json::json!(num_ctx);
+        }
+
         let body = serde_json::json!({
             "model": request.model,
             "messages": messages,
             "stream": request.stream,
-            "options": {
-                "temperature": request.temperature,
-                "num_predict": request.max_tokens,
-            }
+            "options": options,
         });
 
         let resp = self

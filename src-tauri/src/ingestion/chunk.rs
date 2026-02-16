@@ -22,8 +22,14 @@ pub struct ChunkData {
 }
 
 /// Split text into chunks using recursive character splitting.
-/// Respects section headings (markdown), paragraph breaks, line breaks, sentences, word boundaries.
+/// When `source_title` has a recognized code extension, uses code-aware
+/// boundary detection to prefer splitting at structural boundaries.
 pub fn chunk_text(text: &str, source_id: &str) -> Vec<ChunkData> {
+    chunk_text_with_title(text, source_id, "")
+}
+
+/// Split text into chunks, using the source title for code-aware splitting.
+pub fn chunk_text_with_title(text: &str, source_id: &str, source_title: &str) -> Vec<ChunkData> {
     if text.is_empty() {
         return Vec::new();
     }
@@ -33,7 +39,15 @@ pub fn chunk_text(text: &str, source_id: &str) -> Vec<ChunkData> {
     let overlap_chars = OVERLAP_TOKENS * 4;
     let min_chars = MIN_CHUNK_TOKENS * 4;
 
-    let raw_chunks = recursive_split(text, target_chars, max_chars, overlap_chars);
+    // Try code-aware splitting first
+    let ext = source_title.rsplit('.').next().unwrap_or("");
+    let structural_boundaries = get_code_boundaries(ext, text);
+
+    let raw_chunks = if !structural_boundaries.is_empty() {
+        code_aware_split(text, &structural_boundaries, target_chars, max_chars, overlap_chars)
+    } else {
+        recursive_split(text, target_chars, max_chars, overlap_chars)
+    };
 
     let mut result = Vec::new();
     let mut current_offset = 0;
@@ -50,6 +64,10 @@ pub fn chunk_text(text: &str, source_id: &str) -> Vec<ChunkData> {
             .unwrap_or(current_offset);
         let end = start + trimmed.len();
 
+        // Extract heading/section info for chunk metadata
+        let section = extract_section_heading(trimmed, ext);
+        let metadata = section.map(|s| serde_json::json!({ "section": s }).to_string());
+
         result.push(ChunkData {
             id: format!("{}-c{}", source_id, result.len()),
             chunk_index: result.len() as i32,
@@ -57,7 +75,7 @@ pub fn chunk_text(text: &str, source_id: &str) -> Vec<ChunkData> {
             token_count: Some(approx_tokens(trimmed) as i32),
             start_offset: Some(start as i32),
             end_offset: Some(end as i32),
-            metadata: None,
+            metadata,
         });
 
         // Move offset forward (accounting for overlap)
@@ -80,6 +98,214 @@ pub fn chunk_text(text: &str, source_id: &str) -> Vec<ChunkData> {
     }
 
     result
+}
+
+/// Detect structural boundaries in code files based on language.
+fn get_code_boundaries(ext: &str, content: &str) -> Vec<usize> {
+    match ext {
+        "rs" => find_rust_boundaries(content),
+        "ts" | "tsx" | "js" | "jsx" => find_typescript_boundaries(content),
+        "py" => find_python_boundaries(content),
+        _ => Vec::new(),
+    }
+}
+
+fn find_rust_boundaries(content: &str) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    let mut offset = 0;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("pub fn ")
+            || trimmed.starts_with("fn ")
+            || trimmed.starts_with("pub async fn ")
+            || trimmed.starts_with("async fn ")
+            || trimmed.starts_with("impl ")
+            || trimmed.starts_with("pub struct ")
+            || trimmed.starts_with("pub enum ")
+            || trimmed.starts_with("pub trait ")
+            || trimmed.starts_with("pub mod ")
+            || trimmed.starts_with("mod ")
+            || trimmed.starts_with("#[cfg(test)]")
+        {
+            boundaries.push(offset);
+        }
+        offset += line.len() + 1; // +1 for newline
+    }
+
+    boundaries
+}
+
+fn find_typescript_boundaries(content: &str) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    let mut offset = 0;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("export function ")
+            || trimmed.starts_with("export async function ")
+            || trimmed.starts_with("export const ")
+            || trimmed.starts_with("export default ")
+            || trimmed.starts_with("export interface ")
+            || trimmed.starts_with("export type ")
+            || trimmed.starts_with("export class ")
+            || trimmed.starts_with("export enum ")
+            || trimmed.starts_with("interface ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("function ")
+            || trimmed.starts_with("// ===")
+        {
+            boundaries.push(offset);
+        }
+        offset += line.len() + 1;
+    }
+
+    boundaries
+}
+
+fn find_python_boundaries(content: &str) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    let mut offset = 0;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let is_top_level = !line.starts_with(' ') && !line.starts_with('\t');
+        if is_top_level
+            && (trimmed.starts_with("def ")
+                || trimmed.starts_with("async def ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("# ===")
+                || trimmed.starts_with('@'))
+        {
+            boundaries.push(offset);
+        }
+        offset += line.len() + 1;
+    }
+
+    boundaries
+}
+
+/// Split content at structural boundaries, merging small segments and
+/// recursively splitting large ones.
+fn code_aware_split(
+    content: &str,
+    boundaries: &[usize],
+    target: usize,
+    max: usize,
+    overlap: usize,
+) -> Vec<String> {
+    // Split content into segments at boundaries
+    let mut segments: Vec<&str> = Vec::new();
+    let mut prev = 0;
+    for &boundary in boundaries {
+        if boundary > prev && boundary <= content.len() {
+            segments.push(&content[prev..boundary]);
+            prev = boundary;
+        }
+    }
+    if prev < content.len() {
+        segments.push(&content[prev..]);
+    }
+
+    // Merge small segments and split large ones
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for segment in segments {
+        if current.is_empty() {
+            current = segment.to_string();
+        } else if current.len() + segment.len() <= target {
+            // Merge small segments
+            current.push_str(segment);
+        } else {
+            // Current is big enough, push it
+            if current.len() >= target / 4 {
+                chunks.push(current.clone());
+            } else {
+                // Too small on its own, merge with next
+                current.push_str(segment);
+                if current.len() >= target / 2 {
+                    chunks.push(current.clone());
+                    current = String::new();
+                }
+                continue;
+            }
+            current = segment.to_string();
+        }
+
+        // If current segment itself exceeds max, recursively split it
+        if current.len() > max {
+            let sub = recursive_split(&current, target, max, overlap);
+            chunks.extend(sub);
+            current = String::new();
+        }
+    }
+
+    // Push remaining
+    if !current.is_empty() {
+        if current.len() > max {
+            chunks.extend(recursive_split(&current, target, max, overlap));
+        } else {
+            chunks.push(current);
+        }
+    }
+
+    chunks
+}
+
+/// Extract a heading from the first meaningful line of a chunk for metadata.
+fn extract_section_heading(chunk: &str, ext: &str) -> Option<String> {
+    let first_line = chunk.lines().find(|l| !l.trim().is_empty())?;
+    let trimmed = first_line.trim();
+
+    match ext {
+        "rs" => {
+            if trimmed.starts_with("impl ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub struct ")
+                || trimmed.starts_with("pub enum ")
+                || trimmed.starts_with("pub trait ")
+            {
+                // Extract up to the opening brace or end of line
+                let heading = trimmed.split('{').next().unwrap_or(trimmed).trim();
+                Some(heading.to_string())
+            } else {
+                None
+            }
+        }
+        "ts" | "tsx" | "js" | "jsx" => {
+            if trimmed.starts_with("export ")
+                || trimmed.starts_with("function ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("interface ")
+            {
+                let heading = trimmed.split('{').next().unwrap_or(trimmed).trim();
+                Some(heading.to_string())
+            } else {
+                None
+            }
+        }
+        "py" => {
+            if trimmed.starts_with("def ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("async def ")
+            {
+                let heading = trimmed.split(':').next().unwrap_or(trimmed).trim();
+                Some(heading.to_string())
+            } else {
+                None
+            }
+        }
+        "md" | "markdown" => {
+            if trimmed.starts_with('#') {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Recursively split text, respecting boundaries in priority order:
@@ -209,5 +435,55 @@ mod tests {
             assert!(chunk.start_offset.is_some());
             assert!(chunk.end_offset.is_some());
         }
+    }
+
+    #[test]
+    fn test_rust_code_boundaries() {
+        let code = "use std::io;\n\npub fn foo() {\n    println!(\"hello\");\n}\n\npub fn bar() {\n    println!(\"world\");\n}\n";
+        let boundaries = find_rust_boundaries(code);
+        assert!(boundaries.len() >= 2, "Should find at least 2 function boundaries");
+    }
+
+    #[test]
+    fn test_code_aware_chunking() {
+        // Build a Rust file large enough to need splitting
+        let mut code = String::from("use std::io;\n\n");
+        for i in 0..20 {
+            code.push_str(&format!(
+                "pub fn function_{}() {{\n{}\n}}\n\n",
+                i,
+                "    let x = 42;\n".repeat(40)
+            ));
+        }
+        let chunks = chunk_text_with_title(&code, "s1", "example.rs");
+        assert!(chunks.len() > 1, "Should split into multiple chunks");
+        // Each chunk should tend to start at a function boundary
+        for chunk in &chunks {
+            if chunk.chunk_index > 0 {
+                let first_line = chunk.content.lines().next().unwrap_or("");
+                let trimmed = first_line.trim();
+                // Many chunks should start at function boundaries
+                // (not all, since merging may affect this)
+                if trimmed.starts_with("pub fn ") {
+                    assert!(chunk.metadata.is_some(), "Code chunks should have section metadata");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_section_heading_extraction() {
+        assert_eq!(
+            extract_section_heading("pub fn execute(&self) {\n    // body\n}", "rs"),
+            Some("pub fn execute(&self)".to_string())
+        );
+        assert_eq!(
+            extract_section_heading("export function handleClick() {\n}", "ts"),
+            Some("export function handleClick()".to_string())
+        );
+        assert_eq!(
+            extract_section_heading("def process(data):\n    pass", "py"),
+            Some("def process(data)".to_string())
+        );
     }
 }

@@ -66,3 +66,34 @@ pub async fn delete_notebook(
     tracing::info!(id = %id, "Deleted notebook");
     Ok(())
 }
+
+/// Set (or clear) the active notebook for scheduling purposes.
+/// The summary worker will idle when no notebook is active.
+/// Increments the epoch counter so stale summary jobs are soft-cancelled.
+/// Eagerly initializes the embedder and HNSW index so the first chat
+/// message doesn't have to wait for model loading.
+#[tauri::command]
+pub async fn set_active_notebook(
+    notebook_id: Option<String>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), GlossError> {
+    state.set_active_notebook(notebook_id.clone());
+
+    // Eagerly init embedder + HNSW for the selected notebook so the first
+    // chat message is fast. These are no-ops if already initialized.
+    if let Some(ref nb_id) = notebook_id {
+        // Open the notebook DB (needed by ensure_hnsw_index)
+        if let Err(e) = state.get_notebook_db(nb_id) {
+            tracing::warn!(notebook_id = %nb_id, "Eager notebook DB open failed: {}", e);
+        }
+        if let Err(e) = state.ensure_embedder(Some(&app_handle)) {
+            tracing::warn!(notebook_id = %nb_id, "Eager embedder init failed: {}", e);
+        }
+        if let Err(e) = state.ensure_hnsw_index(nb_id) {
+            tracing::warn!(notebook_id = %nb_id, "Eager HNSW init failed: {}", e);
+        }
+    }
+
+    Ok(())
+}

@@ -12,11 +12,13 @@ interface PanelLayoutProps {
 
 export function PanelLayout({ notebookId }: PanelLayoutProps) {
   const loadSources = useSourceStore((s) => s.loadSources);
+  const loadStats = useSourceStore((s) => s.loadStats);
   const loadConversations = useChatStore((s) => s.loadConversations);
   const loadNotes = useNoteStore((s) => s.loadNotes);
 
   useEffect(() => {
     loadSources(notebookId);
+    loadStats(notebookId);
     loadConversations(notebookId);
     loadNotes(notebookId);
   }, [notebookId]);

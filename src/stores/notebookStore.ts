@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import type { Notebook } from '../lib/types';
 import * as api from '../lib/tauri';
+import { useChatStore } from './chatStore';
+import { useSourceStore } from './sourceStore';
 
 interface NotebookStore {
   notebooks: Notebook[];
@@ -9,12 +11,14 @@ interface NotebookStore {
   loadNotebooks: () => Promise<void>;
   createNotebook: (name: string) => Promise<string>;
   deleteNotebook: (id: string) => Promise<void>;
-  setActive: (id: string) => void;
+  setActive: (id: string | null) => void;
 }
+
+const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
 
 export const useNotebookStore = create<NotebookStore>((set, get) => ({
   notebooks: [],
-  activeNotebookId: null,
+  activeNotebookId: localStorage.getItem(ACTIVE_NB_KEY),
   loading: false,
 
   loadNotebooks: async () => {
@@ -32,7 +36,7 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
     try {
       const id = await api.createNotebook(name);
       await get().loadNotebooks();
-      set({ activeNotebookId: id });
+      get().setActive(id);
       return id;
     } catch (e) {
       console.error('Failed to create notebook:', e);
@@ -44,10 +48,31 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
     await api.deleteNotebook(id);
     const { activeNotebookId } = get();
     if (activeNotebookId === id) {
-      set({ activeNotebookId: null });
+      get().setActive(null);
     }
     await get().loadNotebooks();
   },
 
-  setActive: (id) => set({ activeNotebookId: id }),
+  setActive: (id) => {
+    // Reset notebook-scoped frontend state before switching
+    useChatStore.getState().resetForNotebookSwitch();
+    useSourceStore.getState().resetForNotebookSwitch();
+    set({ activeNotebookId: id });
+    // Persist across restarts
+    if (id) {
+      localStorage.setItem(ACTIVE_NB_KEY, id);
+    } else {
+      localStorage.removeItem(ACTIVE_NB_KEY);
+    }
+    // Notify backend so summary worker knows which notebook is active
+    api.setActiveNotebook(id).catch((e) => {
+      console.error('Failed to set active notebook on backend:', e);
+    });
+    // Auto-queue any missing summaries for the newly selected notebook
+    if (id) {
+      api.regenerateMissingSummaries(id).catch((e) => {
+        console.error('Failed to auto-queue summaries:', e);
+      });
+    }
+  },
 }));

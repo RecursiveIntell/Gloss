@@ -1,0 +1,59 @@
+[package]
+name = "llm-pipeline"
+version = "0.2.0"
+edition = "2021"
+authors = ["Josh"]
+license = "MIT"
+description = "Reusable node payloads for LLM workflows: prompt templating, Ollama calls, defensive parsing, streaming, and sequential chaining"
+readme = "README.md"
+keywords = ["llm", "ai", "payload", "ollama", "langgraph"]
+categories = ["asynchronous", "api-bindings"]
+repository = "https://github.com/RecursiveIntell/llm-pipeline"
+homepage = "https://github.com/RecursiveIntell/llm-pipeline"
+
+[features]
+default = []
+yaml = ["llm-output-parser/yaml"]
+openai = []
+
+[dependencies]
+llm-output-parser = { path = "../llm-output-parser" }
+stack-ids = { path = "../stack-ids" }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+futures = "0.3"
+async-trait = "0.1"
+fastrand = "2"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[example]]
+name = "basic_pipeline"
+path = "examples/basic_pipeline.rs"
+
+[[example]]
+name = "streaming_pipeline"
+path = "examples/streaming_pipeline.rs"
+
+[[example]]
+name = "thinking_mode"
+path = "examples/thinking_mode.rs"
+
+[[example]]
+name = "context_injection"
+path = "examples/context_injection.rs"
+
+[[example]]
+name = "payload_chain"
+path = "examples/payload_chain.rs"
+
+[[example]]
+name = "mock_example"
+path = "examples/mock_example.rs"

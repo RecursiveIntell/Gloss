@@ -1,0 +1,20 @@
+/target
+Cargo.lock
+*.db
+
+# Claude Code config
+CLAUDE.md
+AGENTS.md
+CLAUDE.md.bak
+CLAUDE2.md.bak
+AGENTS.md.bak
+AGENTS2.md.bak
+CLAUDE_CODE_PROMPT.md
+
+# Spec/planning docs (not part of the published crate)
+CRATES_IO_FIXES_SPEC.md
+FEATURE_SPEC.md
+IMPLEMENTATION_ORDER.md
+PROTOCOL_REFERENCE.md
+TESTING_STRATEGY.md
+docs/

@@ -13,11 +13,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# === Local libraries ===
-llm-pipeline = { path = "../../Libraries/LLM-Pipeline" }
-# agent-graph used in Phase 2+ for map-reduce
-# agent-graph = { path = "../../Libraries/agent-graph" }
-tauri-queue = { path = "../../Libraries/Tauri-Queue" }
+# === Vendored libraries ===
+llm-pipeline = { path = "vendor/llm-pipeline" }
+tauri-queue = { path = "vendor/tauri-queue" }
 
 # === Tauri ===
 tauri = { version = "2", features = [] }

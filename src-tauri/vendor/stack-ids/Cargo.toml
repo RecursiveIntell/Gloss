@@ -1,0 +1,18 @@
+[package]
+name = "stack-ids"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+description = "Shared identity, scope, and trace primitives for the local-first AI systems stack"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+serde_json = "1"

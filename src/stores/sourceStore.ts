@@ -1,6 +1,9 @@
 import { create } from 'zustand';
 import type { Source, NotebookStats } from '../lib/types';
 import * as api from '../lib/tauri';
+import { useToastStore } from './toastStore';
+
+const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
 
 interface SourceStore {
   sources: Source[];
@@ -18,6 +21,7 @@ interface SourceStore {
   selectAll: () => void;
   selectNone: () => void;
   updateSourceStatus: (sourceId: string, status: string) => void;
+  updateSourceStatusBulk: (updates: Array<{ sourceId: string; status: string; errorMessage?: string }>) => void;
   loadStats: (notebookId: string) => Promise<void>;
   resetForNotebookSwitch: () => void;
 }
@@ -32,37 +36,94 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
     set({ loading: true });
     try {
       const sources = await api.listSources(notebookId);
+      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+        return;
+      }
       const selectedIds = new Set(sources.filter(s => s.selected).map(s => s.id));
       set({ sources, selectedSourceIds: selectedIds, loading: false });
     } catch (e) {
+      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+        return;
+      }
       console.error('Failed to load sources:', e);
       set({ loading: false });
     }
   },
 
   addSourceFile: async (notebookId, path) => {
-    await api.addSourceFile(notebookId, path);
-    await get().loadSources(notebookId);
+    try {
+      await api.addSourceFile(notebookId, path);
+      await get().loadSources(notebookId);
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Import Failed',
+        message: String(e),
+        duration: 5000,
+      });
+    }
   },
 
   addSourceFolder: async (notebookId, path) => {
-    await api.addSourceFolder(notebookId, path);
-    await get().loadSources(notebookId);
+    try {
+      // Schedules the directory walk and ingestion in the background.
+      await api.addSourceFolder(notebookId, path);
+      useToastStore.getState().addToast({
+        type: 'info',
+        title: 'Folder Import Started',
+        message: 'Scanning and ingesting sources in the background.',
+        duration: 3000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Folder Import Failed',
+        message: String(e),
+        duration: 5000,
+      });
+    }
   },
 
   addSourcePaste: async (notebookId, title, text) => {
-    await api.addSourcePaste(notebookId, title, text);
-    await get().loadSources(notebookId);
+    try {
+      await api.addSourcePaste(notebookId, title, text);
+      await get().loadSources(notebookId);
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Paste Failed',
+        message: String(e),
+        duration: 5000,
+      });
+    }
   },
 
   deleteSource: async (notebookId, sourceId) => {
-    await api.deleteSource(notebookId, sourceId);
-    await get().loadSources(notebookId);
+    try {
+      await api.deleteSource(notebookId, sourceId);
+      await get().loadSources(notebookId);
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Delete Failed',
+        message: String(e),
+        duration: 5000,
+      });
+    }
   },
 
   retrySource: async (notebookId, sourceId) => {
-    await api.retrySourceIngestion(notebookId, sourceId);
-    await get().loadSources(notebookId);
+    try {
+      await api.retrySourceIngestion(notebookId, sourceId);
+      await get().loadSources(notebookId);
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Retry Failed',
+        message: String(e),
+        duration: 5000,
+      });
+    }
   },
 
   toggleSource: (sourceId) => {
@@ -106,9 +167,24 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
     }));
   },
 
+  updateSourceStatusBulk: (updates) => {
+    if (updates.length === 0) return;
+    const map = new Map(updates.map(u => [u.sourceId, u]));
+    set((state) => ({
+      sources: state.sources.map((s) => {
+        const u = map.get(s.id);
+        if (!u) return s;
+        return { ...s, status: u.status, error_message: u.errorMessage ?? s.error_message };
+      }),
+    }));
+  },
+
   loadStats: async (notebookId) => {
     try {
       const stats = await api.getNotebookStats(notebookId);
+      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+        return;
+      }
       set({ stats });
     } catch {
       // Stats are optional — don't crash on failure

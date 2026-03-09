@@ -11,7 +11,11 @@ pub async fn summarize_source(
 ) -> Result<String, GlossError> {
     // Truncate content to ~3000 tokens (~12000 chars) for single-pass summary
     let truncated = if content.len() > 12000 {
-        &content[..12000]
+        let mut end = 12000;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        &content[..end]
     } else {
         content
     };
@@ -29,6 +33,7 @@ pub async fn summarize_source(
                 "Summarize this document titled \"{}\":\n\n{}",
                 title, truncated
             ),
+            images: None,
         }],
         max_tokens: 512,
         temperature: 0.3,
@@ -58,11 +63,7 @@ pub async fn generate_suggested_questions(
 
     let summary_text: String = summaries
         .iter()
-        .filter_map(|(_, title, summary)| {
-            summary
-                .as_ref()
-                .map(|s| format!("**{}**: {}", title, s))
-        })
+        .filter_map(|(_, title, summary)| summary.as_ref().map(|s| format!("**{}**: {}", title, s)))
         .collect::<Vec<_>>()
         .join("\n\n");
 
@@ -80,6 +81,7 @@ pub async fn generate_suggested_questions(
         messages: vec![ChatMessage {
             role: "user".to_string(),
             content: summary_text,
+            images: None,
         }],
         max_tokens: 256,
         temperature: 0.7,

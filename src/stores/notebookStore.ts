@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type { Notebook } from '../lib/types';
 import * as api from '../lib/tauri';
 import { useChatStore } from './chatStore';
+import { useNoteStore } from './noteStore';
 import { useSourceStore } from './sourceStore';
 
 interface NotebookStore {
@@ -45,17 +46,20 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
   },
 
   deleteNotebook: async (id) => {
-    await api.deleteNotebook(id);
     const { activeNotebookId } = get();
+    // Clear active notebook BEFORE deletion so the backend stops summary jobs
+    // and the UI resets immediately (prevents race with summary loop)
     if (activeNotebookId === id) {
       get().setActive(null);
     }
+    await api.deleteNotebook(id);
     await get().loadNotebooks();
   },
 
   setActive: (id) => {
     // Reset notebook-scoped frontend state before switching
     useChatStore.getState().resetForNotebookSwitch();
+    useNoteStore.getState().resetForNotebookSwitch();
     useSourceStore.getState().resetForNotebookSwitch();
     set({ activeNotebookId: id });
     // Persist across restarts
@@ -64,14 +68,18 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
     } else {
       localStorage.removeItem(ACTIVE_NB_KEY);
     }
-    // Notify backend so summary worker knows which notebook is active
-    api.setActiveNotebook(id).catch((e) => {
-      console.error('Failed to set active notebook on backend:', e);
-    });
-    // Auto-queue any missing summaries for the newly selected notebook
+    // Await backend initialization before queuing summaries
     if (id) {
-      api.regenerateMissingSummaries(id).catch((e) => {
-        console.error('Failed to auto-queue summaries:', e);
+      const targetId = id;
+      api.setActiveNotebook(targetId)
+        .then(() => {
+          if (get().activeNotebookId !== targetId) return;
+          return api.regenerateMissingSummaries(targetId);
+        })
+        .catch((e) => console.error('Notebook activation failed:', e));
+    } else {
+      api.setActiveNotebook(null).catch((e) => {
+        console.error('Failed to clear active notebook:', e);
       });
     }
   },

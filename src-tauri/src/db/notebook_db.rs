@@ -107,11 +107,18 @@ pub struct StudioOutput {
 }
 
 impl NotebookDb {
-    /// Open (or create) a per-notebook database.
-    pub fn open(path: &Path) -> Result<Self, GlossError> {
+    /// Connect to an existing per-notebook database with runtime pragmas.
+    pub fn connect(path: &Path) -> Result<Self, GlossError> {
         let conn = Connection::open(path)?;
-        migrations::migrate_notebook_db(&conn)?;
+        migrations::apply_pragmas(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Open (or create) a per-notebook database and run migrations.
+    pub fn open(path: &Path) -> Result<Self, GlossError> {
+        let db = Self::connect(path)?;
+        migrations::migrate_notebook_db(&db.conn)?;
+        Ok(db)
     }
 
     // -- Sources --
@@ -381,7 +388,9 @@ impl NotebookDb {
         if chunk_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders: Vec<String> = (0..chunk_ids.len()).map(|i| format!("?{}", i + 1)).collect();
+        let placeholders: Vec<String> = (0..chunk_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
         let sql = format!(
             "SELECT id, source_id, chunk_index, content, token_count, start_offset, end_offset,
                     metadata, embedding_id, embedding_model
@@ -414,6 +423,48 @@ impl NotebookDb {
         Ok(chunks)
     }
 
+    /// Returns true when every chunk in the selected scope has an embedding and
+    /// there is at least one embedded chunk available for hybrid search.
+    pub fn can_run_hybrid_search(&self, source_ids: &[String]) -> Result<bool, GlossError> {
+        let (embedded_sql, missing_sql, params): (String, String, Vec<&dyn rusqlite::types::ToSql>) =
+            if source_ids.is_empty() {
+                (
+                    "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NOT NULL".to_string(),
+                    "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NULL".to_string(),
+                    Vec::new(),
+                )
+            } else {
+                let placeholders: Vec<String> = (0..source_ids.len())
+                    .map(|i| format!("?{}", i + 1))
+                    .collect();
+                let clause = placeholders.join(", ");
+                (
+                    format!(
+                        "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NOT NULL AND source_id IN ({clause})"
+                    ),
+                    format!(
+                        "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NULL AND source_id IN ({clause})"
+                    ),
+                    source_ids
+                        .iter()
+                        .map(|id| id as &dyn rusqlite::types::ToSql)
+                        .collect(),
+                )
+            };
+
+        let embedded: i64 =
+            self.conn
+                .query_row(&embedded_sql, params.as_slice(), |row| row.get(0))?;
+        if embedded == 0 {
+            return Ok(false);
+        }
+
+        let missing: i64 = self
+            .conn
+            .query_row(&missing_sql, params.as_slice(), |row| row.get(0))?;
+        Ok(missing == 0)
+    }
+
     /// Get chunk by embedding_id (HNSW label).
     pub fn get_chunk_by_embedding_id(&self, embedding_id: i64) -> Result<Chunk, GlossError> {
         self.conn
@@ -438,9 +489,9 @@ impl NotebookDb {
                 },
             )
             .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    GlossError::NotFound(format!("Chunk with embedding_id {embedding_id} not found"))
-                }
+                rusqlite::Error::QueryReturnedNoRows => GlossError::NotFound(format!(
+                    "Chunk with embedding_id {embedding_id} not found"
+                )),
                 other => GlossError::Database(other),
             })
     }
@@ -519,10 +570,8 @@ impl NotebookDb {
 
     /// Create a new conversation.
     pub fn create_conversation(&self, id: &str) -> Result<(), GlossError> {
-        self.conn.execute(
-            "INSERT INTO conversations (id) VALUES (?1)",
-            [id],
-        )?;
+        self.conn
+            .execute("INSERT INTO conversations (id) VALUES (?1)", [id])?;
         Ok(())
     }
 
@@ -786,6 +835,16 @@ impl NotebookDb {
         Ok(sources)
     }
 
+    /// Check if a source with the given file hash already exists.
+    pub fn source_exists_by_hash(&self, hash: &str) -> Result<bool, GlossError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sources WHERE file_hash = ?1",
+            [hash],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Get all embedding IDs for a source's chunks (for HNSW cleanup before deletion).
     pub fn get_embedding_ids_for_source(&self, source_id: &str) -> Result<Vec<u64>, GlossError> {
         let mut stmt = self.conn.prepare(
@@ -797,6 +856,14 @@ impl NotebookDb {
             .map(|id| id as u64)
             .collect();
         Ok(ids)
+    }
+
+    /// Get the maximum embedding_id across all chunks (high-water mark for HNSW labels).
+    pub fn max_embedding_id(&self) -> Result<Option<i64>, GlossError> {
+        let result: Option<i64> =
+            self.conn
+                .query_row("SELECT MAX(embedding_id) FROM chunks", [], |row| row.get(0))?;
+        Ok(result)
     }
 
     /// Delete all chunks for a source.
@@ -834,13 +901,13 @@ impl NotebookDb {
     }
 
     /// Get all summaries for selected sources.
-    pub fn get_selected_summaries(&self) -> Result<Vec<(String, String, Option<String>)>, GlossError> {
+    pub fn get_selected_summaries(
+        &self,
+    ) -> Result<Vec<(String, String, Option<String>)>, GlossError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, summary FROM sources WHERE selected = 1 AND summary IS NOT NULL",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         let mut summaries = Vec::new();
         for row in rows {
             summaries.push(row?);

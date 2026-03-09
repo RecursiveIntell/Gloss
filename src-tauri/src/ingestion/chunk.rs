@@ -1,4 +1,3 @@
-
 /// Configuration for the recursive character splitter.
 const TARGET_TOKENS: usize = 800;
 const MAX_TOKENS: usize = 1500;
@@ -8,6 +7,17 @@ const MIN_CHUNK_TOKENS: usize = 50;
 /// Approximate tokens by dividing character count by 4.
 fn approx_tokens(text: &str) -> usize {
     text.len() / 4
+}
+
+/// Snap a byte offset to the nearest valid UTF-8 char boundary.
+/// Searches backward from `offset` to find a valid boundary.
+fn snap_to_char_boundary(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    let mut pos = offset;
+    while pos > 0 && !text.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
 }
 
 /// A chunk produced by the splitter.
@@ -44,7 +54,13 @@ pub fn chunk_text_with_title(text: &str, source_id: &str, source_title: &str) ->
     let structural_boundaries = get_code_boundaries(ext, text);
 
     let raw_chunks = if !structural_boundaries.is_empty() {
-        code_aware_split(text, &structural_boundaries, target_chars, max_chars, overlap_chars)
+        code_aware_split(
+            text,
+            &structural_boundaries,
+            target_chars,
+            max_chars,
+            overlap_chars,
+        )
     } else {
         recursive_split(text, target_chars, max_chars, overlap_chars)
     };
@@ -58,10 +74,11 @@ pub fn chunk_text_with_title(text: &str, source_id: &str, source_title: &str) ->
             continue;
         }
 
-        let start = text[current_offset..]
+        let safe_offset = snap_to_char_boundary(text, current_offset);
+        let start = text[safe_offset..]
             .find(trimmed)
-            .map(|pos| current_offset + pos)
-            .unwrap_or(current_offset);
+            .map(|pos| safe_offset + pos)
+            .unwrap_or(safe_offset);
         let end = start + trimmed.len();
 
         // Extract heading/section info for chunk metadata
@@ -80,7 +97,7 @@ pub fn chunk_text_with_title(text: &str, source_id: &str, source_title: &str) ->
 
         // Move offset forward (accounting for overlap)
         if end > overlap_chars {
-            current_offset = end.saturating_sub(overlap_chars);
+            current_offset = snap_to_char_boundary(text, end.saturating_sub(overlap_chars));
         }
     }
 
@@ -113,6 +130,7 @@ fn get_code_boundaries(ext: &str, content: &str) -> Vec<usize> {
 fn find_rust_boundaries(content: &str) -> Vec<usize> {
     let mut boundaries = Vec::new();
     let mut offset = 0;
+    let bytes = content.as_bytes();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -130,7 +148,14 @@ fn find_rust_boundaries(content: &str) -> Vec<usize> {
         {
             boundaries.push(offset);
         }
-        offset += line.len() + 1; // +1 for newline
+        offset += line.len();
+        // Skip past actual line ending (\r\n or \n)
+        if bytes.get(offset) == Some(&b'\r') {
+            offset += 1;
+        }
+        if bytes.get(offset) == Some(&b'\n') {
+            offset += 1;
+        }
     }
 
     boundaries
@@ -139,6 +164,7 @@ fn find_rust_boundaries(content: &str) -> Vec<usize> {
 fn find_typescript_boundaries(content: &str) -> Vec<usize> {
     let mut boundaries = Vec::new();
     let mut offset = 0;
+    let bytes = content.as_bytes();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -157,7 +183,13 @@ fn find_typescript_boundaries(content: &str) -> Vec<usize> {
         {
             boundaries.push(offset);
         }
-        offset += line.len() + 1;
+        offset += line.len();
+        if bytes.get(offset) == Some(&b'\r') {
+            offset += 1;
+        }
+        if bytes.get(offset) == Some(&b'\n') {
+            offset += 1;
+        }
     }
 
     boundaries
@@ -166,6 +198,7 @@ fn find_typescript_boundaries(content: &str) -> Vec<usize> {
 fn find_python_boundaries(content: &str) -> Vec<usize> {
     let mut boundaries = Vec::new();
     let mut offset = 0;
+    let bytes = content.as_bytes();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -179,7 +212,13 @@ fn find_python_boundaries(content: &str) -> Vec<usize> {
         {
             boundaries.push(offset);
         }
-        offset += line.len() + 1;
+        offset += line.len();
+        if bytes.get(offset) == Some(&b'\r') {
+            offset += 1;
+        }
+        if bytes.get(offset) == Some(&b'\n') {
+            offset += 1;
+        }
     }
 
     boundaries
@@ -308,81 +347,108 @@ fn extract_section_heading(chunk: &str, ext: &str) -> Option<String> {
     }
 }
 
-/// Recursively split text, respecting boundaries in priority order:
-/// section headings > paragraph breaks > line breaks > sentence ends > word boundaries
+fn find_separator_split(remaining: &str, sep: &str, target: usize, max: usize) -> Option<usize> {
+    let max_end = snap_to_char_boundary(remaining, remaining.len().min(max));
+    if max_end == 0 {
+        return None;
+    }
+
+    let target_end = snap_to_char_boundary(remaining, remaining.len().min(target).min(max_end));
+    let min_chunk = (target / 4).max(1).min(target_end.max(1));
+
+    if let Some(pos) = remaining[..target_end].rfind(sep) {
+        if pos >= min_chunk {
+            return Some(pos);
+        }
+    }
+
+    if target_end < max_end {
+        let tail = &remaining[target_end..max_end];
+        if let Some(offset) = tail.find(sep) {
+            let pos = target_end + offset;
+            if pos >= min_chunk {
+                return Some(pos);
+            }
+        }
+    }
+
+    None
+}
+
+fn hard_split_end(remaining: &str, target: usize, max: usize) -> usize {
+    let hard_end = snap_to_char_boundary(remaining, remaining.len().min(max));
+    if hard_end == 0 {
+        return 0;
+    }
+
+    let target_end = snap_to_char_boundary(remaining, remaining.len().min(target).min(hard_end));
+    if target_end == 0 {
+        return hard_end;
+    }
+
+    remaining[..target_end]
+        .rfind(' ')
+        .filter(|pos| *pos > 0)
+        .unwrap_or(target_end)
+}
+
+/// Split text iteratively, respecting boundaries in priority order:
+/// section headings > paragraph breaks > line breaks > sentence ends > word boundaries.
+/// This version guarantees forward progress and avoids recursive blow-ups on
+/// pathological long files.
 fn recursive_split(text: &str, target: usize, max: usize, overlap: usize) -> Vec<String> {
     if text.len() <= max {
         return vec![text.to_string()];
     }
 
-    // Try splitting by section headings (markdown ## headings)
     let separators = [
-        "\n## ",      // Section heading
-        "\n### ",     // Subsection
-        "\n\n",       // Paragraph break
-        "\n",         // Line break
-        ". ",         // Sentence end
-        " ",          // Word boundary
+        "\n## ",  // Section heading
+        "\n### ", // Subsection
+        "\n\n",   // Paragraph break
+        "\n",     // Line break
+        ". ",     // Sentence end
+        " ",      // Word boundary
     ];
 
-    for sep in &separators {
-        let parts: Vec<&str> = text.split(sep).collect();
-        if parts.len() > 1 {
-            let mut chunks = Vec::new();
-            let mut current = String::new();
-
-            for (i, part) in parts.iter().enumerate() {
-                let with_sep = if i > 0 {
-                    format!("{}{}", sep, part)
-                } else {
-                    part.to_string()
-                };
-
-                if current.len() + with_sep.len() > target && !current.is_empty() {
-                    chunks.push(current.clone());
-                    // Start new chunk with overlap
-                    let overlap_start = current.len().saturating_sub(overlap);
-                    current = current[overlap_start..].to_string();
-                    current.push_str(&with_sep);
-                } else {
-                    current.push_str(&with_sep);
-                }
-            }
-
-            if !current.is_empty() {
-                chunks.push(current);
-            }
-
-            // Recursively split any chunks that are still too large
-            let mut result = Vec::new();
-            for chunk in chunks {
-                if chunk.len() > max {
-                    result.extend(recursive_split(&chunk, target, max, overlap));
-                } else {
-                    result.push(chunk);
-                }
-            }
-
-            return result;
-        }
-    }
-
-    // Fallback: hard split at max chars
     let mut chunks = Vec::new();
-    let mut start = 0;
+    let mut start = 0usize;
+
     while start < text.len() {
-        let end = (start + target).min(text.len());
-        // Try to find a word boundary near the target
-        let chunk_end = if end < text.len() {
-            text[start..end]
-                .rfind(' ')
-                .map(|pos| start + pos + 1)
-                .unwrap_or(end)
-        } else {
-            end
-        };
-        chunks.push(text[start..chunk_end].to_string());
-        start = chunk_end.saturating_sub(overlap);
+        let remaining = &text[start..];
+        if remaining.len() <= max {
+            chunks.push(remaining.to_string());
+            break;
+        }
+
+        let mut end_rel = separators
+            .iter()
+            .find_map(|sep| find_separator_split(remaining, sep, target, max))
+            .unwrap_or_else(|| hard_split_end(remaining, target, max));
+
+        end_rel = snap_to_char_boundary(remaining, end_rel);
+        if end_rel == 0 {
+            end_rel = snap_to_char_boundary(remaining, remaining.len().min(max));
+        }
+
+        if end_rel == 0 {
+            break;
+        }
+
+        let end = start + end_rel;
+        if end <= start {
+            let fallback_end = snap_to_char_boundary(text, (start + target).min(text.len()));
+            if fallback_end <= start {
+                break;
+            }
+            chunks.push(text[start..fallback_end].to_string());
+            start = fallback_end;
+            continue;
+        }
+
+        chunks.push(text[start..end].to_string());
+
+        let new_start = snap_to_char_boundary(text, end.saturating_sub(overlap));
+        start = if new_start <= start { end } else { new_start };
     }
 
     chunks
@@ -416,6 +482,15 @@ mod tests {
     }
 
     #[test]
+    fn test_repeated_text_chunking_stays_bounded() {
+        let text = "token ".repeat(20_000);
+        let chunks = chunk_text(&text, "s1");
+        assert!(!chunks.is_empty());
+        assert!(chunks.len() < 1000);
+        assert!(chunks.iter().all(|chunk| !chunk.content.is_empty()));
+    }
+
+    #[test]
     fn test_markdown_heading_split() {
         let text = format!(
             "# Introduction\n\n{}\n\n## Methods\n\n{}\n\n## Results\n\n{}",
@@ -441,7 +516,10 @@ mod tests {
     fn test_rust_code_boundaries() {
         let code = "use std::io;\n\npub fn foo() {\n    println!(\"hello\");\n}\n\npub fn bar() {\n    println!(\"world\");\n}\n";
         let boundaries = find_rust_boundaries(code);
-        assert!(boundaries.len() >= 2, "Should find at least 2 function boundaries");
+        assert!(
+            boundaries.len() >= 2,
+            "Should find at least 2 function boundaries"
+        );
     }
 
     #[test]
@@ -465,7 +543,10 @@ mod tests {
                 // Many chunks should start at function boundaries
                 // (not all, since merging may affect this)
                 if trimmed.starts_with("pub fn ") {
-                    assert!(chunk.metadata.is_some(), "Code chunks should have section metadata");
+                    assert!(
+                        chunk.metadata.is_some(),
+                        "Code chunks should have section metadata"
+                    );
                 }
             }
         }

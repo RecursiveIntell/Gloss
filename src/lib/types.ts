@@ -116,6 +116,7 @@ export interface SourceContent {
 }
 
 export interface ChatTokenPayload {
+  notebook_id: string;
   conversation_id: string;
   message_id: string;
   token: string;
@@ -150,6 +151,7 @@ export interface JobCompletedPayload {
 }
 
 export interface ChatErrorPayload {
+  notebook_id: string;
   conversation_id: string;
   message_id: string;
   error: string;
@@ -161,4 +163,14 @@ export interface QueueStatus {
   processing: number;
   completed: number;
   failed: number;
+}
+
+export interface SourcesBatchCreatedPayload {
+  notebook_id: string;
+  count: number;
+}
+
+export interface BatchIngestionCompletePayload {
+  notebook_id: string;
+  count: number;
 }

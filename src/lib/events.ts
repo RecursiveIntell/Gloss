@@ -3,6 +3,8 @@ import type {
   ChatTokenPayload,
   ChatErrorPayload,
   SourceStatusPayload,
+  SourcesBatchCreatedPayload,
+  BatchIngestionCompletePayload,
   EmbeddingModelPayload,
   JobCompletedPayload,
 } from "./types";
@@ -31,11 +33,30 @@ export function onSourceStatus(
   }).then((unlisten) => unlisten);
 }
 
+export function onSourcesBatchCreated(
+  callback: (payload: SourcesBatchCreatedPayload) => void
+): Promise<() => void> {
+  return listen<SourcesBatchCreatedPayload>("sources:batch_created", (event) => {
+    callback(event.payload);
+  }).then((unlisten) => unlisten);
+}
+
 export function onEmbeddingModelStatus(
   callback: (payload: EmbeddingModelPayload) => void
 ): Promise<() => void> {
   return listen<EmbeddingModelPayload>(
     "status:embedding_model",
+    (event) => {
+      callback(event.payload);
+    }
+  ).then((unlisten) => unlisten);
+}
+
+export function onBatchIngestionComplete(
+  callback: (payload: BatchIngestionCompletePayload) => void
+): Promise<() => void> {
+  return listen<BatchIngestionCompletePayload>(
+    "sources:batch_ingestion_complete",
     (event) => {
       callback(event.payload);
     }

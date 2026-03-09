@@ -37,17 +37,47 @@ pub fn extract_citations(
                         .unwrap_or_else(|| "Unknown".to_string());
 
                     // Extract a short quote from the chunk
-                    let quote = result
-                        .chunk
-                        .content
-                        .chars()
-                        .take(200)
-                        .collect::<String>();
+                    let quote = result.chunk.content.chars().take(200).collect::<String>();
 
                     citations.push(Citation {
                         chunk_id: result.chunk.id.clone(),
                         source_id: result.chunk.source_id.clone(),
                         source_title: title,
+                        quote: Some(quote),
+                        page: None,
+                        section: None,
+                    });
+                }
+            }
+        }
+    }
+
+    citations
+}
+
+/// Extract citations from LLM response using source_context (title, content) pairs.
+/// This matches the [1], [2] ordering in the system prompt exactly.
+pub fn extract_citations_from_context(
+    response: &str,
+    source_context: &[(String, String)],
+) -> Vec<Citation> {
+    let re = Regex::new(r"\[(\d+)\]").unwrap();
+    let mut citations = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for cap in re.captures_iter(response) {
+        if let Some(num_str) = cap.get(1) {
+            if let Ok(num) = num_str.as_str().parse::<usize>() {
+                let idx = num.saturating_sub(1);
+                if idx < source_context.len() && !seen.contains(&idx) {
+                    seen.insert(idx);
+                    let (title, content) = &source_context[idx];
+                    let quote: String = content.chars().take(200).collect();
+
+                    citations.push(Citation {
+                        chunk_id: String::new(),
+                        source_id: String::new(),
+                        source_title: title.clone(),
                         quote: Some(quote),
                         page: None,
                         section: None,

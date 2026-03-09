@@ -8,6 +8,7 @@ interface SettingsStore {
   settings: Record<string, string>;
   activeModel: string;
   loading: boolean;
+  externalTools: Record<string, boolean>;
   loadSettings: () => Promise<void>;
   loadProviders: () => Promise<void>;
   loadModels: () => Promise<void>;
@@ -16,6 +17,7 @@ interface SettingsStore {
   updateProvider: (id: string, enabled: boolean, baseUrl?: string, apiKey?: string) => Promise<void>;
   setActiveModel: (model: string) => void;
   testProvider: (providerId: string) => Promise<boolean>;
+  loadExternalTools: () => Promise<void>;
 }
 
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
@@ -24,6 +26,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   settings: {},
   activeModel: 'qwen3:8b',
   loading: false,
+  externalTools: {},
 
   loadSettings: async () => {
     try {
@@ -86,6 +89,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       return await api.testProvider(providerId);
     } catch {
       return false;
+    }
+  },
+
+  loadExternalTools: async () => {
+    try {
+      const tools = await api.checkExternalTools();
+      set({ externalTools: tools });
+    } catch {
+      // Non-critical — default to empty
     }
   },
 }));

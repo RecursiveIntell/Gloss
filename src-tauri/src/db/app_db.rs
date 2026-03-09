@@ -76,12 +76,7 @@ impl AppDb {
     }
 
     /// Create a new notebook. Returns the ID.
-    pub fn create_notebook(
-        &self,
-        id: &str,
-        name: &str,
-        directory: &str,
-    ) -> Result<(), GlossError> {
+    pub fn create_notebook(&self, id: &str, name: &str, directory: &str) -> Result<(), GlossError> {
         self.conn.execute(
             "INSERT INTO notebooks (id, name, directory) VALUES (?1, ?2, ?3)",
             rusqlite::params![id, name, directory],
@@ -184,16 +179,19 @@ impl AppDb {
 
     /// Get a provider's base URL.
     pub fn get_provider_url(&self, id: &str) -> Result<Option<String>, GlossError> {
-        let url = self.conn.query_row(
-            "SELECT base_url FROM providers WHERE id = ?1",
-            [id],
-            |row| row.get(0),
-        ).map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                GlossError::NotFound(format!("Provider {id} not found"))
-            }
-            other => GlossError::Database(other),
-        })?;
+        let url = self
+            .conn
+            .query_row(
+                "SELECT base_url FROM providers WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    GlossError::NotFound(format!("Provider {id} not found"))
+                }
+                other => GlossError::Database(other),
+            })?;
         Ok(url)
     }
 
@@ -205,10 +203,8 @@ impl AppDb {
         provider_id: &str,
         models: &[ModelRecord],
     ) -> Result<(), GlossError> {
-        self.conn.execute(
-            "DELETE FROM models WHERE provider_id = ?1",
-            [provider_id],
-        )?;
+        self.conn
+            .execute("DELETE FROM models WHERE provider_id = ?1", [provider_id])?;
         let mut stmt = self.conn.prepare(
             "INSERT INTO models (id, provider_id, display_name, parameter_size, context_window, capabilities)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -257,9 +253,7 @@ impl AppDb {
 
     /// Get all settings as key-value pairs.
     pub fn get_settings(&self) -> Result<std::collections::HashMap<String, String>, GlossError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key, value FROM settings")?;
+        let mut stmt = self.conn.prepare("SELECT key, value FROM settings")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -273,11 +267,11 @@ impl AppDb {
 
     /// Get a single setting.
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, GlossError> {
-        let result = self.conn.query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            [key],
-            |row| row.get(0),
-        );
+        let result =
+            self.conn
+                .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                    row.get(0)
+                });
         match result {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),

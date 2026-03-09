@@ -6,17 +6,25 @@ use crate::providers::ModelRegistry;
 use crate::retrieval::hybrid_search::{self, SearchResult};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::AppHandle;
 use tokio::sync::Semaphore;
+
+/// Native semantic indexing (fastembed + usearch) remains an in-process crash
+/// vector during ingestion. Keep it disabled until those calls are isolated from
+/// the desktop process.
+pub const NATIVE_SEMANTIC_INDEXING_ENABLED: bool = false;
 
 /// Global application state managed by Tauri
 pub struct AppState {
     /// App-level database (gloss.db)
     pub app_db: Mutex<AppDb>,
-    /// Open notebook databases keyed by notebook ID
-    pub notebook_dbs: Mutex<HashMap<String, NotebookDb>>,
+    /// Cached notebook database paths keyed by notebook ID.
+    /// Each DB access opens its own SQLite connection so long-running ingestion
+    /// work in one notebook does not serialize every other read for that same
+    /// notebook at the application mutex layer.
+    pub notebook_dbs: Mutex<HashMap<String, PathBuf>>,
     /// LLM provider registry
     pub model_registry: Mutex<ModelRegistry>,
     /// Application data directory
@@ -27,12 +35,17 @@ pub struct AppState {
     pub hnsw_indices: Mutex<HashMap<String, HnswIndex>>,
     /// Whether summary generation is manually paused by the user
     pub summary_paused: AtomicBool,
+    /// Number of sources currently being ingested (extract/chunk/embed).
+    /// Summary loop yields while this is > 0.
+    pub ingestion_active: AtomicU32,
 
     // --- Scheduling primitives (CLAUDE.md contracts) ---
-
     /// Single-flight LLM/GPU gate: at most one inference request in-flight.
     /// Acquire before any LLM call (chat, summary, studio).
     pub llm_gate: Semaphore,
+    /// GPU memory gate: prevents concurrent ONNX embedding + Ollama inference.
+    /// Must be acquired before any GPU-intensive operation (embedding, LLM calls).
+    pub gpu_gate: Semaphore,
     /// Currently active notebook ID. Summary worker idles when None.
     pub active_notebook_id: Mutex<Option<String>>,
     /// Epoch counter incremented on notebook switch. Used for soft-cancel of
@@ -72,7 +85,9 @@ impl AppState {
             embedder: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
             summary_paused: AtomicBool::new(false),
+            ingestion_active: AtomicU32::new(0),
             llm_gate: Semaphore::new(1),
+            gpu_gate: Semaphore::new(1),
             active_notebook_id: Mutex::new(None),
             active_epoch: AtomicU64::new(0),
             chat_grace_until: Mutex::new(0),
@@ -131,17 +146,28 @@ impl AppState {
     }
 
     /// Get or create the HNSW index for a notebook.
+    /// Queries the notebook DB for the max embedding_id to avoid label collisions
+    /// after vector deletions (where index.size() < max label ever assigned).
+    ///
+    /// Gathers external data without holding hnsw_indices (avoids lock-ordering
+    /// deadlocks), then creates the index INSIDE the hnsw_indices lock with a
+    /// second contains_key guard to prevent the race where two threads both
+    /// create a usearch Index and one is immediately dropped (corrupts C++ heap).
     pub fn ensure_hnsw_index(&self, notebook_id: &str) -> Result<(), GlossError> {
-        let mut indices = self
-            .hnsw_indices
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-
-        if indices.contains_key(notebook_id) {
-            return Ok(());
+        // Quick check — avoids unnecessary work if index already loaded
+        {
+            let indices = self
+                .hnsw_indices
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            if indices.contains_key(notebook_id) {
+                return Ok(());
+            }
         }
+        // hnsw_indices released here — safe to gather notebook metadata without
+        // nested lock risk.
 
-        // Try to load existing index from disk
+        // Gather data needed for index creation (requires other locks)
         let nb_dir = {
             let app_db = self
                 .app_db
@@ -151,10 +177,29 @@ impl AppState {
             PathBuf::from(nb.directory)
         };
 
+        let max_embedding_id = self.with_notebook_db(notebook_id, |db| db.max_embedding_id())?;
+
+        // Re-acquire hnsw_indices and create the index INSIDE the lock.
+        // Critical: the second contains_key check prevents the race where two
+        // threads both passed the first check. Without this, two usearch C++
+        // Index objects get created and one is immediately dropped, corrupting
+        // the C++ heap (manifests as "free(): corrupted unsorted chunks").
+        let mut indices = self
+            .hnsw_indices
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        if indices.contains_key(notebook_id) {
+            return Ok(()); // Another thread beat us — nothing to drop
+        }
+
         let index_path = nb_dir.join("embeddings").join("chunks.usearch");
         let index = if index_path.exists() {
-            tracing::debug!(notebook_id, "Loading existing HNSW index");
-            HnswIndex::load(&index_path)?
+            tracing::debug!(
+                notebook_id,
+                ?max_embedding_id,
+                "Loading existing HNSW index"
+            );
+            HnswIndex::load_with_hwm(&index_path, max_embedding_id)?
         } else {
             std::fs::create_dir_all(nb_dir.join("embeddings"))?;
             tracing::debug!(notebook_id, "Creating new HNSW index");
@@ -192,7 +237,10 @@ impl AppState {
     /// Set the active notebook (or None to deselect). Increments epoch.
     pub fn set_active_notebook(&self, id: Option<String>) {
         {
-            let mut active = self.active_notebook_id.lock().unwrap();
+            let mut active = self
+                .active_notebook_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *active = id;
         }
         self.active_epoch.fetch_add(1, Ordering::SeqCst);
@@ -205,12 +253,21 @@ impl AppState {
 
     /// Get the currently active notebook ID (cloned).
     pub fn get_active_notebook_id(&self) -> Option<String> {
-        self.active_notebook_id.lock().unwrap().clone()
+        self.active_notebook_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get the current epoch value.
     pub fn get_active_epoch(&self) -> u64 {
         self.active_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Returns true when the notebook/epoch pair is still the active one.
+    pub fn is_active_notebook_epoch(&self, notebook_id: &str, epoch: u64) -> bool {
+        self.get_active_notebook_id().as_deref() == Some(notebook_id)
+            && self.get_active_epoch() == epoch
     }
 
     /// Bump the chat grace window to now + 15 seconds.
@@ -220,7 +277,10 @@ impl AppState {
             .unwrap_or_default()
             .as_millis() as u64
             + 15_000;
-        let mut grace = self.chat_grace_until.lock().unwrap();
+        let mut grace = self
+            .chat_grace_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *grace = until;
     }
 
@@ -230,7 +290,10 @@ impl AppState {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let grace = self.chat_grace_until.lock().unwrap();
+        let grace = self
+            .chat_grace_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         now < *grace
     }
 
@@ -240,7 +303,10 @@ impl AppState {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let mut last = self.last_user_activity.lock().unwrap();
+        let mut last = self
+            .last_user_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *last = now;
     }
 
@@ -250,35 +316,52 @@ impl AppState {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let last = self.last_user_activity.lock().unwrap();
+        let last = self
+            .last_user_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         now.saturating_sub(*last) / 1000
     }
 
-    /// Get or open a notebook database.
-    pub fn get_notebook_db(&self, notebook_id: &str) -> Result<(), GlossError> {
-        let mut dbs = self.notebook_dbs.lock().map_err(|e| GlossError::Other(e.to_string()))?;
-        if !dbs.contains_key(notebook_id) {
-            let app_db = self.app_db.lock().map_err(|e| GlossError::Other(e.to_string()))?;
-            let notebook = app_db.get_notebook(notebook_id)?;
-            let nb_dir = PathBuf::from(&notebook.directory);
-            let db_path = nb_dir.join("notebook.db");
-            let nb_db = NotebookDb::open(&db_path)?;
-            dbs.insert(notebook_id.to_string(), nb_db);
+    fn notebook_db_path(&self, notebook_id: &str) -> Result<PathBuf, GlossError> {
+        {
+            let dbs = self
+                .notebook_dbs
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            if let Some(path) = dbs.get(notebook_id) {
+                return Ok(path.clone());
+            }
         }
-        Ok(())
+
+        let db_path = {
+            let app_db = self
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            let notebook = app_db.get_notebook(notebook_id)?;
+            PathBuf::from(notebook.directory).join("notebook.db")
+        };
+
+        let mut dbs = self
+            .notebook_dbs
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        dbs.entry(notebook_id.to_string())
+            .or_insert_with(|| db_path.clone());
+        Ok(db_path)
     }
 
-    /// Execute a function with a locked notebook database.
+    /// Execute a function with a notebook database connection.
+    /// A fresh SQLite connection is opened per call so readers are not blocked
+    /// behind long-running work on a shared application mutex.
     pub fn with_notebook_db<F, T>(&self, notebook_id: &str, f: F) -> Result<T, GlossError>
     where
         F: FnOnce(&NotebookDb) -> Result<T, GlossError>,
     {
-        self.get_notebook_db(notebook_id)?;
-        let dbs = self.notebook_dbs.lock().map_err(|e| GlossError::Other(e.to_string()))?;
-        let db = dbs.get(notebook_id).ok_or_else(|| {
-            GlossError::NotFound(format!("Notebook {} not opened", notebook_id))
-        })?;
-        f(db)
+        let db_path = self.notebook_db_path(notebook_id)?;
+        let db = NotebookDb::connect(&db_path)?;
+        f(&db)
     }
 
     /// Try to perform hybrid search using HNSW + FTS5. Returns `Ok(None)` if
@@ -290,36 +373,54 @@ impl AppState {
         selected_source_ids: &[String],
         top_k: usize,
     ) -> Result<Option<Vec<SearchResult>>, GlossError> {
-        // Acquire all three locks — all sync, no await
-        let embedder_guard = self
-            .embedder
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
+        if !NATIVE_SEMANTIC_INDEXING_ENABLED {
+            return Ok(None);
+        }
+
+        // Use try_lock to avoid blocking if locks are held by ingestion
+        let embedder_guard = match self.embedder.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!("Embedder lock busy during search, falling back to raw context");
+                return Ok(None);
+            }
+        };
         let embedder = match embedder_guard.as_ref() {
             Some(e) => e,
             None => return Ok(None),
         };
 
-        let indices_guard = self
-            .hnsw_indices
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let indices_guard = match self.hnsw_indices.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!("HNSW index lock busy during search, falling back to raw context");
+                return Ok(None);
+            }
+        };
         let index = match indices_guard.get(notebook_id) {
             Some(i) => i,
             None => return Ok(None),
         };
 
-        let dbs_guard = self
-            .notebook_dbs
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        let nb_db = match dbs_guard.get(notebook_id) {
-            Some(db) => db,
-            None => return Ok(None),
-        };
+        let db_path = self.notebook_db_path(notebook_id)?;
+        let nb_db = NotebookDb::connect(&db_path)?;
+        if !nb_db.can_run_hybrid_search(selected_source_ids)? {
+            tracing::debug!(
+                notebook_id,
+                selected = selected_source_ids.len(),
+                "Hybrid search skipped because the selected scope is not fully indexed"
+            );
+            return Ok(None);
+        }
 
-        let results =
-            hybrid_search::hybrid_search(query, nb_db, embedder, index, selected_source_ids, top_k)?;
+        let results = hybrid_search::hybrid_search(
+            query,
+            &nb_db,
+            embedder,
+            index,
+            selected_source_ids,
+            top_k,
+        )?;
         Ok(Some(results))
     }
 }

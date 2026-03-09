@@ -44,11 +44,10 @@ impl LlmProvider for OllamaProvider {
             });
         }
 
-        let body: serde_json::Value =
-            resp.json().await.map_err(|e| GlossError::Provider {
-                provider: "ollama".into(),
-                source: e.into(),
-            })?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| GlossError::Provider {
+            provider: "ollama".into(),
+            source: e.into(),
+        })?;
 
         let models = body
             .get("models")
@@ -97,10 +96,14 @@ impl LlmProvider for OllamaProvider {
             }));
         }
         for msg in &request.messages {
-            messages.push(serde_json::json!({
+            let mut msg_json = serde_json::json!({
                 "role": msg.role,
                 "content": msg.content,
-            }));
+            });
+            if let Some(ref images) = msg.images {
+                msg_json["images"] = serde_json::json!(images);
+            }
+            messages.push(msg_json);
         }
 
         let mut options = serde_json::json!({
@@ -154,10 +157,8 @@ impl LlmProvider for OllamaProvider {
                                 let values = decoder.decode(&bytes);
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
                                 for val in values {
-                                    let done = val
-                                        .get("done")
-                                        .and_then(|d| d.as_bool())
-                                        .unwrap_or(false);
+                                    let done =
+                                        val.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
                                     let token = val
                                         .get("message")
                                         .and_then(|m| m.get("content"))
@@ -167,19 +168,14 @@ impl LlmProvider for OllamaProvider {
                                     tokens.push(Ok(ChatToken { token, done }));
                                 }
                                 if !tokens.is_empty() {
-                                    return Some((
-                                        stream::iter(tokens),
-                                        (byte_stream, decoder),
-                                    ));
+                                    return Some((stream::iter(tokens), (byte_stream, decoder)));
                                 }
                             }
                             Ok(None) => {
                                 // Stream ended — flush decoder
                                 if let Some(val) = decoder.flush() {
-                                    let done = val
-                                        .get("done")
-                                        .and_then(|d| d.as_bool())
-                                        .unwrap_or(true);
+                                    let done =
+                                        val.get("done").and_then(|d| d.as_bool()).unwrap_or(true);
                                     let token = val
                                         .get("message")
                                         .and_then(|m| m.get("content"))
@@ -211,11 +207,10 @@ impl LlmProvider for OllamaProvider {
             Ok(Box::pin(stream))
         } else {
             // Non-streaming: parse single response
-            let body: serde_json::Value =
-                resp.json().await.map_err(|e| GlossError::Provider {
-                    provider: "ollama".into(),
-                    source: e.into(),
-                })?;
+            let body: serde_json::Value = resp.json().await.map_err(|e| GlossError::Provider {
+                provider: "ollama".into(),
+                source: e.into(),
+            })?;
 
             let content = body
                 .get("message")

@@ -41,8 +41,7 @@ pub fn hybrid_search(
     for (rank, (label, _distance)) in hnsw_results.iter().enumerate() {
         match nb_db.get_chunk_by_embedding_id(*label as i64) {
             Ok(chunk) => {
-                if selected_source_ids.is_empty()
-                    || selected_source_ids.contains(&chunk.source_id)
+                if selected_source_ids.is_empty() || selected_source_ids.contains(&chunk.source_id)
                 {
                     semantic_chunks.push((chunk, rank));
                 }
@@ -66,8 +65,7 @@ pub fn hybrid_search(
     for (rank, (rowid, _score)) in fts_results.iter().enumerate() {
         match nb_db.get_chunk_by_rowid(*rowid) {
             Ok(chunk) => {
-                if selected_source_ids.is_empty()
-                    || selected_source_ids.contains(&chunk.source_id)
+                if selected_source_ids.is_empty() || selected_source_ids.contains(&chunk.source_id)
                 {
                     keyword_chunks.push((chunk, rank));
                 }
@@ -101,8 +99,46 @@ pub fn hybrid_search(
         .into_values()
         .map(|(score, chunk)| SearchResult { chunk, score })
         .collect();
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(top_k);
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // 4. Rerank: take top-N candidates from RRF, rerank with cross-encoder
+    let rerank_pool_size = (top_k * 5).min(30).min(results.len());
+    if rerank_pool_size > 0 && embedder.has_reranker() {
+        let candidates: Vec<SearchResult> = results.drain(..rerank_pool_size).collect();
+        let documents: Vec<String> = candidates.iter().map(|r| r.chunk.content.clone()).collect();
+
+        tracing::debug!(
+            pool_size = rerank_pool_size,
+            top_k,
+            "Reranking RRF candidates with cross-encoder"
+        );
+
+        match embedder.rerank(query, &documents, top_k) {
+            Ok(reranked) => {
+                results = reranked
+                    .into_iter()
+                    .filter_map(|(orig_idx, score)| {
+                        candidates.get(orig_idx).map(|c| SearchResult {
+                            chunk: c.chunk.clone(),
+                            score: score as f64,
+                        })
+                    })
+                    .collect();
+            }
+            Err(e) => {
+                tracing::warn!("Reranking failed (falling back to RRF order): {}", e);
+                // Put candidates back and truncate
+                results = candidates;
+                results.truncate(top_k);
+            }
+        }
+    } else {
+        results.truncate(top_k);
+    }
 
     Ok(results)
 }

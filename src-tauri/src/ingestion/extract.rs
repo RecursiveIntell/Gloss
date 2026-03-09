@@ -25,24 +25,21 @@ pub fn extract_text(source: &Source, notebook_dir: &Path) -> Result<String, Glos
         }
         "paste" => {
             // Paste sources have content_text set directly
-            source.content_text.clone().ok_or_else(|| GlossError::Ingestion {
-                source_id: source.id.clone(),
-                message: "No content_text for paste source".into(),
-            })
+            source
+                .content_text
+                .clone()
+                .ok_or_else(|| GlossError::Ingestion {
+                    source_id: source.id.clone(),
+                    message: "No content_text for paste source".into(),
+                })
         }
         "image" => {
             // Images cannot be extracted as text yet — requires vision model
-            Ok(format!(
-                "[Image file: {}]",
-                source.title
-            ))
+            Ok(format!("[Image file: {}]", source.title))
         }
         "video" => {
             // Videos cannot be extracted as text yet — requires processing pipeline
-            Ok(format!(
-                "[Video file: {}]",
-                source.title
-            ))
+            Ok(format!("[Video file: {}]", source.title))
         }
         _ => Err(GlossError::Ingestion {
             source_id: source.id.clone(),

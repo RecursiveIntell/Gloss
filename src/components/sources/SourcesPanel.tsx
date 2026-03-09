@@ -78,6 +78,9 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   const [pasteTitle, setPasteTitle] = useState("");
   const [pasteText, setPasteText] = useState("");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+
+  const MAX_VISIBLE_PER_GROUP = 100;
 
   const groups = useMemo(() => groupSources(sources), [sources]);
   const hasGroups = groups.size > 1 || (groups.size === 1 && !groups.has("(ungrouped)"));
@@ -120,17 +123,19 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
         return "text-error";
       case "pending":
         return "text-warning";
+      case "describing":
+      case "described":
+        return "text-accent";
       default:
         return "text-accent";
     }
   };
 
   const statusNote = (source: Source) => {
-    if (
-      (source.source_type === "image" || source.source_type === "video") &&
-      source.status === "pending"
-    ) {
-      return " \u00B7 Awaiting vision model";
+    if (source.source_type === "image" || source.source_type === "video") {
+      if (source.status === "pending") return " \u00B7 Awaiting vision model";
+      if (source.status === "describing") return " \u00B7 Describing with vision model...";
+      if (source.status === "described") return " \u00B7 Embedding...";
     }
     return "";
   };
@@ -269,11 +274,19 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             const allSelected = groupSources.every(s => selectedSourceIds.has(s.id));
             return (
               <div key={group}>
-                <button
+                <div
+                  role="button"
+                  tabIndex={0}
                   onClick={() =>
                     setCollapsed((c) => ({ ...c, [group]: !c[group] }))
                   }
-                  className="flex items-center gap-1.5 w-full px-2 py-1 text-xs font-medium text-text-muted hover:text-text"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setCollapsed((c) => ({ ...c, [group]: !c[group] }));
+                    }
+                  }}
+                  className="flex items-center gap-1.5 w-full px-2 py-1 text-xs font-medium text-text-muted hover:text-text cursor-pointer"
                 >
                   <ChevronRight
                     className={`w-3 h-3 transition-transform ${
@@ -298,18 +311,54 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
                   <span className="text-[10px] text-text-muted ml-auto shrink-0">
                     {groupSources.length}
                   </span>
-                </button>
-                {!isCollapsed && (
-                  <div className="pl-4">
-                    {groupSources.map(renderSourceCard)}
-                  </div>
-                )}
+                </div>
+                {!isCollapsed && (() => {
+                  const isExpanded = expandedGroups.has(group);
+                  const visible = isExpanded ? groupSources : groupSources.slice(0, MAX_VISIBLE_PER_GROUP);
+                  const hasMore = groupSources.length > MAX_VISIBLE_PER_GROUP && !isExpanded;
+                  return (
+                    <div className="pl-4">
+                      {visible.map(renderSourceCard)}
+                      {hasMore && (
+                        <button
+                          onClick={() => setExpandedGroups(prev => {
+                            const next = new Set(prev);
+                            next.add(group);
+                            return next;
+                          })}
+                          className="w-full text-center text-xs text-accent hover:text-accent-hover py-1"
+                        >
+                          Show all {groupSources.length} ({groupSources.length - MAX_VISIBLE_PER_GROUP} more)
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })
-        ) : (
-          sources.map(renderSourceCard)
-        )}
+        ) : (() => {
+          const isExpanded = expandedGroups.has("__ungrouped__");
+          const visible = isExpanded ? sources : sources.slice(0, MAX_VISIBLE_PER_GROUP);
+          const hasMore = sources.length > MAX_VISIBLE_PER_GROUP && !isExpanded;
+          return (
+            <>
+              {visible.map(renderSourceCard)}
+              {hasMore && (
+                <button
+                  onClick={() => setExpandedGroups(prev => {
+                    const next = new Set(prev);
+                    next.add("__ungrouped__");
+                    return next;
+                  })}
+                  className="w-full text-center text-xs text-accent hover:text-accent-hover py-1"
+                >
+                  Show all {sources.length} ({sources.length - MAX_VISIBLE_PER_GROUP} more)
+                </button>
+              )}
+            </>
+          );
+        })()}
 
         {sources.length === 0 && (
           <p className="text-xs text-text-muted text-center mt-4 px-2">

@@ -62,6 +62,7 @@ anyhow = "1"
 directories = "5"
 async-trait = "0.1"
 regex = "1"
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

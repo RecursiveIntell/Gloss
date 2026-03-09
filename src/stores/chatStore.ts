@@ -2,12 +2,15 @@ import { create } from 'zustand';
 import type { Conversation, Message } from '../lib/types';
 import * as api from '../lib/tauri';
 
+const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
+
 interface ChatStore {
   conversations: Conversation[];
   activeConversationId: string | null;
   messages: Message[];
   isStreaming: boolean;
   streamingContent: string;
+  streamingNotebookId: string | null;
   streamingMessageId: string | null;
   streamingError: string | null;
   suggestedQuestions: string[];
@@ -17,9 +20,9 @@ interface ChatStore {
   setActiveConversation: (id: string | null) => void;
   loadMessages: (notebookId: string, conversationId: string) => Promise<void>;
   sendMessage: (notebookId: string, query: string, selectedSourceIds: string[], model: string) => Promise<void>;
-  appendToken: (messageId: string, token: string) => void;
-  finalizeMessage: (messageId: string) => void;
-  setStreamingError: (messageId: string, error: string) => void;
+  appendToken: (notebookId: string, conversationId: string, messageId: string, token: string) => void;
+  finalizeMessage: (notebookId: string, conversationId: string, messageId: string) => void;
+  setStreamingError: (notebookId: string, conversationId: string, messageId: string, error: string) => void;
   resetForNotebookSwitch: () => void;
   loadSuggestedQuestions: (notebookId: string) => Promise<void>;
 }
@@ -30,6 +33,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   messages: [],
   isStreaming: false,
   streamingContent: '',
+  streamingNotebookId: null,
   streamingMessageId: null,
   streamingError: null,
   suggestedQuestions: [],
@@ -37,6 +41,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   loadConversations: async (notebookId) => {
     try {
       const conversations = await api.listConversations(notebookId);
+      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+        return;
+      }
       set({ conversations });
     } catch (e) {
       console.error('Failed to load conversations:', e);
@@ -46,6 +53,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   createConversation: async (notebookId) => {
     const id = await api.createConversation(notebookId);
     await get().loadConversations(notebookId);
+    if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      return id;
+    }
     set({ activeConversationId: id, messages: [] });
     return id;
   },
@@ -62,9 +72,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   setActiveConversation: (id) => set({ activeConversationId: id }),
 
   loadMessages: async (notebookId, conversationId) => {
+    set({ activeConversationId: conversationId });
     try {
       const messages = await api.loadMessages(notebookId, conversationId);
-      set({ messages, activeConversationId: conversationId });
+      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+        return;
+      }
+      if (get().activeConversationId !== conversationId) {
+        return;
+      }
+      set({ messages });
     } catch (e) {
       console.error('Failed to load messages:', e);
     }
@@ -88,6 +105,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       messages: [...state.messages, userMsg],
       isStreaming: true,
       streamingContent: '',
+      streamingNotebookId: notebookId,
       streamingError: null,
     }));
 
@@ -99,31 +117,55 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         selectedSourceIds,
         model
       );
+      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+        return;
+      }
+      if (get().activeConversationId !== activeConversationId) {
+        return;
+      }
       set({ streamingMessageId: messageId });
     } catch (e) {
       console.error('Failed to send message:', e);
-      set({ isStreaming: false });
+      set({
+        isStreaming: false,
+        streamingContent: '',
+        streamingNotebookId: null,
+        streamingMessageId: null,
+      });
     }
   },
 
-  appendToken: (messageId, token) => {
-    // Guard: ignore tokens from a stale streaming session
-    const { streamingMessageId } = get();
+  appendToken: (notebookId, conversationId, messageId, token) => {
+    const {
+      isStreaming,
+      streamingNotebookId,
+      streamingMessageId,
+      activeConversationId,
+    } = get();
+    if (!isStreaming) return;
+    if (streamingNotebookId !== notebookId) return;
+    if (activeConversationId !== conversationId) return;
     if (streamingMessageId && streamingMessageId !== messageId) return;
     set((state) => ({
       streamingContent: state.streamingContent + token,
     }));
   },
 
-  finalizeMessage: (messageId) => {
-    // Guard: ignore finalize for a stale message
-    const { streamingMessageId } = get();
+  finalizeMessage: (notebookId, conversationId, messageId) => {
+    const {
+      isStreaming,
+      streamingNotebookId,
+      streamingMessageId,
+      activeConversationId,
+    } = get();
+    if (!isStreaming) return;
+    if (streamingNotebookId !== notebookId) return;
+    if (activeConversationId !== conversationId) return;
     if (streamingMessageId && streamingMessageId !== messageId) return;
     const finalContent = get().streamingContent;
-    const { activeConversationId } = get();
     const assistantMsg: Message = {
       id: messageId,
-      conversation_id: activeConversationId || '',
+      conversation_id: conversationId,
       role: 'assistant',
       content: finalContent,
       created_at: new Date().toISOString(),
@@ -132,18 +174,28 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       messages: [...state.messages, assistantMsg],
       isStreaming: false,
       streamingContent: '',
+      streamingNotebookId: null,
       streamingMessageId: null,
       streamingError: null,
     }));
   },
 
-  setStreamingError: (messageId, error) => {
-    const { streamingMessageId } = get();
+  setStreamingError: (notebookId, conversationId, messageId, error) => {
+    const {
+      isStreaming,
+      streamingNotebookId,
+      streamingMessageId,
+      activeConversationId,
+    } = get();
+    if (!isStreaming) return;
+    if (streamingNotebookId !== notebookId) return;
+    if (activeConversationId !== conversationId) return;
     if (streamingMessageId && streamingMessageId !== messageId) return;
     set({
       streamingError: error,
       isStreaming: false,
       streamingContent: '',
+      streamingNotebookId: null,
       streamingMessageId: null,
     });
   },
@@ -155,6 +207,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       messages: [],
       isStreaming: false,
       streamingContent: '',
+      streamingNotebookId: null,
       streamingMessageId: null,
       streamingError: null,
       suggestedQuestions: [],
@@ -164,8 +217,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   loadSuggestedQuestions: async (notebookId) => {
     try {
       const questions = await api.getSuggestedQuestions(notebookId);
+      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+        return;
+      }
       set({ suggestedQuestions: questions });
     } catch {
+      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+        return;
+      }
       set({ suggestedQuestions: [] });
     }
   },

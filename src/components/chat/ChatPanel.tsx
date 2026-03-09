@@ -2,8 +2,9 @@ import { useState, useRef, useEffect } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useSourceStore } from "../../stores/sourceStore";
-import { Send, Plus, MessageSquare, Loader2, AlertCircle } from "lucide-react";
+import { Send, Plus, MessageSquare, Loader2, AlertCircle, BookMarked } from "lucide-react";
 import ReactMarkdown from "react-markdown";
+import type { Citation } from "../../lib/types";
 
 interface ChatPanelProps {
   notebookId: string;
@@ -118,28 +119,57 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           </div>
         )}
 
-        {messages.map((msg) => (
-          <div
-            key={msg.id}
-            className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-          >
+        {messages.map((msg) => {
+          // Parse citations JSON string
+          let parsedCitations: Citation[] = [];
+          if (msg.role === "assistant" && msg.citations) {
+            try {
+              const raw = typeof msg.citations === "string"
+                ? JSON.parse(msg.citations)
+                : msg.citations;
+              if (Array.isArray(raw)) parsedCitations = raw;
+            } catch { /* ignore parse errors */ }
+          }
+
+          return (
             <div
-              className={`max-w-[80%] rounded-lg px-3 py-2 text-sm ${
-                msg.role === "user"
-                  ? "bg-accent text-white"
-                  : "bg-bg-tertiary text-text"
-              }`}
+              key={msg.id}
+              className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
             >
-              {msg.role === "assistant" ? (
-                <div className="prose prose-invert prose-sm max-w-none">
-                  <ReactMarkdown>{msg.content}</ReactMarkdown>
-                </div>
-              ) : (
-                <p>{msg.content}</p>
-              )}
+              <div
+                className={`max-w-[80%] rounded-lg px-3 py-2 text-sm ${
+                  msg.role === "user"
+                    ? "bg-accent text-white"
+                    : "bg-bg-tertiary text-text"
+                }`}
+              >
+                {msg.role === "assistant" ? (
+                  <>
+                    <div className="prose prose-invert prose-sm max-w-none">
+                      <ReactMarkdown>{msg.content}</ReactMarkdown>
+                    </div>
+                    {parsedCitations.length > 0 && (
+                      <div className="mt-2 pt-2 border-t border-border/40 flex flex-wrap gap-1.5">
+                        {parsedCitations.map((c, i) => (
+                          <button
+                            key={i}
+                            title={c.quote || c.source_title}
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] bg-accent/15 text-accent rounded hover:bg-accent/25 transition-colors"
+                          >
+                            <BookMarked className="w-2.5 h-2.5" />
+                            [{i + 1}] {c.source_title}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <p>{msg.content}</p>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
 
         {isStreaming && streamingContent && (
           <div className="flex justify-start">

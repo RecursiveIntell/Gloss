@@ -47,7 +47,7 @@ export async function addSourceFile(
 export async function addSourceFolder(
   notebookId: string,
   path: string
-): Promise<string[]> {
+): Promise<void> {
   return invoke("add_source_folder", { notebookId, path });
 }
 
@@ -223,6 +223,10 @@ export async function updateSetting(
   value: string
 ): Promise<void> {
   return invoke("update_setting", { key, value });
+}
+
+export async function checkExternalTools(): Promise<Record<string, boolean>> {
+  return invoke("check_external_tools");
 }
 
 // === Jobs ===

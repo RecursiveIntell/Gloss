@@ -45,8 +45,22 @@ pub fn run() {
                 .with_db_path(state.data_dir.join("queue.db"))
                 .with_poll_interval(Duration::from_secs(3))
                 .build();
-            let queue = QueueManager::new(config)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            let queue =
+                QueueManager::new(config).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+            // Prune completed/failed/cancelled jobs older than 7 days to prevent
+            // unbounded queue.db growth which slows count_by_status and adds
+            // mutex contention with ingestion and the summary loop.
+            match queue.prune(7) {
+                Ok(pruned) if pruned > 0 => {
+                    tracing::info!(pruned, "Pruned old queue jobs on startup");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to prune old queue jobs");
+                }
+                _ => {}
+            }
+
             let event_emitter = TauriEventEmitter::arc(app_handle.clone());
 
             // Don't use queue.spawn() — we drive the loop ourselves so we can
@@ -101,6 +115,7 @@ pub fn run() {
             commands::settings::get_all_models,
             commands::settings::get_settings,
             commands::settings::update_setting,
+            commands::settings::check_external_tools,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -120,7 +135,7 @@ async fn summary_job_loop(
     handle: tauri::AppHandle,
 ) {
     // Brief delay to let the app finish startup
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     tracing::info!("Summary job loop started");
 
     loop {
@@ -134,7 +149,10 @@ async fn summary_job_loop(
         }
 
         // 2. Manual pause
-        if state.summary_paused.load(std::sync::atomic::Ordering::SeqCst) {
+        if state
+            .summary_paused
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
@@ -143,6 +161,57 @@ async fn summary_job_loop(
         if state.is_in_chat_grace() {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
+        }
+
+        // 3b. Don't start summaries while sources are actively being ingested.
+        // The atomic counter is set by run_ingestion_inner (text/code sources).
+        // The DB check catches image/video sources in 'describing'/'described' status.
+        if state
+            .ingestion_active
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            tracing::debug!(
+                active = state
+                    .ingestion_active
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "Ingestion active, deferring summaries"
+            );
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        if let Some(ref nb_id) = active_nb {
+            let nb_id_clone = nb_id.clone();
+            let handle_clone = handle.clone();
+            let has_describing = tokio::task::spawn_blocking(move || {
+                let state = handle_clone.state::<AppState>();
+                state
+                    .with_notebook_db(&nb_id_clone, |db| {
+                        let count: i64 = db.conn.query_row(
+                        "SELECT COUNT(*) FROM sources WHERE status IN ('describing', 'described')",
+                        [],
+                        |row| row.get(0),
+                    ).unwrap_or(0);
+                        Ok(count > 0)
+                    })
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            if has_describing {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        }
+
+        let active_epoch = state.get_active_epoch();
+        let cancelled = jobs::cancel_jobs_not_matching_active_notebook(
+            &queue,
+            active_nb.as_deref(),
+            active_epoch,
+        );
+        if cancelled > 0 {
+            tracing::info!(cancelled, "Cancelled stale queue jobs before processing");
         }
 
         // 4. Acquire LLM gate before processing (ensures no concurrent GPU inference).
@@ -158,12 +227,28 @@ async fn summary_job_loop(
             }
         };
 
+        // Also acquire GPU gate to prevent running while embedding is active
+        let gpu_permit = match state.gpu_gate.acquire().await {
+            Ok(p) => p,
+            Err(_) => {
+                drop(permit);
+                tracing::info!("GPU gate closed, summary loop exiting");
+                return;
+            }
+        };
+
         // Re-check conditions after acquiring the permit (chat may have arrived
         // while we were waiting, or notebook may have changed).
-        if state.summary_paused.load(std::sync::atomic::Ordering::SeqCst)
+        if state
+            .summary_paused
+            .load(std::sync::atomic::Ordering::SeqCst)
             || state.is_in_chat_grace()
-            || state.get_active_notebook_id().is_none()
+            || active_nb
+                .as_deref()
+                .map(|nb_id| !state.is_active_notebook_epoch(nb_id, active_epoch))
+                .unwrap_or(true)
         {
+            drop(gpu_permit);
             drop(permit);
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
@@ -175,15 +260,19 @@ async fn summary_job_loop(
         let job_result = tokio::time::timeout(
             Duration::from_secs(180),
             queue.process_one::<jobs::GlossJob>(&emitter),
-        ).await;
+        )
+        .await;
 
         match job_result {
             Err(_timeout) => {
                 tracing::error!("Summary job timed out after 180s — releasing LLM gate");
+                drop(gpu_permit);
                 drop(permit);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             Ok(Ok(Some(job))) => {
+                let job_meta = serde_json::from_value::<jobs::GlossJob>(job.job_data.clone()).ok();
+
                 // Validate that the job was for the active notebook + epoch
                 let epoch_after = state.get_active_epoch();
                 if epoch_after != epoch_before {
@@ -196,6 +285,92 @@ async fn summary_job_loop(
 
                 if job.success {
                     tracing::debug!(job_id = %job.job_id, "Summary job completed");
+
+                    // Check if this was a DescribeImage/Video job that needs follow-up embedding
+                    if let Some(ref output_str) = job.output {
+                        if let Ok(output) = serde_json::from_str::<serde_json::Value>(output_str) {
+                            if output.get("needs_embedding").and_then(|v| v.as_bool()) == Some(true)
+                            {
+                                let nb_id = output
+                                    .get("notebook_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let src_id = output
+                                    .get("source_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if !nb_id.is_empty() && !src_id.is_empty() {
+                                    let job_is_current = job_meta
+                                        .as_ref()
+                                        .map(|job| {
+                                            state.is_active_notebook_epoch(
+                                                job.notebook_id(),
+                                                job.epoch(),
+                                            )
+                                        })
+                                        .unwrap_or(false);
+                                    let job_epoch =
+                                        job_meta.as_ref().map(|job| job.epoch()).unwrap_or(0);
+                                    if !job_is_current {
+                                        tracing::info!(
+                                            job_id = %job.job_id,
+                                            notebook_id = nb_id,
+                                            source_id = src_id,
+                                            "Skipping follow-up embedding for stale job"
+                                        );
+                                        drop(gpu_permit);
+                                        drop(permit);
+                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                        continue;
+                                    }
+
+                                    tracing::info!(
+                                        source_id = src_id,
+                                        "Running embedding for described source"
+                                    );
+
+                                    // Drop LLM gate — embedding doesn't need LLM
+                                    drop(permit);
+
+                                    let nb_for_err = nb_id.to_string();
+                                    let src_for_err = src_id.to_string();
+                                    let handle2 = handle.clone();
+                                    let nb = nb_for_err.clone();
+                                    let src = src_for_err.clone();
+                                    let q2 = Arc::clone(&queue);
+                                    let embed_result = tokio::task::spawn_blocking(move || {
+                                        let state = handle2.state::<AppState>();
+                                        if !state.is_active_notebook_epoch(&nb, job_epoch) {
+                                            return;
+                                        }
+                                        commands::sources::embed_described_source(
+                                            &state, &nb, &src, &handle2, &q2,
+                                        );
+                                    })
+                                    .await;
+                                    if let Err(e) = embed_result {
+                                        tracing::error!(
+                                            source_id = %src_for_err,
+                                            error = %e,
+                                            "embed_described_source panicked"
+                                        );
+                                        let _ = state.with_notebook_db(&nb_for_err, |db| {
+                                            db.update_source_status(
+                                                &src_for_err,
+                                                "error",
+                                                Some(&format!("Embedding panicked: {}", e)),
+                                            )
+                                        });
+                                    }
+
+                                    drop(gpu_permit);
+                                    // permit already dropped above
+                                    tokio::time::sleep(Duration::from_secs(3)).await;
+                                    continue; // Skip the drops below
+                                }
+                            }
+                        }
+                    }
                 } else {
                     tracing::warn!(
                         job_id = %job.job_id,
@@ -203,11 +378,13 @@ async fn summary_job_loop(
                         "Summary job failed"
                     );
                 }
+                drop(gpu_permit);
                 drop(permit);
                 // Cool-down between jobs to prevent GPU thermal throttling / CUDA errors
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
             Ok(Ok(None)) => {
+                drop(gpu_permit);
                 drop(permit);
 
                 // No pending jobs — check if we should auto-queue missing summaries.
@@ -215,9 +392,8 @@ async fn summary_job_loop(
                 let idle_secs = state.idle_seconds();
                 if idle_secs >= IDLE_AUTO_SUMMARIZE_SECS {
                     if let Some(ref nb_id) = active_nb {
-                        let queued = commands::sources::auto_queue_notebook_summaries(
-                            &state, &queue, nb_id,
-                        );
+                        let queued =
+                            commands::sources::auto_queue_notebook_summaries(&state, &queue, nb_id);
                         if queued > 0 {
                             tracing::info!(
                                 idle_secs,
@@ -235,6 +411,7 @@ async fn summary_job_loop(
             }
             Ok(Err(e)) => {
                 tracing::error!("Job processing error: {}", e);
+                drop(gpu_permit);
                 drop(permit);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }

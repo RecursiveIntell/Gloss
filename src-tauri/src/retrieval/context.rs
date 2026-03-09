@@ -128,9 +128,8 @@ impl ContextAssembler {
                 ));
             }
             manifest.push_str(&capped_footer);
-            manifest.push_str(
-                "\nWhen asked about what sources you have, refer to the list above.\n",
-            );
+            manifest
+                .push_str("\nWhen asked about what sources you have, refer to the list above.\n");
             manifest
         } else {
             // Full mode: titles + summaries
@@ -141,7 +140,11 @@ impl ContextAssembler {
                     .as_deref()
                     .map(|s| {
                         if s.len() > 120 {
-                            format!(" \u{2014} {}…", &s[..117])
+                            let mut end = 117;
+                            while end > 0 && !s.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!(" \u{2014} {}…", &s[..end])
                         } else {
                             format!(" \u{2014} {}", s)
                         }

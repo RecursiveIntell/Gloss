@@ -1,11 +1,17 @@
 use crate::db::app_db::Notebook;
 use crate::error::GlossError;
+use crate::jobs;
 use crate::state::AppState;
-use tauri::State;
+use std::sync::Arc;
+use tauri::{Manager, State};
+use tauri_queue::QueueManager;
 
 #[tauri::command]
 pub async fn list_notebooks(state: State<'_, AppState>) -> Result<Vec<Notebook>, GlossError> {
-    let app_db = state.app_db.lock().map_err(|e| GlossError::Other(e.to_string()))?;
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
     app_db.list_notebooks()
 }
 
@@ -27,25 +33,34 @@ pub async fn create_notebook(
 
     // Register in app DB
     {
-        let app_db = state.app_db.lock().map_err(|e| GlossError::Other(e.to_string()))?;
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
         app_db.create_notebook(&id, &name, &dir_str)?;
     }
 
-    // Open the notebook DB (creates it with migrations)
-    state.get_notebook_db(&id)?;
+    // Create the notebook DB and run its initial migrations once.
+    crate::db::notebook_db::NotebookDb::open(&nb_dir.join("notebook.db"))?;
 
     tracing::info!(id = %id, name = %name, "Created notebook");
     Ok(id)
 }
 
 #[tauri::command]
-pub async fn delete_notebook(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<(), GlossError> {
+pub async fn delete_notebook(id: String, state: State<'_, AppState>) -> Result<(), GlossError> {
+    // If this is the active notebook, clear it and bump epoch so the summary
+    // loop stops picking up jobs for it immediately.
+    if state.get_active_notebook_id().as_deref() == Some(id.as_str()) {
+        state.set_active_notebook(None);
+    }
+
     // Get directory before deleting from DB
     let dir = {
-        let app_db = state.app_db.lock().map_err(|e| GlossError::Other(e.to_string()))?;
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
         let nb = app_db.get_notebook(&id)?;
         app_db.delete_notebook(&id)?;
         nb.directory
@@ -53,8 +68,20 @@ pub async fn delete_notebook(
 
     // Remove from open notebooks
     {
-        let mut dbs = state.notebook_dbs.lock().map_err(|e| GlossError::Other(e.to_string()))?;
+        let mut dbs = state
+            .notebook_dbs
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
         dbs.remove(&id);
+    }
+
+    // Remove HNSW index from memory
+    {
+        let mut indices = state
+            .hnsw_indices
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        indices.remove(&id);
     }
 
     // Delete the notebook directory
@@ -76,23 +103,47 @@ pub async fn delete_notebook(
 pub async fn set_active_notebook(
     notebook_id: Option<String>,
     state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), GlossError> {
     state.set_active_notebook(notebook_id.clone());
+    let active_epoch = state.get_active_epoch();
 
-    // Eagerly init embedder + HNSW for the selected notebook so the first
-    // chat message is fast. These are no-ops if already initialized.
-    if let Some(ref nb_id) = notebook_id {
-        // Open the notebook DB (needed by ensure_hnsw_index)
-        if let Err(e) = state.get_notebook_db(nb_id) {
-            tracing::warn!(notebook_id = %nb_id, "Eager notebook DB open failed: {}", e);
-        }
-        if let Err(e) = state.ensure_embedder(Some(&app_handle)) {
-            tracing::warn!(notebook_id = %nb_id, "Eager embedder init failed: {}", e);
-        }
-        if let Err(e) = state.ensure_hnsw_index(nb_id) {
-            tracing::warn!(notebook_id = %nb_id, "Eager HNSW init failed: {}", e);
-        }
+    let cancelled = jobs::cancel_jobs_not_matching_active_notebook(
+        &queue,
+        notebook_id.as_deref(),
+        active_epoch,
+    );
+    if cancelled > 0 {
+        tracing::info!(
+            cancelled,
+            "Cancelled stale background jobs after notebook switch"
+        );
+    }
+
+    // Warm the notebook DB in the background, but avoid eager native
+    // embedder/HNSW initialization here. Those paths are only needed when a
+    // fully indexed scope is actually queried, and keeping them out of notebook
+    // switching reduces native crash surface during imports.
+    if let Some(nb_id) = notebook_id {
+        let handle = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                let state = handle.state::<AppState>();
+                if !state.is_active_notebook_epoch(&nb_id, active_epoch) {
+                    return;
+                }
+
+                if let Err(e) = state.with_notebook_db(&nb_id, |_db| Ok(())) {
+                    tracing::warn!(notebook_id = %nb_id, "Background notebook DB open failed: {}", e);
+                    return;
+                }
+                if !state.is_active_notebook_epoch(&nb_id, active_epoch) {
+                    return;
+                }
+            })
+            .await;
+        });
     }
 
     Ok(())

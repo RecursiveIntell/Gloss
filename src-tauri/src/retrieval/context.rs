@@ -10,6 +10,13 @@ const MANIFEST_MAX_SOURCES: usize = 50;
 /// Assemble the context for an LLM chat request.
 pub struct ContextAssembler;
 
+#[derive(Debug, Clone)]
+pub struct ContextPassage {
+    pub source_id: String,
+    pub title: String,
+    pub content: String,
+}
+
 impl ContextAssembler {
     /// Build the system prompt. Source context is appended when present so it
     /// lives in the system message — not in user messages — which keeps history
@@ -21,7 +28,7 @@ impl ContextAssembler {
         custom_goal: Option<&str>,
         style: &str,
         all_sources: &[Source],
-        source_context: &[(String, String)],
+        source_context: &[ContextPassage],
     ) -> String {
         let mut prompt = String::new();
 
@@ -60,8 +67,13 @@ impl ContextAssembler {
         // Selected source content + citation instructions
         if !source_context.is_empty() {
             prompt.push_str("Retrieved passages:\n\n");
-            for (i, (title, content)) in source_context.iter().enumerate() {
-                prompt.push_str(&format!("[{}] {}\n{}\n\n", i + 1, title, content));
+            for (i, passage) in source_context.iter().enumerate() {
+                prompt.push_str(&format!(
+                    "[{}] {}\n{}\n\n",
+                    i + 1,
+                    passage.title,
+                    passage.content
+                ));
             }
             prompt.push_str(
                 "When answering, cite the sources above using [1], [2], etc. \

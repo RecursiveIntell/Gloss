@@ -38,9 +38,7 @@ pub use stack_ids::TraceCtx;
 ///
 /// Phase status: current / canonical bridge utility.
 pub fn trace_ctx_from_event_trace_id(trace_id: &Option<String>) -> Option<TraceCtx> {
-    trace_id
-        .as_deref()
-        .map(TraceCtx::from_legacy_trace_id)
+    trace_id.as_deref().map(TraceCtx::from_legacy_trace_id)
 }
 
 /// Policy for handling event overflow when the downstream consumer is slow.
@@ -145,7 +143,10 @@ impl CoalescingEmitter {
         }
     }
 
-    pub fn arc(inner: Arc<dyn QueueEventEmitter>, config: EmitterConfig) -> Arc<dyn QueueEventEmitter> {
+    pub fn arc(
+        inner: Arc<dyn QueueEventEmitter>,
+        config: EmitterConfig,
+    ) -> Arc<dyn QueueEventEmitter> {
         Arc::new(Self::new(inner, config))
     }
 
@@ -181,7 +182,8 @@ impl CoalescingEmitter {
                 .unwrap_or_else(|e| e.into_inner());
             let event = pending_progress.remove(job_id);
             if event.is_some() {
-                let mut pending_order = self.pending_order.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pending_order =
+                    self.pending_order.lock().unwrap_or_else(|e| e.into_inner());
                 pending_order.retain(|queued_job_id| queued_job_id != job_id);
             }
             event
@@ -222,7 +224,8 @@ impl CoalescingEmitter {
                                 .pending_progress
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            pending_order = self.pending_order.lock().unwrap_or_else(|e| e.into_inner());
+                            pending_order =
+                                self.pending_order.lock().unwrap_or_else(|e| e.into_inner());
                         }
                     }
                 }

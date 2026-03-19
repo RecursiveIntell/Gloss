@@ -48,11 +48,39 @@ pub async fn create_notebook(
 }
 
 #[tauri::command]
-pub async fn delete_notebook(id: String, state: State<'_, AppState>) -> Result<(), GlossError> {
+pub async fn rename_notebook(
+    id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<(), GlossError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(GlossError::Config("Notebook name cannot be empty".into()));
+    }
+
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    app_db.rename_notebook(&id, trimmed)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_notebook(
+    id: String,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+) -> Result<(), GlossError> {
     // If this is the active notebook, clear it and bump epoch so the summary
     // loop stops picking up jobs for it immediately.
     if state.get_active_notebook_id().as_deref() == Some(id.as_str()) {
-        state.set_active_notebook(None);
+        let _ = state.set_active_notebook(None, None);
+    }
+
+    let cancelled = jobs::cancel_jobs_matching(&queue, |job, _status| job.notebook_id() == id);
+    if cancelled > 0 {
+        tracing::info!(notebook_id = %id, cancelled, "Cancelled queued jobs for deleted notebook");
     }
 
     // Get directory before deleting from DB
@@ -96,9 +124,9 @@ pub async fn delete_notebook(id: String, state: State<'_, AppState>) -> Result<(
 
 /// Set (or clear) the active notebook for scheduling purposes.
 /// The summary worker will idle when no notebook is active.
-/// Increments the epoch counter so stale summary jobs are soft-cancelled.
-/// Eagerly initializes the embedder and HNSW index so the first chat
-/// message doesn't have to wait for model loading.
+/// Advances the epoch on real notebook switches so stale jobs are soft-cancelled,
+/// but preserves the newest queued epoch for the selected notebook after app
+/// restarts so pending work can resume instead of being discarded as stale.
 #[tauri::command]
 pub async fn set_active_notebook(
     notebook_id: Option<String>,
@@ -106,7 +134,25 @@ pub async fn set_active_notebook(
     queue: State<'_, Arc<QueueManager>>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), GlossError> {
-    state.set_active_notebook(notebook_id.clone());
+    let next_epoch = notebook_id.as_deref().map(|nb_id| {
+        let current_epoch = state.get_active_epoch();
+        let resumed_epoch = jobs::max_pending_epoch_for_notebook(&queue, nb_id).unwrap_or(0);
+        std::cmp::max(current_epoch.saturating_add(1), resumed_epoch)
+    });
+
+    let changed = state.set_active_notebook(notebook_id.clone(), next_epoch);
+    if !changed {
+        return Ok(());
+    }
+
+    if let Some(ref nb_id) = notebook_id {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        app_db.touch_notebook(nb_id)?;
+    }
+
     let active_epoch = state.get_active_epoch();
 
     let cancelled = jobs::cancel_jobs_not_matching_active_notebook(

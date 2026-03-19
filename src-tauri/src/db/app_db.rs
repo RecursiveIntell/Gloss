@@ -119,6 +119,15 @@ impl AppDb {
         Ok(())
     }
 
+    /// Rename a notebook.
+    pub fn rename_notebook(&self, id: &str, name: &str) -> Result<(), GlossError> {
+        self.conn.execute(
+            "UPDATE notebooks SET name = ?1, updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![name, id],
+        )?;
+        Ok(())
+    }
+
     /// Update last_accessed timestamp for a notebook.
     pub fn touch_notebook(&self, id: &str) -> Result<(), GlossError> {
         self.conn.execute(
@@ -169,11 +178,32 @@ impl AppDb {
         base_url: Option<&str>,
         api_key: Option<&str>,
     ) -> Result<(), GlossError> {
+        let _ = api_key;
         self.conn.execute(
             "INSERT OR REPLACE INTO providers (id, enabled, base_url, api_key)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![id, enabled, base_url, api_key],
+            rusqlite::params![id, enabled, base_url, Option::<&str>::None],
         )?;
+        Ok(())
+    }
+
+    pub fn get_provider_api_key(&self, id: &str) -> Result<Option<String>, GlossError> {
+        let result =
+            self.conn
+                .query_row("SELECT api_key FROM providers WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                });
+
+        match result {
+            Ok(value) => Ok(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(GlossError::Database(e)),
+        }
+    }
+
+    pub fn clear_provider_api_key(&self, id: &str) -> Result<(), GlossError> {
+        self.conn
+            .execute("UPDATE providers SET api_key = NULL WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -320,6 +350,24 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_notebook() {
+        let db = test_db();
+        db.create_notebook("nb1", "Before", "/tmp/nb1").unwrap();
+        db.rename_notebook("nb1", "After").unwrap();
+        let notebook = db.get_notebook("nb1").unwrap();
+        assert_eq!(notebook.name, "After");
+    }
+
+    #[test]
+    fn test_update_source_count() {
+        let db = test_db();
+        db.create_notebook("nb1", "Counted", "/tmp/nb1").unwrap();
+        db.update_source_count("nb1", 7).unwrap();
+        let notebook = db.get_notebook("nb1").unwrap();
+        assert_eq!(notebook.source_count, 7);
+    }
+
+    #[test]
     fn test_settings() {
         let db = test_db();
         // Default settings should exist
@@ -339,6 +387,19 @@ mod tests {
         assert!(!providers.is_empty());
         assert_eq!(providers[0].id, "ollama");
         assert!(providers[0].enabled);
+    }
+
+    #[test]
+    fn test_update_provider_does_not_persist_api_key() {
+        let db = test_db();
+        db.update_provider(
+            "openai",
+            true,
+            Some("https://api.openai.com/v1"),
+            Some("sk-secret"),
+        )
+        .unwrap();
+        assert_eq!(db.get_provider_api_key("openai").unwrap(), None);
     }
 
     #[test]

@@ -31,7 +31,9 @@ pub struct JobStartedEvent {
     /// **Deprecated — Phase status: compatibility / migration-only.**
     /// Use [`attempt_id`](Self::attempt_id) / [`trial_id`](Self::trial_id) instead.
     /// Removal condition: removed when all event consumers migrate to `AttemptId`/`TrialId`.
-    #[deprecated(note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate.")]
+    #[deprecated(
+        note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate."
+    )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,7 +66,9 @@ pub struct JobCompletedEvent {
     /// **Deprecated — Phase status: compatibility / migration-only.**
     /// Use [`attempt_id`](Self::attempt_id) / [`trial_id`](Self::trial_id) instead.
     /// Removal condition: removed when all event consumers migrate to `AttemptId`/`TrialId`.
-    #[deprecated(note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate.")]
+    #[deprecated(
+        note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate."
+    )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,7 +101,9 @@ pub struct JobFailedEvent {
     /// **Deprecated — Phase status: compatibility / migration-only.**
     /// Use [`attempt_id`](Self::attempt_id) / [`trial_id`](Self::trial_id) instead.
     /// Removal condition: removed when all event consumers migrate to `AttemptId`/`TrialId`.
-    #[deprecated(note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate.")]
+    #[deprecated(
+        note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate."
+    )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,7 +142,9 @@ pub struct JobProgressEvent {
     /// **Deprecated — Phase status: compatibility / migration-only.**
     /// Use [`attempt_id`](Self::attempt_id) / [`trial_id`](Self::trial_id) instead.
     /// Removal condition: removed when all event consumers migrate to `AttemptId`/`TrialId`.
-    #[deprecated(note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate.")]
+    #[deprecated(
+        note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate."
+    )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,7 +176,9 @@ pub struct JobCancelledEvent {
     /// **Deprecated — Phase status: compatibility / migration-only.**
     /// Use [`attempt_id`](Self::attempt_id) / [`trial_id`](Self::trial_id) instead.
     /// Removal condition: removed when all event consumers migrate to `AttemptId`/`TrialId`.
-    #[deprecated(note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate.")]
+    #[deprecated(
+        note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate."
+    )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

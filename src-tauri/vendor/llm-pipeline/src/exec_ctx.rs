@@ -58,7 +58,9 @@ pub struct ExecCtx {
     /// the canonical trace form on the normal path.
     ///
     /// **Removal condition**: removed when all callers migrate to `TraceCtx`.
-    #[deprecated(note = "Use trace_ctx instead. Will be removed when all callers migrate to TraceCtx.")]
+    #[deprecated(
+        note = "Use trace_ctx instead. Will be removed when all callers migrate to TraceCtx."
+    )]
     pub trace_id: TraceId,
     /// Canonical trace context from `stack_ids`.
     ///
@@ -224,7 +226,10 @@ impl ExecCtxBuilder {
     /// Prefer [`with_trace_ctx`](Self::with_trace_ctx) for new code.
     ///
     /// **Removal condition**: removed when all callers migrate to `TraceCtx`.
-    #[deprecated(since = "0.6.0", note = "Use with_trace_ctx() instead. This method will be removed in v1.0.")]
+    #[deprecated(
+        since = "0.6.0",
+        note = "Use with_trace_ctx() instead. This method will be removed in v1.0."
+    )]
     pub fn with_trace_id(mut self, trace_id: TraceId) -> Self {
         self.trace_id = Some(trace_id);
         self

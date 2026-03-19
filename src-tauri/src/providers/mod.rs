@@ -5,6 +5,7 @@ pub mod openai;
 
 use crate::db::app_db::{AppDb, ModelRecord};
 use crate::error::GlossError;
+use crate::secrets::SecretStore;
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,14 @@ impl ProviderType {
             "anthropic" => Some(ProviderType::Anthropic),
             "llamacpp" => Some(ProviderType::LlamaCpp),
             _ => None,
+        }
+    }
+
+    pub fn api_key_setting_key(&self) -> Option<&'static str> {
+        match self {
+            ProviderType::OpenAI => Some("openai_api_key"),
+            ProviderType::Anthropic => Some("anthropic_api_key"),
+            ProviderType::Ollama | ProviderType::LlamaCpp => None,
         }
     }
 }
@@ -127,14 +136,14 @@ pub struct ModelRegistry {
 
 impl ModelRegistry {
     /// Create registry from app database config.
-    pub fn new(app_db: &AppDb) -> Result<Self, GlossError> {
+    pub fn new(app_db: &AppDb, secret_store: &SecretStore) -> Result<Self, GlossError> {
         let ollama_url = app_db
             .get_setting("ollama_url")?
             .unwrap_or_else(|| "http://localhost:11434".to_string());
         let ollama = Some(ollama::OllamaProvider::new(&ollama_url));
 
         let openai = {
-            let key = app_db.get_setting("openai_api_key")?.unwrap_or_default();
+            let key = secret_store.get("openai_api_key")?.unwrap_or_default();
             let url = app_db
                 .get_setting("openai_base_url")?
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
@@ -146,7 +155,7 @@ impl ModelRegistry {
         };
 
         let anthropic = {
-            let key = app_db.get_setting("anthropic_api_key")?.unwrap_or_default();
+            let key = secret_store.get("anthropic_api_key")?.unwrap_or_default();
             let url = app_db
                 .get_setting("anthropic_base_url")?
                 .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
@@ -199,6 +208,7 @@ impl ModelRegistry {
         &self,
         model_id: &str,
         app_db: &AppDb,
+        secret_store: &SecretStore,
     ) -> Result<ProviderConfig, GlossError> {
         let provider_type = self
             .cached_models
@@ -218,13 +228,13 @@ impl ModelRegistry {
                 app_db
                     .get_setting("openai_base_url")?
                     .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-                app_db.get_setting("openai_api_key")?,
+                secret_store.get("openai_api_key")?,
             ),
             ProviderType::Anthropic => (
                 app_db
                     .get_setting("anthropic_base_url")?
                     .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
-                app_db.get_setting("anthropic_api_key")?,
+                secret_store.get("anthropic_api_key")?,
             ),
             ProviderType::LlamaCpp => (
                 app_db

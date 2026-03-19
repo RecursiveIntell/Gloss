@@ -4,6 +4,24 @@ import * as api from '../lib/tauri';
 import { useToastStore } from './toastStore';
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
+let persistSelectedSourcesChain = Promise.resolve();
+
+async function refreshNotebookList() {
+  const { useNotebookStore } = await import('./notebookStore');
+  await useNotebookStore.getState().loadNotebooks();
+}
+
+function persistSelectedSources(selectedSourceIds: Set<string>) {
+  const notebookId = localStorage.getItem(ACTIVE_NB_KEY);
+  if (!notebookId) return;
+  const snapshot = Array.from(selectedSourceIds);
+  persistSelectedSourcesChain = persistSelectedSourcesChain
+    .catch(() => {})
+    .then(() => api.setSelectedSources(notebookId, snapshot))
+    .catch((e) => {
+      console.error('Failed to persist selected sources:', e);
+    });
+}
 
 interface SourceStore {
   sources: Source[];
@@ -53,7 +71,9 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   addSourceFile: async (notebookId, path) => {
     try {
       await api.addSourceFile(notebookId, path);
+      await refreshNotebookList();
       await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
     } catch (e) {
       useToastStore.getState().addToast({
         type: 'error',
@@ -87,7 +107,9 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   addSourcePaste: async (notebookId, title, text) => {
     try {
       await api.addSourcePaste(notebookId, title, text);
+      await refreshNotebookList();
       await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
     } catch (e) {
       useToastStore.getState().addToast({
         type: 'error',
@@ -101,7 +123,9 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   deleteSource: async (notebookId, sourceId) => {
     try {
       await api.deleteSource(notebookId, sourceId);
+      await refreshNotebookList();
       await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
     } catch (e) {
       useToastStore.getState().addToast({
         type: 'error',
@@ -131,6 +155,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       const next = new Set(state.selectedSourceIds);
       if (next.has(sourceId)) next.delete(sourceId);
       else next.add(sourceId);
+      persistSelectedSources(next);
       return { selectedSourceIds: next };
     });
   },
@@ -147,17 +172,24 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         if (allSelected) next.delete(s.id);
         else next.add(s.id);
       }
+      persistSelectedSources(next);
       return { selectedSourceIds: next };
     });
   },
 
   selectAll: () => {
-    set((state) => ({
-      selectedSourceIds: new Set(state.sources.map(s => s.id)),
-    }));
+    set((state) => {
+      const next = new Set(state.sources.map(s => s.id));
+      persistSelectedSources(next);
+      return { selectedSourceIds: next };
+    });
   },
 
-  selectNone: () => set({ selectedSourceIds: new Set() }),
+  selectNone: () => {
+    const next = new Set<string>();
+    persistSelectedSources(next);
+    set({ selectedSourceIds: next });
+  },
 
   updateSourceStatus: (sourceId, status) => {
     set((state) => ({

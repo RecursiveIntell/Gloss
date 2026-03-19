@@ -133,7 +133,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
 
   const statusNote = (source: Source) => {
     if (source.source_type === "image" || source.source_type === "video") {
-      if (source.status === "pending") return " \u00B7 Awaiting vision model";
+      if (source.status === "pending") return " \u00B7 Queued for vision analysis";
       if (source.status === "describing") return " \u00B7 Describing with vision model...";
       if (source.status === "described") return " \u00B7 Embedding...";
     }

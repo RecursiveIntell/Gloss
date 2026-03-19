@@ -4,6 +4,7 @@ use crate::error::GlossError;
 use crate::ingestion::embed::{EmbeddingService, HnswIndex};
 use crate::providers::ModelRegistry;
 use crate::retrieval::hybrid_search::{self, SearchResult};
+use crate::secrets::SecretStore;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -20,6 +21,8 @@ pub const NATIVE_SEMANTIC_INDEXING_ENABLED: bool = false;
 pub struct AppState {
     /// App-level database (gloss.db)
     pub app_db: Mutex<AppDb>,
+    /// Encrypted local secret storage for provider API keys.
+    pub secret_store: SecretStore,
     /// Cached notebook database paths keyed by notebook ID.
     /// Each DB access opens its own SQLite connection so long-running ingestion
     /// work in one notebook does not serialize every other read for that same
@@ -60,6 +63,79 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn migrate_legacy_secrets(
+        app_db: &AppDb,
+        secret_store: &SecretStore,
+    ) -> Result<(), GlossError> {
+        for setting_key in ["openai_api_key", "anthropic_api_key"] {
+            if let Some(value) = app_db
+                .get_setting(setting_key)?
+                .filter(|value| !value.is_empty())
+            {
+                secret_store.set(setting_key, Some(&value))?;
+                app_db.set_setting(setting_key, "")?;
+            }
+        }
+
+        for (provider_id, setting_key) in [
+            ("openai", "openai_api_key"),
+            ("anthropic", "anthropic_api_key"),
+        ] {
+            if let Some(value) = app_db
+                .get_provider_api_key(provider_id)?
+                .filter(|value| !value.is_empty())
+            {
+                if !secret_store.contains(setting_key)? {
+                    secret_store.set(setting_key, Some(&value))?;
+                }
+                app_db.clear_provider_api_key(provider_id)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reconcile_notebook_source_counts(app_db: &AppDb) -> Result<(), GlossError> {
+        let notebooks = app_db.list_notebooks()?;
+        for notebook in notebooks {
+            let notebook_db_path = PathBuf::from(&notebook.directory).join("notebook.db");
+            if !notebook_db_path.exists() {
+                tracing::warn!(
+                    notebook_id = %notebook.id,
+                    path = %notebook_db_path.display(),
+                    "Skipping source-count reconcile for missing notebook DB"
+                );
+                continue;
+            }
+
+            let count =
+                match NotebookDb::connect(&notebook_db_path).and_then(|db| db.source_count()) {
+                    Ok(count) => count,
+                    Err(e) => {
+                        tracing::warn!(
+                            notebook_id = %notebook.id,
+                            path = %notebook_db_path.display(),
+                            error = %e,
+                            "Failed to reconcile notebook source count"
+                        );
+                        continue;
+                    }
+                };
+
+            if count != notebook.source_count {
+                app_db.update_source_count(&notebook.id, count)?;
+                tracing::info!(
+                    notebook_id = %notebook.id,
+                    old_count = notebook.source_count,
+                    new_count = count,
+                    "Reconciled notebook source count"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Initialize application state on startup.
     pub fn initialize(_app_handle: &AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
         let data_dir = directories::ProjectDirs::from("com", "sikmindz", "Gloss")
@@ -72,13 +148,17 @@ impl AppState {
 
         let db_path = data_dir.join("gloss.db");
         let app_db = AppDb::open(&db_path)?;
+        let secret_store = SecretStore::new(&data_dir)?;
+        Self::migrate_legacy_secrets(&app_db, &secret_store)?;
+        Self::reconcile_notebook_source_counts(&app_db)?;
 
-        let model_registry = ModelRegistry::new(&app_db)?;
+        let model_registry = ModelRegistry::new(&app_db, &secret_store)?;
 
         tracing::info!(data_dir = %data_dir.display(), "Gloss initialized");
 
         Ok(Self {
             app_db: Mutex::new(app_db),
+            secret_store,
             notebook_dbs: Mutex::new(HashMap::new()),
             model_registry: Mutex::new(model_registry),
             data_dir,
@@ -234,21 +314,39 @@ impl AppState {
 
     // --- Scheduling helpers ---
 
-    /// Set the active notebook (or None to deselect). Increments epoch.
-    pub fn set_active_notebook(&self, id: Option<String>) {
-        {
-            let mut active = self
-                .active_notebook_id
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *active = id;
+    /// Set the active notebook (or None to deselect).
+    ///
+    /// Returns true only when the active notebook actually changed. Callers may
+    /// optionally supply a target epoch so pending queue work from a previous
+    /// app session can be resumed instead of being cancelled as stale on the
+    /// first post-restart activation.
+    pub fn set_active_notebook(&self, id: Option<String>, epoch: Option<u64>) -> bool {
+        let mut active = self
+            .active_notebook_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        if *active == id {
+            return false;
         }
-        self.active_epoch.fetch_add(1, Ordering::SeqCst);
+
+        *active = id;
+        drop(active);
+
+        match epoch {
+            Some(epoch) => self.active_epoch.store(epoch, Ordering::SeqCst),
+            None => {
+                self.active_epoch.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
         self.bump_user_activity();
         tracing::debug!(
+            active_notebook_id = ?self.get_active_notebook_id(),
             epoch = self.active_epoch.load(Ordering::SeqCst),
             "Active notebook changed"
         );
+        true
     }
 
     /// Get the currently active notebook ID (cloned).
@@ -422,5 +520,91 @@ impl AppState {
             top_k,
         )?;
         Ok(Some(results))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::notebook_db::Source;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_reconcile_notebook_source_counts() {
+        let dir = tempdir().unwrap();
+        let app_db_path = dir.path().join("gloss.db");
+        let app_db = AppDb::open(&app_db_path).unwrap();
+
+        let notebook_dir = dir.path().join("notebooks").join("nb1");
+        std::fs::create_dir_all(notebook_dir.join("sources")).unwrap();
+        let notebook_dir_str = notebook_dir.to_string_lossy().to_string();
+
+        app_db
+            .create_notebook("nb1", "Count Drift", &notebook_dir_str)
+            .unwrap();
+        app_db.update_source_count("nb1", 99).unwrap();
+
+        let notebook_db = NotebookDb::open(&notebook_dir.join("notebook.db")).unwrap();
+        for id in ["s1", "s2"] {
+            notebook_db
+                .insert_source(&Source {
+                    id: id.to_string(),
+                    source_type: "text".to_string(),
+                    title: id.to_string(),
+                    original_filename: None,
+                    file_hash: None,
+                    url: None,
+                    file_path: None,
+                    content_text: Some("content".to_string()),
+                    word_count: Some(1),
+                    metadata: None,
+                    summary: None,
+                    summary_model: None,
+                    status: "ready".to_string(),
+                    error_message: None,
+                    selected: true,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                })
+                .unwrap();
+        }
+
+        AppState::reconcile_notebook_source_counts(&app_db).unwrap();
+
+        let notebook = app_db.get_notebook("nb1").unwrap();
+        assert_eq!(notebook.source_count, 2);
+    }
+
+    #[test]
+    fn test_migrate_legacy_secrets_scrubs_sqlite() {
+        let dir = tempdir().unwrap();
+        let app_db_path = dir.path().join("gloss.db");
+        let app_db = AppDb::open(&app_db_path).unwrap();
+        let secret_store = SecretStore::new(dir.path()).unwrap();
+
+        app_db.set_setting("openai_api_key", "sk-settings").unwrap();
+        app_db
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO providers (id, enabled, base_url, api_key) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["anthropic", 1, "https://api.anthropic.com/v1", "sk-provider"],
+            )
+            .unwrap();
+
+        AppState::migrate_legacy_secrets(&app_db, &secret_store).unwrap();
+
+        assert_eq!(
+            secret_store.get("openai_api_key").unwrap(),
+            Some("sk-settings".to_string())
+        );
+        assert_eq!(
+            secret_store.get("anthropic_api_key").unwrap(),
+            Some("sk-provider".to_string())
+        );
+        assert_eq!(
+            app_db.get_setting("openai_api_key").unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(app_db.get_provider_api_key("anthropic").unwrap(), None);
     }
 }

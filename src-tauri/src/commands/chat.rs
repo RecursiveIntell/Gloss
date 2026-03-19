@@ -3,7 +3,7 @@ use crate::error::GlossError;
 use crate::jobs;
 use crate::providers::{self, ChatMessage, ChatRequest, ChatToken, LlmProvider};
 use crate::retrieval::citations;
-use crate::retrieval::context::ContextAssembler;
+use crate::retrieval::context::{ContextAssembler, ContextPassage};
 use crate::retrieval::hybrid_search;
 use crate::state::AppState;
 use futures::StreamExt;
@@ -99,6 +99,75 @@ async fn acquire_gate_with_epoch<'a>(
     }
 }
 
+async fn load_or_generate_suggested_questions(
+    notebook_id: &str,
+    state: &AppState,
+) -> Result<Vec<String>, GlossError> {
+    let cached = state.with_notebook_db(notebook_id, |db| db.get_config("suggested_questions"))?;
+    if let Some(json) = cached {
+        let parsed: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+        if !parsed.is_empty() {
+            return Ok(parsed);
+        }
+    }
+
+    let summaries = state.with_notebook_db(notebook_id, |db| db.get_selected_summaries())?;
+    if summaries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (model, provider_config) = {
+        let registry = state
+            .model_registry
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let model = app_db
+            .get_setting("default_model")?
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "qwen3:8b".to_string());
+        let config =
+            registry.get_provider_config_for_model(&model, &app_db, &state.secret_store)?;
+        (model, config)
+    };
+
+    let llm_permit = state
+        .llm_gate
+        .acquire()
+        .await
+        .map_err(|_| GlossError::Other("LLM gate closed".into()))?;
+    let gpu_permit = state
+        .gpu_gate
+        .acquire()
+        .await
+        .map_err(|_| GlossError::Other("GPU gate closed".into()))?;
+
+    let provider = providers::build_provider(&provider_config);
+    let questions = crate::ingestion::summarize::generate_suggested_questions(
+        &summaries,
+        provider.as_ref(),
+        &model,
+    )
+    .await?;
+
+    drop(gpu_permit);
+    drop(llm_permit);
+
+    if !questions.is_empty() {
+        let json = serde_json::to_string(&questions).map_err(|e| {
+            GlossError::Other(format!("Failed to serialize suggested questions: {e}"))
+        })?;
+        state.with_notebook_db(notebook_id, |db| {
+            db.set_config("suggested_questions", &json)
+        })?;
+    }
+
+    Ok(questions)
+}
+
 #[tauri::command]
 pub async fn list_conversations(
     notebook_id: String,
@@ -143,11 +212,14 @@ pub async fn send_message(
     query: String,
     selected_source_ids: Vec<String>,
     model: String,
+    message_id: Option<String>,
     state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, GlossError> {
-    let message_id = uuid::Uuid::new_v4().to_string();
+    let message_id = message_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let request_epoch = state.get_active_epoch();
 
     // Chat preemption begins at user message arrival, not after RAG assembly.
@@ -196,7 +268,7 @@ pub async fn send_message(
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        registry.get_provider_config_for_model(&model, &app_db)?
+        registry.get_provider_config_for_model(&model, &app_db, &state.secret_store)?
     };
 
     // --- RAG context assembly ---
@@ -276,7 +348,7 @@ pub async fn send_message(
     );
 
     // 4. Hybrid search with multi-tier fallback
-    let source_context: Vec<(String, String)> =
+    let source_context: Vec<ContextPassage> =
         match state.try_hybrid_search(&notebook_id, &query, &effective_source_ids, top_k)? {
             Some(results) if !results.is_empty() => {
                 // Resolve source titles for each unique source_id
@@ -306,12 +378,13 @@ pub async fn send_message(
 
                 results
                     .iter()
-                    .map(|r| {
-                        let title = title_map
+                    .map(|r| ContextPassage {
+                        source_id: r.chunk.source_id.clone(),
+                        title: title_map
                             .get(&r.chunk.source_id)
                             .cloned()
-                            .unwrap_or_else(|| r.chunk.source_id.clone());
-                        (title, r.chunk.content.clone())
+                            .unwrap_or_else(|| r.chunk.source_id.clone()),
+                        content: r.chunk.content.clone(),
                     })
                     .collect()
             }
@@ -330,7 +403,7 @@ pub async fn send_message(
                     .collect();
 
                 // Strategy 1: Load chunks directly from DB
-                let chunk_ctx: Vec<(String, String)> =
+                let chunk_ctx: Vec<ContextPassage> =
                     state.with_notebook_db(&notebook_id, |db| {
                         let mut ctx = Vec::new();
                         let mut total_chars = 0usize;
@@ -360,7 +433,11 @@ pub async fn send_message(
                                         chunk.content.clone()
                                     };
                                     total_chars += text.len();
-                                    ctx.push((title.clone(), text));
+                                    ctx.push(ContextPassage {
+                                        source_id: sid.clone(),
+                                        title: title.clone(),
+                                        content: text,
+                                    });
                                 }
                             }
                         }
@@ -408,7 +485,11 @@ pub async fn send_message(
                                             text.clone()
                                         };
                                         total_chars += truncated.len();
-                                        ctx.push((source.title.clone(), truncated));
+                                        ctx.push(ContextPassage {
+                                            source_id: source.id.clone(),
+                                            title: source.title.clone(),
+                                            content: truncated,
+                                        });
                                     }
                                 }
                             }
@@ -422,7 +503,10 @@ pub async fn send_message(
     tracing::info!(
         context_passages = source_context.len(),
         manifest_sources = all_sources.len(),
-        context_chars = source_context.iter().map(|(_, c)| c.len()).sum::<usize>(),
+        context_chars = source_context
+            .iter()
+            .map(|p| p.content.len())
+            .sum::<usize>(),
         "RAG context assembled for chat"
     );
 
@@ -584,7 +668,7 @@ async fn stream_chat_response(
     custom_goal: Option<&str>,
     style: &str,
     all_sources: &[Source],
-    source_context: &[(String, String)],
+    source_context: &[ContextPassage],
 ) -> Result<String, GlossError> {
     use tauri::Manager;
 
@@ -714,15 +798,11 @@ pub async fn get_suggested_questions(
     notebook_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, GlossError> {
-    // For Phase 1, return cached questions from notebook_config or empty
-    let questions = state.with_notebook_db(&notebook_id, |db| {
-        match db.get_config("suggested_questions")? {
-            Some(json) => {
-                let qs: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
-                Ok(qs)
-            }
-            None => Ok(Vec::new()),
+    match load_or_generate_suggested_questions(&notebook_id, &state).await {
+        Ok(questions) => Ok(questions),
+        Err(e) => {
+            tracing::warn!(notebook_id = %notebook_id, error = %e, "Suggested question generation failed");
+            Ok(Vec::new())
         }
-    })?;
-    Ok(questions)
+    }
 }

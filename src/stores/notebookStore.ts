@@ -11,6 +11,7 @@ interface NotebookStore {
   loading: boolean;
   loadNotebooks: () => Promise<void>;
   createNotebook: (name: string) => Promise<string>;
+  renameNotebook: (id: string, name: string) => Promise<void>;
   deleteNotebook: (id: string) => Promise<void>;
   setActive: (id: string | null) => void;
 }
@@ -45,6 +46,11 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
     }
   },
 
+  renameNotebook: async (id, name) => {
+    await api.renameNotebook(id, name);
+    await get().loadNotebooks();
+  },
+
   deleteNotebook: async (id) => {
     const { activeNotebookId } = get();
     // Clear active notebook BEFORE deletion so the backend stops summary jobs
@@ -57,6 +63,10 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
   },
 
   setActive: (id) => {
+    if (get().activeNotebookId === id) {
+      return;
+    }
+
     // Reset notebook-scoped frontend state before switching
     useChatStore.getState().resetForNotebookSwitch();
     useNoteStore.getState().resetForNotebookSwitch();
@@ -74,6 +84,7 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
       api.setActiveNotebook(targetId)
         .then(() => {
           if (get().activeNotebookId !== targetId) return;
+          void get().loadNotebooks();
           return api.regenerateMissingSummaries(targetId);
         })
         .catch((e) => console.error('Notebook activation failed:', e));

@@ -6,9 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::error::{
-    ensure_input_within_limits, truncate, ParseError, ParseOptions, ParseTrace,
-};
+use crate::error::{ensure_input_within_limits, truncate, ParseError, ParseOptions, ParseTrace};
 use crate::extract::preprocess_opts;
 
 /// Extract content from a single XML-style tag in an LLM response.
@@ -224,8 +222,8 @@ mod tests {
     #[test]
     fn tag_with_trace_records_span() {
         let opts = ParseOptions::default();
-        let (result, trace) = parse_xml_tag_with_trace("<answer>Paris</answer>", "answer", &opts)
-            .unwrap();
+        let (result, trace) =
+            parse_xml_tag_with_trace("<answer>Paris</answer>", "answer", &opts).unwrap();
         assert_eq!(result, "Paris");
         assert!(trace.strategies_tried.contains(&"tag_lookup"));
         assert!(trace.extracted_span.is_some());
@@ -234,8 +232,7 @@ mod tests {
     #[test]
     fn tags_with_trace_warn_on_missing_tag() {
         let opts = ParseOptions::default();
-        let (result, trace) =
-            parse_xml_tags_with_trace("<a>one</a>", &["a", "b"], &opts).unwrap();
+        let (result, trace) = parse_xml_tags_with_trace("<a>one</a>", &["a", "b"], &opts).unwrap();
         assert_eq!(result["a"], "one");
         assert_eq!(trace.warnings, vec!["tag 'b' not found"]);
     }
@@ -246,8 +243,8 @@ mod tests {
             max_input_bytes: 8,
             ..ParseOptions::default()
         };
-        let err = parse_xml_tag_with_trace("<answer>too long</answer>", "answer", &opts)
-            .unwrap_err();
+        let err =
+            parse_xml_tag_with_trace("<answer>too long</answer>", "answer", &opts).unwrap_err();
         assert_eq!(err.kind(), "too_large");
     }
 }

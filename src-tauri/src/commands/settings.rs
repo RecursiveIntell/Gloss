@@ -5,13 +5,44 @@ use crate::state::AppState;
 use std::collections::HashMap;
 use tauri::State;
 
+fn secret_setting_key(provider_type: ProviderType) -> Option<&'static str> {
+    provider_type.api_key_setting_key()
+}
+
+fn rebuild_model_registry(state: &AppState) -> Result<(), GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    let new_registry = ModelRegistry::new(&app_db, &state.secret_store)?;
+    let mut registry = state
+        .model_registry
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    let cached = std::mem::take(&mut registry.cached_models);
+    *registry = new_registry;
+    registry.cached_models = cached;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_providers(state: State<'_, AppState>) -> Result<Vec<Provider>, GlossError> {
     let app_db = state
         .app_db
         .lock()
         .map_err(|e| GlossError::Other(e.to_string()))?;
-    app_db.list_providers()
+    let mut providers = app_db.list_providers()?;
+    drop(app_db);
+
+    for provider in &mut providers {
+        if let Some(provider_type) = ProviderType::from_str(&provider.id) {
+            if let Some(secret_key) = secret_setting_key(provider_type) {
+                provider.has_api_key = state.secret_store.contains(secret_key)?;
+            }
+        }
+    }
+
+    Ok(providers)
 }
 
 #[tauri::command]
@@ -22,30 +53,23 @@ pub async fn update_provider(
     api_key: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
-    {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        app_db.update_provider(&id, enabled, base_url.as_deref(), api_key.as_deref())?;
+    if let Some(provider_type) = ProviderType::from_str(&id) {
+        if let Some(secret_key) = secret_setting_key(provider_type) {
+            if let Some(api_key) = api_key.as_deref() {
+                state.secret_store.set(secret_key, Some(api_key))?;
+            }
+        }
     }
 
-    // Rebuild the model registry to pick up new provider config
     {
         let app_db = state
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        let new_registry = ModelRegistry::new(&app_db)?;
-        let mut registry = state
-            .model_registry
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        // Preserve cached models across rebuild
-        let cached = std::mem::take(&mut registry.cached_models);
-        *registry = new_registry;
-        registry.cached_models = cached;
+        app_db.update_provider(&id, enabled, base_url.as_deref(), None)?;
     }
+
+    rebuild_model_registry(&state)?;
 
     Ok(())
 }
@@ -74,13 +98,13 @@ pub async fn test_provider(
                 app_db
                     .get_setting("openai_base_url")?
                     .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-                app_db.get_setting("openai_api_key")?,
+                state.secret_store.get("openai_api_key")?,
             ),
             ProviderType::Anthropic => (
                 app_db
                     .get_setting("anthropic_base_url")?
                     .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
-                app_db.get_setting("anthropic_api_key")?,
+                state.secret_store.get("anthropic_api_key")?,
             ),
             ProviderType::LlamaCpp => (
                 app_db
@@ -125,7 +149,10 @@ pub async fn refresh_models(
         });
 
         // OpenAI (if key set)
-        let openai_key = app_db.get_setting("openai_api_key")?.unwrap_or_default();
+        let openai_key = state
+            .secret_store
+            .get("openai_api_key")?
+            .unwrap_or_default();
         if !openai_key.is_empty() {
             cfgs.push(providers::ProviderConfig {
                 provider_type: ProviderType::OpenAI,
@@ -137,7 +164,10 @@ pub async fn refresh_models(
         }
 
         // Anthropic (if key set)
-        let anthropic_key = app_db.get_setting("anthropic_api_key")?.unwrap_or_default();
+        let anthropic_key = state
+            .secret_store
+            .get("anthropic_api_key")?
+            .unwrap_or_default();
         if !anthropic_key.is_empty() {
             cfgs.push(providers::ProviderConfig {
                 provider_type: ProviderType::Anthropic,
@@ -229,7 +259,22 @@ pub async fn get_settings(
         .app_db
         .lock()
         .map_err(|e| GlossError::Other(e.to_string()))?;
-    app_db.get_settings()
+    let mut settings = app_db.get_settings()?;
+    drop(app_db);
+
+    for secret_key in ["openai_api_key", "anthropic_api_key"] {
+        settings.insert(secret_key.to_string(), String::new());
+        settings.insert(
+            format!("{secret_key}_configured"),
+            if state.secret_store.contains(secret_key)? {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            },
+        );
+    }
+
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -238,6 +283,18 @@ pub async fn update_setting(
     value: String,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
+    if matches!(key.as_str(), "openai_api_key" | "anthropic_api_key") {
+        state.secret_store.set(&key, Some(&value))?;
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        app_db.set_setting(&key, "")?;
+        drop(app_db);
+        rebuild_model_registry(&state)?;
+        return Ok(());
+    }
+
     let app_db = state
         .app_db
         .lock()

@@ -14,12 +14,14 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
   const loadSources = useSourceStore((s) => s.loadSources);
   const loadStats = useSourceStore((s) => s.loadStats);
   const loadConversations = useChatStore((s) => s.loadConversations);
+  const loadSuggestedQuestions = useChatStore((s) => s.loadSuggestedQuestions);
   const loadNotes = useNoteStore((s) => s.loadNotes);
 
   useEffect(() => {
     loadSources(notebookId);
     loadStats(notebookId);
     loadConversations(notebookId);
+    loadSuggestedQuestions(notebookId);
     loadNotes(notebookId);
   }, [notebookId]);
 

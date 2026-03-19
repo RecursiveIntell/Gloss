@@ -70,19 +70,11 @@ pub use extract::{preprocess, strip_think_tags};
 pub use json::{parse_json, parse_json_value, parse_json_value_with_trace, parse_json_with_trace};
 pub use list::{parse_string_list, parse_string_list_raw, parse_string_list_with_trace};
 pub use number::{
-    parse_number,
-    parse_number_in_range,
-    parse_number_in_range_with_trace,
-    parse_number_with_trace,
+    parse_number, parse_number_in_range, parse_number_in_range_with_trace, parse_number_with_trace,
 };
 pub use repair::try_repair_json;
 pub use text::{parse_text, parse_text_with_trace};
-pub use xml::{
-    parse_xml_tag,
-    parse_xml_tag_with_trace,
-    parse_xml_tags,
-    parse_xml_tags_with_trace,
-};
+pub use xml::{parse_xml_tag, parse_xml_tag_with_trace, parse_xml_tags, parse_xml_tags_with_trace};
 
 #[cfg(feature = "yaml")]
 pub use yaml::parse_yaml;

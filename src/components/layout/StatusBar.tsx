@@ -18,6 +18,7 @@ import { useState, useEffect, useCallback } from "react";
 
 export function StatusBar() {
   const activeModel = useSettingsStore((s) => s.activeModel);
+  const models = useSettingsStore((s) => s.models);
   const stats = useSourceStore((s) => s.stats);
   const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
   const [connected, setConnected] = useState(false);
@@ -25,14 +26,16 @@ export function StatusBar() {
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [generating, setGenerating] = useState(false);
   const testProvider = useSettingsStore((s) => s.testProvider);
+  const activeProviderId =
+    models.find((model) => model.id === activeModel)?.provider_id ?? "ollama";
 
   useEffect(() => {
-    testProvider("ollama").then(setConnected);
+    testProvider(activeProviderId).then(setConnected);
     const interval = setInterval(() => {
-      testProvider("ollama").then(setConnected);
+      testProvider(activeProviderId).then(setConnected);
     }, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [activeProviderId, testProvider]);
 
   // Listen for embedding model status events
   useEffect(() => {
@@ -110,6 +113,9 @@ export function StatusBar() {
         <span>{connected ? "Connected" : "Disconnected"}</span>
       </div>
       <div className="flex items-center gap-1.5">
+        <span>Provider: {activeProviderId}</span>
+      </div>
+      <div className="flex items-center gap-1.5">
         <span>Model: {activeModel}</span>
       </div>
 
@@ -163,20 +169,17 @@ export function StatusBar() {
           </button>
         )}
 
-        {/* Pause/Resume — shown when processing or paused */}
-        {(isProcessing || isPaused) && (
-          <button
-            onClick={handleTogglePause}
-            className="p-0.5 rounded hover:bg-bg-tertiary text-text-muted hover:text-text"
-            title={isPaused ? "Resume summaries" : "Pause summaries"}
-          >
-            {isPaused ? (
-              <Play className="w-3 h-3" />
-            ) : (
-              <Pause className="w-3 h-3" />
-            )}
-          </button>
-        )}
+        <button
+          onClick={handleTogglePause}
+          className="p-0.5 rounded hover:bg-bg-tertiary text-text-muted hover:text-text"
+          title={isPaused ? "Resume summaries" : "Pause summaries"}
+        >
+          {isPaused ? (
+            <Play className="w-3 h-3" />
+          ) : (
+            <Pause className="w-3 h-3" />
+          )}
+        </button>
       </div>
 
       {stats && (

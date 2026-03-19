@@ -105,7 +105,9 @@ fn parse_string_list_inner_traced(
     // Strategy 2: JSON object with common list keys
     trace.strategies_tried.push("json_object_list_keys");
     if let Some(tags) = try_extract_list_from_object(&cleaned) {
-        trace.warnings.push("list extracted from object wrapper".to_string());
+        trace
+            .warnings
+            .push("list extracted from object wrapper".to_string());
         return Ok(tags);
     }
 
@@ -177,7 +179,9 @@ fn parse_string_list_inner_traced(
         });
     }
 
-    trace.warnings.push("fell back to comma-separated parsing".to_string());
+    trace
+        .warnings
+        .push("fell back to comma-separated parsing".to_string());
     Ok(tags)
 }
 

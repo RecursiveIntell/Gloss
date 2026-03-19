@@ -1,3 +1,4 @@
+use crate::retrieval::context::ContextPassage;
 use crate::retrieval::hybrid_search::SearchResult;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -59,7 +60,7 @@ pub fn extract_citations(
 /// This matches the [1], [2] ordering in the system prompt exactly.
 pub fn extract_citations_from_context(
     response: &str,
-    source_context: &[(String, String)],
+    source_context: &[ContextPassage],
 ) -> Vec<Citation> {
     let re = Regex::new(r"\[(\d+)\]").unwrap();
     let mut citations = Vec::new();
@@ -71,13 +72,13 @@ pub fn extract_citations_from_context(
                 let idx = num.saturating_sub(1);
                 if idx < source_context.len() && !seen.contains(&idx) {
                     seen.insert(idx);
-                    let (title, content) = &source_context[idx];
-                    let quote: String = content.chars().take(200).collect();
+                    let passage = &source_context[idx];
+                    let quote: String = passage.content.chars().take(200).collect();
 
                     citations.push(Citation {
                         chunk_id: String::new(),
-                        source_id: String::new(),
-                        source_title: title.clone(),
+                        source_id: passage.source_id.clone(),
+                        source_title: passage.title.clone(),
                         quote: Some(quote),
                         page: None,
                         section: None,

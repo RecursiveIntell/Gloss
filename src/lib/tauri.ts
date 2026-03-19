@@ -23,6 +23,10 @@ export async function createNotebook(name: string): Promise<string> {
   return invoke("create_notebook", { name });
 }
 
+export async function renameNotebook(id: string, name: string): Promise<void> {
+  return invoke("rename_notebook", { id, name });
+}
+
 export async function deleteNotebook(id: string): Promise<void> {
   return invoke("delete_notebook", { id });
 }
@@ -35,6 +39,13 @@ export async function setActiveNotebook(notebookId: string | null): Promise<void
 
 export async function listSources(notebookId: string): Promise<Source[]> {
   return invoke("list_sources", { notebookId });
+}
+
+export async function setSelectedSources(
+  notebookId: string,
+  selectedSourceIds: string[]
+): Promise<void> {
+  return invoke("set_selected_sources", { notebookId, selectedSourceIds });
 }
 
 export async function addSourceFile(
@@ -119,7 +130,8 @@ export async function sendMessage(
   conversationId: string,
   query: string,
   selectedSourceIds: string[],
-  model: string
+  model: string,
+  messageId?: string
 ): Promise<string> {
   return invoke("send_message", {
     notebookId,
@@ -127,6 +139,7 @@ export async function sendMessage(
     query,
     selectedSourceIds,
     model,
+    messageId,
   });
 }
 

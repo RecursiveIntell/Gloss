@@ -64,7 +64,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     await api.deleteConversation(notebookId, conversationId);
     const { activeConversationId } = get();
     if (activeConversationId === conversationId) {
-      set({ activeConversationId: null, messages: [] });
+      set({
+        activeConversationId: null,
+        messages: [],
+        isStreaming: false,
+        streamingContent: '',
+        streamingNotebookId: null,
+        streamingMessageId: null,
+        streamingError: null,
+      });
     }
     await get().loadConversations(notebookId);
   },
@@ -93,6 +101,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       activeConversationId = await get().createConversation(notebookId);
     }
 
+    const assistantMessageId = crypto.randomUUID();
+
     // Add user message to local state immediately
     const userMsg: Message = {
       id: crypto.randomUUID(),
@@ -106,6 +116,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       isStreaming: true,
       streamingContent: '',
       streamingNotebookId: notebookId,
+      streamingMessageId: assistantMessageId,
       streamingError: null,
     }));
 
@@ -115,7 +126,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         activeConversationId,
         query,
         selectedSourceIds,
-        model
+        model,
+        assistantMessageId
       );
       if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
         return;
@@ -123,7 +135,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       if (get().activeConversationId !== activeConversationId) {
         return;
       }
-      set({ streamingMessageId: messageId });
+      if (messageId !== assistantMessageId) {
+        set({ streamingMessageId: messageId });
+      }
     } catch (e) {
       console.error('Failed to send message:', e);
       set({
@@ -145,7 +159,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (!isStreaming) return;
     if (streamingNotebookId !== notebookId) return;
     if (activeConversationId !== conversationId) return;
-    if (streamingMessageId && streamingMessageId !== messageId) return;
+    if (!streamingMessageId || streamingMessageId !== messageId) return;
     set((state) => ({
       streamingContent: state.streamingContent + token,
     }));
@@ -161,7 +175,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (!isStreaming) return;
     if (streamingNotebookId !== notebookId) return;
     if (activeConversationId !== conversationId) return;
-    if (streamingMessageId && streamingMessageId !== messageId) return;
+    if (!streamingMessageId || streamingMessageId !== messageId) return;
     const finalContent = get().streamingContent;
     const assistantMsg: Message = {
       id: messageId,
@@ -190,7 +204,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (!isStreaming) return;
     if (streamingNotebookId !== notebookId) return;
     if (activeConversationId !== conversationId) return;
-    if (streamingMessageId && streamingMessageId !== messageId) return;
+    if (!streamingMessageId || streamingMessageId !== messageId) return;
     set({
       streamingError: error,
       isStreaming: false,

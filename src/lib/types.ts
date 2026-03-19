@@ -43,7 +43,7 @@ export interface Message {
   conversation_id: string;
   role: "user" | "assistant";
   content: string;
-  citations?: Citation[];
+  citations?: Citation[] | string;
   model_used?: string;
   tokens_prompt?: number;
   tokens_response?: number;
@@ -64,7 +64,7 @@ export interface Note {
   title?: string;
   content: string;
   note_type: "manual" | "saved_response";
-  citations?: Citation[];
+  citations?: Citation[] | string;
   pinned: boolean;
   source_id?: string;
   created_at: string;

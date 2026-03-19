@@ -72,9 +72,16 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   updateSetting: async (key, value) => {
     await api.updateSetting(key, value);
-    set((state) => ({
-      settings: { ...state.settings, [key]: value },
-    }));
+    set((state) => {
+      const nextSettings = { ...state.settings };
+      if (key === 'openai_api_key' || key === 'anthropic_api_key') {
+        nextSettings[key] = '';
+        nextSettings[`${key}_configured`] = value.trim() ? '1' : '0';
+      } else {
+        nextSettings[key] = value;
+      }
+      return { settings: nextSettings };
+    });
   },
 
   updateProvider: async (id, enabled, baseUrl, apiKey) => {

@@ -47,17 +47,29 @@ function ProviderSection({
   const [showKey, setShowKey] = useState(false);
   const [testStatus, setTestStatus] = useState<TestStatus>("idle");
   const [dirty, setDirty] = useState(false);
+  const configuredKey = apiKeyKey ? `${apiKeyKey}_configured` : null;
+  const hasStoredSecret = configuredKey ? settings[configuredKey] === "1" : false;
 
   useEffect(() => {
     setUrl(settings[urlKey] || urlDefault);
-    if (apiKeyKey) setApiKey(settings[apiKeyKey] || "");
+    if (apiKeyKey) setApiKey("");
     setDirty(false);
   }, [settings, urlKey, urlDefault, apiKeyKey]);
 
   const handleSave = async () => {
     const updates: Record<string, string> = { [urlKey]: url };
-    if (apiKeyKey) updates[apiKeyKey] = apiKey;
+    if (apiKeyKey && (apiKey.trim() || !hasStoredSecret)) {
+      updates[apiKeyKey] = apiKey;
+    }
     await onSave(updates);
+    if (apiKeyKey) setApiKey("");
+    setDirty(false);
+  };
+
+  const handleClearKey = async () => {
+    if (!apiKeyKey) return;
+    await onSave({ [apiKeyKey]: "" });
+    setApiKey("");
     setDirty(false);
   };
 
@@ -130,7 +142,11 @@ function ProviderSection({
                     setDirty(true);
                   }}
                   className="w-full px-2 py-1.5 pr-8 text-sm bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
-                  placeholder="sk-..."
+                  placeholder={
+                    hasStoredSecret
+                      ? "Stored securely on this device"
+                      : "sk-..."
+                  }
                 />
                 <button
                   onClick={() => setShowKey(!showKey)}
@@ -143,7 +159,20 @@ function ProviderSection({
                   )}
                 </button>
               </div>
+              {hasStoredSecret && (
+                <button
+                  onClick={handleClearKey}
+                  className="px-3 py-1.5 text-xs bg-bg-tertiary rounded hover:bg-border text-text-secondary hover:text-text"
+                >
+                  Clear
+                </button>
+              )}
             </div>
+            {hasStoredSecret && !apiKey && (
+              <p className="text-[11px] text-text-muted">
+                Leave the field blank to keep the stored key.
+              </p>
+            )}
           </>
         )}
 
@@ -211,7 +240,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     if (updates["ollama_url"]) {
       await updateProvider("ollama", true, updates["ollama_url"]);
     }
-    if (updates["openai_api_key"] || updates["openai_base_url"]) {
+    if ("openai_api_key" in updates || "openai_base_url" in updates) {
       await updateProvider(
         "openai",
         true,
@@ -219,7 +248,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
         updates["openai_api_key"]
       );
     }
-    if (updates["anthropic_api_key"] || updates["anthropic_base_url"]) {
+    if ("anthropic_api_key" in updates || "anthropic_base_url" in updates) {
       await updateProvider(
         "anthropic",
         true,
@@ -328,6 +357,15 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
             settings={settings}
             onSave={handleProviderSave}
           />
+
+          <section className="rounded-lg border border-warning/30 bg-warning/5 px-3 py-2">
+            <p className="text-xs text-text-secondary">
+              Chat can use multiple providers, but background summaries and
+              image/video analysis still run through the Ollama-compatible job
+              pipeline. Keep Ollama configured if you want those background
+              features to work reliably.
+            </p>
+          </section>
 
           {/* Models Section */}
           <section>

@@ -2,7 +2,18 @@ import { useState, useRef, useEffect } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useSourceStore } from "../../stores/sourceStore";
-import { Send, Plus, MessageSquare, Loader2, AlertCircle, BookMarked } from "lucide-react";
+import { useNoteStore } from "../../stores/noteStore";
+import { SourceViewerModal } from "../sources/SourceViewerModal";
+import {
+  Send,
+  Plus,
+  MessageSquare,
+  Loader2,
+  AlertCircle,
+  BookMarked,
+  BookmarkPlus,
+  Trash2,
+} from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import type { Citation } from "../../lib/types";
 
@@ -20,15 +31,20 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     streamingError,
     sendMessage,
     createConversation,
+    deleteConversation,
     setActiveConversation,
     loadMessages,
     suggestedQuestions,
   } = useChatStore();
+  const saveResponse = useNoteStore((s) => s.saveResponse);
   const { activeModel, models } = useSettingsStore();
   const { selectedSourceIds } = useSourceStore();
   const setActiveModel = useSettingsStore((s) => s.setActiveModel);
+  const updateSetting = useSettingsStore((s) => s.updateSetting);
 
   const [input, setInput] = useState("");
+  const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
+  const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -46,6 +62,21 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     setInput(question);
   };
 
+  const handleDeleteConversation = async () => {
+    if (!activeConversationId) return;
+    await deleteConversation(notebookId, activeConversationId);
+  };
+
+  const handleSaveResponse = async (messageId: string) => {
+    if (savingMessageId) return;
+    setSavingMessageId(messageId);
+    try {
+      await saveResponse(notebookId, messageId);
+    } finally {
+      setSavingMessageId(null);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
@@ -53,13 +84,15 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         <div className="flex items-center gap-2">
           <button
             onClick={() => createConversation(notebookId)}
-            className="flex items-center gap-1 px-2 py-1 text-xs bg-bg-tertiary rounded hover:bg-border text-text-secondary hover:text-text"
+            disabled={isStreaming}
+            className="flex items-center gap-1 px-2 py-1 text-xs bg-bg-tertiary rounded hover:bg-border text-text-secondary hover:text-text disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Plus className="w-3 h-3" /> New Chat
           </button>
           {conversations.length > 0 && (
             <select
               value={activeConversationId || ""}
+              disabled={isStreaming}
               onChange={(e) => {
                 const id = e.target.value;
                 if (id) {
@@ -67,7 +100,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                   loadMessages(notebookId, id);
                 }
               }}
-              className="text-xs bg-bg-tertiary border border-border rounded px-2 py-1 text-text focus:outline-none focus:border-accent"
+              className="text-xs bg-bg-tertiary border border-border rounded px-2 py-1 text-text focus:outline-none focus:border-accent disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <option value="">Select conversation</option>
               {conversations.map((c) => (
@@ -77,10 +110,24 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
               ))}
             </select>
           )}
+          {activeConversationId && (
+            <button
+              onClick={handleDeleteConversation}
+              disabled={isStreaming}
+              className="flex items-center gap-1 px-2 py-1 text-xs bg-bg-tertiary rounded hover:bg-error/15 text-text-secondary hover:text-error disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Delete conversation"
+            >
+              <Trash2 className="w-3 h-3" /> Delete
+            </button>
+          )}
         </div>
         <select
           value={activeModel}
-          onChange={(e) => setActiveModel(e.target.value)}
+          onChange={(e) => {
+            const nextModel = e.target.value;
+            setActiveModel(nextModel);
+            void updateSetting("default_model", nextModel);
+          }}
           className="text-xs bg-bg-tertiary border border-border rounded px-2 py-1 text-text focus:outline-none focus:border-accent"
         >
           {models.length > 0 ? (
@@ -148,12 +195,23 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                     <div className="prose prose-invert prose-sm max-w-none">
                       <ReactMarkdown>{msg.content}</ReactMarkdown>
                     </div>
+                    <div className="mt-2 flex items-center gap-2 text-[10px]">
+                      <button
+                        onClick={() => handleSaveResponse(msg.id)}
+                        disabled={savingMessageId === msg.id}
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 bg-bg-secondary text-text-muted hover:text-text hover:bg-border disabled:opacity-60"
+                      >
+                        <BookmarkPlus className="w-2.5 h-2.5" />
+                        {savingMessageId === msg.id ? "Saving..." : "Save to notes"}
+                      </button>
+                    </div>
                     {parsedCitations.length > 0 && (
                       <div className="mt-2 pt-2 border-t border-border/40 flex flex-wrap gap-1.5">
                         {parsedCitations.map((c, i) => (
                           <button
                             key={i}
                             title={c.quote || c.source_title}
+                            onClick={() => setActiveCitation(c)}
                             className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] bg-accent/15 text-accent rounded hover:bg-accent/25 transition-colors"
                           >
                             <BookMarked className="w-2.5 h-2.5" />
@@ -222,6 +280,13 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           </button>
         </div>
       </div>
+
+      <SourceViewerModal
+        notebookId={notebookId}
+        citation={activeCitation}
+        open={activeCitation != null}
+        onClose={() => setActiveCitation(null)}
+      />
     </div>
   );
 }

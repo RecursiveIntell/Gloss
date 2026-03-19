@@ -1,3 +1,5 @@
+#[allow(deprecated)]
+use crate::trace::TraceId;
 use crate::{
     error::Result,
     events::{Event, FnEventHandler},
@@ -8,8 +10,6 @@ use crate::{
     types::{PipelineContext, PipelineInput, PipelineProgress, PipelineResult, StageOutput},
     PipelineError,
 };
-#[allow(deprecated)]
-use crate::trace::TraceId;
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::{

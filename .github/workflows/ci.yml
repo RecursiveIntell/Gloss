@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Rust format check
+        run: |
+          find src-tauri -path 'src-tauri/vendor' -prune -o -name '*.rs' -print0 \
+            | xargs -0 rustfmt --edition 2021 --check
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test

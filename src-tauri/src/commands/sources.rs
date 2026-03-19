@@ -287,6 +287,7 @@ fn create_file_source(
     };
 
     state.with_notebook_db(notebook_id, |db| db.insert_source(&source))?;
+    sync_notebook_source_count(state, notebook_id)?;
 
     Ok((source_id, source_type.to_string()))
 }
@@ -297,6 +298,17 @@ pub async fn list_sources(
     state: State<'_, AppState>,
 ) -> Result<Vec<Source>, GlossError> {
     state.with_notebook_db(&notebook_id, |db| db.list_sources())
+}
+
+#[tauri::command]
+pub async fn set_selected_sources(
+    notebook_id: String,
+    selected_source_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<(), GlossError> {
+    state.with_notebook_db(&notebook_id, |db| {
+        db.set_selected_sources(&selected_source_ids)
+    })
 }
 
 /// Options for controlling ingestion behavior during batch imports.
@@ -509,6 +521,17 @@ fn run_ingestion_inner(
     // Decrement active ingestion counter (always, even on error)
     state.ingestion_active.fetch_sub(1, Ordering::SeqCst);
 
+    if let Err(e) = &result {
+        if is_deleted_source_error(e, source_id) {
+            tracing::info!(
+                notebook_id,
+                source_id,
+                "Source deleted during ingestion, stopping quietly"
+            );
+            return;
+        }
+    }
+
     let (status, error_msg) = match &result {
         Ok(()) => ("ready", None),
         Err(e) => ("error", Some(e.to_string())),
@@ -538,6 +561,10 @@ fn queue_epoch_for_notebook(state: &AppState, notebook_id: &str) -> u64 {
     } else {
         0
     }
+}
+
+fn is_deleted_source_error(err: &GlossError, source_id: &str) -> bool {
+    matches!(err, GlossError::NotFound(message) if message.contains(&format!("Source {source_id} not found")))
 }
 
 /// Queue a low-priority summary job for a source. Errors are logged but don't
@@ -601,7 +628,7 @@ fn queue_describe_image_job(
     notebook_id: &str,
     source_id: &str,
     _source_path: &Path,
-) {
+) -> Result<(), String> {
     let (ollama_url, model) = match (|| -> Result<(String, String), GlossError> {
         let app_db = state
             .app_db
@@ -619,11 +646,12 @@ fn queue_describe_image_job(
     })() {
         Ok((url, model)) if !model.is_empty() => (url, model),
         _ => {
-            tracing::warn!(
-                source_id,
-                "No vision model configured, image will stay pending"
-            );
-            return;
+            let msg = "No vision model configured. Configure a vision-capable model and retry this source.";
+            tracing::warn!(source_id, "{msg}");
+            let _ = state.with_notebook_db(notebook_id, |db| {
+                db.update_source_status(source_id, "error", Some(msg))
+            });
+            return Err(msg.to_string());
         }
     };
 
@@ -645,9 +673,15 @@ fn queue_describe_image_job(
     match queue.add(job) {
         Ok(job_id) => {
             tracing::info!(source_id, job_id, "Queued describe-image job");
+            Ok(())
         }
         Err(e) => {
+            let msg = format!("Failed to queue image description job: {e}");
             tracing::warn!(source_id, error = %e, "Failed to queue describe-image job");
+            let _ = state.with_notebook_db(notebook_id, |db| {
+                db.update_source_status(source_id, "error", Some(&msg))
+            });
+            Err(msg)
         }
     }
 }
@@ -659,7 +693,7 @@ fn queue_describe_video_job(
     state: &AppState,
     notebook_id: &str,
     source_id: &str,
-) {
+) -> Result<(), String> {
     let (ollama_url, model) = match (|| -> Result<(String, String), GlossError> {
         let app_db = state
             .app_db
@@ -676,11 +710,12 @@ fn queue_describe_video_job(
     })() {
         Ok((url, model)) if !model.is_empty() => (url, model),
         _ => {
-            tracing::warn!(
-                source_id,
-                "No vision model configured, video will stay pending"
-            );
-            return;
+            let msg = "No vision model configured. Configure a vision-capable model and retry this source.";
+            tracing::warn!(source_id, "{msg}");
+            let _ = state.with_notebook_db(notebook_id, |db| {
+                db.update_source_status(source_id, "error", Some(msg))
+            });
+            return Err(msg.to_string());
         }
     };
 
@@ -702,9 +737,15 @@ fn queue_describe_video_job(
     match queue.add(job) {
         Ok(job_id) => {
             tracing::info!(source_id, job_id, "Queued describe-video job");
+            Ok(())
         }
         Err(e) => {
+            let msg = format!("Failed to queue video description job: {e}");
             tracing::warn!(source_id, error = %e, "Failed to queue describe-video job");
+            let _ = state.with_notebook_db(notebook_id, |db| {
+                db.update_source_status(source_id, "error", Some(&msg))
+            });
+            Err(msg)
         }
     }
 }
@@ -778,6 +819,24 @@ fn emit_status(
     let _ = app_handle.emit("source:status", payload);
 }
 
+fn invalidate_suggested_questions(state: &AppState, notebook_id: &str) {
+    if let Err(e) =
+        state.with_notebook_db(notebook_id, |db| db.set_config("suggested_questions", ""))
+    {
+        tracing::warn!(notebook_id, error = %e, "Failed to invalidate suggested questions cache");
+    }
+}
+
+fn sync_notebook_source_count(state: &AppState, notebook_id: &str) -> Result<(), GlossError> {
+    let count = state.with_notebook_db(notebook_id, |db| db.source_count())?;
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    app_db.update_source_count(notebook_id, count)?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn add_source_file(
     notebook_id: String,
@@ -814,16 +873,19 @@ pub async fn add_source_file(
     }
 
     let (source_id, source_type) = create_file_source(&notebook_id, &source_path, None, &state)?;
+    invalidate_suggested_questions(&state, &notebook_id);
 
     match source_type.as_str() {
         "image" => {
-            queue_describe_image_job(&queue, &state, &notebook_id, &source_id, &source_path);
-            emit_status(&app_handle, &notebook_id, &source_id, "pending", None);
+            match queue_describe_image_job(&queue, &state, &notebook_id, &source_id, &source_path) {
+                Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
+                Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
+            }
         }
-        "video" => {
-            queue_describe_video_job(&queue, &state, &notebook_id, &source_id);
-            emit_status(&app_handle, &notebook_id, &source_id, "pending", None);
-        }
+        "video" => match queue_describe_video_job(&queue, &state, &notebook_id, &source_id) {
+            Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
+            Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
+        },
         _ => {
             // Spawn ingestion in background so the IPC thread isn't blocked
             let nb = notebook_id.clone();
@@ -957,10 +1019,11 @@ fn walk_directory_inner(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 pub async fn add_source_folder(
     notebook_id: String,
     path: String,
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), GlossError> {
+    invalidate_suggested_questions(&state, &notebook_id);
     let folder = PathBuf::from(&path);
     if !folder.is_dir() {
         return Err(GlossError::Ingestion {
@@ -1106,10 +1169,11 @@ pub async fn add_source_folder(
                 let state = handle.state::<AppState>();
                 match source_type.as_str() {
                     "image" => {
-                        queue_describe_image_job(&q, &state, &nb_id, &source_id, Path::new(""));
+                        let _ =
+                            queue_describe_image_job(&q, &state, &nb_id, &source_id, Path::new(""));
                     }
                     "video" => {
-                        queue_describe_video_job(&q, &state, &nb_id, &source_id);
+                        let _ = queue_describe_video_job(&q, &state, &nb_id, &source_id);
                     }
                     _ => {
                         run_ingestion_inner(
@@ -1216,6 +1280,8 @@ pub async fn add_source_paste(
     };
 
     state.with_notebook_db(&notebook_id, |db| db.insert_source(&source))?;
+    sync_notebook_source_count(&state, &notebook_id)?;
+    invalidate_suggested_questions(&state, &notebook_id);
 
     // Spawn chunking + embedding + summary in background
     let nb = notebook_id.clone();
@@ -1238,8 +1304,91 @@ pub async fn delete_source(
     notebook_id: String,
     source_id: String,
     state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
 ) -> Result<(), GlossError> {
-    state.with_notebook_db(&notebook_id, |db| db.delete_source(&source_id))
+    let source = state.with_notebook_db(&notebook_id, |db| db.get_source(&source_id))?;
+    let old_embedding_ids = state.with_notebook_db(&notebook_id, |db| {
+        db.get_embedding_ids_for_source(&source_id)
+    })?;
+    let notebook_dir = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let notebook = app_db.get_notebook(&notebook_id)?;
+        PathBuf::from(notebook.directory)
+    };
+
+    let cancelled = jobs::cancel_jobs_matching(&queue, |job, _status| {
+        job.notebook_id() == notebook_id && job.source_id() == source_id
+    });
+    if cancelled > 0 {
+        tracing::info!(
+            notebook_id,
+            source_id,
+            cancelled,
+            "Cancelled queued background jobs for deleted source"
+        );
+    }
+
+    if !old_embedding_ids.is_empty() {
+        let removed_count = {
+            let mut indices = state
+                .hnsw_indices
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            if let Some(index) = indices.get_mut(&notebook_id) {
+                let mut removed = 0usize;
+                for embedding_id in &old_embedding_ids {
+                    match index.remove(*embedding_id) {
+                        Ok(()) => removed += 1,
+                        Err(e) => tracing::warn!(
+                            notebook_id,
+                            source_id,
+                            embedding_id,
+                            error = %e,
+                            "Failed to remove source vector from HNSW index"
+                        ),
+                    }
+                }
+                removed
+            } else {
+                0
+            }
+        };
+
+        if removed_count > 0 {
+            if let Err(e) = state.save_hnsw_index(&notebook_id) {
+                tracing::warn!(
+                    notebook_id,
+                    source_id,
+                    error = %e,
+                    "Failed to persist HNSW index after source deletion"
+                );
+            }
+        }
+    }
+
+    state.with_notebook_db(&notebook_id, |db| db.delete_source(&source_id))?;
+    sync_notebook_source_count(&state, &notebook_id)?;
+    invalidate_suggested_questions(&state, &notebook_id);
+
+    if let Some(file_path) = source.file_path.as_deref() {
+        let source_file = notebook_dir.join("sources").join(file_path);
+        if source_file.exists() {
+            if let Err(e) = std::fs::remove_file(&source_file) {
+                tracing::warn!(
+                    notebook_id,
+                    source_id,
+                    path = %source_file.display(),
+                    error = %e,
+                    "Failed to remove deleted source file from disk"
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -1266,25 +1415,48 @@ pub async fn retry_source_ingestion(
     queue: State<'_, Arc<QueueManager>>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), GlossError> {
+    invalidate_suggested_questions(&state, &notebook_id);
     // Remove old vectors from HNSW index before deleting DB rows
     let old_embedding_ids: Vec<u64> = state.with_notebook_db(&notebook_id, |db| {
         db.get_embedding_ids_for_source(&source_id)
     })?;
 
     if !old_embedding_ids.is_empty() {
-        let mut indices = state
-            .hnsw_indices
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        if let Some(index) = indices.get_mut(&notebook_id) {
-            for eid in &old_embedding_ids {
-                let _ = index.remove(*eid);
+        let removed_count = {
+            let mut indices = state
+                .hnsw_indices
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            if let Some(index) = indices.get_mut(&notebook_id) {
+                let mut removed = 0usize;
+                for eid in &old_embedding_ids {
+                    match index.remove(*eid) {
+                        Ok(()) => removed += 1,
+                        Err(e) => tracing::warn!(
+                            notebook_id,
+                            source_id,
+                            embedding_id = eid,
+                            error = %e,
+                            "Failed to remove old HNSW vector during retry"
+                        ),
+                    }
+                }
+                removed
+            } else {
+                0
             }
-            tracing::debug!(
-                count = old_embedding_ids.len(),
-                source_id,
-                "Removed old HNSW vectors"
-            );
+        };
+
+        tracing::debug!(count = removed_count, source_id, "Removed old HNSW vectors");
+        if removed_count > 0 {
+            if let Err(e) = state.save_hnsw_index(&notebook_id) {
+                tracing::warn!(
+                    notebook_id,
+                    source_id,
+                    error = %e,
+                    "Failed to persist HNSW index after retry cleanup"
+                );
+            }
         }
     }
 
@@ -1299,11 +1471,16 @@ pub async fn retry_source_ingestion(
     // Route based on source type
     match source_type.as_str() {
         "image" => {
-            queue_describe_image_job(&queue, &state, &notebook_id, &source_id, Path::new(""));
+            match queue_describe_image_job(&queue, &state, &notebook_id, &source_id, Path::new(""))
+            {
+                Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
+                Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
+            }
         }
-        "video" => {
-            queue_describe_video_job(&queue, &state, &notebook_id, &source_id);
-        }
+        "video" => match queue_describe_video_job(&queue, &state, &notebook_id, &source_id) {
+            Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
+            Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
+        },
         _ => {
             // Spawn in background so the IPC thread isn't blocked
             let nb = notebook_id.clone();

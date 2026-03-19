@@ -1,4 +1,5 @@
 use crate::db::notebook_db::NotebookDb;
+use crate::error::GlossError;
 use crate::ingestion::chunk::chunk_text_with_title;
 use crate::providers::ollama::OllamaProvider;
 use base64::prelude::*;
@@ -129,6 +130,14 @@ impl GlossJob {
         }
     }
 
+    pub fn source_id(&self) -> &str {
+        match self {
+            GlossJob::SummarizeSource { source_id, .. }
+            | GlossJob::DescribeImage { source_id, .. }
+            | GlossJob::DescribeVideo { source_id, .. } => source_id,
+        }
+    }
+
     pub fn epoch(&self) -> u64 {
         match self {
             GlossJob::SummarizeSource { epoch, .. }
@@ -212,6 +221,45 @@ pub(crate) fn has_jobs_for_notebook_epoch(
     }
 }
 
+pub(crate) fn max_pending_epoch_for_notebook(
+    queue: &Arc<QueueManager>,
+    notebook_id: &str,
+) -> Option<u64> {
+    match queue.list_jobs_with_data() {
+        Ok(jobs) => jobs
+            .into_iter()
+            .filter(|(_job_id, status, _data_json)| {
+                matches!(status.as_str(), "pending" | "processing")
+            })
+            .filter_map(|(_job_id, _status, data_json)| {
+                serde_json::from_str::<GlossJob>(&data_json).ok()
+            })
+            .filter(|job| job.notebook_id() == notebook_id)
+            .map(|job| job.epoch())
+            .max(),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to inspect queue jobs for epoch resume");
+            None
+        }
+    }
+}
+
+fn is_deleted_source_error(err: &GlossError, source_id: &str) -> bool {
+    matches!(err, GlossError::NotFound(message) if message.contains(&format!("Source {source_id} not found")))
+}
+
+fn skipped_source_job(
+    notebook_id: &str,
+    source_id: &str,
+    reason: &str,
+) -> Result<JobResult, QueueError> {
+    tracing::info!(notebook_id, source_id, "{reason}");
+    Ok(JobResult::success_with_output(
+        serde_json::json!({ "notebook_id": notebook_id, "source_id": source_id, "skipped": true })
+            .to_string(),
+    ))
+}
+
 async fn execute_summarize(
     ctx: &JobContext,
     notebook_id: &str,
@@ -241,9 +289,17 @@ async fn execute_summarize(
     let db = NotebookDb::connect(&db_path).map_err(|e| QueueError::Execution(e.to_string()))?;
 
     // Load source content
-    let source = db
-        .get_source(source_id)
-        .map_err(|e| QueueError::Execution(e.to_string()))?;
+    let source = match db.get_source(source_id) {
+        Ok(source) => source,
+        Err(e) if is_deleted_source_error(&e, source_id) => {
+            return skipped_source_job(
+                notebook_id,
+                source_id,
+                "Source deleted, skipping summary job",
+            );
+        }
+        Err(e) => return Err(QueueError::Execution(e.to_string())),
+    };
 
     // Skip if source already has a summary (dedup: prevents duplicate jobs from
     // re-generating summaries that were already completed by an earlier job).
@@ -299,8 +355,17 @@ async fn execute_summarize(
     }
 
     // Store the summary
-    db.update_source_summary(source_id, &summary, model)
-        .map_err(|e| QueueError::Execution(e.to_string()))?;
+    match db.update_source_summary(source_id, &summary, model) {
+        Ok(()) => {}
+        Err(e) if is_deleted_source_error(&e, source_id) => {
+            return skipped_source_job(
+                notebook_id,
+                source_id,
+                "Source deleted before summary save",
+            );
+        }
+        Err(e) => return Err(QueueError::Execution(e.to_string())),
+    }
 
     tracing::info!(
         source_id,
@@ -337,9 +402,17 @@ async fn execute_describe_image(
     }
 
     let db = NotebookDb::connect(&db_path).map_err(|e| QueueError::Execution(e.to_string()))?;
-    let source = db
-        .get_source(source_id)
-        .map_err(|e| QueueError::Execution(e.to_string()))?;
+    let source = match db.get_source(source_id) {
+        Ok(source) => source,
+        Err(e) if is_deleted_source_error(&e, source_id) => {
+            return skipped_source_job(
+                notebook_id,
+                source_id,
+                "Source deleted, skipping describe job",
+            );
+        }
+        Err(e) => return Err(QueueError::Execution(e.to_string())),
+    };
 
     // Skip if already described
     if source.content_text.is_some() && source.status != "pending" {
@@ -489,9 +562,17 @@ async fn execute_describe_video(
     }
 
     let db = NotebookDb::connect(&db_path).map_err(|e| QueueError::Execution(e.to_string()))?;
-    let source = db
-        .get_source(source_id)
-        .map_err(|e| QueueError::Execution(e.to_string()))?;
+    let source = match db.get_source(source_id) {
+        Ok(source) => source,
+        Err(e) if is_deleted_source_error(&e, source_id) => {
+            return skipped_source_job(
+                notebook_id,
+                source_id,
+                "Source deleted, skipping video job",
+            );
+        }
+        Err(e) => return Err(QueueError::Execution(e.to_string())),
+    };
 
     // Skip if already described
     if source.content_text.is_some() && source.status != "pending" {

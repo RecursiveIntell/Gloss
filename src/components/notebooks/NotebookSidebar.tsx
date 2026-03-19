@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { useNotebookStore } from "../../stores/notebookStore";
-import { BookOpen, Plus, Trash2, Settings } from "lucide-react";
+import { BookOpen, Plus, Trash2, Settings, Pencil, Save, X } from "lucide-react";
 import { SettingsDialog } from "../settings/SettingsDialog";
 
 export function NotebookSidebar() {
-  const { notebooks, activeNotebookId, setActive, createNotebook, deleteNotebook } = useNotebookStore();
+  const { notebooks, activeNotebookId, setActive, createNotebook, renameNotebook, deleteNotebook } = useNotebookStore();
   const [newName, setNewName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [editingNotebookId, setEditingNotebookId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
 
   const handleCreate = async () => {
     if (!newName.trim()) return;
@@ -17,6 +19,26 @@ export function NotebookSidebar() {
       setShowCreate(false);
     } catch (e) {
       console.error('Failed to create notebook:', e);
+    }
+  };
+
+  const startRename = (id: string, name: string) => {
+    setEditingNotebookId(id);
+    setEditingName(name);
+  };
+
+  const cancelRename = () => {
+    setEditingNotebookId(null);
+    setEditingName("");
+  };
+
+  const handleRename = async (id: string) => {
+    if (!editingName.trim()) return;
+    try {
+      await renameNotebook(id, editingName.trim());
+      cancelRename();
+    } catch (e) {
+      console.error("Failed to rename notebook:", e);
     }
   };
 
@@ -58,14 +80,58 @@ export function NotebookSidebar() {
             }`}
           >
             <BookOpen className="w-4 h-4 shrink-0" />
-            <span className="truncate flex-1">{nb.name}</span>
+            {editingNotebookId === nb.id ? (
+              <input
+                type="text"
+                value={editingName}
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => setEditingName(e.target.value)}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Enter") {
+                    void handleRename(nb.id);
+                  } else if (e.key === "Escape") {
+                    cancelRename();
+                  }
+                }}
+                className="flex-1 min-w-0 px-1.5 py-0.5 text-xs bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+                autoFocus
+              />
+            ) : (
+              <span className="truncate flex-1">{nb.name}</span>
+            )}
             <span className="text-xs text-text-muted">{nb.source_count}</span>
-            <button
-              onClick={(e) => { e.stopPropagation(); deleteNotebook(nb.id); }}
-              className="hidden group-hover:block p-0.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
-            >
-              <Trash2 className="w-3 h-3" />
-            </button>
+            {editingNotebookId === nb.id ? (
+              <>
+                <button
+                  onClick={(e) => { e.stopPropagation(); void handleRename(nb.id); }}
+                  className="p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent"
+                >
+                  <Save className="w-3 h-3" />
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); cancelRename(); }}
+                  className="p-0.5 rounded hover:bg-bg-tertiary text-text-muted hover:text-text"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={(e) => { e.stopPropagation(); startRename(nb.id, nb.name); }}
+                  className="hidden group-hover:block p-0.5 rounded hover:bg-bg-tertiary text-text-muted hover:text-text"
+                >
+                  <Pencil className="w-3 h-3" />
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); deleteNotebook(nb.id); }}
+                  className="hidden group-hover:block p-0.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+              </>
+            )}
           </div>
         ))}
 

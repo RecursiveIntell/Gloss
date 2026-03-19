@@ -414,10 +414,8 @@ impl LlmCall {
             }
         };
 
-        let (transport_retries, backoff_total_ms) = retry_stats
-            .lock()
-            .map(|stats| *stats)
-            .unwrap_or((0, 0));
+        let (transport_retries, backoff_total_ms) =
+            retry_stats.lock().map(|stats| *stats).unwrap_or((0, 0));
 
         Ok((response, transport_retries, backoff_total_ms))
     }
@@ -897,7 +895,8 @@ mod tests {
     #[test]
     fn test_build_output_string_list_strategy() {
         let call = LlmCall::new("test", "prompt").expecting_list();
-        let output = call.build_output("[\"apple\", \"banana\", \"cherry\"]".into(), &parser_opts());
+        let output =
+            call.build_output("[\"apple\", \"banana\", \"cherry\"]".into(), &parser_opts());
         assert!(output.value.is_array());
         let arr = output.value.as_array().unwrap();
         assert_eq!(arr.len(), 3);
@@ -945,8 +944,10 @@ mod tests {
     #[test]
     fn test_build_output_text_strategy() {
         let call = LlmCall::new("test", "prompt").expecting_text();
-        let output =
-            call.build_output("Sure! Here's the answer: The sky is blue.".into(), &parser_opts());
+        let output = call.build_output(
+            "Sure! Here's the answer: The sky is blue.".into(),
+            &parser_opts(),
+        );
         let text = output.value.as_str().unwrap();
         // parse_text strips "Sure!" and "Here's..." prefixes
         assert!(!text.starts_with("Sure!"));
@@ -1083,8 +1084,10 @@ mod tests {
             .expecting_json()
             .with_retry(RetryConfig::new(2).requiring_keys(&["title", "year"]));
 
-        let output =
-            call.build_output(r#"{"title": "Matrix", "year": 1999}"#.into(), &parser_opts());
+        let output = call.build_output(
+            r#"{"title": "Matrix", "year": 1999}"#.into(),
+            &parser_opts(),
+        );
         let retry_config = call.retry.as_ref().unwrap();
         assert!(call.check_retry_needed(&output, retry_config).is_none());
     }
@@ -1267,15 +1270,24 @@ mod tests {
         assert_eq!(output.semantic_retries_used, 1);
         assert_eq!(output.transport_retries_used, 0);
         assert_eq!(output.trace_id, Some(ctx.trace_id.clone()));
-        assert_eq!(output.trace_ctx.as_ref().map(|t| &t.trace_id), Some(&ctx.trace_ctx.trace_id));
+        assert_eq!(
+            output.trace_ctx.as_ref().map(|t| &t.trace_id),
+            Some(&ctx.trace_ctx.trace_id)
+        );
         assert_eq!(
             output.diagnostics.as_ref().map(|d| d.retry_attempts),
             Some(1)
         );
         // Verify structured retry identifiers are populated
         let diag = output.diagnostics.as_ref().unwrap();
-        assert!(diag.attempt_id.is_some(), "attempt_id should be set after retry");
-        assert!(diag.trial_id.is_some(), "trial_id should be set after retry");
+        assert!(
+            diag.attempt_id.is_some(),
+            "attempt_id should be set after retry"
+        );
+        assert!(
+            diag.trial_id.is_some(),
+            "trial_id should be set after retry"
+        );
     }
 
     #[tokio::test]
@@ -1294,8 +1306,14 @@ mod tests {
 
         assert_eq!(output.semantic_retries_used, 0);
         let diag = output.diagnostics.as_ref().unwrap();
-        assert!(diag.attempt_id.is_none(), "attempt_id should be None when no retries occurred");
-        assert!(diag.trial_id.is_none(), "trial_id should be None when no retries occurred");
+        assert!(
+            diag.attempt_id.is_none(),
+            "attempt_id should be None when no retries occurred"
+        );
+        assert!(
+            diag.trial_id.is_none(),
+            "trial_id should be None when no retries occurred"
+        );
     }
 
     #[test]

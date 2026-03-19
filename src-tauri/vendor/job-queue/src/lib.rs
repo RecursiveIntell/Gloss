@@ -78,13 +78,22 @@ pub struct LoggingEventEmitter;
 impl QueueEventEmitter for LoggingEventEmitter {
     fn emit_job_started(&self, event: events::JobStartedEvent) {
         // Prefer canonical trace_ctx over legacy trace_id
-        let trace = event.trace_ctx.as_ref()
+        let trace = event
+            .trace_ctx
+            .as_ref()
             .map(|ctx| ctx.trace_id.as_str())
             .or(event.trace_id.as_deref())
             .unwrap_or("");
-        let attempt = event.attempt_id.as_ref()
+        let attempt = event
+            .attempt_id
+            .as_ref()
             .map(|a| a.to_string())
-            .unwrap_or_else(|| event.attempt_count.map(|c| c.to_string()).unwrap_or_default());
+            .unwrap_or_else(|| {
+                event
+                    .attempt_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_default()
+            });
         tracing::info!(
             job_id = %event.job_id,
             worker_id = event.worker_id.as_deref().unwrap_or(""),
@@ -95,13 +104,22 @@ impl QueueEventEmitter for LoggingEventEmitter {
         );
     }
     fn emit_job_completed(&self, event: events::JobCompletedEvent) {
-        let trace = event.trace_ctx.as_ref()
+        let trace = event
+            .trace_ctx
+            .as_ref()
             .map(|ctx| ctx.trace_id.as_str())
             .or(event.trace_id.as_deref())
             .unwrap_or("");
-        let attempt = event.attempt_id.as_ref()
+        let attempt = event
+            .attempt_id
+            .as_ref()
             .map(|a| a.to_string())
-            .unwrap_or_else(|| event.attempt_count.map(|c| c.to_string()).unwrap_or_default());
+            .unwrap_or_else(|| {
+                event
+                    .attempt_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_default()
+            });
         tracing::info!(
             job_id = %event.job_id,
             worker_id = event.worker_id.as_deref().unwrap_or(""),
@@ -112,13 +130,22 @@ impl QueueEventEmitter for LoggingEventEmitter {
         );
     }
     fn emit_job_failed(&self, event: events::JobFailedEvent) {
-        let trace = event.trace_ctx.as_ref()
+        let trace = event
+            .trace_ctx
+            .as_ref()
             .map(|ctx| ctx.trace_id.as_str())
             .or(event.trace_id.as_deref())
             .unwrap_or("");
-        let attempt = event.attempt_id.as_ref()
+        let attempt = event
+            .attempt_id
+            .as_ref()
             .map(|a| a.to_string())
-            .unwrap_or_else(|| event.attempt_count.map(|c| c.to_string()).unwrap_or_default());
+            .unwrap_or_else(|| {
+                event
+                    .attempt_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_default()
+            });
         tracing::warn!(
             job_id = %event.job_id,
             worker_id = event.worker_id.as_deref().unwrap_or(""),
@@ -131,7 +158,9 @@ impl QueueEventEmitter for LoggingEventEmitter {
         );
     }
     fn emit_job_progress(&self, event: events::JobProgressEvent) {
-        let trace = event.trace_ctx.as_ref()
+        let trace = event
+            .trace_ctx
+            .as_ref()
             .map(|ctx| ctx.trace_id.as_str())
             .or(event.trace_id.as_deref())
             .unwrap_or("");
@@ -146,7 +175,9 @@ impl QueueEventEmitter for LoggingEventEmitter {
         );
     }
     fn emit_job_cancelled(&self, event: events::JobCancelledEvent) {
-        let trace = event.trace_ctx.as_ref()
+        let trace = event
+            .trace_ctx
+            .as_ref()
             .map(|ctx| ctx.trace_id.as_str())
             .or(event.trace_id.as_deref())
             .unwrap_or("");
@@ -184,7 +215,9 @@ pub struct JobContext {
     /// Phase status: compatibility / migration-only.
     ///
     /// Current attempt count (legacy counter).
-    #[deprecated(note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate.")]
+    #[deprecated(
+        note = "Use attempt_id/trial_id instead. Will be removed when all consumers migrate."
+    )]
     pub attempt_count: u32,
     /// Event emitter for reporting progress.
     pub(crate) event_emitter: Arc<dyn QueueEventEmitter>,

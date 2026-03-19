@@ -278,6 +278,29 @@ impl NotebookDb {
         Ok(())
     }
 
+    /// Persist the exact set of selected sources for this notebook.
+    pub fn set_selected_sources(&self, selected_ids: &[String]) -> Result<(), GlossError> {
+        self.conn.execute("UPDATE sources SET selected = 0", [])?;
+
+        if selected_ids.is_empty() {
+            return Ok(());
+        }
+
+        let placeholders: Vec<String> = (0..selected_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "UPDATE sources SET selected = 1 WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = selected_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        self.conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
     /// Get count of sources.
     pub fn source_count(&self) -> Result<i32, GlossError> {
         let count: i32 = self
@@ -426,19 +449,22 @@ impl NotebookDb {
     /// Returns true when every chunk in the selected scope has an embedding and
     /// there is at least one embedded chunk available for hybrid search.
     pub fn can_run_hybrid_search(&self, source_ids: &[String]) -> Result<bool, GlossError> {
-        let (embedded_sql, missing_sql, params): (String, String, Vec<&dyn rusqlite::types::ToSql>) =
-            if source_ids.is_empty() {
-                (
-                    "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NOT NULL".to_string(),
-                    "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NULL".to_string(),
-                    Vec::new(),
-                )
-            } else {
-                let placeholders: Vec<String> = (0..source_ids.len())
-                    .map(|i| format!("?{}", i + 1))
-                    .collect();
-                let clause = placeholders.join(", ");
-                (
+        let (embedded_sql, missing_sql, params): (
+            String,
+            String,
+            Vec<&dyn rusqlite::types::ToSql>,
+        ) = if source_ids.is_empty() {
+            (
+                "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NOT NULL".to_string(),
+                "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NULL".to_string(),
+                Vec::new(),
+            )
+        } else {
+            let placeholders: Vec<String> = (0..source_ids.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect();
+            let clause = placeholders.join(", ");
+            (
                     format!(
                         "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NOT NULL AND source_id IN ({clause})"
                     ),
@@ -450,11 +476,11 @@ impl NotebookDb {
                         .map(|id| id as &dyn rusqlite::types::ToSql)
                         .collect(),
                 )
-            };
+        };
 
-        let embedded: i64 =
-            self.conn
-                .query_row(&embedded_sql, params.as_slice(), |row| row.get(0))?;
+        let embedded: i64 = self
+            .conn
+            .query_row(&embedded_sql, params.as_slice(), |row| row.get(0))?;
         if embedded == 0 {
             return Ok(false);
         }
@@ -957,6 +983,37 @@ mod tests {
         db.delete_source("s1").unwrap();
         let sources = db.list_sources().unwrap();
         assert_eq!(sources.len(), 0);
+    }
+
+    #[test]
+    fn test_set_selected_sources() {
+        let db = test_db();
+        for id in ["s1", "s2"] {
+            db.insert_source(&Source {
+                id: id.to_string(),
+                source_type: "text".to_string(),
+                title: id.to_string(),
+                original_filename: None,
+                file_hash: None,
+                url: None,
+                file_path: None,
+                content_text: Some("content".to_string()),
+                word_count: Some(1),
+                metadata: None,
+                summary: None,
+                summary_model: None,
+                status: "ready".to_string(),
+                error_message: None,
+                selected: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+        }
+
+        db.set_selected_sources(&["s2".to_string()]).unwrap();
+        let selected = db.get_selected_source_ids().unwrap();
+        assert_eq!(selected, vec!["s2".to_string()]);
     }
 
     #[test]

@@ -41,7 +41,10 @@ use serde::{Deserialize, Serialize};
 /// let id2 = TraceId::from_string("custom-trace-123");
 /// assert_eq!(id2.as_str(), "custom-trace-123");
 /// ```
-#[deprecated(since = "0.6.0", note = "Use stack_ids::TraceCtx instead. This type will be removed in v1.0. Retained for backward compatibility only.")]
+#[deprecated(
+    since = "0.6.0",
+    note = "Use stack_ids::TraceCtx instead. This type will be removed in v1.0. Retained for backward compatibility only."
+)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TraceId(pub String);
 

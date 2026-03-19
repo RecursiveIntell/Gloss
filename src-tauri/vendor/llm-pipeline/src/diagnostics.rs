@@ -134,7 +134,10 @@ mod tests {
         });
 
         assert!(d.repaired);
-        assert_eq!(d.parser_strategies, vec!["direct_parse", "repair_candidate"]);
+        assert_eq!(
+            d.parser_strategies,
+            vec!["direct_parse", "repair_candidate"]
+        );
         assert_eq!(d.parser_repair_actions, vec!["repaired_candidate"]);
         assert_eq!(d.parser_extracted_span, Some((2, 8)));
         assert_eq!(d.parser_warnings, vec!["fallback path"]);

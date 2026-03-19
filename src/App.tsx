@@ -184,6 +184,7 @@ export function App() {
         if (batchCreatedDebounceRef.current) clearTimeout(batchCreatedDebounceRef.current);
         batchCreatedDebounceRef.current = setTimeout(() => {
           batchCreatedDebounceRef.current = null;
+          void useNotebookStore.getState().loadNotebooks();
           useSourceStore.getState().loadStats(nbId);
           if (payload.count <= EAGER_BATCH_SOURCE_LOAD_LIMIT) {
             useSourceStore.getState().loadSources(nbId);
@@ -211,6 +212,7 @@ export function App() {
             jobCompletedDebounceRef.current = null;
             useSourceStore.getState().loadSources(nbId);
             useSourceStore.getState().loadStats(nbId);
+            useChatStore.getState().loadSuggestedQuestions(nbId);
           }, 3000);
         }
       } catch {
@@ -229,6 +231,7 @@ export function App() {
     const unlisten = onBatchIngestionComplete((payload) => {
       const nbId = useNotebookStore.getState().activeNotebookId;
       if (payload.notebook_id === nbId) {
+        void useNotebookStore.getState().loadNotebooks();
         useSourceStore.getState().loadSources(nbId);
         useSourceStore.getState().loadStats(nbId);
         useToastStore.getState().addToast({

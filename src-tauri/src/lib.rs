@@ -8,6 +8,7 @@ mod ingestion;
 mod jobs;
 mod providers;
 mod retrieval;
+mod secrets;
 mod state;
 mod studio;
 
@@ -82,9 +83,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::notebooks::list_notebooks,
             commands::notebooks::create_notebook,
+            commands::notebooks::rename_notebook,
             commands::notebooks::delete_notebook,
             commands::notebooks::set_active_notebook,
             commands::sources::list_sources,
+            commands::sources::set_selected_sources,
             commands::sources::add_source_file,
             commands::sources::add_source_folder,
             commands::sources::add_source_paste,

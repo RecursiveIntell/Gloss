@@ -4,6 +4,7 @@ version = "1.0.0"
 description = "A local-first NotebookLM alternative"
 authors = ["sikmindz"]
 edition = "2021"
+license = "AGPL-3.0-only"
 
 [lib]
 name = "gloss_lib"

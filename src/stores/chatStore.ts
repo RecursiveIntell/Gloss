@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Conversation, Message } from '../lib/types';
+import type { Conversation, Message, SourceScope } from '../lib/types';
 import * as api from '../lib/tauri';
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
@@ -19,12 +19,13 @@ interface ChatStore {
   deleteConversation: (notebookId: string, conversationId: string) => Promise<void>;
   setActiveConversation: (id: string | null) => void;
   loadMessages: (notebookId: string, conversationId: string) => Promise<void>;
-  sendMessage: (notebookId: string, query: string, selectedSourceIds: string[], model: string) => Promise<void>;
+  sendMessage: (notebookId: string, query: string, sourceScope: SourceScope, model: string) => Promise<void>;
   appendToken: (notebookId: string, conversationId: string, messageId: string, token: string) => void;
   finalizeMessage: (notebookId: string, conversationId: string, messageId: string) => void;
   setStreamingError: (notebookId: string, conversationId: string, messageId: string, error: string) => void;
   resetForNotebookSwitch: () => void;
   loadSuggestedQuestions: (notebookId: string) => Promise<void>;
+  clearSuggestedQuestions: () => void;
 }
 
 export const useChatStore = create<ChatStore>((set, get) => ({
@@ -95,7 +96,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
-  sendMessage: async (notebookId, query, selectedSourceIds, model) => {
+  sendMessage: async (notebookId, query, sourceScope, model) => {
     let { activeConversationId } = get();
     if (!activeConversationId) {
       activeConversationId = await get().createConversation(notebookId);
@@ -125,7 +126,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         notebookId,
         activeConversationId,
         query,
-        selectedSourceIds,
+        sourceScope,
         model,
         assistantMessageId
       );
@@ -241,5 +242,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       }
       set({ suggestedQuestions: [] });
     }
+  },
+
+  clearSuggestedQuestions: () => {
+    set({ suggestedQuestions: [] });
   },
 }));

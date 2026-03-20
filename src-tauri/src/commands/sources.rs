@@ -1,9 +1,10 @@
+use crate::db::app_db::ModelRecord;
 use crate::db::notebook_db::{Chunk, NotebookStats, Source};
 use crate::error::GlossError;
 use crate::ingestion::chunk::chunk_text_with_title;
 use crate::ingestion::extract::extract_text;
 use crate::jobs::{self, GlossJob};
-use crate::state::AppState;
+use crate::state::{AppState, SUMMARY_MODE_AUTO, SUMMARY_MODE_MANUAL};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -308,7 +309,9 @@ pub async fn set_selected_sources(
 ) -> Result<(), GlossError> {
     state.with_notebook_db(&notebook_id, |db| {
         db.set_selected_sources(&selected_source_ids)
-    })
+    })?;
+    invalidate_suggested_questions(&state, &notebook_id);
+    Ok(())
 }
 
 /// Options for controlling ingestion behavior during batch imports.
@@ -506,7 +509,11 @@ fn run_ingestion_inner(
         // Queue background summary job if a model is configured
         if opts.queue_summary {
             let source_title = source.title.clone();
-            queue_summary_job(queue, state, notebook_id, source_id, &source_title);
+            if let Err(error) =
+                queue_summary_job(queue, state, notebook_id, source_id, &source_title)
+            {
+                tracing::warn!(source_id, error = %error, "Failed to schedule background summary job");
+            }
         }
 
         tracing::info!(
@@ -567,37 +574,212 @@ fn is_deleted_source_error(err: &GlossError, source_id: &str) -> bool {
     matches!(err, GlossError::NotFound(message) if message.contains(&format!("Source {source_id} not found")))
 }
 
-/// Queue a low-priority summary job for a source. Errors are logged but don't
-/// fail the calling operation (summaries are non-critical background work).
+#[derive(Clone, Copy)]
+enum BackgroundJobKind {
+    Summary,
+    Vision,
+}
+
+impl BackgroundJobKind {
+    fn setting_key(self) -> &'static str {
+        match self {
+            BackgroundJobKind::Summary => "summary_model",
+            BackgroundJobKind::Vision => "vision_model",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BackgroundJobKind::Summary => "summary",
+            BackgroundJobKind::Vision => "vision",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundJobConfig {
+    provider_id: String,
+    base_url: String,
+    model: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QueueSummariesResponse {
+    pub queued: u32,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackgroundBackendStatus {
+    pub ready: bool,
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
+    pub diagnostic: Option<String>,
+}
+
+fn normalize_setting(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn has_vision_capability(model: &ModelRecord) -> bool {
+    if let Some(capabilities) = model.capabilities.as_deref() {
+        if capabilities
+            .split(',')
+            .map(|cap| cap.trim().to_ascii_lowercase())
+            .any(|cap| matches!(cap.as_str(), "vision" | "image" | "multimodal"))
+        {
+            return true;
+        }
+    }
+
+    let fingerprint = format!(
+        "{} {}",
+        model.id.to_ascii_lowercase(),
+        model.display_name.to_ascii_lowercase()
+    );
+    [
+        "llava",
+        "bakllava",
+        "moondream",
+        "minicpm-v",
+        "qwen-vl",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "vision",
+        "vl",
+    ]
+    .iter()
+    .any(|needle| fingerprint.contains(needle))
+}
+
+fn resolve_background_job_config(
+    state: &AppState,
+    kind: BackgroundJobKind,
+) -> Result<BackgroundJobConfig, String> {
+    let app_db = state.app_db.lock().map_err(|e| e.to_string())?;
+    resolve_background_job_config_from_db(&app_db, kind)
+}
+
+fn resolve_background_job_config_from_db(
+    app_db: &crate::db::app_db::AppDb,
+    kind: BackgroundJobKind,
+) -> Result<BackgroundJobConfig, String> {
+    let configured_model = normalize_setting(
+        app_db
+            .get_setting(kind.setting_key())
+            .map_err(|e| e.to_string())?,
+    );
+    let default_model = normalize_setting(
+        app_db
+            .get_setting("default_model")
+            .map_err(|e| e.to_string())?,
+    );
+    let selected_model = configured_model
+        .clone()
+        .or(default_model.clone())
+        .ok_or_else(|| {
+            format!(
+                "No {} model is configured. Choose a compatible Ollama model in Settings.",
+                kind.label()
+            )
+        })?;
+
+    let models = app_db.get_all_models().map_err(|e| e.to_string())?;
+    let model_record = models.iter().find(|model| model.id == selected_model);
+    let provider_id = model_record
+        .map(|model| model.provider_id.clone())
+        .or_else(|| {
+            if configured_model.is_none() && default_model.as_deref() == Some(selected_model.as_str())
+            {
+                normalize_setting(app_db.get_setting("default_provider").ok().flatten())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            format!(
+                "Background {} model '{}' is not available in the model registry. Refresh models or choose a compatible Ollama model.",
+                kind.label(),
+                selected_model
+            )
+        })?;
+
+    if provider_id != "ollama" {
+        return Err(format!(
+            "Background {} requires an Ollama model, but '{}' uses provider '{}'.",
+            kind.label(),
+            selected_model,
+            provider_id
+        ));
+    }
+
+    if matches!(kind, BackgroundJobKind::Vision) {
+        match model_record {
+            Some(model) if has_vision_capability(model) => {}
+            Some(_) | None => {
+                return Err(format!(
+                    "Background vision requires a vision-capable Ollama model, but '{}' is not marked as vision-capable.",
+                    selected_model
+                ));
+            }
+        }
+    }
+
+    let base_url = app_db
+        .get_setting("ollama_url")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "http://localhost:11434".to_string());
+
+    Ok(BackgroundJobConfig {
+        provider_id,
+        base_url,
+        model: selected_model,
+    })
+}
+
+fn background_backend_status(state: &AppState, kind: BackgroundJobKind) -> BackgroundBackendStatus {
+    match resolve_background_job_config(state, kind) {
+        Ok(config) => BackgroundBackendStatus {
+            ready: true,
+            provider_id: Some(config.provider_id),
+            model: Some(config.model),
+            diagnostic: None,
+        },
+        Err(diagnostic) => BackgroundBackendStatus {
+            ready: false,
+            provider_id: None,
+            model: None,
+            diagnostic: Some(diagnostic),
+        },
+    }
+}
+
+fn persist_summary_mode(state: &AppState, mode: &str) -> Result<(), GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    app_db.set_setting("summary_mode", mode)
+}
+
+fn push_diagnostic(diagnostics: &mut Vec<String>, diagnostic: String) {
+    if diagnostics.iter().all(|existing| existing != &diagnostic) {
+        diagnostics.push(diagnostic);
+    }
+}
+
+/// Queue a low-priority summary job for a source. Errors are surfaced to the
+/// caller so queue counts stay truthful.
 pub(crate) fn queue_summary_job(
     queue: &Arc<QueueManager>,
     state: &AppState,
     notebook_id: &str,
     source_id: &str,
     source_title: &str,
-) {
-    // Get the model and Ollama URL from settings.
-    // Prefer summary_model if set, otherwise fall back to default_model.
-    let (ollama_url, model) = match (|| -> Result<(String, String), GlossError> {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        let url = app_db
-            .get_setting("ollama_url")?
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
-        let model = app_db
-            .get_setting("summary_model")?
-            .filter(|m| !m.is_empty())
-            .or_else(|| app_db.get_setting("default_model").ok().flatten());
-        Ok((url, model.unwrap_or_default()))
-    })() {
-        Ok((url, model)) if !model.is_empty() => (url, model),
-        _ => {
-            tracing::debug!(source_id, "No model configured, skipping summary job");
-            return;
-        }
-    };
+) -> Result<bool, String> {
+    let config = resolve_background_job_config(state, BackgroundJobKind::Summary)?;
 
     let job = QueueJob::new(GlossJob::SummarizeSource {
         epoch: queue_epoch_for_notebook(state, notebook_id),
@@ -605,18 +787,17 @@ pub(crate) fn queue_summary_job(
         source_id: source_id.to_string(),
         source_title: source_title.to_string(),
         data_dir: state.data_dir.to_string_lossy().to_string(),
-        ollama_url,
-        model,
+        ollama_url: config.base_url,
+        model: config.model,
     })
     .with_priority(QueuePriority::Low);
 
     match queue.add(job) {
         Ok(job_id) => {
             tracing::debug!(source_id, job_id, "Queued summary job");
+            Ok(true)
         }
-        Err(e) => {
-            tracing::warn!(source_id, error = %e, "Failed to queue summary job");
-        }
+        Err(e) => Err(format!("Failed to queue summary job: {e}")),
     }
 }
 
@@ -629,29 +810,14 @@ fn queue_describe_image_job(
     source_id: &str,
     _source_path: &Path,
 ) -> Result<(), String> {
-    let (ollama_url, model) = match (|| -> Result<(String, String), GlossError> {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        let url = app_db
-            .get_setting("ollama_url")?
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
-        // Prefer vision_model, then default_model
-        let model = app_db
-            .get_setting("vision_model")?
-            .filter(|m| !m.is_empty())
-            .or_else(|| app_db.get_setting("default_model").ok().flatten());
-        Ok((url, model.unwrap_or_default()))
-    })() {
-        Ok((url, model)) if !model.is_empty() => (url, model),
-        _ => {
-            let msg = "No vision model configured. Configure a vision-capable model and retry this source.";
+    let config = match resolve_background_job_config(state, BackgroundJobKind::Vision) {
+        Ok(config) => config,
+        Err(msg) => {
             tracing::warn!(source_id, "{msg}");
             let _ = state.with_notebook_db(notebook_id, |db| {
-                db.update_source_status(source_id, "error", Some(msg))
+                db.update_source_status(source_id, "error", Some(&msg))
             });
-            return Err(msg.to_string());
+            return Err(msg);
         }
     };
 
@@ -665,8 +831,8 @@ fn queue_describe_image_job(
         source_id: source_id.to_string(),
         source_title,
         data_dir: state.data_dir.to_string_lossy().to_string(),
-        ollama_url,
-        model,
+        ollama_url: config.base_url,
+        model: config.model,
     })
     .with_priority(QueuePriority::Low);
 
@@ -694,28 +860,14 @@ fn queue_describe_video_job(
     notebook_id: &str,
     source_id: &str,
 ) -> Result<(), String> {
-    let (ollama_url, model) = match (|| -> Result<(String, String), GlossError> {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        let url = app_db
-            .get_setting("ollama_url")?
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
-        let model = app_db
-            .get_setting("vision_model")?
-            .filter(|m| !m.is_empty())
-            .or_else(|| app_db.get_setting("default_model").ok().flatten());
-        Ok((url, model.unwrap_or_default()))
-    })() {
-        Ok((url, model)) if !model.is_empty() => (url, model),
-        _ => {
-            let msg = "No vision model configured. Configure a vision-capable model and retry this source.";
+    let config = match resolve_background_job_config(state, BackgroundJobKind::Vision) {
+        Ok(config) => config,
+        Err(msg) => {
             tracing::warn!(source_id, "{msg}");
             let _ = state.with_notebook_db(notebook_id, |db| {
-                db.update_source_status(source_id, "error", Some(msg))
+                db.update_source_status(source_id, "error", Some(&msg))
             });
-            return Err(msg.to_string());
+            return Err(msg);
         }
     };
 
@@ -729,8 +881,8 @@ fn queue_describe_video_job(
         source_id: source_id.to_string(),
         source_title,
         data_dir: state.data_dir.to_string_lossy().to_string(),
-        ollama_url,
-        model,
+        ollama_url: config.base_url,
+        model: config.model,
     })
     .with_priority(QueuePriority::Low);
 
@@ -770,7 +922,9 @@ pub(crate) fn embed_described_source(
         let source_title = state
             .with_notebook_db(notebook_id, |db| db.get_source(source_id).map(|s| s.title))
             .unwrap_or_else(|_| source_id.to_string());
-        queue_summary_job(queue, state, notebook_id, source_id, &source_title);
+        if let Err(error) = queue_summary_job(queue, state, notebook_id, source_id, &source_title) {
+            tracing::warn!(source_id, error = %error, "Failed to schedule summary for described source");
+        }
 
         tracing::info!(
             source_id,
@@ -1514,9 +1668,8 @@ pub async fn regenerate_missing_summaries(
     notebook_id: String,
     state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
-) -> Result<u32, GlossError> {
-    let count = auto_queue_notebook_summaries(&state, &queue, &notebook_id);
-    Ok(count)
+) -> Result<QueueSummariesResponse, GlossError> {
+    Ok(auto_queue_notebook_summaries(&state, &queue, &notebook_id))
 }
 
 /// Auto-queue missing summaries for a notebook. Used by both the
@@ -1530,7 +1683,7 @@ pub(crate) fn auto_queue_notebook_summaries(
     state: &AppState,
     queue: &Arc<QueueManager>,
     notebook_id: &str,
-) -> u32 {
+) -> QueueSummariesResponse {
     let epoch = queue_epoch_for_notebook(state, notebook_id);
     if jobs::has_jobs_for_notebook_epoch(queue, notebook_id, epoch) {
         tracing::debug!(
@@ -1538,38 +1691,54 @@ pub(crate) fn auto_queue_notebook_summaries(
             epoch,
             "Skipping auto-queue: notebook already has pending or processing jobs"
         );
-        return 0;
+        return QueueSummariesResponse {
+            queued: 0,
+            diagnostics: Vec::new(),
+        };
     }
 
     let sources = match state.with_notebook_db(notebook_id, |db| db.list_sources()) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(notebook_id, error = %e, "Failed to list sources for auto-queue");
-            return 0;
+            return QueueSummariesResponse {
+                queued: 0,
+                diagnostics: vec![e.to_string()],
+            };
         }
     };
 
-    let mut count = 0u32;
+    let mut queued = 0u32;
+    let mut diagnostics = Vec::new();
     for source in &sources {
         if source.status == "ready" && source.summary.is_none() {
-            queue_summary_job(queue, state, notebook_id, &source.id, &source.title);
-            count += 1;
+            match queue_summary_job(queue, state, notebook_id, &source.id, &source.title) {
+                Ok(true) => queued += 1,
+                Ok(false) => {}
+                Err(diagnostic) => push_diagnostic(&mut diagnostics, diagnostic),
+            }
         }
     }
 
-    if count > 0 {
-        tracing::info!(notebook_id, count, "Auto-queued missing summary jobs");
+    if queued > 0 {
+        tracing::info!(notebook_id, queued, "Auto-queued missing summary jobs");
     }
-    count
+    QueueSummariesResponse {
+        queued,
+        diagnostics,
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct QueueStatusResponse {
     pub paused: bool,
+    pub mode: String,
     pub pending: u32,
     pub processing: u32,
     pub completed: u32,
     pub failed: u32,
+    pub summary_backend: BackgroundBackendStatus,
+    pub vision_backend: BackgroundBackendStatus,
 }
 
 /// Pause background summary generation.
@@ -1579,6 +1748,7 @@ pub async fn pause_summaries(
     queue: State<'_, Arc<QueueManager>>,
 ) -> Result<(), GlossError> {
     state.summary_paused.store(true, Ordering::SeqCst);
+    persist_summary_mode(&state, SUMMARY_MODE_MANUAL)?;
     let cancelled = jobs::cancel_jobs_matching(&queue, |_job, status| status == "processing");
     tracing::info!("Summary generation paused by user");
     if cancelled > 0 {
@@ -1594,6 +1764,7 @@ pub async fn resume_summaries(
     queue: State<'_, Arc<QueueManager>>,
 ) -> Result<(), GlossError> {
     state.summary_paused.store(false, Ordering::SeqCst);
+    persist_summary_mode(&state, SUMMARY_MODE_AUTO)?;
     let cancelled = jobs::cancel_jobs_not_matching_active_notebook(
         &queue,
         state.get_active_notebook_id().as_deref(),
@@ -1618,9 +1789,199 @@ pub async fn get_queue_status(
         .map_err(|e| GlossError::Other(e.to_string()))?;
     Ok(QueueStatusResponse {
         paused,
+        mode: if paused {
+            SUMMARY_MODE_MANUAL.to_string()
+        } else {
+            SUMMARY_MODE_AUTO.to_string()
+        },
         pending: stats.pending,
         processing: stats.processing,
         completed: stats.completed,
         failed: stats.failed,
+        summary_backend: background_backend_status(&state, BackgroundJobKind::Summary),
+        vision_backend: background_backend_status(&state, BackgroundJobKind::Vision),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::app_db::AppDb;
+    use crate::db::notebook_db::NotebookDb;
+    use crate::providers::ModelRegistry;
+    use crate::secrets::SecretStore;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tauri_queue::{QueueConfig, QueueManager};
+    use tempfile::TempDir;
+
+    fn build_state() -> (TempDir, AppState, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(data_dir.join("notebooks")).unwrap();
+
+        let app_db = AppDb::open(&data_dir.join("gloss.db")).unwrap();
+        let secret_store = SecretStore::new(&data_dir).unwrap();
+        let model_registry = ModelRegistry::new(&app_db, &secret_store).unwrap();
+
+        let notebook_id = "nb1".to_string();
+        let notebook_dir = data_dir.join("notebooks").join(&notebook_id);
+        std::fs::create_dir_all(notebook_dir.join("sources")).unwrap();
+        std::fs::create_dir_all(notebook_dir.join("embeddings")).unwrap();
+        std::fs::create_dir_all(notebook_dir.join("audio")).unwrap();
+        std::fs::create_dir_all(notebook_dir.join("exports")).unwrap();
+
+        app_db
+            .create_notebook(&notebook_id, "Notebook", &notebook_dir.to_string_lossy())
+            .unwrap();
+        NotebookDb::open(&notebook_dir.join("notebook.db")).unwrap();
+
+        let state = AppState {
+            app_db: Mutex::new(app_db),
+            secret_store,
+            notebook_dbs: Mutex::new(HashMap::new()),
+            model_registry: Mutex::new(model_registry),
+            data_dir,
+            embedder: Mutex::new(None),
+            hnsw_indices: Mutex::new(HashMap::new()),
+            summary_paused: AtomicBool::new(true),
+            ingestion_active: AtomicU32::new(0),
+            llm_gate: tokio::sync::Semaphore::new(1),
+            gpu_gate: tokio::sync::Semaphore::new(1),
+            active_notebook_id: Mutex::new(Some(notebook_id.clone())),
+            active_epoch: AtomicU64::new(1),
+            chat_grace_until: Mutex::new(0),
+            last_user_activity: Mutex::new(0),
+        };
+
+        (dir, state, notebook_id)
+    }
+
+    fn build_queue(dir: &TempDir) -> Arc<QueueManager> {
+        Arc::new(
+            QueueManager::new(
+                QueueConfig::builder()
+                    .with_db_path(dir.path().join("queue.db"))
+                    .with_poll_interval(Duration::from_secs(1))
+                    .build(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn ready_source(id: &str) -> Source {
+        Source {
+            id: id.to_string(),
+            source_type: "text".to_string(),
+            title: format!("Source {id}"),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: Some("content".to_string()),
+            word_count: Some(1),
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: "ready".to_string(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn summary_config_rejects_non_ollama_default_model() {
+        let (_dir, state, _notebook_id) = build_state();
+        let app_db = state.app_db.lock().unwrap();
+        app_db.set_setting("default_model", "gpt-4o-mini").unwrap();
+        app_db.set_setting("default_provider", "openai").unwrap();
+        app_db
+            .update_provider("openai", true, Some("https://api.openai.com/v1"), None)
+            .unwrap();
+        app_db
+            .replace_models(
+                "openai",
+                &[ModelRecord {
+                    id: "gpt-4o-mini".to_string(),
+                    provider_id: "openai".to_string(),
+                    display_name: "GPT-4o mini".to_string(),
+                    parameter_size: None,
+                    context_window: None,
+                    capabilities: Some("chat".to_string()),
+                }],
+            )
+            .unwrap();
+
+        let error =
+            resolve_background_job_config_from_db(&app_db, BackgroundJobKind::Summary).unwrap_err();
+        assert!(error.contains("requires an Ollama model"));
+    }
+
+    #[test]
+    fn vision_config_rejects_non_vision_model() {
+        let (_dir, state, _notebook_id) = build_state();
+        let app_db = state.app_db.lock().unwrap();
+        app_db.set_setting("default_model", "llama3:8b").unwrap();
+        app_db.set_setting("default_provider", "ollama").unwrap();
+        app_db
+            .replace_models(
+                "ollama",
+                &[ModelRecord {
+                    id: "llama3:8b".to_string(),
+                    provider_id: "ollama".to_string(),
+                    display_name: "Llama 3 8B".to_string(),
+                    parameter_size: None,
+                    context_window: None,
+                    capabilities: Some("chat".to_string()),
+                }],
+            )
+            .unwrap();
+
+        let error =
+            resolve_background_job_config_from_db(&app_db, BackgroundJobKind::Vision).unwrap_err();
+        assert!(error.contains("vision-capable"));
+    }
+
+    #[test]
+    fn auto_queue_reports_zero_when_background_config_is_invalid() {
+        let (dir, state, notebook_id) = build_state();
+        state
+            .with_notebook_db(&notebook_id, |db| db.insert_source(&ready_source("s1")))
+            .unwrap();
+
+        {
+            let app_db = state.app_db.lock().unwrap();
+            app_db.set_setting("default_model", "gpt-4o-mini").unwrap();
+            app_db.set_setting("default_provider", "openai").unwrap();
+            app_db
+                .update_provider("openai", true, Some("https://api.openai.com/v1"), None)
+                .unwrap();
+            app_db
+                .replace_models(
+                    "openai",
+                    &[ModelRecord {
+                        id: "gpt-4o-mini".to_string(),
+                        provider_id: "openai".to_string(),
+                        display_name: "GPT-4o mini".to_string(),
+                        parameter_size: None,
+                        context_window: None,
+                        capabilities: Some("chat".to_string()),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let queue = build_queue(&dir);
+        let result = auto_queue_notebook_summaries(&state, &queue, &notebook_id);
+        let stats = queue.count_by_status().unwrap();
+
+        assert_eq!(result.queued, 0);
+        assert!(!result.diagnostics.is_empty());
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.processing, 0);
+    }
 }

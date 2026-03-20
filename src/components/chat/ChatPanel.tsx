@@ -38,7 +38,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   } = useChatStore();
   const saveResponse = useNoteStore((s) => s.saveResponse);
   const { activeModel, models } = useSettingsStore();
-  const { selectedSourceIds } = useSourceStore();
+  const getSourceScope = useSourceStore((s) => s.getSourceScope);
   const setActiveModel = useSettingsStore((s) => s.setActiveModel);
   const updateSetting = useSettingsStore((s) => s.updateSetting);
 
@@ -55,7 +55,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     if (!input.trim() || isStreaming) return;
     const query = input.trim();
     setInput("");
-    await sendMessage(notebookId, query, Array.from(selectedSourceIds), activeModel);
+    await sendMessage(notebookId, query, getSourceScope(), activeModel);
   };
 
   const handleSuggestionClick = (question: string) => {
@@ -126,7 +126,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           onChange={(e) => {
             const nextModel = e.target.value;
             setActiveModel(nextModel);
+            const nextProvider = models.find((model) => model.id === nextModel)?.provider_id;
             void updateSetting("default_model", nextModel);
+            if (nextProvider) {
+              void updateSetting("default_provider", nextProvider);
+            }
           }}
           className="text-xs bg-bg-tertiary border border-border rounded px-2 py-1 text-text focus:outline-none focus:border-accent"
         >

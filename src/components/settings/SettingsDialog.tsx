@@ -24,6 +24,34 @@ interface SettingsDialogProps {
 
 type TestStatus = "idle" | "testing" | "success" | "error";
 
+function isVisionCapableModel(model: {
+  id: string;
+  display_name: string;
+  capabilities?: string;
+}) {
+  if (model.capabilities) {
+    const caps = model.capabilities
+      .split(",")
+      .map((cap) => cap.trim().toLowerCase());
+    if (caps.includes("vision") || caps.includes("image") || caps.includes("multimodal")) {
+      return true;
+    }
+  }
+
+  const fingerprint = `${model.id} ${model.display_name}`.toLowerCase();
+  return [
+    "llava",
+    "bakllava",
+    "moondream",
+    "minicpm-v",
+    "qwen-vl",
+    "qwen2-vl",
+    "qwen2.5-vl",
+    "vision",
+    "vl",
+  ].some((needle) => fingerprint.includes(needle));
+}
+
 function ProviderSection({
   id,
   label,
@@ -230,8 +258,6 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     }
   }, [open, loadSettings, loadProviders, loadModels, loadExternalTools]);
 
-  if (!open) return null;
-
   const handleProviderSave = async (updates: Record<string, string>) => {
     for (const [key, value] of Object.entries(updates)) {
       await updateSetting(key, value);
@@ -268,6 +294,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const handleSelectModel = async (modelId: string) => {
     setActiveModel(modelId);
     await updateSetting("default_model", modelId);
+    const providerId = models.find((model) => model.id === modelId)?.provider_id;
+    if (providerId) {
+      await updateSetting("default_provider", providerId);
+    }
   };
 
   const handleSelectSummaryModel = async (modelId: string) => {
@@ -296,6 +326,26 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     anthropic: "Anthropic",
     llamacpp: "llama.cpp",
   };
+  const summaryModels = models.filter((model) => model.provider_id === "ollama");
+  const visionModels = summaryModels.filter(isVisionCapableModel);
+
+  useEffect(() => {
+    if (!open || models.length === 0) {
+      return;
+    }
+
+    const summaryModel = settings["summary_model"];
+    if (summaryModel && !summaryModels.some((model) => model.id === summaryModel)) {
+      void updateSetting("summary_model", "");
+    }
+
+    const visionModel = settings["vision_model"];
+    if (visionModel && !visionModels.some((model) => model.id === visionModel)) {
+      void updateSetting("vision_model", "");
+    }
+  }, [models, open, settings, summaryModels, updateSetting, visionModels]);
+
+  if (!open) return null;
 
   return (
     <div
@@ -450,8 +500,9 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               </h3>
             </div>
             <p className="text-xs text-text-muted mb-2">
-              Model used for generating source summaries. A smaller, faster
-              model works well here since summaries run in the background.
+              Background summaries run through the Ollama backend. Choose an
+              Ollama model here or leave this empty to reuse the chat model when
+              it is also an Ollama model.
             </p>
             <select
               value={settings["summary_model"] || ""}
@@ -459,7 +510,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
             >
               <option value="">Same as chat model ({activeModel})</option>
-              {models.map((model) => (
+              {summaryModels.map((model) => (
                 <option key={model.id} value={model.id}>
                   {model.display_name}
                   {model.parameter_size ? ` (${model.parameter_size})` : ""}
@@ -477,9 +528,9 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               </h3>
             </div>
             <p className="text-xs text-text-muted mb-2">
-              Model used for describing images. Must be a vision-capable model
-              (e.g. llava, bakllava, moondream). Images are base64-encoded and
-              sent to this model for description.
+              Image and video background jobs require a vision-capable Ollama
+              model. Images are base64-encoded and sent to this model for
+              description.
             </p>
             <select
               value={settings["vision_model"] || ""}
@@ -487,7 +538,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
             >
               <option value="">Same as chat model ({activeModel})</option>
-              {models.map((model) => (
+              {visionModels.map((model) => (
                 <option key={model.id} value={model.id}>
                   {model.display_name}
                   {model.parameter_size ? ` (${model.parameter_size})` : ""}

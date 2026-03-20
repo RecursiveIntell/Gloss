@@ -395,12 +395,15 @@ async fn summary_job_loop(
                 let idle_secs = state.idle_seconds();
                 if idle_secs >= IDLE_AUTO_SUMMARIZE_SECS {
                     if let Some(ref nb_id) = active_nb {
-                        let queued =
+                        let queued_result =
                             commands::sources::auto_queue_notebook_summaries(&state, &queue, nb_id);
-                        if queued > 0 {
+                        for diagnostic in &queued_result.diagnostics {
+                            tracing::warn!(notebook_id = %nb_id, diagnostic = %diagnostic, "Summary auto-queue skipped");
+                        }
+                        if queued_result.queued > 0 {
                             tracing::info!(
                                 idle_secs,
-                                queued,
+                                queued = queued_result.queued,
                                 "Auto-queued summaries after idle period"
                             );
                             // Process immediately instead of sleeping

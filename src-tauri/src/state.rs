@@ -4,6 +4,7 @@ use crate::error::GlossError;
 use crate::ingestion::embed::{EmbeddingService, HnswIndex};
 use crate::providers::ModelRegistry;
 use crate::retrieval::hybrid_search::{self, SearchResult};
+use crate::retrieval::source_scope::ResolvedSourceScope;
 use crate::secrets::SecretStore;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,6 +17,8 @@ use tokio::sync::Semaphore;
 /// vector during ingestion. Keep it disabled until those calls are isolated from
 /// the desktop process.
 pub const NATIVE_SEMANTIC_INDEXING_ENABLED: bool = false;
+pub const SUMMARY_MODE_AUTO: &str = "auto";
+pub const SUMMARY_MODE_MANUAL: &str = "manual";
 
 /// Global application state managed by Tauri
 pub struct AppState {
@@ -63,6 +66,13 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn summary_mode_starts_paused(app_db: &AppDb) -> Result<bool, GlossError> {
+        let summary_mode = app_db
+            .get_setting("summary_mode")?
+            .unwrap_or_else(|| SUMMARY_MODE_MANUAL.to_string());
+        Ok(summary_mode != SUMMARY_MODE_AUTO)
+    }
+
     fn migrate_legacy_secrets(
         app_db: &AppDb,
         secret_store: &SecretStore,
@@ -153,6 +163,7 @@ impl AppState {
         Self::reconcile_notebook_source_counts(&app_db)?;
 
         let model_registry = ModelRegistry::new(&app_db, &secret_store)?;
+        let summary_starts_paused = Self::summary_mode_starts_paused(&app_db)?;
 
         tracing::info!(data_dir = %data_dir.display(), "Gloss initialized");
 
@@ -164,7 +175,7 @@ impl AppState {
             data_dir,
             embedder: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
-            summary_paused: AtomicBool::new(false),
+            summary_paused: AtomicBool::new(summary_starts_paused),
             ingestion_active: AtomicU32::new(0),
             llm_gate: Semaphore::new(1),
             gpu_gate: Semaphore::new(1),
@@ -468,10 +479,14 @@ impl AppState {
         &self,
         notebook_id: &str,
         query: &str,
-        selected_source_ids: &[String],
+        scope: &ResolvedSourceScope,
         top_k: usize,
     ) -> Result<Option<Vec<SearchResult>>, GlossError> {
         if !NATIVE_SEMANTIC_INDEXING_ENABLED {
+            return Ok(None);
+        }
+
+        if scope.is_none() {
             return Ok(None);
         }
 
@@ -502,23 +517,16 @@ impl AppState {
 
         let db_path = self.notebook_db_path(notebook_id)?;
         let nb_db = NotebookDb::connect(&db_path)?;
-        if !nb_db.can_run_hybrid_search(selected_source_ids)? {
+        if !nb_db.can_run_hybrid_search(scope.source_ids())? {
             tracing::debug!(
                 notebook_id,
-                selected = selected_source_ids.len(),
+                selected = scope.source_ids().len(),
                 "Hybrid search skipped because the selected scope is not fully indexed"
             );
             return Ok(None);
         }
 
-        let results = hybrid_search::hybrid_search(
-            query,
-            &nb_db,
-            embedder,
-            index,
-            selected_source_ids,
-            top_k,
-        )?;
+        let results = hybrid_search::hybrid_search(query, &nb_db, embedder, index, scope, top_k)?;
         Ok(Some(results))
     }
 }
@@ -606,5 +614,24 @@ mod tests {
             Some(String::new())
         );
         assert_eq!(app_db.get_provider_api_key("anthropic").unwrap(), None);
+    }
+
+    #[test]
+    fn summary_mode_defaults_to_manual_startup() {
+        let dir = tempdir().unwrap();
+        let app_db_path = dir.path().join("gloss.db");
+        let app_db = AppDb::open(&app_db_path).unwrap();
+
+        assert!(AppState::summary_mode_starts_paused(&app_db).unwrap());
+
+        app_db
+            .set_setting("summary_mode", SUMMARY_MODE_AUTO)
+            .unwrap();
+        assert!(!AppState::summary_mode_starts_paused(&app_db).unwrap());
+
+        app_db
+            .set_setting("summary_mode", SUMMARY_MODE_MANUAL)
+            .unwrap();
+        assert!(AppState::summary_mode_starts_paused(&app_db).unwrap());
     }
 }

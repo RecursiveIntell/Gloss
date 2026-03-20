@@ -78,14 +78,13 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
     } else {
       localStorage.removeItem(ACTIVE_NB_KEY);
     }
-    // Await backend initialization before queuing summaries
+    // Await backend initialization before reloading notebook metadata
     if (id) {
       const targetId = id;
       api.setActiveNotebook(targetId)
         .then(() => {
           if (get().activeNotebookId !== targetId) return;
           void get().loadNotebooks();
-          return api.regenerateMissingSummaries(targetId);
         })
         .catch((e) => console.error('Notebook activation failed:', e));
     } else {

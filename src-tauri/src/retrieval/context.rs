@@ -1,5 +1,6 @@
 use crate::db::notebook_db::{Message, Source};
 use crate::retrieval::hybrid_search::SearchResult;
+use crate::retrieval::source_scope::ResolvedSourceScopeKind;
 
 /// Maximum estimated tokens for the source manifest before switching to compact mode.
 const MANIFEST_MAX_TOKENS: usize = 2000;
@@ -22,12 +23,13 @@ impl ContextAssembler {
     /// lives in the system message — not in user messages — which keeps history
     /// clean across turns.
     ///
-    /// `all_sources` is the full list of sources for the manifest.
-    /// `source_context` is the content of SELECTED sources for grounding.
+    /// `manifest_sources` is the source list visible to the model for this turn.
+    /// `source_context` is the retrieved content for grounding.
     pub fn build_system_prompt(
         custom_goal: Option<&str>,
         style: &str,
-        all_sources: &[Source],
+        scope_kind: ResolvedSourceScopeKind,
+        manifest_sources: &[Source],
         source_context: &[ContextPassage],
     ) -> String {
         let mut prompt = String::new();
@@ -58,9 +60,12 @@ impl ContextAssembler {
             }
         }
 
-        // Source manifest — tells the LLM what's in the notebook
-        if !all_sources.is_empty() {
-            prompt.push_str(&Self::build_source_manifest(all_sources));
+        if matches!(
+            scope_kind,
+            ResolvedSourceScopeKind::All | ResolvedSourceScopeKind::Explicit
+        ) && !manifest_sources.is_empty()
+        {
+            prompt.push_str(&Self::build_source_manifest(scope_kind, manifest_sources));
             prompt.push('\n');
         }
 
@@ -80,24 +85,42 @@ impl ContextAssembler {
                  Only cite information directly supported by these sources. \
                  Be concise.\n",
             );
-        } else if !all_sources.is_empty() {
-            // Sources exist but no passages were retrieved for this query.
-            // Still direct the model to use its knowledge of the source list.
-            prompt.push_str(
-                "No specific passages were retrieved for this query, but you have access \
-                 to the sources listed above. Use the source titles and summaries to provide \
-                 a helpful response. If you cannot answer from the source information available, \
-                 say so honestly and suggest the user refine their question.\n",
-            );
+        } else {
+            match scope_kind {
+                ResolvedSourceScopeKind::All if !manifest_sources.is_empty() => {
+                    prompt.push_str(
+                        "No specific passages were retrieved for this query, but you have access \
+                         to the sources listed above. Use the source titles and summaries to provide \
+                         a helpful response. If you cannot answer from the source information available, \
+                         say so honestly and suggest the user refine their question.\n",
+                    );
+                }
+                ResolvedSourceScopeKind::Explicit if !manifest_sources.is_empty() => {
+                    prompt.push_str(
+                        "No passages were retrieved from the selected sources for this query. \
+                         Do not infer document details from source titles or summaries alone. \
+                         Tell the user the current selection did not surface supporting passages \
+                         and suggest refining the question or broadening the scope.\n",
+                    );
+                }
+                ResolvedSourceScopeKind::None => {
+                    prompt.push_str(
+                        "No notebook sources are selected for this chat turn. \
+                         Tell the user that no sources are currently selected and ask them to \
+                         select sources or widen scope before relying on notebook content.\n",
+                    );
+                }
+                _ => {}
+            }
         }
 
         prompt
     }
 
-    /// Build a compact source manifest listing ALL sources in the notebook.
+    /// Build a compact source manifest for the effective chat scope.
     /// Uses compact mode (titles only) when the full manifest would exceed
     /// the token budget.
-    fn build_source_manifest(sources: &[Source]) -> String {
+    fn build_source_manifest(scope_kind: ResolvedSourceScopeKind, sources: &[Source]) -> String {
         let total_count = sources.len();
         let capped = total_count > MANIFEST_MAX_SOURCES;
         let display_sources = if capped {
@@ -110,8 +133,19 @@ impl ContextAssembler {
         let estimated_full_tokens = display_sources.len() * 30;
 
         let header = format!(
-            "You have access to {} sources in this notebook{}:\n",
-            total_count,
+            "{}{}:\n",
+            match scope_kind {
+                ResolvedSourceScopeKind::All => {
+                    format!(
+                        "You have access to {} sources in this notebook",
+                        total_count
+                    )
+                }
+                ResolvedSourceScopeKind::Explicit => {
+                    format!("This chat is scoped to {} selected sources", total_count)
+                }
+                ResolvedSourceScopeKind::None => "No notebook sources are available".to_string(),
+            },
             if capped {
                 format!(" (showing {} of {})", MANIFEST_MAX_SOURCES, total_count)
             } else {
@@ -140,8 +174,15 @@ impl ContextAssembler {
                 ));
             }
             manifest.push_str(&capped_footer);
-            manifest
-                .push_str("\nWhen asked about what sources you have, refer to the list above.\n");
+            manifest.push_str(match scope_kind {
+                ResolvedSourceScopeKind::All => {
+                    "\nWhen asked about what sources you have, refer to the list above.\n"
+                }
+                ResolvedSourceScopeKind::Explicit => {
+                    "\nWhen asked about the current chat scope, refer to the selected-source list above.\n"
+                }
+                ResolvedSourceScopeKind::None => "\n",
+            });
             manifest
         } else {
             // Full mode: titles + summaries
@@ -172,10 +213,16 @@ impl ContextAssembler {
                 ));
             }
             manifest.push_str(&capped_footer);
-            manifest.push_str(
-                "\nWhen asked about what sources you have or what's in this notebook, \
-                 refer to the complete source list above.\n",
-            );
+            manifest.push_str(match scope_kind {
+                ResolvedSourceScopeKind::All => {
+                    "\nWhen asked about what sources you have or what's in this notebook, \
+                     refer to the complete source list above.\n"
+                }
+                ResolvedSourceScopeKind::Explicit => {
+                    "\nWhen asked about the current chat scope, refer to the selected-source list above.\n"
+                }
+                ResolvedSourceScopeKind::None => "\n",
+            });
             manifest
         }
     }
@@ -210,5 +257,84 @@ impl ContextAssembler {
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(id: &str, title: &str, summary: &str) -> Source {
+        Source {
+            id: id.to_string(),
+            source_type: "text".to_string(),
+            title: title.to_string(),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: None,
+            word_count: Some(42),
+            metadata: None,
+            summary: Some(summary.to_string()),
+            summary_model: None,
+            status: "ready".to_string(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn scoped_prompt_only_includes_selected_manifest_and_passages() {
+        let selected = vec![source("s1", "Selected Source", "selected summary")];
+        let prompt = ContextAssembler::build_system_prompt(
+            None,
+            "default",
+            ResolvedSourceScopeKind::Explicit,
+            &selected,
+            &[ContextPassage {
+                source_id: "s1".to_string(),
+                title: "Selected Source".to_string(),
+                content: "Selected evidence".to_string(),
+            }],
+        );
+
+        assert!(prompt.contains("Selected Source"));
+        assert!(prompt.contains("Selected evidence"));
+        assert!(!prompt.contains("Unselected Source"));
+        assert!(!prompt.contains("unselected summary"));
+    }
+
+    #[test]
+    fn scoped_prompt_does_not_fallback_to_manifest_summaries() {
+        let selected = vec![source("s1", "Selected Source", "selected summary")];
+        let prompt = ContextAssembler::build_system_prompt(
+            None,
+            "default",
+            ResolvedSourceScopeKind::Explicit,
+            &selected,
+            &[],
+        );
+
+        assert!(prompt.contains("Selected Source"));
+        assert!(prompt.contains("Do not infer document details"));
+        assert!(!prompt.contains("Use the source titles and summaries"));
+    }
+
+    #[test]
+    fn none_scope_prompt_does_not_leak_manifest() {
+        let prompt = ContextAssembler::build_system_prompt(
+            None,
+            "default",
+            ResolvedSourceScopeKind::None,
+            &[],
+            &[],
+        );
+
+        assert!(prompt.contains("No notebook sources are selected"));
+        assert!(!prompt.contains("This chat is scoped"));
+        assert!(!prompt.contains("You have access to"));
     }
 }

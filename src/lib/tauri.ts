@@ -11,6 +11,8 @@ import type {
   SourceContent,
   NotebookStats,
   QueueStatus,
+  SourceScope,
+  QueueSummariesResult,
 } from "./types";
 
 // === Notebooks ===
@@ -129,7 +131,7 @@ export async function sendMessage(
   notebookId: string,
   conversationId: string,
   query: string,
-  selectedSourceIds: string[],
+  sourceScope: SourceScope,
   model: string,
   messageId?: string
 ): Promise<string> {
@@ -137,7 +139,7 @@ export async function sendMessage(
     notebookId,
     conversationId,
     query,
-    selectedSourceIds,
+    sourceScope,
     model,
     messageId,
   });
@@ -246,7 +248,7 @@ export async function checkExternalTools(): Promise<Record<string, boolean>> {
 
 export async function regenerateMissingSummaries(
   notebookId: string
-): Promise<number> {
+): Promise<QueueSummariesResult> {
   return invoke("regenerate_missing_summaries", { notebookId });
 }
 

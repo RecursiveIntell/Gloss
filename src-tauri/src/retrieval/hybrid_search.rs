@@ -1,6 +1,7 @@
 use crate::db::notebook_db::{Chunk, NotebookDb};
 use crate::error::GlossError;
 use crate::ingestion::embed::{EmbeddingService, HnswIndex};
+use crate::retrieval::source_scope::ResolvedSourceScope;
 use std::collections::HashMap;
 
 /// A search result with relevance score.
@@ -27,7 +28,7 @@ pub fn hybrid_search(
     nb_db: &NotebookDb,
     embedder: &EmbeddingService,
     index: &HnswIndex,
-    selected_source_ids: &[String],
+    scope: &ResolvedSourceScope,
     top_k: usize,
 ) -> Result<Vec<SearchResult>, GlossError> {
     // Scale the pre-rerank pool proportionally to top_k
@@ -41,8 +42,7 @@ pub fn hybrid_search(
     for (rank, (label, _distance)) in hnsw_results.iter().enumerate() {
         match nb_db.get_chunk_by_embedding_id(*label as i64) {
             Ok(chunk) => {
-                if selected_source_ids.is_empty() || selected_source_ids.contains(&chunk.source_id)
-                {
+                if scope.allows(&chunk.source_id) {
                     semantic_chunks.push((chunk, rank));
                 }
             }
@@ -65,8 +65,7 @@ pub fn hybrid_search(
     for (rank, (rowid, _score)) in fts_results.iter().enumerate() {
         match nb_db.get_chunk_by_rowid(*rowid) {
             Ok(chunk) => {
-                if selected_source_ids.is_empty() || selected_source_ids.contains(&chunk.source_id)
-                {
+                if scope.allows(&chunk.source_id) {
                     keyword_chunks.push((chunk, rank));
                 }
             }

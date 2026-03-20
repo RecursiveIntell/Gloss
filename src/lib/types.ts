@@ -115,6 +115,11 @@ export interface SourceContent {
   word_count?: number;
 }
 
+export type SourceScope =
+  | { kind: "all" }
+  | { kind: "explicit"; ids: string[] }
+  | { kind: "none" };
+
 export interface ChatTokenPayload {
   notebook_id: string;
   conversation_id: string;
@@ -159,10 +164,13 @@ export interface ChatErrorPayload {
 
 export interface QueueStatus {
   paused: boolean;
+  mode: string;
   pending: number;
   processing: number;
   completed: number;
   failed: number;
+  summary_backend: BackgroundBackendStatus;
+  vision_backend: BackgroundBackendStatus;
 }
 
 export interface SourcesBatchCreatedPayload {
@@ -173,4 +181,16 @@ export interface SourcesBatchCreatedPayload {
 export interface BatchIngestionCompletePayload {
   notebook_id: string;
   count: number;
+}
+
+export interface BackgroundBackendStatus {
+  ready: boolean;
+  provider_id?: string | null;
+  model?: string | null;
+  diagnostic?: string | null;
+}
+
+export interface QueueSummariesResult {
+  queued: number;
+  diagnostics: string[];
 }

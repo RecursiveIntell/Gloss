@@ -1,6 +1,7 @@
 import { create } from 'zustand';
-import type { Source, NotebookStats } from '../lib/types';
+import type { Source, NotebookStats, SourceScope } from '../lib/types';
 import * as api from '../lib/tauri';
+import { useChatStore } from './chatStore';
 import { useToastStore } from './toastStore';
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
@@ -9,6 +10,23 @@ let persistSelectedSourcesChain = Promise.resolve();
 async function refreshNotebookList() {
   const { useNotebookStore } = await import('./notebookStore');
   await useNotebookStore.getState().loadNotebooks();
+}
+
+function buildSourceScope(sources: Source[], selectedSourceIds: Set<string>): SourceScope {
+  if (sources.length === 0) {
+    return { kind: 'all' };
+  }
+  if (selectedSourceIds.size === 0) {
+    return { kind: 'none' };
+  }
+  if (selectedSourceIds.size === sources.length) {
+    return { kind: 'all' };
+  }
+  return { kind: 'explicit', ids: Array.from(selectedSourceIds) };
+}
+
+function clearSuggestedQuestions() {
+  useChatStore.getState().clearSuggestedQuestions();
 }
 
 function persistSelectedSources(selectedSourceIds: Set<string>) {
@@ -38,6 +56,7 @@ interface SourceStore {
   toggleGroup: (group: string) => void;
   selectAll: () => void;
   selectNone: () => void;
+  getSourceScope: () => SourceScope;
   updateSourceStatus: (sourceId: string, status: string) => void;
   updateSourceStatusBulk: (updates: Array<{ sourceId: string; status: string; errorMessage?: string }>) => void;
   loadStats: (notebookId: string) => Promise<void>;
@@ -70,6 +89,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
 
   addSourceFile: async (notebookId, path) => {
     try {
+      clearSuggestedQuestions();
       await api.addSourceFile(notebookId, path);
       await refreshNotebookList();
       await get().loadSources(notebookId);
@@ -87,6 +107,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   addSourceFolder: async (notebookId, path) => {
     try {
       // Schedules the directory walk and ingestion in the background.
+      clearSuggestedQuestions();
       await api.addSourceFolder(notebookId, path);
       useToastStore.getState().addToast({
         type: 'info',
@@ -106,6 +127,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
 
   addSourcePaste: async (notebookId, title, text) => {
     try {
+      clearSuggestedQuestions();
       await api.addSourcePaste(notebookId, title, text);
       await refreshNotebookList();
       await get().loadSources(notebookId);
@@ -122,6 +144,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
 
   deleteSource: async (notebookId, sourceId) => {
     try {
+      clearSuggestedQuestions();
       await api.deleteSource(notebookId, sourceId);
       await refreshNotebookList();
       await get().loadSources(notebookId);
@@ -138,6 +161,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
 
   retrySource: async (notebookId, sourceId) => {
     try {
+      clearSuggestedQuestions();
       await api.retrySourceIngestion(notebookId, sourceId);
       await get().loadSources(notebookId);
     } catch (e) {
@@ -156,6 +180,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       if (next.has(sourceId)) next.delete(sourceId);
       else next.add(sourceId);
       persistSelectedSources(next);
+      clearSuggestedQuestions();
       return { selectedSourceIds: next };
     });
   },
@@ -173,6 +198,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         else next.add(s.id);
       }
       persistSelectedSources(next);
+      clearSuggestedQuestions();
       return { selectedSourceIds: next };
     });
   },
@@ -181,6 +207,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
     set((state) => {
       const next = new Set(state.sources.map(s => s.id));
       persistSelectedSources(next);
+      clearSuggestedQuestions();
       return { selectedSourceIds: next };
     });
   },
@@ -188,7 +215,13 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   selectNone: () => {
     const next = new Set<string>();
     persistSelectedSources(next);
+    clearSuggestedQuestions();
     set({ selectedSourceIds: next });
+  },
+
+  getSourceScope: () => {
+    const { sources, selectedSourceIds } = get();
+    return buildSourceScope(sources, selectedSourceIds);
   },
 
   updateSourceStatus: (sourceId, status) => {

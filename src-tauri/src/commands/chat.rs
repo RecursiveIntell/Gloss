@@ -5,6 +5,7 @@ use crate::providers::{self, ChatMessage, ChatRequest, ChatToken, LlmProvider};
 use crate::retrieval::citations;
 use crate::retrieval::context::{ContextAssembler, ContextPassage};
 use crate::retrieval::hybrid_search;
+use crate::retrieval::source_scope::{ResolvedSourceScope, SourceScope};
 use crate::state::AppState;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -99,7 +100,7 @@ async fn acquire_gate_with_epoch<'a>(
     }
 }
 
-async fn load_or_generate_suggested_questions(
+fn load_cached_suggested_questions(
     notebook_id: &str,
     state: &AppState,
 ) -> Result<Vec<String>, GlossError> {
@@ -110,62 +111,7 @@ async fn load_or_generate_suggested_questions(
             return Ok(parsed);
         }
     }
-
-    let summaries = state.with_notebook_db(notebook_id, |db| db.get_selected_summaries())?;
-    if summaries.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let (model, provider_config) = {
-        let registry = state
-            .model_registry
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        let model = app_db
-            .get_setting("default_model")?
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| "qwen3:8b".to_string());
-        let config =
-            registry.get_provider_config_for_model(&model, &app_db, &state.secret_store)?;
-        (model, config)
-    };
-
-    let llm_permit = state
-        .llm_gate
-        .acquire()
-        .await
-        .map_err(|_| GlossError::Other("LLM gate closed".into()))?;
-    let gpu_permit = state
-        .gpu_gate
-        .acquire()
-        .await
-        .map_err(|_| GlossError::Other("GPU gate closed".into()))?;
-
-    let provider = providers::build_provider(&provider_config);
-    let questions = crate::ingestion::summarize::generate_suggested_questions(
-        &summaries,
-        provider.as_ref(),
-        &model,
-    )
-    .await?;
-
-    drop(gpu_permit);
-    drop(llm_permit);
-
-    if !questions.is_empty() {
-        let json = serde_json::to_string(&questions).map_err(|e| {
-            GlossError::Other(format!("Failed to serialize suggested questions: {e}"))
-        })?;
-        state.with_notebook_db(notebook_id, |db| {
-            db.set_config("suggested_questions", &json)
-        })?;
-    }
-
-    Ok(questions)
+    Ok(Vec::new())
 }
 
 #[tauri::command]
@@ -210,7 +156,7 @@ pub async fn send_message(
     notebook_id: String,
     conversation_id: String,
     query: String,
-    selected_source_ids: Vec<String>,
+    source_scope: SourceScope,
     model: String,
     message_id: Option<String>,
     state: State<'_, AppState>,
@@ -272,44 +218,21 @@ pub async fn send_message(
     };
 
     // --- RAG context assembly ---
-    // 1. Load all sources upfront for manifest + ID validation
+    // 1. Load notebook sources upfront for scope resolution and manifest assembly.
     let all_sources: Vec<Source> = state.with_notebook_db(&notebook_id, |db| db.list_sources())?;
-    let all_source_ids: HashSet<String> = all_sources.iter().map(|s| s.id.clone()).collect();
+    let resolved_scope = source_scope.resolve(&all_sources);
 
-    // 2. Compute effective_source_ids with validation
-    let effective_source_ids: Vec<String> = if selected_source_ids.is_empty() {
-        tracing::debug!("No sources explicitly selected — using all sources");
-        all_source_ids.iter().cloned().collect()
-    } else {
-        // Validate selected IDs against this notebook's actual sources
-        let valid: Vec<String> = selected_source_ids
-            .iter()
-            .filter(|id| all_source_ids.contains(id.as_str()))
-            .cloned()
-            .collect();
-        if valid.is_empty() && !all_source_ids.is_empty() {
-            tracing::warn!(
-                sent_ids = selected_source_ids.len(),
-                notebook_sources = all_source_ids.len(),
-                "All selected source IDs are stale/invalid — using all notebook sources"
-            );
-            all_source_ids.iter().cloned().collect()
-        } else if valid.len() < selected_source_ids.len() {
-            tracing::debug!(
-                valid = valid.len(),
-                sent = selected_source_ids.len(),
-                "Some selected source IDs were invalid, using {} valid ones",
-                valid.len()
-            );
-            valid
-        } else {
-            valid
-        }
-    };
+    if matches!(source_scope, SourceScope::Explicit(_)) && resolved_scope.is_none() {
+        tracing::warn!(
+            notebook_sources = all_sources.len(),
+            "Scoped chat request resolved to no valid sources"
+        );
+    }
 
     let hybrid_search_ready = crate::state::NATIVE_SEMANTIC_INDEXING_ENABLED
+        && !resolved_scope.is_none()
         && state.with_notebook_db(&notebook_id, |db| {
-            db.can_run_hybrid_search(&effective_source_ids)
+            db.can_run_hybrid_search(resolved_scope.source_ids())
         })?;
 
     // 3. Only initialize semantic search infrastructure when the selected
@@ -331,25 +254,27 @@ pub async fn send_message(
     } else {
         tracing::info!(
             notebook_id = %notebook_id,
-            selected_sources = effective_source_ids.len(),
+            selected_sources = resolved_scope.source_count(),
             "Skipping semantic search warmup because selected sources are not fully indexed"
         );
     }
 
-    let source_count = all_sources.len();
+    let source_count = resolved_scope.source_count();
     let top_k = hybrid_search::compute_top_k(source_count);
 
     tracing::info!(
-        selected_source_ids = selected_source_ids.len(),
-        effective_source_ids = effective_source_ids.len(),
+        scope_kind = ?resolved_scope.kind(),
+        scoped_sources = resolved_scope.source_count(),
         source_count,
         top_k,
         "Starting RAG context assembly"
     );
 
     // 4. Hybrid search with multi-tier fallback
-    let source_context: Vec<ContextPassage> =
-        match state.try_hybrid_search(&notebook_id, &query, &effective_source_ids, top_k)? {
+    let source_context: Vec<ContextPassage> = if resolved_scope.is_none() {
+        Vec::new()
+    } else {
+        match state.try_hybrid_search(&notebook_id, &query, &resolved_scope, top_k)? {
             Some(results) if !results.is_empty() => {
                 // Resolve source titles for each unique source_id
                 let unique_source_ids: Vec<String> = results
@@ -396,8 +321,9 @@ pub async fn send_message(
                 };
                 tracing::info!(reason, "Hybrid search unavailable, using fallback context");
 
-                // Build title map from already-loaded all_sources
-                let title_map: HashMap<String, String> = all_sources
+                // Build title map from the resolved manifest scope
+                let title_map: HashMap<String, String> = resolved_scope
+                    .manifest_sources()
                     .iter()
                     .map(|s| (s.id.clone(), s.title.clone()))
                     .collect();
@@ -408,7 +334,7 @@ pub async fn send_message(
                         let mut ctx = Vec::new();
                         let mut total_chars = 0usize;
 
-                        for sid in &effective_source_ids {
+                        for sid in resolved_scope.source_ids() {
                             if total_chars >= MAX_TOTAL_CONTEXT_CHARS {
                                 break;
                             }
@@ -454,7 +380,7 @@ pub async fn send_message(
                         let mut ctx = Vec::new();
                         let mut total_chars = 0usize;
                         let mut seen_hashes = HashSet::new();
-                        for sid in &effective_source_ids {
+                        for sid in resolved_scope.source_ids() {
                             if total_chars >= MAX_TOTAL_CONTEXT_CHARS {
                                 break;
                             }
@@ -498,11 +424,12 @@ pub async fn send_message(
                     })?
                 }
             }
-        };
+        }
+    };
 
     tracing::info!(
         context_passages = source_context.len(),
-        manifest_sources = all_sources.len(),
+        manifest_sources = resolved_scope.manifest_sources().len(),
         context_chars = source_context
             .iter()
             .map(|p| p.content.len())
@@ -526,6 +453,7 @@ pub async fn send_message(
     let nb_id = notebook_id.clone();
     let epoch = request_epoch;
     let handle = app_handle.clone();
+    let prompt_scope: ResolvedSourceScope = resolved_scope.clone();
 
     // Construct the provider outside any lock (provider_config was extracted above)
     let provider = providers::build_provider(&provider_config);
@@ -596,7 +524,7 @@ pub async fn send_message(
             &history,
             custom_goal.as_deref(),
             &style,
-            &all_sources,
+            &prompt_scope,
             &source_context,
         )
         .await;
@@ -667,14 +595,19 @@ async fn stream_chat_response(
     history: &[Message],
     custom_goal: Option<&str>,
     style: &str,
-    all_sources: &[Source],
+    resolved_scope: &ResolvedSourceScope,
     source_context: &[ContextPassage],
 ) -> Result<String, GlossError> {
     use tauri::Manager;
 
     // Build system prompt with source manifest + selected source content.
-    let system_prompt =
-        ContextAssembler::build_system_prompt(custom_goal, style, all_sources, source_context);
+    let system_prompt = ContextAssembler::build_system_prompt(
+        custom_goal,
+        style,
+        resolved_scope.kind(),
+        resolved_scope.manifest_sources(),
+        source_context,
+    );
 
     tracing::info!(
         system_prompt_len = system_prompt.len(),
@@ -798,10 +731,10 @@ pub async fn get_suggested_questions(
     notebook_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, GlossError> {
-    match load_or_generate_suggested_questions(&notebook_id, &state).await {
+    match load_cached_suggested_questions(&notebook_id, &state) {
         Ok(questions) => Ok(questions),
         Err(e) => {
-            tracing::warn!(notebook_id = %notebook_id, error = %e, "Suggested question generation failed");
+            tracing::warn!(notebook_id = %notebook_id, error = %e, "Suggested question cache load failed");
             Ok(Vec::new())
         }
     }

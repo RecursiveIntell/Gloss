@@ -208,13 +208,13 @@ export function App() {
         const nbId = useNotebookStore.getState().activeNotebookId;
         if (data.notebook_id && data.notebook_id === nbId) {
           if (jobCompletedDebounceRef.current) clearTimeout(jobCompletedDebounceRef.current);
-          jobCompletedDebounceRef.current = setTimeout(() => {
-            jobCompletedDebounceRef.current = null;
-            useSourceStore.getState().loadSources(nbId);
-            useSourceStore.getState().loadStats(nbId);
-            useChatStore.getState().loadSuggestedQuestions(nbId);
-          }, 3000);
-        }
+            jobCompletedDebounceRef.current = setTimeout(() => {
+              jobCompletedDebounceRef.current = null;
+              useSourceStore.getState().loadSources(nbId);
+              useSourceStore.getState().loadStats(nbId);
+              useChatStore.getState().clearSuggestedQuestions();
+            }, 3000);
+          }
       } catch {
         // Ignore unparseable output
       }
@@ -234,6 +234,7 @@ export function App() {
         void useNotebookStore.getState().loadNotebooks();
         useSourceStore.getState().loadSources(nbId);
         useSourceStore.getState().loadStats(nbId);
+        useChatStore.getState().clearSuggestedQuestions();
         useToastStore.getState().addToast({
           type: 'success',
           title: 'Folder Import Complete',

@@ -373,6 +373,7 @@ mod tests {
         // Default settings should exist
         let settings = db.get_settings().unwrap();
         assert_eq!(settings.get("default_provider").unwrap(), "ollama");
+        assert_eq!(settings.get("summary_mode").unwrap(), "manual");
 
         // Set and get
         db.set_setting("theme", "dark").unwrap();

@@ -1,0 +1,321 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "AuthorityBasisV1": {
+      "additionalProperties": false,
+      "properties": {
+        "actor_ref": {
+          "$ref": "#/definitions/ExternalArtifactRef"
+        },
+        "authority_result": {
+          "type": "string"
+        },
+        "permit_ref": {
+          "$ref": "#/definitions/ExternalArtifactRef"
+        },
+        "reason_codes": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ReasonCode"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "actor_ref",
+        "authority_result",
+        "permit_ref"
+      ],
+      "type": "object"
+    },
+    "ControlAction": {
+      "enum": [
+        "allow_with_receipt",
+        "backlog",
+        "require_source_basis",
+        "require_verification",
+        "require_approval",
+        "generate_repair_packet",
+        "require_owner_resolution",
+        "block_mutation",
+        "block_release",
+        "quarantine_artifact"
+      ],
+      "type": "string"
+    },
+    "DerivedPressuresV1": {
+      "additionalProperties": false,
+      "description": "Derived deterministic pressures used by the action resolver.",
+      "properties": {
+        "autonomy_pressure": {
+          "$ref": "#/definitions/ScoreBps"
+        },
+        "quarantine_pressure": {
+          "$ref": "#/definitions/ScoreBps"
+        },
+        "repair_priority": {
+          "$ref": "#/definitions/ScoreBps"
+        },
+        "verification_pressure": {
+          "$ref": "#/definitions/ScoreBps"
+        }
+      },
+      "required": [
+        "autonomy_pressure",
+        "quarantine_pressure",
+        "repair_priority",
+        "verification_pressure"
+      ],
+      "type": "object"
+    },
+    "EvidenceBasisV1": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_refs": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ExternalArtifactRef"
+          },
+          "type": "array"
+        },
+        "evidence_result": {
+          "type": "string"
+        },
+        "reason_codes": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ReasonCode"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "evidence_result"
+      ],
+      "type": "object"
+    },
+    "ExternalArtifactRef": {
+      "additionalProperties": false,
+      "description": "Opaque reference to an external owner boundary.\n\nThis is an adapter reference only. It does not assert that SCR owns, canonicalizes, fetches, validates, or mutates the referenced object.",
+      "properties": {
+        "owner_hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ref_kind": {
+          "type": "string"
+        },
+        "ref_value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref_kind",
+        "ref_value"
+      ],
+      "type": "object"
+    },
+    "HardRuleResultV1": {
+      "additionalProperties": false,
+      "properties": {
+        "checked": {
+          "type": "boolean"
+        },
+        "reason_codes": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ReasonCode"
+          },
+          "type": "array"
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "triggered": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "checked",
+        "rule_id",
+        "triggered"
+      ],
+      "type": "object"
+    },
+    "ReasonCode": {
+      "type": "string"
+    },
+    "RejectedActionV1": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/ControlAction"
+        },
+        "reason_codes": {
+          "items": {
+            "$ref": "#/definitions/ReasonCode"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "action",
+        "reason_codes"
+      ],
+      "type": "object"
+    },
+    "ScoreAxesV1": {
+      "additionalProperties": false,
+      "description": "Separate control axes. These must not be collapsed into a truth score.",
+      "properties": {
+        "authority": {
+          "$ref": "#/definitions/ScoreBps"
+        },
+        "containment": {
+          "$ref": "#/definitions/ScoreBps"
+        },
+        "evidence_confidence": {
+          "$ref": "#/definitions/ScoreBps"
+        },
+        "hazard": {
+          "$ref": "#/definitions/ScoreBps"
+        },
+        "integrity_risk": {
+          "$ref": "#/definitions/ScoreBps"
+        },
+        "uncertainty": {
+          "$ref": "#/definitions/ScoreBps"
+        }
+      },
+      "required": [
+        "authority",
+        "containment",
+        "evidence_confidence",
+        "hazard",
+        "integrity_risk",
+        "uncertainty"
+      ],
+      "type": "object"
+    },
+    "ScoreBps": {
+      "description": "A fixed-point score in basis points, where `0` is 0% and `10000` is 100%.",
+      "format": "uint16",
+      "maximum": 10000,
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "description": "Replayable SCR decision receipt.\n\nThis is scoped to SCR-P0A evaluation and is not a replacement for upstream domain receipts.",
+  "properties": {
+    "authority_basis": {
+      "$ref": "#/definitions/AuthorityBasisV1"
+    },
+    "axes": {
+      "$ref": "#/definitions/ScoreAxesV1"
+    },
+    "canonical_policy_hash": {
+      "type": "string"
+    },
+    "chosen_action": {
+      "$ref": "#/definitions/ControlAction"
+    },
+    "derived_pressures": {
+      "$ref": "#/definitions/DerivedPressuresV1"
+    },
+    "evaluator_algorithm_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "evaluator_algorithm_id": {
+      "type": "string"
+    },
+    "evidence_basis": {
+      "$ref": "#/definitions/EvidenceBasisV1"
+    },
+    "hard_rule_results": {
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/HardRuleResultV1"
+      },
+      "type": "array"
+    },
+    "hard_rules_checked": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "hard_rules_triggered": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "input_hash": {
+      "type": "string"
+    },
+    "minimum_action_floors_applied": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "reason_codes": {
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/ReasonCode"
+      },
+      "type": "array"
+    },
+    "recorded_time": {
+      "type": "string"
+    },
+    "rejected_actions": {
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/RejectedActionV1"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "control_decision_receipt_v1",
+      "type": "string"
+    },
+    "supersession_ref": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ExternalArtifactRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "valid_time_basis": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "authority_basis",
+    "axes",
+    "canonical_policy_hash",
+    "chosen_action",
+    "derived_pressures",
+    "evaluator_algorithm_id",
+    "evidence_basis",
+    "input_hash",
+    "recorded_time",
+    "schema_version",
+    "valid_time_basis"
+  ],
+  "title": "ControlDecisionReceiptV1",
+  "type": "object"
+}

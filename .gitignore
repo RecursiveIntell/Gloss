@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 dist-ssr/
+src-tauri/target/
 
 # Logs
 logs/
@@ -35,10 +36,96 @@ lerna-debug.log*
 Thumbs.db
 .DS_Store
 
+# Python/cache output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local app/runtime state
+*.db
+*.sqlite
+*.sqlite3
+src/stores/memory/
+
 # Working files / backups
 .files/
 sr/
 Archive.tar.gz
+*.tmp
+*.bak
 
-# Claude Code
+# Local assistant/workbench state
 .claude/
+
+# Generated source packages and bundle sidecars
+/*.zip
+/*.codex-archive.json
+/*.excluded.json
+/*.findings.json
+/*.manifest.json
+/*.report.md
+/BUNDLE_MANIFEST.json
+/*.xlsx
+
+# Large generated Cargo vendor cache. Keep curated path crates in src-tauri/vendor/.
+src-tauri/vendor/crates/
+
+# Codex pass bundle scaffolding copied into the repo root.
+/ACCEPTANCE_GATES.md
+/AUDITOR_HANDOFF_TEMPLATE.md
+/AUDIT_BASIS_AND_FINDINGS.md
+/AUDIT_FINDINGS.md
+/AUDIT_TO_PASS_BRIEFING.md
+/BACKEND_COMPLETION_SPEC.md
+/COMMAND_BAR.md
+/COPY_PASTE_SEQUENCE.md
+/FEATURE_COVERAGE_MATRIX.md
+/FINAL_AUDITOR_HANDOFF.md
+/FINISHLINE_SPEC.md
+/IMPLEMENTATION_PLAN.md
+/ISSUE_MATRIX*.csv
+/ISSUE_MATRIX*.md
+/MASTER_CODEX_PROMPT.md
+/MASTER_ISSUE_MATRIX.*
+/P32R3_*.md
+/P32R3_*.csv
+/PACKAGE_SCOPE_POLICY.md
+/PASS_SPEC.md
+/PATCH_ORDER_AND_TEST_PLAN.md
+/PATCH_SPEC.md
+/PHASE_INJECTION_PROTOCOL.md
+/PHASE_ORDER.md
+/PLANS.md
+/RECEIPT_SCHEMA.json
+/RELEASE_CRITERIA.md
+/RELEASE_GATES.md
+/ROLLBACK_AND_QUARANTINE*.md
+/SECURITY_AND_PRIVACY.md
+/SOURCE_BASIS.md
+/START_HERE*.md
+/STOP_RULES.md
+/TEST_AND_REPLAY_PLAN.md
+/UI_UX_SPEC.md
+/MANUAL_INJECTIONS/
+/PHASE_PROMPTS/
+/REPORT_TEMPLATES/
+/checklists/
+/phase_prompts/
+/product_docs/
+/repo_scaffold/
+/templates/
+/install_into_gloss.sh
+/install_into_repo.py
+/run_codex_p32r3.sh
+/z.py
+/zip.py
+
+# Historical run archives are large; keep current chat runtime receipts tracked.
+docs/codex-runs/*
+!docs/codex-runs/CURRENT_RUN.md
+!docs/codex-runs/ARCHIVAL_POLICY.md
+!docs/codex-runs/CODEX_RUN_INDEX.md
+!docs/codex-runs/CHAT_RUNTIME_FIX_20260518/
+!docs/codex-runs/CHAT_RUNTIME_FIX_20260518/**

@@ -1,6 +1,7 @@
 import { useState, useMemo } from "react";
 import { useSourceStore } from "../../stores/sourceStore";
 import { open } from "@tauri-apps/plugin-dialog";
+import * as api from "../../lib/tauri";
 import type { Source } from "../../lib/types";
 import {
   FileText,
@@ -16,6 +17,8 @@ import {
   ChevronRight,
   RefreshCw,
   AlertCircle,
+  Search,
+  Layers,
 } from "lucide-react";
 
 interface SourcesPanelProps {
@@ -68,22 +71,48 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     toggleGroup,
     selectAll,
     selectNone,
-    addSourceFile,
+    addSourceFiles,
     addSourceFolder,
     deleteSource,
     addSourcePaste,
     retrySource,
+    reindexSource,
+    reindexNotebook,
+    bulkDeleteSelected,
   } = useSourceStore();
   const [showPaste, setShowPaste] = useState(false);
   const [pasteTitle, setPasteTitle] = useState("");
   const [pasteText, setPasteText] = useState("");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [typeFilter, setTypeFilter] = useState("all");
+  const [dragActive, setDragActive] = useState(false);
+  const [summarizing, setSummarizing] = useState(false);
 
   const MAX_VISIBLE_PER_GROUP = 100;
+  const MAX_EXPANDED_PER_GROUP = 300;
 
-  const groups = useMemo(() => groupSources(sources), [sources]);
+  const filteredSources = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return sources.filter((source) => {
+      if (needle && !source.title.toLowerCase().includes(needle)) return false;
+      if (statusFilter !== "all" && source.status !== statusFilter) return false;
+      if (typeFilter !== "all" && source.source_type !== typeFilter) return false;
+      return true;
+    });
+  }, [query, sources, statusFilter, typeFilter]);
+  const groups = useMemo(() => groupSources(filteredSources), [filteredSources]);
   const hasGroups = groups.size > 1 || (groups.size === 1 && !groups.has("(ungrouped)"));
+  const sourceTypes = useMemo(
+    () => Array.from(new Set(sources.map((source) => source.source_type))).sort(),
+    [sources]
+  );
+  const sourceStatuses = useMemo(
+    () => Array.from(new Set(sources.map((source) => source.status))).sort(),
+    [sources]
+  );
 
   const handleFileUpload = async () => {
     const selected = await open({
@@ -94,9 +123,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     });
     if (selected) {
       const paths = Array.isArray(selected) ? selected : [selected];
-      for (const path of paths) {
-        if (path) await addSourceFile(notebookId, path);
-      }
+      await addSourceFiles(notebookId, paths.filter(Boolean));
     }
   };
 
@@ -113,6 +140,26 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     setPasteTitle("");
     setPasteText("");
     setShowPaste(false);
+  };
+
+  const handleDrop = async (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDragActive(false);
+    const files = Array.from(event.dataTransfer.files);
+    const paths = files
+      .map((file) => (file as File & { path?: string }).path)
+      .filter((path): path is string => Boolean(path));
+    await addSourceFiles(notebookId, paths);
+  };
+
+  const handleSummarize = async () => {
+    if (summarizing) return;
+    setSummarizing(true);
+    try {
+      await api.regenerateMissingSummaries(notebookId);
+    } finally {
+      setSummarizing(false);
+    }
   };
 
   const statusColor = (status: string) => {
@@ -195,6 +242,13 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
         </button>
       )}
       <button
+        onClick={() => reindexSource(notebookId, source.id)}
+        className="hidden group-hover:block p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent"
+        title="Reindex for semantic-memory preview"
+      >
+        <Layers className="w-3 h-3" />
+      </button>
+      <button
         onClick={() => deleteSource(notebookId, source.id)}
         className="hidden group-hover:block p-0.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
       >
@@ -204,7 +258,15 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   );
 
   return (
-    <div className="flex flex-col h-full">
+    <div
+      className={`flex flex-col h-full ${dragActive ? "outline outline-2 outline-accent outline-offset-[-2px]" : ""}`}
+      onDragOver={(event) => {
+        event.preventDefault();
+        setDragActive(true);
+      }}
+      onDragLeave={() => setDragActive(false)}
+      onDrop={handleDrop}
+    >
       <div className="p-3 border-b border-border">
         <h2 className="text-sm font-semibold text-text mb-2">Sources</h2>
         <div className="flex gap-1">
@@ -229,7 +291,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
         </div>
 
         {sources.length > 0 && (
-          <div className="flex gap-2 mt-2 text-xs text-text-muted">
+          <div className="flex flex-wrap gap-2 mt-2 text-xs text-text-muted">
             <button onClick={selectAll} className="hover:text-text">
               Select all
             </button>
@@ -237,7 +299,56 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             <button onClick={selectNone} className="hover:text-text">
               None
             </button>
+            <span>|</span>
+            <button onClick={() => bulkDeleteSelected(notebookId)} className="hover:text-error">
+              Delete selected
+            </button>
+            <button onClick={() => reindexNotebook(notebookId)} className="hover:text-accent">
+              Reindex all
+            </button>
+            <button onClick={handleSummarize} className="hover:text-accent" disabled={summarizing}>
+              {summarizing ? "Queuing..." : "Summarize missing"}
+            </button>
             <span className="ml-auto">{sources.length} sources</span>
+          </div>
+        )}
+        <div className="mt-2 space-y-1.5">
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-text-muted" />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Filter sources"
+              className="w-full rounded border border-border bg-bg-tertiary py-1 pl-7 pr-2 text-xs text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-1">
+            <select
+              value={statusFilter}
+              onChange={(event) => setStatusFilter(event.target.value)}
+              className="rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text focus:border-accent focus:outline-none"
+            >
+              <option value="all">All statuses</option>
+              {sourceStatuses.map((status) => (
+                <option key={status} value={status}>{status}</option>
+              ))}
+            </select>
+            <select
+              value={typeFilter}
+              onChange={(event) => setTypeFilter(event.target.value)}
+              className="rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text focus:border-accent focus:outline-none"
+            >
+              <option value="all">All types</option>
+              {sourceTypes.map((type) => (
+                <option key={type} value={type}>{type}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        {dragActive && (
+          <div className="mt-2 flex items-center gap-1.5 rounded border border-accent/40 bg-accent/10 px-2 py-1 text-xs text-accent">
+            <Upload className="h-3 w-3" />
+            Drop files to import
           </div>
         )}
       </div>
@@ -314,8 +425,9 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
                 </div>
                 {!isCollapsed && (() => {
                   const isExpanded = expandedGroups.has(group);
-                  const visible = isExpanded ? groupSources : groupSources.slice(0, MAX_VISIBLE_PER_GROUP);
-                  const hasMore = groupSources.length > MAX_VISIBLE_PER_GROUP && !isExpanded;
+                  const limit = isExpanded ? MAX_EXPANDED_PER_GROUP : MAX_VISIBLE_PER_GROUP;
+                  const visible = groupSources.slice(0, limit);
+                  const hasMore = groupSources.length > visible.length;
                   return (
                     <div className="pl-4">
                       {visible.map(renderSourceCard)}
@@ -328,7 +440,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
                           })}
                           className="w-full text-center text-xs text-accent hover:text-accent-hover py-1"
                         >
-                          Show all {groupSources.length} ({groupSources.length - MAX_VISIBLE_PER_GROUP} more)
+                          Show more ({groupSources.length - visible.length} hidden)
                         </button>
                       )}
                     </div>
@@ -339,8 +451,9 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
           })
         ) : (() => {
           const isExpanded = expandedGroups.has("__ungrouped__");
-          const visible = isExpanded ? sources : sources.slice(0, MAX_VISIBLE_PER_GROUP);
-          const hasMore = sources.length > MAX_VISIBLE_PER_GROUP && !isExpanded;
+          const limit = isExpanded ? MAX_EXPANDED_PER_GROUP : MAX_VISIBLE_PER_GROUP;
+          const visible = filteredSources.slice(0, limit);
+          const hasMore = filteredSources.length > visible.length;
           return (
             <>
               {visible.map(renderSourceCard)}
@@ -353,7 +466,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
                   })}
                   className="w-full text-center text-xs text-accent hover:text-accent-hover py-1"
                 >
-                  Show all {sources.length} ({sources.length - MAX_VISIBLE_PER_GROUP} more)
+                  Show more ({filteredSources.length - visible.length} hidden)
                 </button>
               )}
             </>
@@ -363,6 +476,11 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
         {sources.length === 0 && (
           <p className="text-xs text-text-muted text-center mt-4 px-2">
             No sources yet. Upload files, add a folder, or paste text.
+          </p>
+        )}
+        {sources.length > 0 && filteredSources.length === 0 && (
+          <p className="text-xs text-text-muted text-center mt-4 px-2">
+            No sources match the current filters.
           </p>
         )}
       </div>

@@ -2,14 +2,14 @@ use crate::db::app_db::AppDb;
 use crate::db::notebook_db::NotebookDb;
 use crate::error::GlossError;
 use crate::ingestion::embed::{EmbeddingService, HnswIndex};
+use crate::provider_config_store::SecretStore;
 use crate::providers::ModelRegistry;
 use crate::retrieval::hybrid_search::{self, SearchResult};
 use crate::retrieval::source_scope::ResolvedSourceScope;
-use crate::secrets::SecretStore;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
 use tokio::sync::Semaphore;
 
@@ -19,6 +19,14 @@ use tokio::sync::Semaphore;
 pub const NATIVE_SEMANTIC_INDEXING_ENABLED: bool = false;
 pub const SUMMARY_MODE_AUTO: &str = "auto";
 pub const SUMMARY_MODE_MANUAL: &str = "manual";
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RuntimeGateOwner {
+    pub gate: String,
+    pub owner: String,
+    pub detail: String,
+    pub since_ms: u64,
+}
 
 /// Global application state managed by Tauri
 pub struct AppState {
@@ -43,7 +51,7 @@ pub struct AppState {
     pub summary_paused: AtomicBool,
     /// Number of sources currently being ingested (extract/chunk/embed).
     /// Summary loop yields while this is > 0.
-    pub ingestion_active: AtomicU32,
+    pub ingestion_active: Arc<AtomicU32>,
 
     // --- Scheduling primitives (CLAUDE.md contracts) ---
     /// Single-flight LLM/GPU gate: at most one inference request in-flight.
@@ -52,6 +60,8 @@ pub struct AppState {
     /// GPU memory gate: prevents concurrent ONNX embedding + Ollama inference.
     /// Must be acquired before any GPU-intensive operation (embedding, LLM calls).
     pub gpu_gate: Semaphore,
+    /// Current runtime gate owners for user-visible contention diagnostics.
+    pub gate_owners: Mutex<HashMap<String, RuntimeGateOwner>>,
     /// Currently active notebook ID. Summary worker idles when None.
     pub active_notebook_id: Mutex<Option<String>>,
     /// Epoch counter incremented on notebook switch. Used for soft-cancel of
@@ -71,6 +81,17 @@ impl AppState {
             .get_setting("summary_mode")?
             .unwrap_or_else(|| SUMMARY_MODE_MANUAL.to_string());
         Ok(summary_mode != SUMMARY_MODE_AUTO)
+    }
+
+    pub fn summary_mode_is_auto(&self) -> Result<bool, GlossError> {
+        let app_db = self
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        Ok(app_db
+            .get_setting("summary_mode")?
+            .unwrap_or_else(|| SUMMARY_MODE_MANUAL.to_string())
+            == SUMMARY_MODE_AUTO)
     }
 
     fn migrate_legacy_secrets(
@@ -158,6 +179,36 @@ impl AppState {
 
         let db_path = data_dir.join("gloss.db");
         let app_db = AppDb::open(&db_path)?;
+        if app_db.get_setting("memory_backend")?.is_none() {
+            app_db.set_setting("memory_backend", "gloss-local")?;
+        }
+        if app_db.get_setting("memory_backend_fallback")?.is_none() {
+            app_db.set_setting("memory_backend_fallback", "true")?;
+        }
+        if app_db
+            .get_setting("semantic_memory_embedding_url")?
+            .is_none()
+        {
+            app_db.set_setting("semantic_memory_embedding_url", "http://localhost:11434")?;
+        }
+        if app_db
+            .get_setting("semantic_memory_embedding_model")?
+            .is_none()
+        {
+            app_db.set_setting("semantic_memory_embedding_model", "nomic-embed-text")?;
+        }
+        if app_db
+            .get_setting("semantic_memory_embedding_timeout_secs")?
+            .is_none()
+        {
+            app_db.set_setting("semantic_memory_embedding_timeout_secs", "10")?;
+        }
+        if app_db
+            .get_setting("semantic_memory_search_timeout_ms")?
+            .is_none()
+        {
+            app_db.set_setting("semantic_memory_search_timeout_ms", "8000")?;
+        }
         let secret_store = SecretStore::new(&data_dir)?;
         Self::migrate_legacy_secrets(&app_db, &secret_store)?;
         Self::reconcile_notebook_source_counts(&app_db)?;
@@ -176,9 +227,10 @@ impl AppState {
             embedder: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
             summary_paused: AtomicBool::new(summary_starts_paused),
-            ingestion_active: AtomicU32::new(0),
+            ingestion_active: Arc::new(AtomicU32::new(0)),
             llm_gate: Semaphore::new(1),
             gpu_gate: Semaphore::new(1),
+            gate_owners: Mutex::new(HashMap::new()),
             active_notebook_id: Mutex::new(None),
             active_epoch: AtomicU64::new(0),
             chat_grace_until: Mutex::new(0),
@@ -379,6 +431,46 @@ impl AppState {
             && self.get_active_epoch() == epoch
     }
 
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    pub fn set_gate_owner(&self, gate: &str, owner: &str, detail: &str) {
+        let mut owners = self.gate_owners.lock().unwrap_or_else(|e| e.into_inner());
+        owners.insert(
+            gate.to_string(),
+            RuntimeGateOwner {
+                gate: gate.to_string(),
+                owner: owner.to_string(),
+                detail: detail.to_string(),
+                since_ms: Self::now_ms(),
+            },
+        );
+    }
+
+    pub fn clear_gate_owner(&self, gate: &str, owner: &str) {
+        let mut owners = self.gate_owners.lock().unwrap_or_else(|e| e.into_inner());
+        if owners
+            .get(gate)
+            .map(|current| current.owner == owner)
+            .unwrap_or(false)
+        {
+            owners.remove(gate);
+        }
+    }
+
+    pub fn gate_owners_snapshot(&self) -> Vec<RuntimeGateOwner> {
+        self.gate_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// Bump the chat grace window to now + 15 seconds.
     pub fn bump_chat_grace(&self) {
         let until = std::time::SystemTime::now()
@@ -432,7 +524,7 @@ impl AppState {
         now.saturating_sub(*last) / 1000
     }
 
-    fn notebook_db_path(&self, notebook_id: &str) -> Result<PathBuf, GlossError> {
+    pub(crate) fn notebook_db_path(&self, notebook_id: &str) -> Result<PathBuf, GlossError> {
         {
             let dbs = self
                 .notebook_dbs
@@ -531,11 +623,85 @@ impl AppState {
     }
 }
 
+/// RAII guard for background activity counters that must not remain elevated
+/// after an early return, panic unwind, or dropped async task.
+pub struct ActiveCounterGuard {
+    counter: Arc<AtomicU32>,
+    label: &'static str,
+    active: bool,
+}
+
+impl ActiveCounterGuard {
+    pub fn new(counter: &Arc<AtomicU32>, label: &'static str) -> Self {
+        let active = counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .is_ok();
+        if !active {
+            tracing::warn!(
+                counter = label,
+                "Background activity counter guard could not increment saturated counter"
+            );
+        }
+        Self {
+            counter: Arc::clone(counter),
+            label,
+            active,
+        }
+    }
+}
+
+impl Drop for ActiveCounterGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if self
+            .counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_sub(1)
+            })
+            .is_err()
+        {
+            self.active = false;
+            tracing::warn!(
+                counter = self.label,
+                "Background activity counter finalizer found an already-zero counter"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::notebook_db::Source;
     use tempfile::tempdir;
+
+    #[test]
+    fn active_counter_guard_finalizes_on_drop_and_saturates() {
+        let counter = Arc::new(AtomicU32::new(0));
+        {
+            let _guard = ActiveCounterGuard::new(&counter, "test");
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        {
+            let guard = ActiveCounterGuard::new(&counter, "test");
+            counter.store(0, Ordering::SeqCst);
+            drop(guard);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        counter.store(u32::MAX, Ordering::SeqCst);
+        {
+            let _guard = ActiveCounterGuard::new(&counter, "test");
+            assert_eq!(counter.load(Ordering::SeqCst), u32::MAX);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), u32::MAX);
+    }
 
     #[test]
     fn test_reconcile_notebook_source_counts() {

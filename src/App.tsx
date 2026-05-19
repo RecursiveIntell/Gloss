@@ -7,7 +7,7 @@ import { useNotebookStore } from "./stores/notebookStore";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useToastStore } from "./stores/toastStore";
-import { onChatToken, onChatError, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
+import { onChatToken, onChatStatus, onChatError, onChatEvidence, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
 import { useSourceStore } from "./stores/sourceStore";
 import { setActiveNotebook } from "./lib/tauri";
 
@@ -49,8 +49,6 @@ export function App() {
   // Listen for chat token events
   useEffect(() => {
     const unlisten = onChatToken((payload) => {
-      const activeNotebookId = useNotebookStore.getState().activeNotebookId;
-      if (payload.notebook_id !== activeNotebookId) return;
       const chatStore = useChatStore.getState();
       if (payload.token) {
         chatStore.appendToken(
@@ -71,11 +69,17 @@ export function App() {
     return () => { unlisten.then(fn => fn()); };
   }, []);
 
+  // Listen for chat lifecycle status events
+  useEffect(() => {
+    const unlisten = onChatStatus((payload) => {
+      useChatStore.getState().setStreamingStatus(payload);
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
   // Listen for chat error events
   useEffect(() => {
     const unlisten = onChatError((payload) => {
-      const activeNotebookId = useNotebookStore.getState().activeNotebookId;
-      if (payload.notebook_id !== activeNotebookId) return;
       const chatStore = useChatStore.getState();
       chatStore.setStreamingError(
         payload.notebook_id,
@@ -93,11 +97,23 @@ export function App() {
     return () => { unlisten.then(fn => fn()); };
   }, []);
 
+  useEffect(() => {
+    const unlisten = onChatEvidence((payload) => {
+      useChatStore.getState().attachAssistantEvidence(
+        payload.notebook_id,
+        payload.conversation_id,
+        payload.message_id,
+        { citations: payload.citations, evidence: payload.evidence }
+      );
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
   // Listen for source status events — BATCHED + THROTTLED
   useEffect(() => {
     const unlisten = onSourceStatus((payload) => {
-      const activeNotebookId = useNotebookStore.getState().activeNotebookId;
-      if (payload.notebook_id !== activeNotebookId) return;
+      const currentNotebookId = useNotebookStore.getState().activeNotebookId;
+      if (payload.notebook_id !== currentNotebookId) return;
 
       // Accumulate into pending map (latest status wins per source)
       pendingStatusRef.current.set(payload.source_id, {

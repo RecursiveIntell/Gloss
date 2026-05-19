@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://recursiveintell.local/schemas/turbo-quant/codec_profile_v1.schema.json",
+  "title": "CodecProfileV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "crate",
+    "crate_version",
+    "codec_kind",
+    "dim",
+    "bits",
+    "seed",
+    "rotation_kind",
+    "storage_layout",
+    "score_semantics"
+  ],
+  "properties": {
+    "schema": {
+      "const": "CodecProfileV1"
+    },
+    "crate": {
+      "type": "string"
+    },
+    "crate_version": {
+      "type": "string"
+    },
+    "codec_kind": {
+      "type": "string"
+    },
+    "dim": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "bits": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16
+    },
+    "projections": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "seed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rotation_kind": {
+      "type": "string"
+    },
+    "storage_layout": {
+      "type": "string"
+    },
+    "codebook_kind": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "qjl_enabled": {
+      "type": "boolean"
+    },
+    "score_semantics": {
+      "type": "string"
+    },
+    "profile_digest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

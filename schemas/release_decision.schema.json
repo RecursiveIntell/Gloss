@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "decision": {
+      "enum": [
+        "eligible",
+        "blocked"
+      ]
+    },
+    "default_backend": {
+      "const": "gloss-local"
+    },
+    "p0_gates": {
+      "type": "array"
+    },
+    "residual_risks": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "run_id": {
+      "const": "GLOSS_COMPLETION_AND_UX_RELEASE_CANDIDATE_P3_20260513"
+    },
+    "semantic_memory_status": {
+      "enum": [
+        "not_promoted",
+        "promotable_preview",
+        "safe_to_default_candidate",
+        "blocked"
+      ]
+    }
+  },
+  "required": [
+    "run_id",
+    "decision",
+    "default_backend",
+    "semantic_memory_status",
+    "p0_gates"
+  ],
+  "title": "Gloss Release Decision",
+  "type": "object"
+}

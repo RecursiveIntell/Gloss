@@ -4,7 +4,7 @@ import { useNotebookStore } from "../../stores/notebookStore";
 import { useToastStore } from "../../stores/toastStore";
 import { onEmbeddingModelStatus } from "../../lib/events";
 import * as api from "../../lib/tauri";
-import type { QueueStatus } from "../../lib/types";
+import type { MemoryBackendStatus, QueueStatus } from "../../lib/types";
 import {
   Wifi,
   WifiOff,
@@ -20,19 +20,41 @@ import { useState, useEffect, useCallback } from "react";
 export function StatusBar() {
   const activeModel = useSettingsStore((s) => s.activeModel);
   const models = useSettingsStore((s) => s.models);
+  const settings = useSettingsStore((s) => s.settings);
   const stats = useSourceStore((s) => s.stats);
   const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
   const [chatConnected, setChatConnected] = useState(false);
   const [backgroundConnected, setBackgroundConnected] = useState(false);
   const [embeddingStatus, setEmbeddingStatus] = useState<string | null>(null);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
+  const [memoryStatus, setMemoryStatus] = useState<MemoryBackendStatus | null>(null);
   const [generating, setGenerating] = useState(false);
+  const [healthOpen, setHealthOpen] = useState(false);
   const testProvider = useSettingsStore((s) => s.testProvider);
-  const activeProviderId =
-    models.find((model) => model.id === activeModel)?.provider_id ?? "ollama";
+  const selectedProviderId = settings["default_provider"] || null;
+  const activeModelRecord =
+    models.find(
+      (model) =>
+        model.id === activeModel &&
+        (!selectedProviderId || model.provider_id === selectedProviderId),
+    ) ?? models.find((model) => model.id === activeModel);
+  const activeProviderId = activeModelRecord?.provider_id ?? selectedProviderId;
+  const selectedModelPresent = Boolean(activeModelRecord);
+  const selectedModelAvailable = Boolean(
+    activeModelRecord && activeModelRecord.available && !activeModelRecord.stale,
+  );
+  const selectedModelIssue = !selectedModelPresent
+    ? "Selected model missing"
+    : !selectedModelAvailable
+      ? activeModelRecord?.last_error || "Selected model unavailable"
+      : null;
   const backgroundProviderId = queueStatus?.summary_backend.provider_id ?? null;
 
   useEffect(() => {
+    if (!activeProviderId) {
+      setChatConnected(false);
+      return;
+    }
     testProvider(activeProviderId).then(setChatConnected);
     const interval = setInterval(() => {
       testProvider(activeProviderId).then(setChatConnected);
@@ -71,6 +93,7 @@ export function StatusBar() {
   useEffect(() => {
     const poll = () => {
       api.getQueueStatus().then(setQueueStatus).catch(() => {});
+      api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => {});
       if (activeNotebookId) {
         useSourceStore.getState().loadStats(activeNotebookId);
       }
@@ -123,6 +146,11 @@ export function StatusBar() {
   const pendingCount = queueStatus
     ? queueStatus.pending + queueStatus.processing
     : 0;
+  const gateOwnerLabel = queueStatus?.gate_owners.length
+    ? queueStatus.gate_owners
+        .map((owner) => `${owner.gate}: ${owner.owner} (${owner.detail})`)
+        .join(", ")
+    : null;
   const missingSummaries = stats?.missing_summaries ?? 0;
   const isProcessing = pendingCount > 0;
   const isPaused = queueStatus?.paused ?? false;
@@ -131,6 +159,16 @@ export function StatusBar() {
   const summaryBackendReady = queueStatus?.summary_backend.ready ?? false;
   const canGenerate = needsSummaries && summaryBackendReady && backgroundConnected;
   const summaryDiagnostic = queueStatus?.summary_backend.diagnostic ?? null;
+  const memoryBackendLabel = memoryStatus
+    ? memoryStatus.backend_used !== memoryStatus.active_backend
+      ? `${memoryStatus.backend_used} fallback`
+      : memoryStatus.active_backend
+    : "gloss-local";
+  const memoryTooltip =
+    memoryStatus?.fallback_reason ||
+    memoryStatus?.diagnostic ||
+    memoryStatus?.semantic_memory_path ||
+    undefined;
   const backgroundStatus = !summaryBackendReady
     ? "Config error"
     : backgroundConnected
@@ -146,14 +184,63 @@ export function StatusBar() {
         ) : (
           <WifiOff className="w-3 h-3 text-error" />
         )}
-        <span>{chatConnected ? "Chat connected" : "Chat disconnected"}</span>
+        <span>
+          {activeProviderId
+            ? chatConnected
+              ? "Provider reachable"
+              : "Provider unreachable"
+            : "Provider unknown"}
+        </span>
       </div>
       <div className="flex items-center gap-1.5">
-        <span>Chat provider: {activeProviderId}</span>
+        <span>Chat provider: {activeProviderId ?? "unknown"}</span>
       </div>
-      <div className="flex items-center gap-1.5">
-        <span>Chat model: {activeModel}</span>
+      <div
+        className={`flex items-center gap-1.5 ${selectedModelAvailable ? "" : "text-warning"}`}
+        title={selectedModelIssue ?? undefined}
+      >
+        {!selectedModelAvailable && <AlertTriangle className="w-3 h-3 text-warning" />}
+        <span>
+          Chat model: {activeModel}
+          {selectedModelIssue ? ` (${selectedModelIssue})` : ""}
+        </span>
       </div>
+      <button
+        onClick={() => setHealthOpen((open) => !open)}
+        className="relative flex items-center gap-1.5 hover:text-text"
+        title={memoryTooltip}
+      >
+        {memoryStatus?.degraded ? (
+          <AlertTriangle className="w-3 h-3 text-warning" />
+        ) : (
+          <Database className="w-3 h-3" />
+        )}
+        <span>
+          Memory: {memoryBackendLabel}
+          {memoryStatus?.index_sync_status &&
+            memoryStatus.index_sync_status !== "unknown" &&
+            ` (${memoryStatus.index_sync_status})`}
+        </span>
+        {healthOpen && (
+          <div className="absolute bottom-6 left-0 z-40 w-80 rounded border border-border bg-bg-secondary p-3 text-left text-xs shadow-xl">
+            <div className="mb-2 font-medium text-text">Health</div>
+            <div className="space-y-1 text-text-secondary">
+              <HealthLine label="Backend requested" value={memoryStatus?.active_backend ?? "gloss-local"} />
+              <HealthLine label="Backend used" value={memoryStatus?.backend_used ?? "gloss-local"} />
+              <HealthLine label="Default backend" value={memoryStatus?.default_backend ?? "gloss-local"} />
+              <HealthLine label="Fallback" value={memoryStatus?.fallback_reason ?? "none"} />
+              <HealthLine label="Index state" value={memoryStatus?.index_sync_status ?? "unknown"} />
+              <HealthLine label="Preview feature" value={memoryStatus?.semantic_memory_feature_enabled ? "enabled" : "disabled"} />
+              <HealthLine label="Preview availability" value={memoryStatus?.semantic_memory_available ? "available" : "not active"} />
+              {memoryStatus?.degradation_markers.length ? (
+                <HealthLine label="Degraded" value={memoryStatus.degradation_markers.join(", ")} />
+              ) : (
+                <HealthLine label="Degraded" value="no" />
+              )}
+            </div>
+          </div>
+        )}
+      </button>
       <div
         className="flex items-center gap-1.5"
         title={summaryDiagnostic || summaryModelLabel}
@@ -171,6 +258,12 @@ export function StatusBar() {
       {embeddingStatus && (
         <div className="flex items-center gap-1.5 text-accent">
           <span className="animate-pulse">{embeddingStatus}</span>
+        </div>
+      )}
+
+      {gateOwnerLabel && (
+        <div className="flex items-center gap-1.5 text-text-muted" title={gateOwnerLabel}>
+          <span>Runtime: {gateOwnerLabel}</span>
         </div>
       )}
 
@@ -249,6 +342,15 @@ export function StatusBar() {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function HealthLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid grid-cols-[7.5rem_1fr] gap-2">
+      <span className="text-text-muted">{label}</span>
+      <span className="break-words text-text-secondary">{value}</span>
     </div>
   );
 }

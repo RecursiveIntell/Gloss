@@ -1,0 +1,88 @@
+
+> gloss@1.0.0 tauri
+> tauri dev
+
+     Running BeforeDevCommand (`npm run dev`)
+
+> gloss@1.0.0 dev
+> vite
+
+
+  VITE v7.3.3  ready in 1048 ms
+
+  ➜  Local:   http://localhost:1420/
+     Running DevCommand (`cargo  run --no-default-features --color always --`)
+        Info Watching /home/sikmindz/Coding/Gloss/src-tauri for changes...
+[1m[92m   Compiling[0m gloss v1.0.0 (/home/sikmindz/Coding/Gloss/src-tauri)
+[1m[96m    Building[0m [=======================> ] 824/828: gloss(build.rs)             [1m[96m    Building[0m [=======================> ] 825/828: gloss(build)                [1m[96m    Building[0m [=======================> ] 826/828: gloss                       [1m[96m    Building[0m [=======================> ] 827/828: gloss(bin)                  [K[1m[92m    Finished[0m ]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\`dev` profile [unoptimized + debuginfo]]8;;\ target(s) in 1m 15s
+[1m[92m     Running[0m `target/debug/gloss`
+2026-05-18T22:23:07.344702Z  INFO gloss_lib::state: Gloss initialized data_dir=/home/sikmindz/.local/share/gloss
+2026-05-18T22:23:12.374858Z  INFO gloss_lib: Summary job loop started
+5:23:19 PM [vite] Internal server error: The service is no longer running: write EPIPE
+  Plugin: vite:esbuild
+  File: /home/sikmindz/Coding/Gloss/src/main.tsx
+      at /home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:718:38
+      at sendRequest (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:599:36)
+      at start (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:717:9)
+      at Object.transform2 [as transform] (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:778:5)
+      at /home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:2043:77
+      at new Promise (<anonymous>)
+      at Object.transform (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:2043:36)
+      at transform (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:1878:62)
+      at transformWithEsbuild (file:///home/sikmindz/Coding/Gloss/node_modules/vite/dist/node/chunks/config.js:6123:24)
+      at async TransformPluginContext.transform (file:///home/sikmindz/Coding/Gloss/node_modules/vite/dist/node/chunks/config.js:6172:20)
+5:23:19 PM [vite] Internal server error: The service is no longer running: write EPIPE
+  Plugin: vite:esbuild
+  File: /home/sikmindz/Coding/Gloss/src/App.tsx
+      at /home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:718:38
+      at sendRequest (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:599:36)
+      at start (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:717:9)
+      at Object.transform2 [as transform] (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:778:5)
+      at /home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:2043:77
+      at new Promise (<anonymous>)
+      at Object.transform (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:2043:36)
+      at transform (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:1878:62)
+      at transformWithEsbuild (file:///home/sikmindz/Coding/Gloss/node_modules/vite/dist/node/chunks/config.js:6123:24)
+      at async TransformPluginContext.transform (file:///home/sikmindz/Coding/Gloss/node_modules/vite/dist/node/chunks/config.js:6172:20)
+5:23:19 PM [vite] (client) Pre-transform error: The service is no longer running: write EPIPE
+  Plugin: vite:esbuild
+  File: /home/sikmindz/Coding/Gloss/src/main.tsx
+5:23:19 PM [vite] Internal server error: The service is no longer running: write EPIPE
+  Plugin: vite:esbuild
+  File: /home/sikmindz/Coding/Gloss/src/components/notebooks/NotebookSidebar.tsx
+      at /home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:718:38
+      at sendRequest (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:599:36)
+      at start (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:717:9)
+      at Object.transform2 [as transform] (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:778:5)
+      at /home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:2043:77
+      at new Promise (<anonymous>)
+      at Object.transform (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:2043:36)
+      at transform (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:1878:62)
+      at transformWithEsbuild (file:///home/sikmindz/Coding/Gloss/node_modules/vite/dist/node/chunks/config.js:6123:24)
+      at async TransformPluginContext.transform (file:///home/sikmindz/Coding/Gloss/node_modules/vite/dist/node/chunks/config.js:6172:20)
+5:23:19 PM [vite] Internal server error: The service is no longer running: write EPIPE
+  Plugin: vite:esbuild
+  File: /home/sikmindz/Coding/Gloss/src/components/layout/PanelLayout.tsx
+      at /home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:718:38
+      at sendRequest (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:599:36)
+      at start (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:717:9)
+      at Object.transform2 [as transform] (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:778:5)
+      at /home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:2043:77
+      at new Promise (<anonymous>)
+      at Object.transform (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:2043:36)
+      at transform (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:1878:62)
+      at transformWithEsbuild (file:///home/sikmindz/Coding/Gloss/node_modules/vite/dist/node/chunks/config.js:6123:24)
+      at async TransformPluginContext.transform (file:///home/sikmindz/Coding/Gloss/node_modules/vite/dist/node/chunks/config.js:6172:20)
+5:23:19 PM [vite] Internal server error: The service is no longer running: write EPIPE
+  Plugin: vite:esbuild
+  File: /home/sikmindz/Coding/Gloss/src/components/layout/StatusBar.tsx
+      at /home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:718:38
+      at sendRequest (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:599:36)
+      at start (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:717:9)
+      at Object.transform2 [as transform] (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:778:5)
+      at /home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:2043:77
+      at new Promise (<anonymous>)
+      at Object.transform (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:2043:36)
+      at transform (/home/sikmindz/Coding/Gloss/node_modules/esbuild/lib/main.js:1878:62)
+      at transformWithEsbuild (file:///home/sikmindz/Coding/Gloss/node_modules/vite/dist/node/chunks/config.js:6123:24)
+      at async TransformPluginContext.transform (file:///home/sikmindz/Coding/Gloss/node_modules/vite/dist/node/chunks/config.js:6172:20)

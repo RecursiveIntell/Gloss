@@ -3,13 +3,19 @@
 //! ## Digest law (from MASTER_SUPPORTING_DELTA §7)
 //!
 //! The digest algorithm for export/import idempotency is:
-//! - Deterministic canonical serialization (JSON with sorted keys, no trailing whitespace)
+//! - Deterministic canonical serialization using normalized JSON object keys
+//!   and deterministic recursive traversal
 //! - UTF-8 encoding
 //! - BLAKE3 hash
 //! - Hex-encoded output (64 chars)
 //!
 //! The digest domain (which fields are included) is defined per envelope type.
 //! Bridge and importer must agree exactly on which fields are digested.
+//!
+//! `compute_json()` and `DigestBuilder::update_json()` do not trust map key order from
+//! transient serializer internals. Inputs that serialize to JSON objects are normalized
+//! before hashing so callers may use map-like structures without silently introducing
+//! unstable key-order behavior.
 //!
 //! ## Usage
 //!
@@ -20,12 +26,16 @@
 //! assert_eq!(digest.hex().len(), 64);
 //! ```
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// A BLAKE3 content digest for idempotent deduplication.
 ///
 /// The inner value is a 64-character hex string representing the BLAKE3 hash.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct ContentDigest(pub String);
 
@@ -44,15 +54,19 @@ impl ContentDigest {
     /// Compute a digest from a JSON-serializable value using canonical serialization.
     ///
     /// Canonical serialization means:
-    /// - `serde_json::to_string()` (compact, no trailing whitespace)
-    /// - The caller is responsible for ensuring field ordering is stable
-    ///   (use `#[serde(sort_keys)]` or `BTreeMap` for maps).
+    /// - JSON object key ordering is normalized recursively.
+    /// - `serde_json::to_string()` (compact, no trailing whitespace).
     ///
     /// For structured data with guaranteed field order (structs with named fields),
     /// serde_json produces deterministic output by default.
     pub fn compute_json<T: Serialize>(value: &T) -> Result<Self, DigestError> {
+        let canonical = canonicalize_json_value(serde_json::to_value(value).map_err(|e| {
+            DigestError::SerializationFailed {
+                reason: e.to_string(),
+            }
+        })?);
         let canonical =
-            serde_json::to_string(value).map_err(|e| DigestError::SerializationFailed {
+            serde_json::to_string(&canonical).map_err(|e| DigestError::SerializationFailed {
                 reason: e.to_string(),
             })?;
         Ok(Self::compute_str(&canonical))
@@ -134,8 +148,13 @@ impl DigestBuilder {
         &mut self,
         value: &T,
     ) -> Result<&mut Self, DigestError> {
+        let canonical = canonicalize_json_value(serde_json::to_value(value).map_err(|e| {
+            DigestError::SerializationFailed {
+                reason: e.to_string(),
+            }
+        })?);
         let canonical =
-            serde_json::to_string(value).map_err(|e| DigestError::SerializationFailed {
+            serde_json::to_string(&canonical).map_err(|e| DigestError::SerializationFailed {
                 reason: e.to_string(),
             })?;
         self.hasher.update(canonical.as_bytes());
@@ -146,6 +165,27 @@ impl DigestBuilder {
     pub fn finalize(self) -> ContentDigest {
         let hash = self.hasher.finalize();
         ContentDigest(hash.to_hex().to_string())
+    }
+}
+
+fn canonicalize_json_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries = map
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_json_value(value)))
+                .collect::<Vec<(String, Value)>>();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut ordered = serde_json::Map::new();
+            for (key, value) in entries {
+                ordered.insert(key, value);
+            }
+            Value::Object(ordered)
+        }
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(canonicalize_json_value).collect())
+        }
+        other => other,
     }
 }
 
@@ -162,6 +202,15 @@ pub enum DigestError {
     SerializationFailed { reason: String },
     /// The provided digest string is invalid.
     InvalidDigest { reason: String },
+}
+
+impl DigestError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::SerializationFailed { .. } => "serialization_failed",
+            Self::InvalidDigest { .. } => "invalid_digest",
+        }
+    }
 }
 
 impl std::fmt::Display for DigestError {
@@ -182,7 +231,7 @@ impl std::error::Error for DigestError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn compute_and_verify_length() {
@@ -219,6 +268,36 @@ mod tests {
 
         // BTreeMap ensures sorted keys → same digest regardless of insertion order
         assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn compute_json_normalizes_hash_map_key_order() {
+        let mut unsorted = HashMap::new();
+        unsorted.insert("b", "two");
+        unsorted.insert("a", "one");
+
+        let mut reordered = HashMap::new();
+        reordered.insert("a", "one");
+        reordered.insert("b", "two");
+
+        let left = ContentDigest::compute_json(&unsorted).unwrap();
+        let right = ContentDigest::compute_json(&reordered).unwrap();
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn compute_json_matches_pinned_golden_digest() {
+        let mut ordered = BTreeMap::new();
+        ordered.insert("a", serde_json::json!({ "z": 1, "y": [3, 2, 1] }));
+        ordered.insert("b", serde_json::json!("two"));
+
+        let digest = ContentDigest::compute_json(&ordered).unwrap();
+
+        assert_eq!(
+            digest.hex(),
+            "5359182562bfb1083acba7077061a75d451f373026ae4a79c28118403f58cb1f"
+        );
     }
 
     #[test]

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://recursiveintell.local/schemas/turbo-quant/benchmark_receipt_v1.schema.json",
+  "title": "BenchmarkReceiptV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "profile",
+    "corpus",
+    "metrics",
+    "commands"
+  ],
+  "properties": {
+    "schema": {
+      "const": "BenchmarkReceiptV1"
+    },
+    "profile": {
+      "$ref": "codec_profile_v1.schema.json"
+    },
+    "corpus": {
+      "type": "object"
+    },
+    "metrics": {
+      "type": "object"
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

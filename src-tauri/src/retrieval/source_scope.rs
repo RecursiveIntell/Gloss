@@ -47,7 +47,7 @@ impl ResolvedSourceScope {
 
     pub fn allows(&self, source_id: &str) -> bool {
         match self.kind {
-            ResolvedSourceScopeKind::All => true,
+            ResolvedSourceScopeKind::All => self.source_ids.iter().any(|id| id == source_id),
             ResolvedSourceScopeKind::Explicit => self.source_ids.iter().any(|id| id == source_id),
             ResolvedSourceScopeKind::None => false,
         }
@@ -133,6 +133,7 @@ mod tests {
         assert_eq!(resolved.manifest_sources().len(), 2);
         assert!(resolved.allows("a"));
         assert!(resolved.allows("b"));
+        assert!(!resolved.allows("deleted"));
     }
 
     #[test]
@@ -157,5 +158,64 @@ mod tests {
         assert!(resolved.source_ids().is_empty());
         assert!(resolved.manifest_sources().is_empty());
         assert!(!resolved.allows("a"));
+    }
+
+    #[test]
+    fn source_scope_none_returns_no_manifest_or_passages() {
+        let all_sources = vec![source("a", "Alpha"), source("b", "Beta")];
+
+        let resolved = SourceScope::None.resolve(&all_sources);
+
+        assert_eq!(resolved.kind(), ResolvedSourceScopeKind::None);
+        assert!(resolved.source_ids().is_empty());
+        assert!(resolved.manifest_sources().is_empty());
+        assert!(!resolved.allows("a"));
+        assert!(!resolved.allows("b"));
+    }
+
+    #[test]
+    fn explicit_scope_dedupes_and_preserves_order_without_widening() {
+        let all_sources = vec![
+            source("a", "Alpha"),
+            source("b", "Beta"),
+            source("c", "Gamma"),
+        ];
+
+        let resolved =
+            SourceScope::Explicit(vec!["b".to_string(), "b".to_string(), "a".to_string()])
+                .resolve(&all_sources);
+
+        assert_eq!(resolved.kind(), ResolvedSourceScopeKind::Explicit);
+        assert_eq!(resolved.source_ids(), &["b".to_string(), "a".to_string()]);
+        assert!(resolved.allows("a"));
+        assert!(resolved.allows("b"));
+        assert!(!resolved.allows("c"));
+    }
+
+    #[test]
+    fn explicit_scope_with_one_valid_and_invalid_stays_bounded_to_valid() {
+        let all_sources = vec![source("a", "Alpha"), source("b", "Beta")];
+
+        let resolved = SourceScope::Explicit(vec!["missing".to_string(), "a".to_string()])
+            .resolve(&all_sources);
+
+        assert_eq!(resolved.kind(), ResolvedSourceScopeKind::Explicit);
+        assert_eq!(resolved.source_ids(), &["a".to_string()]);
+        assert_eq!(resolved.manifest_sources().len(), 1);
+        assert!(resolved.allows("a"));
+        assert!(!resolved.allows("b"));
+    }
+
+    #[test]
+    fn explicit_scope_treats_sql_fts_payload_as_data() {
+        let all_sources = vec![source("a", "Alpha"), source("b", "Beta")];
+
+        let resolved =
+            SourceScope::Explicit(vec!["a') OR 1=1 --".to_string()]).resolve(&all_sources);
+
+        assert_eq!(resolved.kind(), ResolvedSourceScopeKind::None);
+        assert!(resolved.source_ids().is_empty());
+        assert!(!resolved.allows("a"));
+        assert!(!resolved.allows("b"));
     }
 }

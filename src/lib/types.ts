@@ -43,7 +43,7 @@ export interface Message {
   conversation_id: string;
   role: "user" | "assistant";
   content: string;
-  citations?: Citation[] | string;
+  citations?: Citation[] | ChatEvidencePayload | string;
   model_used?: string;
   tokens_prompt?: number;
   tokens_response?: number;
@@ -57,6 +57,51 @@ export interface Citation {
   quote?: string;
   page?: number;
   section?: string;
+}
+
+export interface ChatEvidenceDisclosure {
+  backend_requested: string;
+  backend_used: string;
+  retrieval_mode: string;
+  fallback_used: boolean;
+  fallback_reason?: string | null;
+  degradation_markers: string[];
+  source_scope_mode: string;
+  requested_source_ids: string[];
+  selected_source_ids: string[];
+  effective_source_ids: string[];
+  invalid_source_ids: string[];
+  excluded_source_ids: string[];
+  invalid_source_count: number;
+  effective_source_count: number;
+  excluded_source_count: number;
+  context_passage_count: number;
+  citation_valid_count: number;
+  citation_invalid_count: number;
+  omitted_candidate_count: number;
+  source_scope_preserved: boolean;
+  index_status: string;
+  link_status: string;
+  receipt_id: string;
+  semantic_memory_receipt_id?: string | null;
+  candidate_backend?: string | null;
+  turbo_quant_generation_id?: string | null;
+  vector_artifact_manifest_digest?: string | null;
+  exact_rerank?: boolean | null;
+  exact_rerank_count?: number | null;
+  approximate_candidate_count?: number | null;
+  semantic_memory_fallback_reason?: string | null;
+}
+
+export interface ChatEvidencePayload {
+  citations: Citation[];
+  evidence: ChatEvidenceDisclosure;
+}
+
+export interface ChatEvidenceEventPayload extends ChatEvidencePayload {
+  notebook_id: string;
+  conversation_id: string;
+  message_id: string;
 }
 
 export interface Note {
@@ -100,6 +145,9 @@ export interface ModelRecord {
   parameter_size?: string;
   context_window?: number;
   capabilities?: string;
+  available: boolean;
+  stale: boolean;
+  last_error?: string;
 }
 
 export interface Provider {
@@ -126,6 +174,51 @@ export interface ChatTokenPayload {
   message_id: string;
   token: string;
   done: boolean;
+}
+
+export interface ChatStatusPayload {
+  notebook_id: string;
+  conversation_id: string;
+  message_id: string;
+  phase: string;
+  message: string;
+  provider?: string | null;
+  model?: string | null;
+  gate?: string | null;
+  owner?: string | null;
+  owner_detail?: string | null;
+  elapsed_ms: number;
+  timeout_ms?: number | null;
+  truncated: boolean;
+  error?: string | null;
+  vector_artifact_receipt?: Record<string, unknown> | null;
+}
+
+export interface ChatAttemptTraceEvent {
+  phase: string;
+  recorded_at: string;
+  elapsed_ms?: number | null;
+  detail?: string | null;
+  error?: string | null;
+}
+
+export interface ChatAttemptTraceV1 {
+  schema: "ChatAttemptTraceV1";
+  attempt_id: string;
+  notebook_id: string;
+  conversation_id: string;
+  message_id: string;
+  model: string;
+  provider: string;
+  provider_base_url?: string | null;
+  memory_backend?: string | null;
+  memory_backend_fallback?: boolean | null;
+  source_scope_mode?: string | null;
+  first_token_seen: boolean;
+  done_seen: boolean;
+  assistant_persisted: boolean;
+  error?: string | null;
+  events: ChatAttemptTraceEvent[];
 }
 
 export interface SourceStatusPayload {
@@ -169,8 +262,16 @@ export interface QueueStatus {
   processing: number;
   completed: number;
   failed: number;
+  gate_owners: RuntimeGateOwner[];
   summary_backend: BackgroundBackendStatus;
   vision_backend: BackgroundBackendStatus;
+}
+
+export interface RuntimeGateOwner {
+  gate: string;
+  owner: string;
+  detail: string;
+  since_ms: number;
 }
 
 export interface SourcesBatchCreatedPayload {
@@ -193,4 +294,46 @@ export interface BackgroundBackendStatus {
 export interface QueueSummariesResult {
   queued: number;
   diagnostics: string[];
+}
+
+export interface MemoryBackendStatus {
+  backend_id: string;
+  default_backend: string;
+  active_backend: string;
+  backend_used: string;
+  available: boolean;
+  semantic_memory_feature_enabled: boolean;
+  semantic_memory_available: boolean;
+  semantic_memory_path?: string | null;
+  index_sync_status: string;
+  sync_status: string;
+  last_sync_at?: string | null;
+  last_sync_error?: string | null;
+  last_retrieval_receipt_id?: string | null;
+  last_receipt_ref?: string | null;
+  fallback_reason?: string | null;
+  degradation_markers: string[];
+  backend_version_or_digest?: string | null;
+  degraded: boolean;
+  diagnostic?: string | null;
+}
+
+export interface SemanticMemoryLinkStatus {
+  notebook_id: string;
+  total_links: number;
+  synced_links: number;
+  stale_links: number;
+  failed_links: number;
+  missing_document_links: number;
+  last_sync_error?: string | null;
+}
+
+export interface IndexSourceReceipt {
+  backend_id: string;
+  notebook_id: string;
+  source_id: string;
+  receipt_id: string;
+  indexed_chunks: number;
+  sync_status: string;
+  error?: string | null;
 }

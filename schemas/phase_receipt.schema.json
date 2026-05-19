@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "run_id": {
+      "const": "P32R3"
+    },
+    "status": {
+      "enum": [
+        "pass",
+        "fail",
+        "blocked"
+      ]
+    },
+    "ts": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "phase",
+    "status",
+    "ts"
+  ],
+  "type": "object"
+}

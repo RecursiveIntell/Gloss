@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Gloss P31 Phase Gate Decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "injection_id",
+    "phase",
+    "phase_name",
+    "verdict",
+    "skills_invoked",
+    "hooks_observed",
+    "subagents",
+    "commands",
+    "evidence_artifacts",
+    "blocking_findings",
+    "required_repairs",
+    "unresolved_risks",
+    "next_action"
+  ],
+  "properties": {
+    "injection_id": {
+      "type": "string"
+    },
+    "phase": {
+      "type": "string"
+    },
+    "phase_name": {
+      "type": "string"
+    },
+    "verdict": {
+      "enum": [
+        "PROCEED",
+        "REPAIR",
+        "QUARANTINE",
+        "ABORT"
+      ]
+    },
+    "skills_invoked": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "hooks_observed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "name",
+          "status"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "subagents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "label",
+          "scope",
+          "status",
+          "summary"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pass",
+              "fail",
+              "blocked",
+              "skipped"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "cmd",
+          "status"
+        ],
+        "properties": {
+          "cmd": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pass",
+              "fail",
+              "blocked",
+              "skipped"
+            ]
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "evidence_artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blocking_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "severity",
+          "finding",
+          "evidence",
+          "required_fix"
+        ],
+        "properties": {
+          "severity": {
+            "enum": [
+              "P0",
+              "P1",
+              "P2",
+              "P3"
+            ]
+          },
+          "finding": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "required_fix": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "required_repairs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "unresolved_risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_action": {
+      "type": "string"
+    }
+  }
+}

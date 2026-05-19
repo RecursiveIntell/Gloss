@@ -1,0 +1,38 @@
+{
+  "fixture_classes": [
+    {
+      "name": "small_exact",
+      "notebooks": 1,
+      "sources": 5
+    },
+    {
+      "name": "medium_mixed",
+      "notebooks": 3,
+      "sources": 50
+    },
+    {
+      "chunks_min": 1000,
+      "name": "large_ranked",
+      "notebooks": 5,
+      "sources": 100
+    },
+    {
+      "cases": [
+        "invalid IDs",
+        "empty IDs",
+        "cross notebook IDs",
+        "deleted IDs",
+        "missing backpointers"
+      ],
+      "name": "hostile_scope"
+    }
+  ],
+  "hard_gates": {
+    "citation_anchor_validity": "100%",
+    "cross_notebook_leakage": 0,
+    "fallback_disclosure": "100%",
+    "invalid_explicit_scope_widening": 0,
+    "missing_backpointer_silent_inclusion": 0,
+    "scope_preservation": "100%"
+  }
+}

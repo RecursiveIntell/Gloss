@@ -13,9 +13,17 @@ import {
   BookMarked,
   BookmarkPlus,
   Trash2,
+  StopCircle,
+  RotateCcw,
+  Copy,
+  FileEdit,
+  ShieldCheck,
+  ShieldAlert,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
-import type { Citation } from "../../lib/types";
+import type { ChatEvidenceDisclosure, ChatEvidencePayload, Citation, Message } from "../../lib/types";
 
 interface ChatPanelProps {
   notebookId: string;
@@ -29,7 +37,9 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     isStreaming,
     streamingContent,
     streamingError,
+    streamingStatus,
     sendMessage,
+    stopStreaming,
     createConversation,
     deleteConversation,
     setActiveConversation,
@@ -37,14 +47,18 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     suggestedQuestions,
   } = useChatStore();
   const saveResponse = useNoteStore((s) => s.saveResponse);
-  const { activeModel, models } = useSettingsStore();
+  const { activeModel, models, settings } = useSettingsStore();
   const getSourceScope = useSourceStore((s) => s.getSourceScope);
+  const sources = useSourceStore((s) => s.sources);
+  const selectedSourceIds = useSourceStore((s) => s.selectedSourceIds);
   const setActiveModel = useSettingsStore((s) => s.setActiveModel);
   const updateSetting = useSettingsStore((s) => s.updateSetting);
 
   const [input, setInput] = useState("");
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
+  const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
+  const [editingUserMessageId, setEditingUserMessageId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -55,6 +69,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     if (!input.trim() || isStreaming) return;
     const query = input.trim();
     setInput("");
+    setEditingUserMessageId(null);
     await sendMessage(notebookId, query, getSourceScope(), activeModel);
   };
 
@@ -76,6 +91,63 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       setSavingMessageId(null);
     }
   };
+
+  const handleStop = async () => {
+    await stopStreaming(notebookId);
+  };
+
+  const handleCopy = async (content: string) => {
+    await navigator.clipboard.writeText(content);
+  };
+
+  const handleRegenerate = async (messageIndex: number) => {
+    if (isStreaming) return;
+    const priorUser = [...messages]
+      .slice(0, messageIndex)
+      .reverse()
+      .find((message) => message.role === "user");
+    if (priorUser) {
+      await sendMessage(notebookId, priorUser.content, getSourceScope(), activeModel);
+    }
+  };
+
+  const handleEditUserMessage = (message: Message) => {
+    setInput(message.content);
+    setEditingUserMessageId(message.id);
+  };
+
+  const toggleEvidence = (messageId: string) => {
+    setExpandedEvidence((previous) => {
+      const next = new Set(previous);
+      if (next.has(messageId)) next.delete(messageId);
+      else next.add(messageId);
+      return next;
+    });
+  };
+
+  const selectedSources = sources.filter((source) => selectedSourceIds.has(source.id));
+  const invalidSelectedCount = Array.from(selectedSourceIds).filter(
+    (id) => !sources.some((source) => source.id === id)
+  ).length;
+  const unreadySelectedCount = selectedSources.filter((source) => source.status !== "ready").length;
+  const unindexedSelectedCount = selectedSources.filter((source) => source.status === "pending").length;
+  const streamingStatusLabel = streamingStatus
+    ? [
+        streamingStatus.message,
+        streamingStatus.gate ? `Gate: ${streamingStatus.gate}` : null,
+        streamingStatus.owner ? `Owner: ${streamingStatus.owner}` : null,
+        streamingStatus.owner_detail ? `Detail: ${streamingStatus.owner_detail}` : null,
+      ]
+        .filter(Boolean)
+        .join(" - ")
+    : "Starting chat";
+  const scopeMode = sources.length === 0
+    ? "all"
+    : selectedSourceIds.size === 0
+      ? "none"
+      : selectedSourceIds.size === sources.length
+        ? "all"
+        : "explicit";
 
   return (
     <div className="flex flex-col h-full">
@@ -122,28 +194,67 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           )}
         </div>
         <select
-          value={activeModel}
+          value={`${settings["default_provider"] || models.find((model) => model.id === activeModel)?.provider_id || ""}::${activeModel}`}
           onChange={(e) => {
-            const nextModel = e.target.value;
-            setActiveModel(nextModel);
-            const nextProvider = models.find((model) => model.id === nextModel)?.provider_id;
+            const [nextProvider, ...modelParts] = e.target.value.split("::");
+            const nextModel = modelParts.join("::");
             void updateSetting("default_model", nextModel);
             if (nextProvider) {
               void updateSetting("default_provider", nextProvider);
             }
+            setActiveModel(nextModel);
           }}
           className="text-xs bg-bg-tertiary border border-border rounded px-2 py-1 text-text focus:outline-none focus:border-accent"
         >
           {models.length > 0 ? (
             models.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.display_name}
+              <option
+                key={`${m.provider_id}::${m.id}`}
+                value={`${m.provider_id}::${m.id}`}
+                disabled={!m.available || m.stale}
+              >
+                {m.display_name} ({m.provider_id}
+                {!m.available || m.stale ? ", unavailable" : ""})
               </option>
             ))
           ) : (
-            <option value={activeModel}>{activeModel}</option>
+            <option value={`::${activeModel}`}>{activeModel}</option>
           )}
         </select>
+      </div>
+
+      <div className="border-b border-border bg-bg-secondary px-3 py-2">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="font-medium text-text">Scope</span>
+          <span className={`rounded px-1.5 py-0.5 ${
+            scopeMode === "none" ? "bg-warning/15 text-warning" : "bg-bg-tertiary text-text-secondary"
+          }`}>
+            {scopeMode}
+          </span>
+          <span className="text-text-muted">
+            {selectedSourceIds.size}/{sources.length} selected
+          </span>
+          {invalidSelectedCount > 0 && (
+            <span className="rounded bg-error/15 px-1.5 py-0.5 text-error">
+              {invalidSelectedCount} invalid
+            </span>
+          )}
+          {unreadySelectedCount > 0 && (
+            <span className="rounded bg-warning/15 px-1.5 py-0.5 text-warning">
+              {unreadySelectedCount} not ready
+            </span>
+          )}
+          {unindexedSelectedCount > 0 && (
+            <span className="rounded bg-warning/15 px-1.5 py-0.5 text-warning">
+              {unindexedSelectedCount} unindexed
+            </span>
+          )}
+          {scopeMode === "none" && (
+            <span className="text-warning">
+              Selected scope has no valid sources; retrieval will stay empty.
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Messages */}
@@ -170,17 +281,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           </div>
         )}
 
-        {messages.map((msg) => {
-          // Parse citations JSON string
-          let parsedCitations: Citation[] = [];
-          if (msg.role === "assistant" && msg.citations) {
-            try {
-              const raw = typeof msg.citations === "string"
-                ? JSON.parse(msg.citations)
-                : msg.citations;
-              if (Array.isArray(raw)) parsedCitations = raw;
-            } catch { /* ignore parse errors */ }
-          }
+        {messages.map((msg, messageIndex) => {
+          const parsedPayload = parseAssistantPayload(msg.citations);
+          const parsedCitations = parsedPayload.citations;
+          const evidence = parsedPayload.evidence;
+          const evidenceOpen = expandedEvidence.has(msg.id);
 
           return (
             <div
@@ -199,7 +304,24 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                     <div className="prose prose-invert prose-sm max-w-none">
                       <ReactMarkdown>{msg.content}</ReactMarkdown>
                     </div>
-                    <div className="mt-2 flex items-center gap-2 text-[10px]">
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px]">
+                      <button
+                        onClick={() => void handleCopy(msg.content)}
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 bg-bg-secondary text-text-muted hover:text-text hover:bg-border"
+                        title="Copy markdown"
+                      >
+                        <Copy className="w-2.5 h-2.5" />
+                        Copy
+                      </button>
+                      <button
+                        onClick={() => void handleRegenerate(messageIndex)}
+                        disabled={isStreaming}
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 bg-bg-secondary text-text-muted hover:text-text hover:bg-border disabled:opacity-60"
+                        title="Regenerate"
+                      >
+                        <RotateCcw className="w-2.5 h-2.5" />
+                        Regenerate
+                      </button>
                       <button
                         onClick={() => handleSaveResponse(msg.id)}
                         disabled={savingMessageId === msg.id}
@@ -208,7 +330,24 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                         <BookmarkPlus className="w-2.5 h-2.5" />
                         {savingMessageId === msg.id ? "Saving..." : "Save to notes"}
                       </button>
+                      <button
+                        onClick={() => toggleEvidence(msg.id)}
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 bg-bg-secondary text-text-muted hover:text-text hover:bg-border"
+                        title="Evidence"
+                        aria-expanded={evidenceOpen}
+                        aria-controls={`evidence-${msg.id}`}
+                      >
+                        {evidenceOpen ? (
+                          <ChevronDown className="w-2.5 h-2.5" />
+                        ) : (
+                          <ChevronRight className="w-2.5 h-2.5" />
+                        )}
+                        Evidence
+                      </button>
                     </div>
+                    {evidenceOpen && (
+                      <EvidenceDrawer id={`evidence-${msg.id}`} evidence={evidence} />
+                    )}
                     {parsedCitations.length > 0 && (
                       <div className="mt-2 pt-2 border-t border-border/40 flex flex-wrap gap-1.5">
                         {parsedCitations.map((c, i) => (
@@ -226,7 +365,20 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                     )}
                   </>
                 ) : (
-                  <p>{msg.content}</p>
+                  <div>
+                    <p>{msg.content}</p>
+                    <div className="mt-1 flex justify-end">
+                      <button
+                        onClick={() => handleEditUserMessage(msg)}
+                        disabled={isStreaming}
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] bg-white/10 text-white/80 hover:bg-white/15 disabled:opacity-60"
+                        title="Edit and rerun"
+                      >
+                        <FileEdit className="w-2.5 h-2.5" />
+                        Edit
+                      </button>
+                    </div>
+                  </div>
                 )}
               </div>
             </div>
@@ -245,8 +397,17 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
 
         {isStreaming && !streamingContent && (
           <div className="flex justify-start">
-            <div className="rounded-lg px-3 py-2 bg-bg-tertiary">
+            <div className="rounded-lg px-3 py-2 bg-bg-tertiary text-sm text-text-secondary flex items-center gap-2">
               <Loader2 className="w-4 h-4 text-text-muted animate-spin" />
+              <span>{streamingStatusLabel}</span>
+            </div>
+          </div>
+        )}
+
+        {isStreaming && streamingContent && streamingStatus && streamingStatus.phase !== "streaming" && (
+          <div className="flex justify-start">
+            <div className="rounded px-2 py-1 bg-bg-secondary text-xs text-text-muted">
+              {streamingStatusLabel}
             </div>
           </div>
         )}
@@ -276,13 +437,19 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             className="flex-1 px-3 py-2 text-sm bg-bg-tertiary border border-border rounded-lg text-text placeholder:text-text-muted focus:outline-none focus:border-accent disabled:opacity-50"
           />
           <button
-            onClick={handleSend}
-            disabled={!input.trim() || isStreaming}
+            onClick={isStreaming ? handleStop : handleSend}
+            disabled={!isStreaming && !input.trim()}
             className="p-2 rounded-lg bg-accent text-white hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
+            title={isStreaming ? "Stop generation" : editingUserMessageId ? "Rerun edited message" : "Send"}
           >
-            <Send className="w-4 h-4" />
+            {isStreaming ? <StopCircle className="w-4 h-4" /> : <Send className="w-4 h-4" />}
           </button>
         </div>
+        {editingUserMessageId && (
+          <div className="mt-1 text-[10px] text-text-muted">
+            Editing a previous question; sending will rerun it as a new turn.
+          </div>
+        )}
       </div>
 
       <SourceViewerModal
@@ -291,6 +458,135 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         open={activeCitation != null}
         onClose={() => setActiveCitation(null)}
       />
+    </div>
+  );
+}
+
+function parseAssistantPayload(raw: Message["citations"]): ChatEvidencePayload {
+  if (!raw) return { citations: [], evidence: nullEvidence() };
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (Array.isArray(parsed)) {
+      return { citations: parsed, evidence: nullEvidence(parsed.length) };
+    }
+    if (parsed && typeof parsed === "object" && Array.isArray(parsed.citations)) {
+      return {
+        citations: parsed.citations,
+        evidence: parsed.evidence ?? nullEvidence(parsed.citations.length),
+      };
+    }
+  } catch {
+    return { citations: [], evidence: nullEvidence() };
+  }
+  return { citations: [], evidence: nullEvidence() };
+}
+
+function nullEvidence(citationCount = 0): ChatEvidenceDisclosure {
+  return {
+    backend_requested: "unknown",
+    backend_used: "unknown",
+    retrieval_mode: "unknown",
+    fallback_used: false,
+    fallback_reason: null,
+    degradation_markers: [],
+    source_scope_mode: "unknown",
+    requested_source_ids: [],
+    selected_source_ids: [],
+    effective_source_ids: [],
+    invalid_source_ids: [],
+    excluded_source_ids: [],
+    invalid_source_count: 0,
+    effective_source_count: 0,
+    excluded_source_count: 0,
+    context_passage_count: 0,
+    citation_valid_count: citationCount,
+    citation_invalid_count: 0,
+    omitted_candidate_count: 0,
+    source_scope_preserved: true,
+    index_status: "unknown",
+    link_status: "unknown",
+    receipt_id: "not recorded",
+    semantic_memory_receipt_id: null,
+    candidate_backend: null,
+    turbo_quant_generation_id: null,
+    vector_artifact_manifest_digest: null,
+    exact_rerank: null,
+    exact_rerank_count: null,
+    approximate_candidate_count: null,
+    semantic_memory_fallback_reason: null,
+  };
+}
+
+function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDisclosure }) {
+  const degraded = evidence.fallback_used || evidence.degradation_markers.length > 0 || evidence.citation_invalid_count > 0;
+  return (
+    <div id={id} role="region" aria-label="Answer evidence" className="mt-2 rounded border border-border/70 bg-bg-secondary p-2 text-[10px] text-text-secondary">
+      <div className="mb-2 flex items-center gap-1.5 text-text">
+        {degraded ? (
+          <ShieldAlert className="w-3 h-3 text-warning" />
+        ) : (
+          <ShieldCheck className="w-3 h-3 text-success" />
+        )}
+        <span>Answer evidence</span>
+      </div>
+      <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+        <EvidenceRow label="Backend requested" value={evidence.backend_requested} />
+        <EvidenceRow label="Backend used" value={evidence.backend_used} />
+        <EvidenceRow label="Retrieval" value={evidence.retrieval_mode} />
+        <EvidenceRow label="Fallback" value={evidence.fallback_used ? evidence.fallback_reason || "yes" : "no"} />
+        <EvidenceRow label="Scope" value={`${evidence.source_scope_mode} (${evidence.effective_source_count} selected, ${evidence.excluded_source_count} excluded, ${evidence.invalid_source_count} invalid)`} />
+        <EvidenceRow label="Context" value={`${evidence.context_passage_count} passages, preserved: ${evidence.source_scope_preserved ? "yes" : "no"}`} />
+        <EvidenceRow label="Citations" value={`${evidence.citation_valid_count} valid, ${evidence.citation_invalid_count} filtered`} />
+        <EvidenceRow label="Omitted" value={`${evidence.omitted_candidate_count} candidates/passages`} />
+        <EvidenceRow label="Index" value={evidence.index_status} />
+        <EvidenceRow label="Links" value={evidence.link_status} />
+        {evidence.candidate_backend && (
+          <EvidenceRow label="Candidate backend" value={evidence.candidate_backend} />
+        )}
+        {evidence.exact_rerank !== null && evidence.exact_rerank !== undefined && (
+          <EvidenceRow label="Exact rerank" value={evidence.exact_rerank ? `yes (${evidence.exact_rerank_count ?? 0})` : "no"} />
+        )}
+        {evidence.approximate_candidate_count !== null && evidence.approximate_candidate_count !== undefined && (
+          <EvidenceRow label="Approx candidates" value={`${evidence.approximate_candidate_count}`} />
+        )}
+        {evidence.turbo_quant_generation_id && (
+          <EvidenceRow label="TurboQuant generation" value={evidence.turbo_quant_generation_id} />
+        )}
+      </div>
+      {evidence.semantic_memory_fallback_reason && (
+        <p className="mt-2 text-warning">semantic-memory fallback: {evidence.semantic_memory_fallback_reason}</p>
+      )}
+      {evidence.vector_artifact_manifest_digest && (
+        <p className="mt-2 text-text-muted">Vector artifact manifest: {evidence.vector_artifact_manifest_digest}</p>
+      )}
+      {evidence.invalid_source_ids.length > 0 && (
+        <p className="mt-2 text-error">Invalid scope IDs: {evidence.invalid_source_ids.join(", ")}</p>
+      )}
+      {evidence.requested_source_ids.length > 0 && (
+        <p className="mt-2">Requested source IDs: {evidence.requested_source_ids.join(", ")}</p>
+      )}
+      {evidence.effective_source_ids.length > 0 && (
+        <p className="mt-2">Selected source IDs: {(evidence.selected_source_ids.length ? evidence.selected_source_ids : evidence.effective_source_ids).join(", ")}</p>
+      )}
+      {evidence.excluded_source_ids.length > 0 && (
+        <p className="mt-2 text-text-muted">Excluded source IDs: {evidence.excluded_source_ids.join(", ")}</p>
+      )}
+      {evidence.degradation_markers.length > 0 && (
+        <p className="mt-2 text-warning">Degraded: {evidence.degradation_markers.join(", ")}</p>
+      )}
+      <p className="mt-2 text-text-muted">Receipt: {evidence.receipt_id}</p>
+      {evidence.semantic_memory_receipt_id && (
+        <p className="mt-1 text-text-muted">semantic-memory receipt: {evidence.semantic_memory_receipt_id}</p>
+      )}
+    </div>
+  );
+}
+
+function EvidenceRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <span className="text-text-muted">{label}: </span>
+      <span className="break-words text-text-secondary">{value}</span>
     </div>
   );
 }

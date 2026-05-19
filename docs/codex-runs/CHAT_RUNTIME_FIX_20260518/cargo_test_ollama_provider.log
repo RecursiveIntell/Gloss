@@ -1,0 +1,13 @@
+
+running 3 tests
+test providers::ollama::tests::ollama_normal_frame_extracts_content_and_done ... ok
+test providers::ollama::tests::ollama_stream_error_frame_becomes_provider_error ... ok
+test providers::ollama::tests::ollama_chat_body_disables_thinking_for_visible_content ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

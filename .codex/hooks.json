@@ -1,0 +1,8 @@
+{
+  "UserPromptSubmit": [
+    {"command": "python3 .codex/hooks/chat_runtime_prompt_guard.py"}
+  ],
+  "Stop": [
+    {"command": "python3 .codex/hooks/chat_runtime_stop_gate.py"}
+  ]
+}

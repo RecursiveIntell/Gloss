@@ -17,13 +17,14 @@
 //! and `ScopeKey::to_legacy_namespace()`. All bridge, importer, and test code
 //! must use these functions for namespace↔ScopeKey conversion.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Multi-dimensional scope that bounds every runtime query and projection.
 ///
 /// At minimum a `namespace` is required. Optional `domain`, `workspace_id`,
 /// and `repo_id` narrow scope further.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct Scope {
     /// Primary namespace partition.
     pub namespace: String,
@@ -91,7 +92,9 @@ impl Scope {
 /// - `prod` — namespace only
 /// - `prod/code` — with domain
 /// - `prod/code@ws1#myrepo` — fully specified
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ScopeKey {
     pub namespace: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,7 +161,7 @@ impl std::fmt::Display for ScopeKey {
 ///
 /// Used in code comments and metadata to distinguish implemented features
 /// from planned ones. Prevents confusion about what is actually working.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PhaseStatus {
     /// Fully implemented and tested.

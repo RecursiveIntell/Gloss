@@ -1,12 +1,14 @@
 import { listen } from "@tauri-apps/api/event";
 import type {
   ChatTokenPayload,
+  ChatStatusPayload,
   ChatErrorPayload,
   SourceStatusPayload,
   SourcesBatchCreatedPayload,
   BatchIngestionCompletePayload,
   EmbeddingModelPayload,
   JobCompletedPayload,
+  ChatEvidenceEventPayload,
 } from "./types";
 
 export function onChatToken(
@@ -21,6 +23,22 @@ export function onChatError(
   callback: (payload: ChatErrorPayload) => void
 ): Promise<() => void> {
   return listen<ChatErrorPayload>("chat:error", (event) => {
+    callback(event.payload);
+  }).then((unlisten) => unlisten);
+}
+
+export function onChatStatus(
+  callback: (payload: ChatStatusPayload) => void
+): Promise<() => void> {
+  return listen<ChatStatusPayload>("chat:status", (event) => {
+    callback(event.payload);
+  }).then((unlisten) => unlisten);
+}
+
+export function onChatEvidence(
+  callback: (payload: ChatEvidenceEventPayload) => void
+): Promise<() => void> {
+  return listen<ChatEvidenceEventPayload>("chat:evidence", (event) => {
     callback(event.payload);
   }).then((unlisten) => unlisten);
 }

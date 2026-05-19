@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "changed_files": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "commands": {
+      "type": "array"
+    },
+    "run_id": {
+      "const": "P32R3"
+    },
+    "status": {
+      "enum": [
+        "pass",
+        "fail",
+        "blocked"
+      ]
+    },
+    "tests": {
+      "type": "array"
+    },
+    "unresolved_risks": {
+      "type": "array"
+    }
+  },
+  "required": [
+    "run_id",
+    "status",
+    "changed_files",
+    "commands",
+    "tests",
+    "unresolved_risks"
+  ],
+  "type": "object"
+}

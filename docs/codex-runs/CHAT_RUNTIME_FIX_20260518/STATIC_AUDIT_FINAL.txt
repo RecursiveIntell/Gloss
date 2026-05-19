@@ -1,0 +1,11 @@
+CHAT_RUNTIME_STATIC_AUDIT repo=/home/sikmindz/Coding/Gloss
+PASS	frontend_active_notebook_chat_event_filter	activeNotebookId chat-event filters found: 0
+PASS	frontend_has_stream_identity_state	streamingNotebookId/streamingMessageId present
+PASS	provider_config_uses_provider_rows	settings_url_reads settings.rs=False providers/mod.rs=False
+PASS	chat_attempt_trace_exists	ChatAttemptTraceV1 command present
+PASS	provider_only_smoke_exists	debug_chat_provider_smoke present
+PASS	ollama_stream_error_detection	Ollama stream error field detection present
+PASS	semantic_memory_timeout_fallback	semantic-memory timeout/fallback status present
+PASS	current_run_not_stale_p30	CURRENT_RUN.md content: '# Current Codex Run\n\nCurrent run: `CHAT_RUNTIME_FIX_20260518`\nUpdated UTC: `2026-05-18T00:00:00Z`\n\nHistorical run material in `docs/codex-runs/archive/` is evidence, not active instruction.'
+PASS	missing_auto_phase_runner_reference	references auto_phase_runner=True, exists=True
+SUMMARY failures=0 checks=9

@@ -44,10 +44,15 @@ pub async fn save_response_as_note(
 
     let id = uuid::Uuid::new_v4().to_string();
     let title = msg.content.chars().take(60).collect::<String>();
+    let backlink_section = msg
+        .citations
+        .as_deref()
+        .and_then(citation_backlinks)
+        .unwrap_or_default();
     let note = Note {
         id: id.clone(),
         title: Some(title),
-        content: msg.content,
+        content: format!("{}{}", msg.content, backlink_section),
         note_type: "saved_response".to_string(),
         citations: msg.citations,
         pinned: true,
@@ -57,6 +62,41 @@ pub async fn save_response_as_note(
     };
     state.with_notebook_db(&notebook_id, |db| db.create_note(&note))?;
     Ok(id)
+}
+
+fn citation_backlinks(citations_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(citations_json).ok()?;
+    let citations = if let Some(items) = value.as_array() {
+        items
+    } else {
+        value.get("citations")?.as_array()?
+    };
+    if citations.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    for (idx, citation) in citations.iter().enumerate() {
+        let source_id = citation.get("source_id")?.as_str()?;
+        let chunk_id = citation.get("chunk_id")?.as_str()?;
+        let title = citation
+            .get("source_title")
+            .and_then(|v| v.as_str())
+            .unwrap_or(source_id);
+        lines.push(format!(
+            "{}. {} (source: {}, chunk: {})",
+            idx + 1,
+            title,
+            source_id,
+            chunk_id
+        ));
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!("\n\nSources\n{}", lines.join("\n")))
+    }
 }
 
 #[tauri::command]

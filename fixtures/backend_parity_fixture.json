@@ -1,0 +1,61 @@
+{
+  "name": "backend_parity_required_fields",
+  "required_report_fields": [
+    "local_backend_result",
+    "semantic_memory_result",
+    "intersection_by_chunk_id",
+    "source_scope_violations",
+    "unmapped_semantic_candidates",
+    "local_latency_ms",
+    "semantic_memory_latency_ms",
+    "receipt_ids",
+    "decision"
+  ],
+  "allowed_decisions": [
+    "pass",
+    "degraded-semantic-memory",
+    "blocked-source-scope-violation",
+    "no-overlap"
+  ],
+  "sample_comparison": {
+    "local_backend_result": {
+      "backend_requested": "gloss-local",
+      "backend_used": "gloss-local",
+      "receipt_id": "local-fixture-receipt",
+      "source_scope_preserved": true,
+      "degraded": false,
+      "fallback_used": false,
+      "candidates": [
+        {
+          "chunk_id": "chunk-answer",
+          "source_id": "source-selected",
+          "score": -2.1
+        }
+      ]
+    },
+    "semantic_memory_result": {
+      "backend_requested": "semantic-memory-preview",
+      "backend_used": "semantic-memory-preview",
+      "receipt_id": "semantic-fixture-receipt",
+      "source_scope_preserved": true,
+      "degraded": true,
+      "fallback_used": false,
+      "degradation_markers": [
+        "semantic-memory-unavailable"
+      ],
+      "candidates": []
+    },
+    "intersection_by_chunk_id": [],
+    "source_scope_violations": [],
+    "unmapped_semantic_candidates": [
+      "semantic-memory-backend feature is not enabled"
+    ],
+    "local_latency_ms": 1,
+    "semantic_memory_latency_ms": 1,
+    "receipt_ids": [
+      "local-fixture-receipt",
+      "semantic-fixture-receipt"
+    ],
+    "decision": "degraded-semantic-memory"
+  }
+}

@@ -6,9 +6,10 @@ mod db;
 mod error;
 mod ingestion;
 mod jobs;
+mod memory;
+mod provider_config_store;
 mod providers;
 mod retrieval;
-mod secrets;
 mod state;
 mod studio;
 
@@ -17,10 +18,47 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::Manager;
 use tauri_queue::{QueueConfig, QueueEventEmitter, QueueManager, TauriEventEmitter};
+use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tracing_subscriber::EnvFilter;
 
 /// Idle duration (seconds) after which auto-summarization kicks in.
 const IDLE_AUTO_SUMMARIZE_SECS: u64 = 600; // 10 minutes
+const SUMMARY_LLM_GATE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryGateWait {
+    Acquired,
+    ReleaseForChat,
+    Timeout,
+    Closed,
+}
+
+async fn acquire_summary_llm_gate_while_holding_gpu<'a, F>(
+    llm_gate: &'a Semaphore,
+    mut should_release_gpu: F,
+    timeout: Duration,
+) -> (SummaryGateWait, Option<SemaphorePermit<'a>>)
+where
+    F: FnMut() -> bool,
+{
+    let started = std::time::Instant::now();
+    loop {
+        if should_release_gpu() {
+            return (SummaryGateWait::ReleaseForChat, None);
+        }
+
+        match llm_gate.try_acquire() {
+            Ok(permit) => return (SummaryGateWait::Acquired, Some(permit)),
+            Err(TryAcquireError::Closed) => return (SummaryGateWait::Closed, None),
+            Err(TryAcquireError::NoPermits) => {
+                if started.elapsed() >= timeout {
+                    return (SummaryGateWait::Timeout, None);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -89,9 +127,11 @@ pub fn run() {
             commands::sources::list_sources,
             commands::sources::set_selected_sources,
             commands::sources::add_source_file,
+            commands::sources::add_source_files,
             commands::sources::add_source_folder,
             commands::sources::add_source_paste,
             commands::sources::delete_source,
+            commands::sources::delete_sources,
             commands::sources::get_source_content,
             commands::sources::retry_source_ingestion,
             commands::sources::get_notebook_stats,
@@ -99,12 +139,20 @@ pub fn run() {
             commands::sources::pause_summaries,
             commands::sources::resume_summaries,
             commands::sources::get_queue_status,
+            commands::sources::memory_backend_status,
+            commands::sources::semantic_memory_link_status,
+            commands::sources::semantic_memory_reindex_notebook,
+            commands::sources::semantic_memory_reindex_source,
+            commands::sources::compare_memory_backends,
             commands::chat::list_conversations,
             commands::chat::create_conversation,
             commands::chat::delete_conversation,
+            commands::chat::stop_chat,
             commands::chat::load_messages,
             commands::chat::send_message,
             commands::chat::get_suggested_questions,
+            commands::chat::debug_chat_provider_smoke,
+            commands::chat::get_last_chat_attempt_trace,
             commands::notes::list_notes,
             commands::notes::create_note,
             commands::notes::save_response_as_note,
@@ -128,8 +176,9 @@ pub fn run() {
 ///
 /// 1. **No summaries before notebook selection** — idles when active_notebook_id is None.
 /// 2. **Chat grace window** — does not start a summary within 15s of the last user message.
-/// 3. **Single-flight LLM gate** — acquires `llm_gate` semaphore before LLM work,
-///    so chat (which also acquires it) naturally serializes with summaries.
+/// 3. **Single-flight LLM gate** — acquires `llm_gate` only after `gpu_gate`,
+///    records gate owner state, and releases both gates at safe boundaries so
+///    chat can disclose who owns contested runtime capacity.
 /// 4. **Notebook switching** — validates job notebook_id + epoch before executing.
 /// 5. **Manual pause** — respects `summary_paused` flag.
 async fn summary_job_loop(
@@ -217,28 +266,69 @@ async fn summary_job_loop(
             tracing::info!(cancelled, "Cancelled stale queue jobs before processing");
         }
 
-        // 4. Acquire LLM gate before processing (ensures no concurrent GPU inference).
-        //    We acquire here so that if chat arrives while we wait, the chat will
-        //    also try to acquire and one will block. The semaphore enforces ordering.
-        let permit = state.llm_gate.acquire().await;
-        let permit = match permit {
-            Ok(p) => p,
-            Err(_) => {
-                // Semaphore closed — app is shutting down
-                tracing::info!("LLM gate closed, summary loop exiting");
-                return;
-            }
-        };
-
-        // Also acquire GPU gate to prevent running while embedding is active
+        // 4. Acquire GPU before LLM so a background job never holds LLM capacity
+        // while merely waiting for GPU.
         let gpu_permit = match state.gpu_gate.acquire().await {
             Ok(p) => p,
             Err(_) => {
-                drop(permit);
                 tracing::info!("GPU gate closed, summary loop exiting");
                 return;
             }
         };
+        state.set_gate_owner("GPU gate", "background_summary", "queue.process_one");
+
+        if state.is_in_chat_grace() {
+            state.clear_gate_owner("GPU gate", "background_summary");
+            drop(gpu_permit);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+
+        let (llm_gate_wait, permit) = acquire_summary_llm_gate_while_holding_gpu(
+            &state.llm_gate,
+            || {
+                state
+                    .summary_paused
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    || state.is_in_chat_grace()
+                    || active_nb
+                        .as_deref()
+                        .map(|nb_id| !state.is_active_notebook_epoch(nb_id, active_epoch))
+                        .unwrap_or(true)
+            },
+            SUMMARY_LLM_GATE_WAIT_TIMEOUT,
+        )
+        .await;
+        let permit = match (llm_gate_wait, permit) {
+            (SummaryGateWait::Acquired, Some(permit)) => permit,
+            (SummaryGateWait::Closed, _) => {
+                state.clear_gate_owner("GPU gate", "background_summary");
+                drop(gpu_permit);
+                tracing::info!("LLM gate closed, summary loop exiting");
+                return;
+            }
+            (SummaryGateWait::ReleaseForChat, _) => {
+                state.clear_gate_owner("GPU gate", "background_summary");
+                drop(gpu_permit);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            (SummaryGateWait::Timeout, _) => {
+                state.clear_gate_owner("GPU gate", "background_summary");
+                drop(gpu_permit);
+                tracing::debug!("Released GPU gate after summary waited for LLM gate slice");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            (SummaryGateWait::Acquired, None) => {
+                state.clear_gate_owner("GPU gate", "background_summary");
+                drop(gpu_permit);
+                tracing::warn!("LLM gate reported acquired without a permit");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
+        state.set_gate_owner("LLM gate", "background_summary", "queue.process_one");
 
         // Re-check conditions after acquiring the permit (chat may have arrived
         // while we were waiting, or notebook may have changed).
@@ -251,6 +341,8 @@ async fn summary_job_loop(
                 .map(|nb_id| !state.is_active_notebook_epoch(nb_id, active_epoch))
                 .unwrap_or(true)
         {
+            state.clear_gate_owner("GPU gate", "background_summary");
+            state.clear_gate_owner("LLM gate", "background_summary");
             drop(gpu_permit);
             drop(permit);
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -269,6 +361,8 @@ async fn summary_job_loop(
         match job_result {
             Err(_timeout) => {
                 tracing::error!("Summary job timed out after 180s — releasing LLM gate");
+                state.clear_gate_owner("GPU gate", "background_summary");
+                state.clear_gate_owner("LLM gate", "background_summary");
                 drop(gpu_permit);
                 drop(permit);
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -289,10 +383,11 @@ async fn summary_job_loop(
                 if job.success {
                     tracing::debug!(job_id = %job.job_id, "Summary job completed");
 
-                    // Check if this was a DescribeImage/Video job that needs follow-up embedding
+                    // Check if this was a DescribeImage/Video job that needs follow-up finalization
                     if let Some(ref output_str) = job.output {
                         if let Ok(output) = serde_json::from_str::<serde_json::Value>(output_str) {
-                            if output.get("needs_embedding").and_then(|v| v.as_bool()) == Some(true)
+                            if output.get("needs_finalization").and_then(|v| v.as_bool())
+                                == Some(true)
                             {
                                 let nb_id = output
                                     .get("notebook_id")
@@ -319,8 +414,10 @@ async fn summary_job_loop(
                                             job_id = %job.job_id,
                                             notebook_id = nb_id,
                                             source_id = src_id,
-                                            "Skipping follow-up embedding for stale job"
+                                            "Skipping follow-up finalization for stale job"
                                         );
+                                        state.clear_gate_owner("GPU gate", "background_summary");
+                                        state.clear_gate_owner("LLM gate", "background_summary");
                                         drop(gpu_permit);
                                         drop(permit);
                                         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -329,11 +426,15 @@ async fn summary_job_loop(
 
                                     tracing::info!(
                                         source_id = src_id,
-                                        "Running embedding for described source"
+                                        "Finalizing described source"
                                     );
 
-                                    // Drop LLM gate — embedding doesn't need LLM
+                                    // Drop runtime gates — described-source finalization only
+                                    // updates DB status and queues a summary.
+                                    state.clear_gate_owner("LLM gate", "background_summary");
                                     drop(permit);
+                                    state.clear_gate_owner("GPU gate", "background_summary");
+                                    drop(gpu_permit);
 
                                     let nb_for_err = nb_id.to_string();
                                     let src_for_err = src_id.to_string();
@@ -346,7 +447,7 @@ async fn summary_job_loop(
                                         if !state.is_active_notebook_epoch(&nb, job_epoch) {
                                             return;
                                         }
-                                        commands::sources::embed_described_source(
+                                        commands::sources::finalize_described_source(
                                             &state, &nb, &src, &handle2, &q2,
                                         );
                                     })
@@ -355,19 +456,18 @@ async fn summary_job_loop(
                                         tracing::error!(
                                             source_id = %src_for_err,
                                             error = %e,
-                                            "embed_described_source panicked"
+                                            "finalize_described_source panicked"
                                         );
                                         let _ = state.with_notebook_db(&nb_for_err, |db| {
                                             db.update_source_status(
                                                 &src_for_err,
                                                 "error",
-                                                Some(&format!("Embedding panicked: {}", e)),
+                                                Some(&format!("Finalization panicked: {}", e)),
                                             )
                                         });
                                     }
 
-                                    drop(gpu_permit);
-                                    // permit already dropped above
+                                    // permits already dropped above
                                     tokio::time::sleep(Duration::from_secs(3)).await;
                                     continue; // Skip the drops below
                                 }
@@ -381,19 +481,30 @@ async fn summary_job_loop(
                         "Summary job failed"
                     );
                 }
+                state.clear_gate_owner("GPU gate", "background_summary");
+                state.clear_gate_owner("LLM gate", "background_summary");
                 drop(gpu_permit);
                 drop(permit);
                 // Cool-down between jobs to prevent GPU thermal throttling / CUDA errors
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
             Ok(Ok(None)) => {
+                state.clear_gate_owner("GPU gate", "background_summary");
+                state.clear_gate_owner("LLM gate", "background_summary");
                 drop(gpu_permit);
                 drop(permit);
 
                 // No pending jobs — check if we should auto-queue missing summaries.
                 // Triggers when user has been idle for 10+ minutes.
                 let idle_secs = state.idle_seconds();
-                if idle_secs >= IDLE_AUTO_SUMMARIZE_SECS {
+                let auto_summary_enabled = match state.summary_mode_is_auto() {
+                    Ok(enabled) => enabled,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to read summary mode; skipping idle auto-queue");
+                        false
+                    }
+                };
+                if auto_summary_enabled && idle_secs >= IDLE_AUTO_SUMMARIZE_SECS {
                     if let Some(ref nb_id) = active_nb {
                         let queued_result =
                             commands::sources::auto_queue_notebook_summaries(&state, &queue, nb_id);
@@ -417,10 +528,81 @@ async fn summary_job_loop(
             }
             Ok(Err(e)) => {
                 tracing::error!("Job processing error: {}", e);
+                state.clear_gate_owner("GPU gate", "background_summary");
+                state.clear_gate_owner("LLM gate", "background_summary");
                 drop(gpu_permit);
                 drop(permit);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn summary_llm_wait_releases_gpu_when_chat_arrives() {
+        let gpu_gate = Semaphore::new(1);
+        let llm_gate = Semaphore::new(1);
+        let _llm_held_by_other_work = llm_gate.acquire().await.unwrap();
+        let gpu_permit = gpu_gate.acquire().await.unwrap();
+        let chat_arrived = AtomicBool::new(false);
+
+        let wait = tokio::time::timeout(Duration::from_secs(1), async {
+            let chat_arrived_ref = &chat_arrived;
+            tokio::join!(
+                async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    chat_arrived_ref.store(true, Ordering::SeqCst);
+                },
+                async {
+                    acquire_summary_llm_gate_while_holding_gpu(
+                        &llm_gate,
+                        || chat_arrived.load(Ordering::SeqCst),
+                        Duration::from_secs(30),
+                    )
+                    .await
+                }
+            )
+            .1
+        })
+        .await
+        .expect("summary LLM wait should observe chat arrival promptly");
+
+        assert_eq!(wait.0, SummaryGateWait::ReleaseForChat);
+        assert!(wait.1.is_none());
+
+        drop(gpu_permit);
+        let chat_gpu = gpu_gate
+            .try_acquire()
+            .expect("chat should be able to acquire GPU after summary yields");
+        drop(chat_gpu);
+    }
+
+    #[tokio::test]
+    async fn summary_llm_wait_times_out_without_holding_gpu_forever() {
+        let gpu_gate = Semaphore::new(1);
+        let llm_gate = Semaphore::new(1);
+        let _llm_held_by_other_work = llm_gate.acquire().await.unwrap();
+        let gpu_permit = gpu_gate.acquire().await.unwrap();
+
+        let (wait, permit) = acquire_summary_llm_gate_while_holding_gpu(
+            &llm_gate,
+            || false,
+            Duration::from_millis(25),
+        )
+        .await;
+
+        assert_eq!(wait, SummaryGateWait::Timeout);
+        assert!(permit.is_none());
+
+        drop(gpu_permit);
+        let chat_gpu = gpu_gate
+            .try_acquire()
+            .expect("summary timeout path must release GPU for chat");
+        drop(chat_gpu);
     }
 }

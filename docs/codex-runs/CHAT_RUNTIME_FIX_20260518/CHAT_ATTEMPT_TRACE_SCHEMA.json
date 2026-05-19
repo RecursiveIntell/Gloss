@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ChatAttemptTraceV1",
+  "type": "object",
+  "required": ["schema", "attempt_id", "notebook_id", "conversation_id", "message_id", "model", "provider", "events"],
+  "properties": {
+    "schema": {"const": "ChatAttemptTraceV1"},
+    "attempt_id": {"type": "string"},
+    "notebook_id": {"type": "string"},
+    "conversation_id": {"type": "string"},
+    "message_id": {"type": "string"},
+    "model": {"type": "string"},
+    "provider": {"type": "string"},
+    "provider_base_url": {"type": ["string", "null"]},
+    "memory_backend": {"type": ["string", "null"]},
+    "memory_backend_fallback": {"type": ["boolean", "null"]},
+    "source_scope_mode": {"type": ["string", "null"]},
+    "first_token_seen": {"type": "boolean"},
+    "done_seen": {"type": "boolean"},
+    "assistant_persisted": {"type": "boolean"},
+    "error": {"type": ["string", "null"]},
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["phase", "recorded_at"],
+        "properties": {
+          "phase": {"type": "string"},
+          "recorded_at": {"type": "string"},
+          "elapsed_ms": {"type": ["integer", "null"]},
+          "detail": {"type": ["string", "null"]},
+          "error": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}

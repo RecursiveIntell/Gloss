@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "blocking_count": {
+      "type": "integer"
+    },
+    "warning_count": {
+      "type": "integer"
+    },
+    "warnings": {
+      "type": "array"
+    }
+  },
+  "required": [
+    "warning_count",
+    "blocking_count",
+    "warnings"
+  ],
+  "title": "Package Warning Review",
+  "type": "object"
+}

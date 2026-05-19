@@ -1,0 +1,152 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "Domain": {
+      "oneOf": [
+        {
+          "enum": [
+            "code",
+            "release",
+            "policy",
+            "artifact",
+            "audit",
+            "operations"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "other": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "other"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ExternalArtifactRef": {
+      "additionalProperties": false,
+      "description": "Opaque reference to an external owner boundary.\n\nThis is an adapter reference only. It does not assert that SCR owns, canonicalizes, fetches, validates, or mutates the referenced object.",
+      "properties": {
+        "owner_hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ref_kind": {
+          "type": "string"
+        },
+        "ref_value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref_kind",
+        "ref_value"
+      ],
+      "type": "object"
+    },
+    "ProposedAction": {
+      "oneOf": [
+        {
+          "enum": [
+            "read",
+            "analyze",
+            "verify",
+            "generate_repair_packet",
+            "mutate_artifact",
+            "release",
+            "quarantine"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "other": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "other"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RequestedEffect": {
+      "oneOf": [
+        {
+          "enum": [
+            "no_mutation",
+            "advisory_only",
+            "prepare_patch",
+            "apply_patch",
+            "generate_release_artifact",
+            "block_release"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "other": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "other"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "case_id": {
+      "type": "string"
+    },
+    "domain": {
+      "$ref": "#/definitions/Domain"
+    },
+    "evidence_refs": {
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/ExternalArtifactRef"
+      },
+      "type": "array"
+    },
+    "proposed_action": {
+      "$ref": "#/definitions/ProposedAction"
+    },
+    "requested_effect": {
+      "$ref": "#/definitions/RequestedEffect"
+    },
+    "schema_version": {
+      "const": "audit_fixture_case_v1",
+      "type": "string"
+    },
+    "signals": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "case_id",
+    "domain",
+    "proposed_action",
+    "requested_effect",
+    "schema_version"
+  ],
+  "title": "AuditFixtureCaseV1",
+  "type": "object"
+}

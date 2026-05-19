@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "backendDefault": {
+      "type": "string"
+    },
+    "backendRequested": {
+      "type": "string"
+    },
+    "backendUsed": {
+      "type": "string"
+    },
+    "citationCount": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "degradationMarkers": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "degraded": {
+      "type": "boolean"
+    },
+    "effectiveSourceIds": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "excludedSourceCount": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "fallbackReason": {
+      "type": "string"
+    },
+    "fallbackUsed": {
+      "type": "boolean"
+    },
+    "indexStatus": {
+      "type": "string"
+    },
+    "invalidSourceIds": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "omittedCandidateCount": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "receiptId": {
+      "type": "string"
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "requestedSourceIds": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "semanticMemoryFeatureEnabled": {
+      "type": "boolean"
+    },
+    "semanticMemoryLinkStatus": {
+      "type": "string"
+    },
+    "sourceScopeMode": {
+      "type": "string"
+    },
+    "validCitationCount": {
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "requestId",
+    "backendRequested",
+    "backendUsed",
+    "backendDefault",
+    "fallbackUsed",
+    "degraded",
+    "sourceScopeMode",
+    "requestedSourceIds",
+    "effectiveSourceIds",
+    "invalidSourceIds",
+    "citationCount",
+    "validCitationCount",
+    "omittedCandidateCount"
+  ],
+  "title": "Gloss Retrieval Disclosure",
+  "type": "object"
+}

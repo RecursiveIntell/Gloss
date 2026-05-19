@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "logs": {
+      "type": "array"
+    },
+    "run_id": {
+      "const": "GLOSS_COMPLETION_AND_UX_RELEASE_CANDIDATE_P3_20260513"
+    }
+  },
+  "required": [
+    "run_id",
+    "logs"
+  ],
+  "title": "Gloss Log Evidence Index",
+  "type": "object"
+}

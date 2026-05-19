@@ -1,0 +1,6 @@
+# Project-local Codex config for the Gloss chat runtime fix pass.
+# Keep this minimal. User-level model/provider settings belong in ~/.codex/config.toml.
+project_root_markers = [".git", "package.json", "src-tauri"]
+
+[features]
+hooks = true

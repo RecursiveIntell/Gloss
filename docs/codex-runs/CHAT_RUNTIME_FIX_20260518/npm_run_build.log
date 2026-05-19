@@ -1,0 +1,13 @@
+
+> gloss@1.0.0 build
+> tsc && vite build
+
+vite v7.3.3 building client environment for production...
+transforming...
+✓ 1896 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.45 kB │ gzip:   0.29 kB
+dist/assets/index-CIUfXDo9.css   32.33 kB │ gzip:   6.51 kB
+dist/assets/index-iaiJmnHn.js   411.73 kB │ gzip: 123.76 kB
+✓ built in 10.11s

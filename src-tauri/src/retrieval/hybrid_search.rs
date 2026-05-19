@@ -22,6 +22,10 @@ pub fn compute_top_k(source_count: usize) -> usize {
     }
 }
 
+fn scope_allows_chunk(scope: &ResolvedSourceScope, chunk: &Chunk) -> bool {
+    scope.allows(&chunk.source_id)
+}
+
 /// Perform hybrid search: HNSW semantic + FTS5 keyword, fused with RRF.
 pub fn hybrid_search(
     query: &str,
@@ -42,7 +46,7 @@ pub fn hybrid_search(
     for (rank, (label, _distance)) in hnsw_results.iter().enumerate() {
         match nb_db.get_chunk_by_embedding_id(*label as i64) {
             Ok(chunk) => {
-                if scope.allows(&chunk.source_id) {
+                if scope_allows_chunk(scope, &chunk) {
                     semantic_chunks.push((chunk, rank));
                 }
             }
@@ -65,7 +69,7 @@ pub fn hybrid_search(
     for (rank, (rowid, _score)) in fts_results.iter().enumerate() {
         match nb_db.get_chunk_by_rowid(*rowid) {
             Ok(chunk) => {
-                if scope.allows(&chunk.source_id) {
+                if scope_allows_chunk(scope, &chunk) {
                     keyword_chunks.push((chunk, rank));
                 }
             }
@@ -157,4 +161,65 @@ fn sanitize_fts_query(query: &str) -> String {
         .filter(|w| !w.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::notebook_db::Source;
+    use crate::retrieval::source_scope::SourceScope;
+
+    fn source(id: &str) -> Source {
+        Source {
+            id: id.to_string(),
+            source_type: "text".to_string(),
+            title: id.to_string(),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: None,
+            word_count: None,
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: "ready".to_string(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn chunk(id: &str, source_id: &str) -> Chunk {
+        Chunk {
+            id: id.to_string(),
+            source_id: source_id.to_string(),
+            chunk_index: 0,
+            content: "content".to_string(),
+            token_count: None,
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: None,
+            embedding_model: None,
+        }
+    }
+
+    #[test]
+    fn shared_scope_filter_excludes_unselected_semantic_and_fts_chunks() {
+        let all_sources = vec![source("selected"), source("unselected")];
+        let scope = SourceScope::Explicit(vec!["selected".to_string()]).resolve(&all_sources);
+
+        assert!(scope_allows_chunk(&scope, &chunk("c1", "selected")));
+        assert!(!scope_allows_chunk(&scope, &chunk("c2", "unselected")));
+    }
+
+    #[test]
+    fn invalid_explicit_scope_filters_every_chunk() {
+        let all_sources = vec![source("selected")];
+        let scope = SourceScope::Explicit(vec!["missing".to_string()]).resolve(&all_sources);
+
+        assert!(!scope_allows_chunk(&scope, &chunk("c1", "selected")));
+    }
 }

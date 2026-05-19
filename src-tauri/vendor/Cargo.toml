@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "forge-memory-bridge",
+    "semantic-memory",
+    "semantic-memory-forge",
+    "stack-ids",
+]
+exclude = [
+    "job-queue",
+    "llm-output-parser",
+    "llm-pipeline",
+    "tauri-queue",
+    "turbo-quant",
+]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+todo = "deny"
+dbg_macro = "deny"
+unimplemented = "deny"
+expect_used = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+blake3 = "1.8.3"
+chrono = "0.4.44"
+proptest = "1.10.0"
+rusqlite = "0.32.1"
+schemars = "0.8.22"
+serde = "1.0.228"
+serde_json = "1.0.149"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = "1.50.0"
+tracing = "0.1.44"
+uuid = "1.22.0"

@@ -1,0 +1,86 @@
+
+running 71 tests
+test db::app_db::tests::test_rename_notebook ... ok
+test db::app_db::tests::test_delete_notebook ... ok
+test db::app_db::tests::test_settings ... ok
+test db::app_db::tests::test_update_source_count ... ok
+test db::app_db::tests::test_create_and_list_notebooks ... ok
+test db::app_db::tests::test_models_crud ... ok
+test ingestion::chunk::tests::test_chunk_offsets ... ok
+test db::app_db::tests::test_providers ... ok
+test db::app_db::tests::test_update_provider_does_not_persist_api_key ... ok
+test ingestion::chunk::tests::test_empty_text ... ok
+test ingestion::chunk::tests::test_long_text_multiple_chunks ... ok
+test ingestion::chunk::tests::test_markdown_heading_split ... ok
+test ingestion::chunk::tests::test_rust_code_boundaries ... ok
+test ingestion::chunk::tests::test_section_heading_extraction ... ok
+test ingestion::chunk::tests::test_short_text_single_chunk ... ok
+test ingestion::chunk::tests::test_code_aware_chunking ... ok
+test memory::backend::tests::ambiguous_exact_semantic_matches_are_suppressed ... ok
+test memory::backend::tests::candidate_set_intersection_is_deterministic_for_parity_reports ... ok
+test memory::backend::tests::citation_source_outside_scope_and_missing_or_stale_links_do_not_widen ... ok
+test memory::backend::tests::comparison_receipt_ids_include_nested_semantic_memory_receipt ... ok
+test memory::backend::tests::deterministic_large_corpus_scope_parity_and_ranking_order ... ok
+test memory::backend::tests::hostile_scope_fixtures_fail_closed_for_semantic_candidates ... ok
+test memory::backend::tests::invalid_requested_ids_reports_all_invalid_when_explicit_scope_resolves_none ... ok
+test db::migrations::tests::notebook_migration_creates_missing_semantic_memory_links_table ... ok
+test memory::backend::tests::semantic_candidates_require_exact_chunk_id_and_digest ... ok
+test memory::backend::tests::stale_delete_and_reindex_links_only_accept_synced_backpointers ... ok
+test db::migrations::tests::notebook_migration_repairs_missing_fts_for_existing_schema ... ok
+test ingestion::chunk::tests::test_repeated_text_chunking_stays_bounded ... ok
+test provider_config_store::tests::test_secret_store_round_trip ... ok
+test providers::ollama::tests::ollama_chat_body_disables_thinking_for_visible_content ... ok
+test providers::ollama::tests::ollama_normal_frame_extracts_content_and_done ... ok
+test providers::ollama::tests::ollama_stream_error_frame_becomes_provider_error ... ok
+test db::migrations::tests::notebook_migration_repairs_legacy_semantic_memory_links ... ok
+test retrieval::citations::tests::context_citations_require_valid_chunk_identity ... ok
+test retrieval::citations::tests::test_extract_citations ... ok
+test db::notebook_db::tests::test_cascade_delete_source_removes_chunks ... ok
+test retrieval::citations::tests::counts_unique_citation_references_for_invalid_citation_metrics ... ok
+test retrieval::citations::tests::test_no_citations ... ok
+test retrieval::context::tests::none_scope_prompt_does_not_leak_manifest ... ok
+test retrieval::context::tests::scoped_prompt_does_not_fallback_to_manifest_summaries ... ok
+test retrieval::context::tests::scoped_prompt_only_includes_selected_manifest_and_passages ... ok
+test retrieval::hybrid_search::tests::invalid_explicit_scope_filters_every_chunk ... ok
+test retrieval::hybrid_search::tests::shared_scope_filter_excludes_unselected_semantic_and_fts_chunks ... ok
+test retrieval::source_scope::tests::explicit_scope_dedupes_and_preserves_order_without_widening ... ok
+test retrieval::citations::tests::test_out_of_range_citation ... ok
+test retrieval::source_scope::tests::explicit_scope_treats_sql_fts_payload_as_data ... ok
+test retrieval::source_scope::tests::explicit_scope_with_one_valid_and_invalid_stays_bounded_to_valid ... ok
+test retrieval::source_scope::tests::resolves_all_scope_without_dropping_sources ... ok
+test retrieval::source_scope::tests::resolves_explicit_scope_without_widening_to_all ... ok
+test retrieval::source_scope::tests::resolves_invalid_explicit_scope_to_none_instead_of_all ... ok
+test retrieval::source_scope::tests::source_scope_none_returns_no_manifest_or_passages ... ok
+test state::tests::active_counter_guard_finalizes_on_drop_and_saturates ... ok
+test db::notebook_db::tests::scoped_fts_search_filters_sources_limits_and_orders_deterministically ... ok
+test db::notebook_db::tests::test_set_selected_sources ... ok
+test db::notebook_db::tests::test_conversation_and_messages ... ok
+test retrieval::citations::tests::zero_citation_is_invalid_and_never_anchored ... ok
+test db::notebook_db::tests::test_notes_crud ... ok
+test db::notebook_db::tests::test_source_crud ... ok
+test db::notebook_db::tests::test_chunk_and_fts ... ok
+test memory::backend::tests::backend_comparison_returns_truthful_semantic_result_when_unavailable ... ok
+test state::tests::summary_mode_defaults_to_manual_startup ... ok
+test memory::gloss_local::tests::local_search_handles_hyphenated_queries_without_degrading ... ok
+test state::tests::test_migrate_legacy_secrets_scrubs_sqlite ... ok
+test memory::gloss_local::tests::local_search_marks_source_order_fallback_as_degraded ... ok
+test memory::gloss_local::tests::local_search_returns_late_answer_chunk_before_unrelated_early_chunks ... ok
+test commands::sources::tests::summary_config_rejects_non_ollama_default_model ... ok
+test commands::sources::tests::vision_config_rejects_non_vision_model ... ok
+test state::tests::test_reconcile_notebook_source_counts ... ok
+test commands::sources::tests::auto_queue_reports_zero_when_background_config_is_invalid ... ok
+test tests::summary_llm_wait_releases_gpu_when_chat_arrives ... ok
+test tests::summary_llm_wait_times_out_without_holding_gpu_forever ... ok
+
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

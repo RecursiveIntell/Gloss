@@ -23,6 +23,60 @@ impl OllamaProvider {
     }
 }
 
+fn ollama_chat_token_from_value(val: &serde_json::Value) -> Result<ChatToken, GlossError> {
+    if let Some(error) = val.get("error").and_then(|error| error.as_str()) {
+        return Err(GlossError::Provider {
+            provider: "ollama".into(),
+            source: anyhow::anyhow!("Ollama stream error: {error}"),
+        });
+    }
+
+    let done = val.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+    let token = val
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(ChatToken { token, done })
+}
+
+fn build_ollama_chat_body(request: &ChatRequest) -> serde_json::Value {
+    let mut messages = Vec::new();
+    if let Some(ref system) = request.system_prompt {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": system,
+        }));
+    }
+    for msg in &request.messages {
+        let mut msg_json = serde_json::json!({
+            "role": msg.role,
+            "content": msg.content,
+        });
+        if let Some(ref images) = msg.images {
+            msg_json["images"] = serde_json::json!(images);
+        }
+        messages.push(msg_json);
+    }
+
+    let mut options = serde_json::json!({
+        "temperature": request.temperature,
+        "num_predict": request.max_tokens,
+    });
+    if let Some(num_ctx) = request.num_ctx {
+        options["num_ctx"] = serde_json::json!(num_ctx);
+    }
+
+    serde_json::json!({
+        "model": request.model,
+        "messages": messages,
+        "stream": request.stream,
+        "think": false,
+        "options": options,
+    })
+}
+
 #[async_trait]
 impl LlmProvider for OllamaProvider {
     async fn list_models(&self) -> Result<Vec<ModelInfo>, GlossError> {
@@ -86,40 +140,7 @@ impl LlmProvider for OllamaProvider {
         request: ChatRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatToken, GlossError>> + Send>>, GlossError> {
         let url = format!("{}/api/chat", self.base_url);
-
-        // Build messages array
-        let mut messages = Vec::new();
-        if let Some(ref system) = request.system_prompt {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": system,
-            }));
-        }
-        for msg in &request.messages {
-            let mut msg_json = serde_json::json!({
-                "role": msg.role,
-                "content": msg.content,
-            });
-            if let Some(ref images) = msg.images {
-                msg_json["images"] = serde_json::json!(images);
-            }
-            messages.push(msg_json);
-        }
-
-        let mut options = serde_json::json!({
-            "temperature": request.temperature,
-            "num_predict": request.max_tokens,
-        });
-        if let Some(num_ctx) = request.num_ctx {
-            options["num_ctx"] = serde_json::json!(num_ctx);
-        }
-
-        let body = serde_json::json!({
-            "model": request.model,
-            "messages": messages,
-            "stream": request.stream,
-            "options": options,
-        });
+        let body = build_ollama_chat_body(&request);
 
         let resp = self
             .client
@@ -157,15 +178,7 @@ impl LlmProvider for OllamaProvider {
                                 let values = decoder.decode(&bytes);
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
                                 for val in values {
-                                    let done =
-                                        val.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
-                                    let token = val
-                                        .get("message")
-                                        .and_then(|m| m.get("content"))
-                                        .and_then(|c| c.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    tokens.push(Ok(ChatToken { token, done }));
+                                    tokens.push(ollama_chat_token_from_value(&val));
                                 }
                                 if !tokens.is_empty() {
                                     return Some((stream::iter(tokens), (byte_stream, decoder)));
@@ -174,16 +187,8 @@ impl LlmProvider for OllamaProvider {
                             Ok(None) => {
                                 // Stream ended — flush decoder
                                 if let Some(val) = decoder.flush() {
-                                    let done =
-                                        val.get("done").and_then(|d| d.as_bool()).unwrap_or(true);
-                                    let token = val
-                                        .get("message")
-                                        .and_then(|m| m.get("content"))
-                                        .and_then(|c| c.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
                                     return Some((
-                                        stream::iter(vec![Ok(ChatToken { token, done })]),
+                                        stream::iter(vec![ollama_chat_token_from_value(&val)]),
                                         (byte_stream, decoder),
                                     ));
                                 }
@@ -212,6 +217,13 @@ impl LlmProvider for OllamaProvider {
                 source: e.into(),
             })?;
 
+            if let Some(error) = body.get("error").and_then(|error| error.as_str()) {
+                return Err(GlossError::Provider {
+                    provider: "ollama".into(),
+                    source: anyhow::anyhow!("Ollama response error: {error}"),
+                });
+            }
+
             let content = body
                 .get("message")
                 .and_then(|m| m.get("content"))
@@ -236,5 +248,70 @@ impl LlmProvider for OllamaProvider {
 
     fn provider_type(&self) -> ProviderType {
         ProviderType::Ollama
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::ChatMessage;
+
+    fn smoke_request() -> ChatRequest {
+        ChatRequest {
+            model: "qwen3.5:4b".to_string(),
+            system_prompt: Some("system".to_string()),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Reply exactly: gloss smoke ok".to_string(),
+                images: None,
+            }],
+            max_tokens: 64,
+            temperature: 0.0,
+            stream: true,
+            num_ctx: Some(8192),
+        }
+    }
+
+    #[test]
+    fn ollama_chat_body_disables_thinking_for_visible_content() {
+        let body = build_ollama_chat_body(&smoke_request());
+        assert_eq!(
+            body.get("think").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            body.get("options")
+                .and_then(|options| options.get("num_ctx"))
+                .and_then(|value| value.as_u64()),
+            Some(8192)
+        );
+        assert_eq!(
+            body.get("messages")
+                .and_then(|messages| messages.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn ollama_stream_error_frame_becomes_provider_error() {
+        let value = serde_json::json!({
+            "error": "model not found"
+        });
+        let err = ollama_chat_token_from_value(&value).expect_err("error frame must fail");
+        assert!(err
+            .to_string()
+            .contains("Ollama stream error: model not found"));
+    }
+
+    #[test]
+    fn ollama_normal_frame_extracts_content_and_done() {
+        let value = serde_json::json!({
+            "message": {"content": "gloss smoke ok"},
+            "done": true
+        });
+        let token = ollama_chat_token_from_value(&value).expect("normal frame should parse");
+        assert_eq!(token.token, "gloss smoke ok");
+        assert!(token.done);
     }
 }

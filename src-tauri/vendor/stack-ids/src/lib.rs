@@ -11,7 +11,10 @@
 //! `stack-ids` is authoritative for:
 //! - Opaque ID newtypes (EnvelopeId, ClaimId, ClaimVersionId, EntityId,
 //!   EpisodeId, AttemptId, TrialId, ArtifactId, ProjectionId, RelationId,
-//!   RelationVersionId, ImportBatchId)
+//!   RelationVersionId, ImportBatchId, KernelRunId, ConstraintId,
+//!   HyperedgeId, ResidualId, SyndromeId, WitnessId, CertificateId,
+//!   OracleSliceId, RefutationResultId, OperatorId, OperatorVersionId,
+//!   CalibrationReportId)
 //! - Scope representation (ScopeKey, Scope)
 //! - Trace context (TraceCtx, W3C trace-context helpers)
 //! - Content digest computation (canonical BLAKE3 digest)
@@ -26,9 +29,13 @@
 mod digest;
 mod ids;
 mod scope;
+mod status;
 mod trace;
+mod v25;
 
 pub use digest::*;
 pub use ids::*;
 pub use scope::*;
+pub use status::*;
 pub use trace::*;
+pub use v25::*;

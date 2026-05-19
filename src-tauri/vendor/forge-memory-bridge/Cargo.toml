@@ -1,0 +1,25 @@
+[package]
+name = "forge-memory-bridge"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.75.0"
+description = "Transform Forge export envelopes into projection import batches for semantic-memory"
+license = "Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+semantic-memory-forge = { version = "0.1.1", path = "../semantic-memory-forge" }
+stack-ids = { version = "0.1.1", path = "../stack-ids" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["v4"] }
+schemars = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+# LIB-005: inherit workspace lint policy
+[lints]
+workspace = true

@@ -1,0 +1,1 @@
+{"model":"qwen3.5:4b","created_at":"2026-05-18T19:20:49.722374915Z","message":{"role":"assistant","content":"gloss smoke ok"},"done":true,"done_reason":"stop","total_duration":15399818182,"load_duration":2158603256,"prompt_eval_count":18,"prompt_eval_duration":6651018640,"eval_count":5,"eval_duration":6425983297}

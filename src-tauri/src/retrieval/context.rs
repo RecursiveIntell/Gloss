@@ -14,6 +14,7 @@ pub struct ContextAssembler;
 #[derive(Debug, Clone)]
 pub struct ContextPassage {
     pub source_id: String,
+    pub chunk_id: Option<String>,
     pub title: String,
     pub content: String,
 }
@@ -296,6 +297,7 @@ mod tests {
             &selected,
             &[ContextPassage {
                 source_id: "s1".to_string(),
+                chunk_id: Some("c1".to_string()),
                 title: "Selected Source".to_string(),
                 content: "Selected evidence".to_string(),
             }],

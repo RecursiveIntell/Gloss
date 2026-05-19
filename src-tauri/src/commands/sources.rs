@@ -4,7 +4,16 @@ use crate::error::GlossError;
 use crate::ingestion::chunk::chunk_text_with_title;
 use crate::ingestion::extract::extract_text;
 use crate::jobs::{self, GlossJob};
-use crate::state::{AppState, SUMMARY_MODE_AUTO, SUMMARY_MODE_MANUAL};
+use crate::memory::backend::MemorySearchBackend;
+use crate::memory::gloss_local::GlossLocalMemoryBackend;
+#[cfg(feature = "semantic-memory-backend")]
+use crate::memory::semantic_memory_adapter;
+use crate::memory::{
+    compare_memory_backends_for_notebook, MemoryBackendComparison, MemoryBackendStatus,
+    MemorySearchRequest, SemanticMemoryLinkStatus, MEMORY_BACKEND_GLOSS_LOCAL,
+};
+use crate::retrieval::source_scope::SourceScope;
+use crate::state::{ActiveCounterGuard, AppState, SUMMARY_MODE_AUTO, SUMMARY_MODE_MANUAL};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -12,6 +21,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 use tauri_queue::{QueueJob, QueueManager, QueuePriority};
 
@@ -371,8 +381,9 @@ fn run_ingestion_inner(
     queue: &Arc<QueueManager>,
     opts: IngestionOpts,
 ) {
-    // Signal that ingestion is active so the summary loop yields
-    state.ingestion_active.fetch_add(1, Ordering::SeqCst);
+    // Signal that ingestion is active so the summary loop yields. The guard
+    // finalizes the counter on early returns or panic unwind.
+    let _ingestion_guard = ActiveCounterGuard::new(&state.ingestion_active, "ingestion_active");
 
     let result = (|| -> Result<(), GlossError> {
         // Get notebook dir + source record
@@ -413,24 +424,22 @@ fn run_ingestion_inner(
         tracing::debug!(source_id, chunks = chunks.len(), "Chunking complete");
 
         // 3. Insert chunks into DB
-        state.with_notebook_db(notebook_id, |db| {
-            for chunk_data in &chunks {
-                let chunk = Chunk {
-                    id: chunk_data.id.clone(),
-                    source_id: source_id.to_string(),
-                    chunk_index: chunk_data.chunk_index,
-                    content: chunk_data.content.clone(),
-                    token_count: chunk_data.token_count,
-                    start_offset: chunk_data.start_offset,
-                    end_offset: chunk_data.end_offset,
-                    metadata: chunk_data.metadata.clone(),
-                    embedding_id: None,
-                    embedding_model: None,
-                };
-                db.insert_chunk(&chunk)?;
-            }
-            Ok(())
-        })?;
+        let db_chunks = chunks
+            .iter()
+            .map(|chunk_data| Chunk {
+                id: chunk_data.id.clone(),
+                source_id: source_id.to_string(),
+                chunk_index: chunk_data.chunk_index,
+                content: chunk_data.content.clone(),
+                token_count: chunk_data.token_count,
+                start_offset: chunk_data.start_offset,
+                end_offset: chunk_data.end_offset,
+                metadata: chunk_data.metadata.clone(),
+                embedding_id: None,
+                embedding_model: None,
+            })
+            .collect::<Vec<_>>();
+        state.with_notebook_db(notebook_id, |db| db.insert_chunks(&db_chunks))?;
 
         if opts.embed_chunks {
             // Acquire GPU gate to prevent ONNX + Ollama VRAM contention
@@ -524,9 +533,6 @@ fn run_ingestion_inner(
         );
         Ok(())
     })();
-
-    // Decrement active ingestion counter (always, even on error)
-    state.ingestion_active.fetch_sub(1, Ordering::SeqCst);
 
     if let Err(e) = &result {
         if is_deleted_source_error(e, source_id) {
@@ -687,17 +693,9 @@ fn resolve_background_job_config_from_db(
         })?;
 
     let models = app_db.get_all_models().map_err(|e| e.to_string())?;
-    let model_record = models.iter().find(|model| model.id == selected_model);
-    let provider_id = model_record
-        .map(|model| model.provider_id.clone())
-        .or_else(|| {
-            if configured_model.is_none() && default_model.as_deref() == Some(selected_model.as_str())
-            {
-                normalize_setting(app_db.get_setting("default_provider").ok().flatten())
-            } else {
-                None
-            }
-        })
+    let model_record = models
+        .iter()
+        .find(|model| model.id == selected_model && model.available && !model.stale)
         .ok_or_else(|| {
             format!(
                 "Background {} model '{}' is not available in the model registry. Refresh models or choose a compatible Ollama model.",
@@ -705,6 +703,7 @@ fn resolve_background_job_config_from_db(
                 selected_model
             )
         })?;
+    let provider_id = model_record.provider_id.clone();
 
     if provider_id != "ollama" {
         return Err(format!(
@@ -715,16 +714,11 @@ fn resolve_background_job_config_from_db(
         ));
     }
 
-    if matches!(kind, BackgroundJobKind::Vision) {
-        match model_record {
-            Some(model) if has_vision_capability(model) => {}
-            Some(_) | None => {
-                return Err(format!(
-                    "Background vision requires a vision-capable Ollama model, but '{}' is not marked as vision-capable.",
-                    selected_model
-                ));
-            }
-        }
+    if matches!(kind, BackgroundJobKind::Vision) && !has_vision_capability(model_record) {
+        return Err(format!(
+            "Background vision requires a vision-capable Ollama model, but '{}' is not marked as vision-capable.",
+            selected_model
+        ));
     }
 
     let base_url = app_db
@@ -902,9 +896,9 @@ fn queue_describe_video_job(
     }
 }
 
-/// Run the embedding pipeline for a described source (image/video that already
-/// has content_text and chunks but no vector embeddings).
-pub(crate) fn embed_described_source(
+/// Finalize a described media source by marking it ready and queueing summary
+/// generation. This does not create semantic embeddings.
+pub(crate) fn finalize_described_source(
     state: &AppState,
     notebook_id: &str,
     source_id: &str,
@@ -934,8 +928,8 @@ pub(crate) fn embed_described_source(
         Ok(())
     })();
 
-    let embed_error_msg = if let Err(ref e) = result {
-        tracing::warn!(source_id, error = %e, "Embedding failed for described source");
+    let finalize_error_msg = if let Err(ref e) = result {
+        tracing::warn!(source_id, error = %e, "Finalization failed for described source");
         let msg = e.to_string();
         let _ = state.with_notebook_db(notebook_id, |db| {
             db.update_source_status(source_id, "error", Some(&msg))
@@ -950,7 +944,7 @@ pub(crate) fn embed_described_source(
         notebook_id,
         source_id,
         if result.is_ok() { "ready" } else { "error" },
-        embed_error_msg.as_deref(),
+        finalize_error_msg.as_deref(),
     );
 }
 
@@ -973,6 +967,26 @@ fn emit_status(
     let _ = app_handle.emit("source:status", payload);
 }
 
+fn emit_folder_scan_event(
+    app_handle: &tauri::AppHandle,
+    notebook_id: &str,
+    status: &str,
+    path: &str,
+    count: usize,
+    message: Option<&str>,
+) {
+    let _ = app_handle.emit(
+        "sources:folder_scan",
+        serde_json::json!({
+            "notebook_id": notebook_id,
+            "status": status,
+            "path": path,
+            "count": count,
+            "message": message,
+        }),
+    );
+}
+
 fn invalidate_suggested_questions(state: &AppState, notebook_id: &str) {
     if let Err(e) =
         state.with_notebook_db(notebook_id, |db| db.set_config("suggested_questions", ""))
@@ -991,17 +1005,7 @@ fn sync_notebook_source_count(state: &AppState, notebook_id: &str) -> Result<(),
     Ok(())
 }
 
-#[tauri::command]
-pub async fn add_source_file(
-    notebook_id: String,
-    path: String,
-    state: State<'_, AppState>,
-    queue: State<'_, Arc<QueueManager>>,
-    app_handle: tauri::AppHandle,
-) -> Result<String, GlossError> {
-    let source_path = PathBuf::from(&path);
-
-    // Check file size before creating source
+fn validate_import_size(source_path: &Path) -> Result<(), GlossError> {
     let ext = source_path
         .extension()
         .and_then(|e| e.to_str())
@@ -1025,6 +1029,20 @@ pub async fn add_source_file(
             });
         }
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn add_source_file(
+    notebook_id: String,
+    path: String,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, GlossError> {
+    let source_path = PathBuf::from(&path);
+
+    validate_import_size(&source_path)?;
 
     let (source_id, source_type) = create_file_source(&notebook_id, &source_path, None, &state)?;
     invalidate_suggested_questions(&state, &notebook_id);
@@ -1057,6 +1075,72 @@ pub async fn add_source_file(
     }
 
     Ok(source_id)
+}
+
+#[tauri::command]
+pub async fn add_source_files(
+    notebook_id: String,
+    paths: Vec<String>,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+    app_handle: tauri::AppHandle,
+) -> Result<Vec<String>, GlossError> {
+    let mut created = Vec::new();
+    for path in paths {
+        let source_path = PathBuf::from(&path);
+        validate_import_size(&source_path)?;
+        let (source_id, source_type) =
+            create_file_source(&notebook_id, &source_path, None, &state)?;
+
+        match source_type.as_str() {
+            "image" => {
+                match queue_describe_image_job(
+                    &queue,
+                    &state,
+                    &notebook_id,
+                    &source_id,
+                    &source_path,
+                ) {
+                    Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
+                    Err(msg) => {
+                        emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg))
+                    }
+                }
+            }
+            "video" => match queue_describe_video_job(&queue, &state, &notebook_id, &source_id) {
+                Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
+                Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
+            },
+            _ => {
+                let nb = notebook_id.clone();
+                let src = source_id.clone();
+                let q = Arc::clone(&queue);
+                let handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let state = handle.state::<AppState>();
+                        run_ingestion(&nb, &src, &state, &handle, &q);
+                    })
+                    .await;
+                });
+            }
+        }
+        created.push(source_id);
+    }
+
+    if !created.is_empty() {
+        sync_notebook_source_count(&state, &notebook_id)?;
+        invalidate_suggested_questions(&state, &notebook_id);
+        let _ = app_handle.emit(
+            "sources:batch_created",
+            serde_json::json!({
+                "notebook_id": &notebook_id,
+                "count": created.len(),
+            }),
+        );
+    }
+
+    Ok(created)
 }
 
 /// Maximum file size (10 MB) for folder imports. Files larger than this are
@@ -1105,27 +1189,20 @@ fn walk_directory_inner(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
         return;
     }
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
+    let mut entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
         Err(e) => {
             tracing::warn!(dir = %dir.display(), error = %e, "Cannot read directory, skipping");
             return;
         }
     };
+    entries.sort_by_key(|a| a.path());
 
     for entry in entries {
         if out.len() >= MAX_WALK_FILES {
             tracing::warn!("File limit ({}) reached during folder walk", MAX_WALK_FILES);
             return;
         }
-
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(dir = %dir.display(), error = %e, "Bad directory entry, skipping");
-                continue;
-            }
-        };
 
         let path = entry.path();
         let name = entry.file_name();
@@ -1180,6 +1257,14 @@ pub async fn add_source_folder(
     invalidate_suggested_questions(&state, &notebook_id);
     let folder = PathBuf::from(&path);
     if !folder.is_dir() {
+        emit_folder_scan_event(
+            &app_handle,
+            &notebook_id,
+            "scan_failed",
+            &path,
+            0,
+            Some("Not a directory"),
+        );
         return Err(GlossError::Ingestion {
             source_id: String::new(),
             message: format!("Not a directory: {}", path),
@@ -1193,6 +1278,12 @@ pub async fn add_source_folder(
     let folder_create = folder.clone();
     let import_path = path.clone();
     tauri::async_runtime::spawn(async move {
+        emit_folder_scan_event(&handle, &nb_id, "scan_started", &import_path, 0, None);
+        let batch_ingestion_guard = {
+            let state = handle.state::<AppState>();
+            ActiveCounterGuard::new(&state.ingestion_active, "batch_ingestion_active")
+        };
+
         // Keep the IPC command fast: scan the folder entirely in the background.
         let files = match tokio::task::spawn_blocking(move || {
             let mut files = Vec::new();
@@ -1208,6 +1299,14 @@ pub async fn add_source_folder(
                     error = %e,
                     "Directory walk failed during background folder import"
                 );
+                emit_folder_scan_event(
+                    &handle,
+                    &nb_id,
+                    "scan_failed",
+                    &import_path,
+                    0,
+                    Some(&e.to_string()),
+                );
                 return;
             }
         };
@@ -1217,6 +1316,14 @@ pub async fn add_source_folder(
                 folder = %import_path,
                 "Folder contains more than {} supported files; only importing first {}",
                 MAX_WALK_FILES, MAX_WALK_FILES
+            );
+            emit_folder_scan_event(
+                &handle,
+                &nb_id,
+                "scan_truncated",
+                &import_path,
+                files.len(),
+                Some("Folder scan reached the supported file cap"),
             );
         }
 
@@ -1228,6 +1335,14 @@ pub async fn add_source_folder(
         );
 
         if file_count == 0 {
+            emit_folder_scan_event(
+                &handle,
+                &nb_id,
+                "scan_empty",
+                &import_path,
+                0,
+                Some("No supported files found"),
+            );
             return;
         }
 
@@ -1302,14 +1417,15 @@ pub async fn add_source_folder(
 
         let total = sources.len();
         if total == 0 {
+            emit_folder_scan_event(
+                &handle,
+                &nb_id,
+                "import_completed",
+                &import_path,
+                0,
+                Some("No new sources created"),
+            );
             return;
-        }
-
-        // Hold ingestion_active for the entire batch so the summary loop
-        // cannot steal the GPU gate between individual source ingestions.
-        {
-            let state = handle.state::<AppState>();
-            state.ingestion_active.fetch_add(1, Ordering::SeqCst);
         }
 
         // Phase 2: Ingest one at a time on blocking thread pool.
@@ -1362,11 +1478,8 @@ pub async fn add_source_folder(
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        // Release the batch-level ingestion hold
-        {
-            let state = handle.state::<AppState>();
-            state.ingestion_active.fetch_sub(1, Ordering::SeqCst);
-        }
+        // Release the batch-level ingestion hold before post-processing.
+        drop(batch_ingestion_guard);
 
         // Save HNSW index once after all sources are ingested
         {
@@ -1388,6 +1501,14 @@ pub async fn add_source_folder(
                 "notebook_id": &nb_id,
                 "count": total,
             }),
+        );
+        emit_folder_scan_event(
+            &handle,
+            &nb_id,
+            "import_completed",
+            &import_path,
+            total,
+            None,
         );
 
         tracing::info!(
@@ -1523,7 +1644,17 @@ pub async fn delete_source(
         }
     }
 
-    state.with_notebook_db(&notebook_id, |db| db.delete_source(&source_id))?;
+    state.with_notebook_db(&notebook_id, |db| {
+        db.conn.execute(
+            "UPDATE semantic_memory_links
+             SET sync_status = 'stale',
+                 sync_error = 'Gloss source deleted',
+                 synced_at = datetime('now')
+             WHERE notebook_id = ?1 AND source_id = ?2",
+            rusqlite::params![notebook_id, source_id],
+        )?;
+        db.delete_source(&source_id)
+    })?;
     sync_notebook_source_count(&state, &notebook_id)?;
     invalidate_suggested_questions(&state, &notebook_id);
 
@@ -1540,6 +1671,103 @@ pub async fn delete_source(
                 );
             }
         }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_sources(
+    notebook_id: String,
+    source_ids: Vec<String>,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+) -> Result<(), GlossError> {
+    let notebook_dir = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let notebook = app_db.get_notebook(&notebook_id)?;
+        PathBuf::from(notebook.directory)
+    };
+
+    for source_id in &source_ids {
+        let source = state.with_notebook_db(&notebook_id, |db| db.get_source(source_id))?;
+        let old_embedding_ids = state.with_notebook_db(&notebook_id, |db| {
+            db.get_embedding_ids_for_source(source_id)
+        })?;
+
+        let cancelled = jobs::cancel_jobs_matching(&queue, |job, _status| {
+            job.notebook_id() == notebook_id && job.source_id() == source_id
+        });
+        if cancelled > 0 {
+            tracing::info!(
+                notebook_id,
+                source_id,
+                cancelled,
+                "Cancelled queued background jobs for deleted source"
+            );
+        }
+
+        if !old_embedding_ids.is_empty() {
+            let mut indices = state
+                .hnsw_indices
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            if let Some(index) = indices.get_mut(&notebook_id) {
+                for embedding_id in &old_embedding_ids {
+                    if let Err(e) = index.remove(*embedding_id) {
+                        tracing::warn!(
+                            notebook_id,
+                            source_id,
+                            embedding_id,
+                            error = %e,
+                            "Failed to remove source vector from HNSW index"
+                        );
+                    }
+                }
+            }
+        }
+
+        state.with_notebook_db(&notebook_id, |db| {
+            db.conn.execute(
+                "UPDATE semantic_memory_links
+                 SET sync_status = 'stale',
+                     sync_error = 'Gloss source deleted',
+                     synced_at = datetime('now')
+                 WHERE notebook_id = ?1 AND source_id = ?2",
+                rusqlite::params![notebook_id, source_id],
+            )?;
+            db.delete_source(source_id)
+        })?;
+
+        if let Some(file_path) = source.file_path.as_deref() {
+            let source_file = notebook_dir.join("sources").join(file_path);
+            if source_file.exists() {
+                if let Err(e) = std::fs::remove_file(&source_file) {
+                    tracing::warn!(
+                        notebook_id,
+                        source_id,
+                        path = %source_file.display(),
+                        error = %e,
+                        "Failed to remove deleted source file from disk"
+                    );
+                }
+            }
+        }
+    }
+
+    if !source_ids.is_empty() {
+        if let Err(e) = state.save_hnsw_index(&notebook_id) {
+            tracing::warn!(
+                notebook_id,
+                error = %e,
+                "Failed to persist HNSW index after bulk source deletion"
+            );
+        }
+        sync_notebook_source_count(&state, &notebook_id)?;
+        invalidate_suggested_questions(&state, &notebook_id);
     }
 
     Ok(())
@@ -1616,6 +1844,14 @@ pub async fn retry_source_ingestion(
 
     // Reset status and delete old chunks
     let source_type = state.with_notebook_db(&notebook_id, |db| {
+        db.conn.execute(
+            "UPDATE semantic_memory_links
+             SET sync_status = 'stale',
+                 sync_error = 'Gloss source reingestion requested',
+                 synced_at = datetime('now')
+             WHERE notebook_id = ?1 AND source_id = ?2",
+            rusqlite::params![notebook_id, source_id],
+        )?;
         db.update_source_status(&source_id, "pending", None)?;
         db.delete_chunks_for_source(&source_id)?;
         let source = db.get_source(&source_id)?;
@@ -1697,26 +1933,25 @@ pub(crate) fn auto_queue_notebook_summaries(
         };
     }
 
-    let sources = match state.with_notebook_db(notebook_id, |db| db.list_sources()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(notebook_id, error = %e, "Failed to list sources for auto-queue");
-            return QueueSummariesResponse {
-                queued: 0,
-                diagnostics: vec![e.to_string()],
-            };
-        }
-    };
+    let sources =
+        match state.with_notebook_db(notebook_id, |db| db.list_source_headers_needing_summary()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(notebook_id, error = %e, "Failed to list sources for auto-queue");
+                return QueueSummariesResponse {
+                    queued: 0,
+                    diagnostics: vec![e.to_string()],
+                };
+            }
+        };
 
     let mut queued = 0u32;
     let mut diagnostics = Vec::new();
     for source in &sources {
-        if source.status == "ready" && source.summary.is_none() {
-            match queue_summary_job(queue, state, notebook_id, &source.id, &source.title) {
-                Ok(true) => queued += 1,
-                Ok(false) => {}
-                Err(diagnostic) => push_diagnostic(&mut diagnostics, diagnostic),
-            }
+        match queue_summary_job(queue, state, notebook_id, &source.id, &source.title) {
+            Ok(true) => queued += 1,
+            Ok(false) => {}
+            Err(diagnostic) => push_diagnostic(&mut diagnostics, diagnostic),
         }
     }
 
@@ -1737,6 +1972,7 @@ pub struct QueueStatusResponse {
     pub processing: u32,
     pub completed: u32,
     pub failed: u32,
+    pub gate_owners: Vec<crate::state::RuntimeGateOwner>,
     pub summary_backend: BackgroundBackendStatus,
     pub vision_backend: BackgroundBackendStatus,
 }
@@ -1798,9 +2034,297 @@ pub async fn get_queue_status(
         processing: stats.processing,
         completed: stats.completed,
         failed: stats.failed,
+        gate_owners: state.gate_owners_snapshot(),
         summary_backend: background_backend_status(&state, BackgroundJobKind::Summary),
         vision_backend: background_backend_status(&state, BackgroundJobKind::Vision),
     })
+}
+
+fn active_memory_backend(state: &AppState) -> Result<String, GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    Ok(app_db
+        .get_setting("memory_backend")?
+        .unwrap_or_else(|| MEMORY_BACKEND_GLOSS_LOCAL.to_string()))
+}
+
+fn link_status_for_notebook(
+    state: &AppState,
+    notebook_id: &str,
+) -> Result<SemanticMemoryLinkStatus, GlossError> {
+    state.with_notebook_db(notebook_id, |db| {
+        let (total, synced, stale, failed, missing_docs, last_error): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+        ) = db.conn.query_row(
+            "SELECT
+                COUNT(*),
+                SUM(CASE WHEN sync_status = 'synced' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN sync_status = 'stale' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN sync_status = 'failed' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN sm_document_id IS NULL THEN 1 ELSE 0 END),
+                (SELECT sync_error FROM semantic_memory_links
+                 WHERE sync_error IS NOT NULL AND sync_error != ''
+                 ORDER BY synced_at DESC LIMIT 1)
+             FROM semantic_memory_links",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+
+        Ok(SemanticMemoryLinkStatus {
+            notebook_id: notebook_id.to_string(),
+            total_links: total.max(0) as usize,
+            synced_links: synced.max(0) as usize,
+            stale_links: stale.max(0) as usize,
+            failed_links: failed.max(0) as usize,
+            missing_document_links: missing_docs.max(0) as usize,
+            last_sync_error: last_error,
+        })
+    })
+}
+
+#[tauri::command]
+pub async fn memory_backend_status(
+    notebook_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<MemoryBackendStatus, GlossError> {
+    let active_backend = active_memory_backend(&state)?;
+    let semantic_memory_feature_enabled = cfg!(feature = "semantic-memory-backend");
+    let semantic_memory_available = semantic_memory_feature_enabled
+        && active_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW;
+    let link_status = notebook_id
+        .as_deref()
+        .map(|id| link_status_for_notebook(&state, id))
+        .transpose()?;
+
+    let index_sync_status = link_status
+        .as_ref()
+        .map(|status| {
+            if status.failed_links > 0 {
+                "failed"
+            } else if status.stale_links > 0 || status.missing_document_links > 0 {
+                "degraded"
+            } else if status.synced_links > 0 {
+                "synced"
+            } else {
+                "empty"
+            }
+        })
+        .unwrap_or("unknown")
+        .to_string();
+    let mut degradation_markers = Vec::new();
+    let mut fallback_reason = None;
+    if active_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
+        && !semantic_memory_feature_enabled
+    {
+        fallback_reason =
+            Some("semantic-memory preview selected but feature is not enabled".to_string());
+        degradation_markers.push("semantic-memory-feature-disabled".to_string());
+    }
+    if index_sync_status == "failed" || index_sync_status == "degraded" {
+        degradation_markers.push(format!("semantic-memory-sync-{index_sync_status}"));
+    }
+
+    let degraded = fallback_reason.is_some() || !degradation_markers.is_empty();
+
+    Ok(MemoryBackendStatus {
+        backend_id: active_backend.clone(),
+        default_backend: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+        active_backend: active_backend.clone(),
+        backend_used: if fallback_reason.is_some() {
+            MEMORY_BACKEND_GLOSS_LOCAL.to_string()
+        } else {
+            active_backend
+        },
+        available: true,
+        semantic_memory_feature_enabled,
+        semantic_memory_available,
+        semantic_memory_path: Some("src-tauri/vendor/semantic-memory".to_string()),
+        index_sync_status: index_sync_status.clone(),
+        sync_status: index_sync_status,
+        last_sync_at: None,
+        last_sync_error: link_status.and_then(|status| status.last_sync_error),
+        last_retrieval_receipt_id: None,
+        last_receipt_ref: None,
+        fallback_reason: fallback_reason.clone(),
+        degradation_markers,
+        backend_version_or_digest: None,
+        degraded,
+        diagnostic: fallback_reason,
+    })
+}
+
+#[tauri::command]
+pub async fn semantic_memory_link_status(
+    notebook_id: String,
+    state: State<'_, AppState>,
+) -> Result<SemanticMemoryLinkStatus, GlossError> {
+    link_status_for_notebook(&state, &notebook_id)
+}
+
+#[tauri::command]
+pub async fn semantic_memory_reindex_source(
+    notebook_id: String,
+    source_id: String,
+    trace_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<crate::memory::IndexSourceReceipt, GlossError> {
+    #[cfg(feature = "semantic-memory-backend")]
+    {
+        let db_path = state.notebook_db_path(&notebook_id)?;
+        let runtime_config = {
+            let app_db = state
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            semantic_memory_adapter::runtime_config_from_settings(
+                app_db.get_setting("semantic_memory_embedding_url")?,
+                app_db.get_setting("semantic_memory_embedding_model")?,
+                app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+            )
+        };
+        semantic_memory_adapter::reindex_source(
+            &state.data_dir,
+            &notebook_id,
+            &db_path,
+            &source_id,
+            trace_id,
+            Some(runtime_config),
+        )
+        .await
+    }
+
+    #[cfg(not(feature = "semantic-memory-backend"))]
+    {
+        let _ = (notebook_id, source_id, trace_id, state);
+        Err(GlossError::Config(
+            "semantic-memory-backend feature is not enabled".to_string(),
+        ))
+    }
+}
+
+#[tauri::command]
+pub async fn semantic_memory_reindex_notebook(
+    notebook_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::memory::IndexSourceReceipt>, GlossError> {
+    #[cfg(not(feature = "semantic-memory-backend"))]
+    {
+        let _ = (notebook_id, state);
+        Err(GlossError::Config(
+            "semantic-memory-backend feature is not enabled".to_string(),
+        ))
+    }
+
+    #[cfg(feature = "semantic-memory-backend")]
+    {
+        let sources = state.with_notebook_db(&notebook_id, |db| db.list_sources())?;
+        let runtime_config = {
+            let app_db = state
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            semantic_memory_adapter::runtime_config_from_settings(
+                app_db.get_setting("semantic_memory_embedding_url")?,
+                app_db.get_setting("semantic_memory_embedding_model")?,
+                app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+            )
+        };
+        let mut receipts = Vec::new();
+        for source in sources {
+            let db_path = state.notebook_db_path(&notebook_id)?;
+            receipts.push(
+                semantic_memory_adapter::reindex_source(
+                    &state.data_dir,
+                    &notebook_id,
+                    &db_path,
+                    &source.id,
+                    Some(uuid::Uuid::new_v4().to_string()),
+                    Some(runtime_config.clone()),
+                )
+                .await?,
+            );
+        }
+        Ok(receipts)
+    }
+}
+
+#[tauri::command]
+pub async fn compare_memory_backends(
+    notebook_id: String,
+    query: String,
+    source_scope: SourceScope,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<MemoryBackendComparison, GlossError> {
+    let request = MemorySearchRequest {
+        notebook_id: notebook_id.clone(),
+        source_scope,
+        query,
+        limit: limit.unwrap_or(8),
+        trace_id: Some(uuid::Uuid::new_v4().to_string()),
+        allow_fallback: false,
+    };
+
+    let db_path = state.notebook_db_path(&notebook_id)?;
+    #[cfg(feature = "semantic-memory-backend")]
+    let semantic_runtime_config = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        semantic_memory_adapter::runtime_config_from_settings(
+            app_db.get_setting("semantic_memory_embedding_url")?,
+            app_db.get_setting("semantic_memory_embedding_model")?,
+            app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+        )
+    };
+    let (all_sources, local_backend_result, local_latency_ms, semantic_links) = {
+        let db = crate::db::notebook_db::NotebookDb::connect(&db_path)?;
+        let all_sources = db.list_sources()?;
+        let local = GlossLocalMemoryBackend::new(notebook_id.clone(), &db, &all_sources);
+        let local_started = Instant::now();
+        let local_backend_result = local.search(request.clone())?;
+        let local_latency_ms = local_started.elapsed().as_millis();
+        #[cfg(feature = "semantic-memory-backend")]
+        let semantic_links = semantic_memory_adapter::load_links(&db)?;
+        #[cfg(not(feature = "semantic-memory-backend"))]
+        let semantic_links = Vec::new();
+        (
+            all_sources,
+            local_backend_result,
+            local_latency_ms,
+            semantic_links,
+        )
+    };
+
+    compare_memory_backends_for_notebook(
+        &state.data_dir,
+        &notebook_id,
+        &all_sources,
+        request,
+        local_backend_result,
+        local_latency_ms,
+        semantic_links,
+        #[cfg(feature = "semantic-memory-backend")]
+        Some(semantic_runtime_config),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1808,10 +2332,10 @@ mod tests {
     use super::*;
     use crate::db::app_db::AppDb;
     use crate::db::notebook_db::NotebookDb;
+    use crate::provider_config_store::SecretStore;
     use crate::providers::ModelRegistry;
-    use crate::secrets::SecretStore;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Mutex;
     use std::time::Duration;
     use tauri_queue::{QueueConfig, QueueManager};
@@ -1847,9 +2371,10 @@ mod tests {
             embedder: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
             summary_paused: AtomicBool::new(true),
-            ingestion_active: AtomicU32::new(0),
+            ingestion_active: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             llm_gate: tokio::sync::Semaphore::new(1),
             gpu_gate: tokio::sync::Semaphore::new(1),
+            gate_owners: Mutex::new(HashMap::new()),
             active_notebook_id: Mutex::new(Some(notebook_id.clone())),
             active_epoch: AtomicU64::new(1),
             chat_grace_until: Mutex::new(0),
@@ -1912,6 +2437,9 @@ mod tests {
                     parameter_size: None,
                     context_window: None,
                     capabilities: Some("chat".to_string()),
+                    available: true,
+                    stale: false,
+                    last_error: None,
                 }],
             )
             .unwrap();
@@ -1937,6 +2465,9 @@ mod tests {
                     parameter_size: None,
                     context_window: None,
                     capabilities: Some("chat".to_string()),
+                    available: true,
+                    stale: false,
+                    last_error: None,
                 }],
             )
             .unwrap();
@@ -1970,6 +2501,9 @@ mod tests {
                         parameter_size: None,
                         context_window: None,
                         capabilities: Some("chat".to_string()),
+                        available: true,
+                        stale: false,
+                        last_error: None,
                     }],
                 )
                 .unwrap();

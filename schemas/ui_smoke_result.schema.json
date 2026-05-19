@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "run_id": {
+      "const": "GLOSS_COMPLETION_AND_UX_RELEASE_CANDIDATE_P3_20260513"
+    },
+    "steps": {
+      "type": "array"
+    }
+  },
+  "required": [
+    "run_id",
+    "steps"
+  ],
+  "title": "Gloss UI Smoke Result",
+  "type": "object"
+}

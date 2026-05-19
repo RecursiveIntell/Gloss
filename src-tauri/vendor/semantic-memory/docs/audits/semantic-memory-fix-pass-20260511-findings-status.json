@@ -1,0 +1,3042 @@
+{
+  "SM-AUD-0001": {
+    "evidence": "Generated semantic-memory archive profile injects root workspace Cargo.toml; clean extraction cargo check passed under /home/sikmindz/sm-hermetic.",
+    "notes": "Archive is not hermetic despite passing certifier",
+    "status": "fixed"
+  },
+  "SM-AUD-0002": {
+    "evidence": "Generated archive root Cargo.toml includes semantic-memory, stack-ids, semantic-memory-forge, forge-memory-bridge.",
+    "notes": "No packaged root workspace manifest for included local crates",
+    "status": "fixed"
+  },
+  "SM-AUD-0003": {
+    "evidence": "semantic-memory z.py profile prunes member Cargo.lock files and includes one root Cargo.lock.",
+    "notes": "Multiple Cargo.lock files create ambiguous dependency source of truth",
+    "status": "fixed"
+  },
+  "SM-AUD-0004": {
+    "evidence": "MemoryStore::embed_batch_internal validates returned batch count before document ingest writes; vector_invariants tests cover fewer/more vectors.",
+    "notes": "Document ingest silently truncates chunks on embedder batch-count mismatch",
+    "status": "fixed"
+  },
+  "SM-AUD-0005": {
+    "evidence": "MemoryStore::embed_batch_internal validates returned batch count before fact reembed updates.",
+    "notes": "Fact re-embedding silently truncates on batch-count mismatch",
+    "status": "fixed"
+  },
+  "SM-AUD-0006": {
+    "evidence": "MemoryStore::embed_batch_internal validates returned batch count before chunk reembed updates.",
+    "notes": "Chunk re-embedding silently truncates on batch-count mismatch",
+    "status": "fixed"
+  },
+  "SM-AUD-0007": {
+    "evidence": "MemoryStore::embed_batch_internal validates returned batch count before message reembed updates.",
+    "notes": "Message re-embedding silently truncates on batch-count mismatch",
+    "status": "fixed"
+  },
+  "SM-AUD-0008": {
+    "evidence": "MemoryStore::embed_batch_internal validates returned batch count before episode reembed updates.",
+    "notes": "Episode re-embedding silently truncates on batch-count mismatch",
+    "status": "fixed"
+  },
+  "SM-AUD-0009": {
+    "evidence": "db::validate_embedding checks dimension and finite values; facade write paths call it; vector_invariants tests cover NaN/Inf.",
+    "notes": "Public embedding validation is dimension-only",
+    "status": "fixed"
+  },
+  "SM-AUD-0010": {
+    "evidence": "documents::delete_document_with_chunks deletes episode FTS, rowid map, episode_causes, episode rows, and queues HNSW deletes before document delete.",
+    "notes": "delete_document does not explicitly clean episode derived state",
+    "status": "fixed"
+  },
+  "SM-AUD-0011": {
+    "evidence": "documents::delete_document_with_chunks queues pending HNSW deletes for every episode attached to deleted document.",
+    "notes": "delete_document can leave stale HNSW episode keys",
+    "status": "fixed"
+  },
+  "SM-AUD-0012": {
+    "evidence": "search vector scan now decodes SQLite blobs with db::decode_f32_le instead of bytemuck casts.",
+    "notes": "Vector scan uses bytemuck::try_cast_slice on SQLite Vec<u8>",
+    "status": "fixed"
+  },
+  "SM-AUD-0013": {
+    "evidence": "hnsw sidecar loader validates byte_len against configured dimensions before allocation and uses checked usize conversion.",
+    "notes": "HNSW sidecar loader allocates raw byte_len from file without cap",
+    "status": "fixed"
+  },
+  "SM-AUD-0014": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P0 hnsw: HNSW data format stores dimensions using usize",
+    "status": "deferred"
+  },
+  "SM-AUD-0015": {
+    "evidence": "HnswIndex::save writes temp sidecars, fsyncs files, and renames into place.",
+    "notes": "HNSW save is not atomic",
+    "status": "fixed"
+  },
+  "SM-AUD-0016": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P0 hnsw: Pending HNSW mutations are applied before sidecar save succeeds",
+    "status": "deferred"
+  },
+  "SM-AUD-0017": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P0 hnsw: Pending upsert calls insert instead of update",
+    "status": "deferred"
+  },
+  "SM-AUD-0018": {
+    "evidence": "flush/sync paths hold the HNSW write guard while saving/flushing keymap instead of saving an unlocked clone.",
+    "notes": "HNSW sidecar save clones Arc while graph can still mutate",
+    "status": "fixed"
+  },
+  "SM-AUD-0019": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P0 hnsw: Graph sidecar validation only checks non-empty file",
+    "status": "deferred"
+  },
+  "SM-AUD-0020": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P0 integrity: HNSW integrity is count-based, not key-level",
+    "status": "deferred"
+  },
+  "SM-AUD-0021": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P0 integrity: FTS integrity count checks use dynamic table names and count parity only",
+    "status": "deferred"
+  },
+  "SM-AUD-0022": {
+    "evidence": "search::cosine_similarity returns Result and checks length in all builds; search_tests cover mismatch.",
+    "notes": "cosine_similarity truncates mismatched vectors in release builds",
+    "status": "fixed"
+  },
+  "SM-AUD-0023": {
+    "evidence": "central validation rejects non-finite vectors before storage; cosine also rejects non-finite query/stored vectors.",
+    "notes": "cosine similarity accepts non-finite stored/query vectors",
+    "status": "fixed"
+  },
+  "SM-AUD-0024": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P0 search: HNSW filtered search can return empty results without brute-force fallback",
+    "status": "deferred"
+  },
+  "SM-AUD-0025": {
+    "evidence": "conversation HNSW search is routed through tokio::task::spawn_blocking with bounded candidates.",
+    "notes": "conversation HNSW search runs blocking CPU work on async thread",
+    "status": "fixed"
+  },
+  "SM-AUD-0026": {
+    "evidence": "delete_fact_with_fts removes episode_causes and derivation_edges referencing the fact.",
+    "notes": "delete_fact does not clean episode_causes references",
+    "status": "fixed"
+  },
+  "SM-AUD-0027": {
+    "evidence": "update_fact_with_fts invalidates derivation_edges touching the fact so dependent projection surfaces must be recomputed.",
+    "notes": "update_fact does not update dependent episode/projection search text",
+    "status": "fixed"
+  },
+  "SM-AUD-0028": {
+    "evidence": "delete_namespace now returns NamespaceDeleteReport with facts/documents/chunks/messages/sessions/episodes/projection_rows/hnsw_ops.",
+    "notes": "delete_namespace returns only fact count despite deleting many entity types",
+    "status": "fixed"
+  },
+  "SM-AUD-0029": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 hnsw: Open-time HNSW rebuild/degrade policy is implicit",
+    "status": "deferred"
+  },
+  "SM-AUD-0030": {
+    "evidence": "HNSW open embedding-count query now propagates SQL errors instead of unwrap_or(0).",
+    "notes": "SQL errors while counting embeddings are swallowed as zero",
+    "status": "fixed"
+  },
+  "SM-AUD-0031": {
+    "evidence": "HNSW orphan-count query now propagates SQL errors instead of unwrap_or(0).",
+    "notes": "Orphan-count SQL errors are swallowed as zero",
+    "status": "fixed"
+  },
+  "SM-AUD-0032": {
+    "evidence": "load_keymap returns HnswError when hnsw_keymap table is missing while sidecar exists.",
+    "notes": "Missing hnsw_keymap table silently leaves loaded graph without keys",
+    "status": "fixed"
+  },
+  "SM-AUD-0033": {
+    "evidence": "Malformed hnsw_metadata next_id now returns HnswError instead of silently falling back.",
+    "notes": "Malformed next_id metadata falls back silently",
+    "status": "fixed"
+  },
+  "SM-AUD-0034": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 hnsw: HNSW len can report nonzero even when keymap is empty",
+    "status": "deferred"
+  },
+  "SM-AUD-0035": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 hnsw: Tombstone overfetch is too naive",
+    "status": "deferred"
+  },
+  "SM-AUD-0036": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 hnsw: deleted_ratio may divide using graph count that includes unreachable/unmapped points",
+    "status": "deferred"
+  },
+  "SM-AUD-0037": {
+    "evidence": "HNSW sidecar node_id uses usize::try_from and max_elements validation.",
+    "notes": "u64 node id is cast to usize without range check",
+    "status": "fixed"
+  },
+  "SM-AUD-0038": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 hnsw: insert ignores return/status from hnsw_rs graph.insert",
+    "status": "deferred"
+  },
+  "SM-AUD-0039": {
+    "evidence": "HNSW rebuild validates fact embedding blobs and returns an error if any invalid rows were skipped.",
+    "notes": "HNSW rebuild silently skips invalid fact embeddings",
+    "status": "fixed"
+  },
+  "SM-AUD-0040": {
+    "evidence": "HNSW rebuild validates chunk embedding blobs and returns an error if any invalid rows were skipped.",
+    "notes": "HNSW rebuild silently skips invalid chunk embeddings",
+    "status": "fixed"
+  },
+  "SM-AUD-0041": {
+    "evidence": "HNSW rebuild validates message embedding blobs and returns an error if any invalid rows were skipped.",
+    "notes": "HNSW rebuild silently skips invalid message embeddings",
+    "status": "fixed"
+  },
+  "SM-AUD-0042": {
+    "evidence": "HNSW rebuild validates episode embedding blobs and returns an error if any invalid rows were skipped.",
+    "notes": "HNSW rebuild silently skips invalid episode embeddings",
+    "status": "fixed"
+  },
+  "SM-AUD-0043": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 hnsw: clear_pending_index_ops is all-or-nothing per processed key list after sidecar save",
+    "status": "deferred"
+  },
+  "SM-AUD-0044": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 q8: q8 optionality conflicts with integrity expectations",
+    "status": "deferred"
+  },
+  "SM-AUD-0045": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 q8: q8 baseline lacks explicit versioned storage envelope",
+    "status": "deferred"
+  },
+  "SM-AUD-0046": {
+    "evidence": "Invalid timestamps now produce no recency contribution instead of age zero.",
+    "notes": "Invalid timestamp becomes maximally fresh",
+    "status": "fixed"
+  },
+  "SM-AUD-0047": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 search: recency scoring uses wall-clock inside ranking",
+    "status": "deferred"
+  },
+  "SM-AUD-0048": {
+    "evidence": "Main search candidate calculation uses saturating_mul and max candidate caps.",
+    "notes": "candidate_pool_size.max(k * 3) can overflow",
+    "status": "fixed"
+  },
+  "SM-AUD-0049": {
+    "evidence": "Vector-only search candidate calculation uses saturating_mul and max candidate caps.",
+    "notes": "Second candidate_pool_size.max(k * 3) overflow surface",
+    "status": "fixed"
+  },
+  "SM-AUD-0050": {
+    "evidence": "Explained search candidate calculation uses saturating_mul and max candidate caps.",
+    "notes": "Third candidate_pool_size.max(k * 3) overflow surface",
+    "status": "fixed"
+  },
+  "SM-AUD-0051": {
+    "evidence": "Conversation search candidate calculation uses saturating_mul and max candidate caps.",
+    "notes": "conversation candidate_pool_size.max(k * 3) overflow surface",
+    "status": "fixed"
+  },
+  "SM-AUD-0052": {
+    "evidence": "Unknown token counts in budget selection are conservatively estimated from content length.",
+    "notes": "Unknown token counts are treated as zero in budget selection",
+    "status": "fixed"
+  },
+  "SM-AUD-0053": {
+    "evidence": "Token budget accumulation uses saturating_add.",
+    "notes": "Token budget addition can overflow u32",
+    "status": "fixed"
+  },
+  "SM-AUD-0054": {
+    "evidence": "session_token_count rejects negative aggregates as corrupt data before u64 conversion.",
+    "notes": "session_token_count casts negative SQL sum to u64",
+    "status": "fixed"
+  },
+  "SM-AUD-0055": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 validation: Session/channel identifiers are not consistently length/whitespace validated",
+    "status": "deferred"
+  },
+  "SM-AUD-0056": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 validation: Document title/source/metadata size validation is weaker than content validation",
+    "status": "deferred"
+  },
+  "SM-AUD-0057": {
+    "evidence": "episode search limit is clamped and bound as a SQL parameter.",
+    "notes": "Episode search limit is unbounded",
+    "status": "fixed"
+  },
+  "SM-AUD-0058": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 api: search_episodes drops episode_id and returns document_id",
+    "status": "deferred"
+  },
+  "SM-AUD-0059": {
+    "evidence": "episode parsing diagnostics use episode_id rather than document_id.",
+    "notes": "Episode parse errors report document_id instead of episode_id",
+    "status": "fixed"
+  },
+  "SM-AUD-0060": {
+    "evidence": "episode cause sync rejects duplicate cause_ids and uses INSERT instead of INSERT OR IGNORE.",
+    "notes": "INSERT OR IGNORE collapses duplicate cause IDs silently",
+    "status": "fixed"
+  },
+  "SM-AUD-0061": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 episodes: update_episode_outcome cannot clear experiment_id",
+    "status": "deferred"
+  },
+  "SM-AUD-0062": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 keys: HNSW key parsing split_once(:) is fragile for IDs containing colon",
+    "status": "deferred"
+  },
+  "SM-AUD-0063": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 keys: Message dedup key uses session_id:message_id delimiter",
+    "status": "deferred"
+  },
+  "SM-AUD-0064": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 foreign-keys: Correctness depends on PRAGMA foreign_keys being enabled for every pooled connection",
+    "status": "deferred"
+  },
+  "SM-AUD-0065": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 db: PRAGMA max_page_count computed with dynamic formatting",
+    "status": "deferred"
+  },
+  "SM-AUD-0066": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 db: Dynamic table_info table name formatting relies on internal callers only",
+    "status": "deferred"
+  },
+  "SM-AUD-0067": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 db: Dynamic ALTER TABLE formatting relies on internal table/column whitelists",
+    "status": "deferred"
+  },
+  "SM-AUD-0068": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 db: Dynamic SELECT COUNT table name relies on internal map table list",
+    "status": "deferred"
+  },
+  "SM-AUD-0069": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 sqlite: SQLite WAL/checkpoint/backpressure policy not visible in archive-level docs",
+    "status": "deferred"
+  },
+  "SM-AUD-0070": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 pool: Connection pool shutdown/poison behavior needs stress coverage",
+    "status": "deferred"
+  },
+  "SM-AUD-0071": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 projection: Projection storage integrity is likely separate from memory integrity",
+    "status": "deferred"
+  },
+  "SM-AUD-0072": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 projection: Projection query uses unwrap_or_default for missing claim/source IDs",
+    "status": "deferred"
+  },
+  "SM-AUD-0073": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 bridge: Bridge transform uses unwrap_or_default, potentially hiding malformed optional payloads",
+    "status": "deferred"
+  },
+  "SM-AUD-0074": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 import: JSON import begins with from_str(...).ok()",
+    "status": "deferred"
+  },
+  "SM-AUD-0075": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 import: Legacy compatibility serializes with unwrap_or_default",
+    "status": "deferred"
+  },
+  "SM-AUD-0076": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 security: HTTP embedder response body uses unwrap_or_default on error",
+    "status": "deferred"
+  },
+  "SM-AUD-0077": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 security: External embedder failure modes need retry/backoff/rate-limit policy",
+    "status": "deferred"
+  },
+  "SM-AUD-0078": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Prompt docs are packaged at project root",
+    "status": "deferred"
+  },
+  "SM-AUD-0079": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Implementation prompt is packaged at project root",
+    "status": "deferred"
+  },
+  "SM-AUD-0080": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Patch prompt is packaged at project root",
+    "status": "deferred"
+  },
+  "SM-AUD-0081": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: V2 patch prompt is packaged at project root",
+    "status": "deferred"
+  },
+  "SM-AUD-0082": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Prior codex sidecar is included in current source package",
+    "status": "deferred"
+  },
+  "SM-AUD-0083": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Most source/docs are marked executable",
+    "status": "deferred"
+  },
+  "SM-AUD-0084": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "ci: No packaged CI workflow surface",
+    "status": "deferred"
+  },
+  "SM-AUD-0085": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "benchmarks: No benchmark suite/result artifact included",
+    "status": "deferred"
+  },
+  "SM-AUD-0086": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "structure: lib.rs is very large and high blast-radius",
+    "status": "deferred"
+  },
+  "SM-AUD-0087": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "structure: db.rs is very large and high blast-radius",
+    "status": "deferred"
+  },
+  "SM-AUD-0088": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "structure: search.rs combines lexical, vector, HNSW resolution, fusion, scoring",
+    "status": "deferred"
+  },
+  "SM-AUD-0089": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: forge-memory-bridge/AGENTS.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0090": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: forge-memory-bridge/Cargo.lock",
+    "status": "deferred"
+  },
+  "SM-AUD-0091": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: forge-memory-bridge/Cargo.toml",
+    "status": "deferred"
+  },
+  "SM-AUD-0092": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: forge-memory-bridge/src/batch.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0093": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: forge-memory-bridge/src/error.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0094": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: forge-memory-bridge/src/legacy.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0095": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: forge-memory-bridge/src/lib.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0096": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: forge-memory-bridge/tests/forge_bridge_memory_proof.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0097": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory-forge/Cargo.toml",
+    "status": "deferred"
+  },
+  "SM-AUD-0098": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory-forge/src/bundle.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0099": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory-forge/src/estimator.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0100": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory-forge/src/lib.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0101": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory-forge/src/tool_receipt.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0102": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory-forge/src/v11.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0103": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory-forge/src/v13.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0104": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory-forge/src/v14.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0105": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory-forge/src/v9.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0106": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/.gitignore",
+    "status": "deferred"
+  },
+  "SM-AUD-0107": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/AGENTS.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0108": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/CLAUDE_CODE_PROMPT.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0109": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/Cargo.lock",
+    "status": "deferred"
+  },
+  "SM-AUD-0110": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/Cargo.toml",
+    "status": "deferred"
+  },
+  "SM-AUD-0111": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/HNSWLIB_RS_REFERENCE.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0112": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/IMPLEMENTATION_PROMPT.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0113": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/PATCH_PROMPT.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0114": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/SPEC.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0115": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/TESTING.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0116": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/UPGRADE_SPEC.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0117": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V1_1_AGENTS_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0118": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V1_1_SPEC_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0119": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V1_1_TESTING_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0120": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V2_AGENTS_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0121": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V2_PATCH_PROMPT.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0122": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V2_SPEC_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0123": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V2_TESTING_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0124": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V3_AGENTS_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0125": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V3_CHANGE_MAP.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0126": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V3_SPEC.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0127": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/V3_TESTING.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0128": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/examples/basic_search.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0129": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/examples/conversation_memory.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0130": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/reference/chunk.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0131": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/reference/hybrid_search.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0132": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/semantic-memory-spec.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0133": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/chunker.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0134": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/config.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0135": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/conversation.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0136": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/db.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0137": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/documents.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0138": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/embedder.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0139": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/episodes.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0140": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/error.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0141": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/graph.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0142": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/hnsw.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0143": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/hnsw_ops.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0144": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/json_compat_import.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0145": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/knowledge.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0146": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/lib.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0147": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/pool.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0148": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/projection_batch.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0149": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/projection_derivation.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0150": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/projection_import.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0151": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/projection_lane.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0152": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/projection_legacy_compat.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0153": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/projection_storage.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0154": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/quantize.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0155": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/search.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0156": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/storage.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0157": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/store_support.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0158": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/tokenizer.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0159": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/src/types.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0160": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/brute_force_parity.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0161": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/chunker_tests.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0162": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/compaction.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0163": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/concurrent_access.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0164": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/conversation_search_tests.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0165": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/conversation_tests.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0166": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/db_tests.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0167": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/episode_identity.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0168": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/hardening_semantics.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0169": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/hardening_v5.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0170": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/hnsw_hotswap.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0171": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/hnsw_integration.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0172": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/hnsw_persistence.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0173": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/import_boundary_tests.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0174": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/import_ugly_cases.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0175": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/integration_tests.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0176": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/knowledge_tests.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0177": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/migration_v5.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0178": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/projection_v11_tests.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0179": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/quantization.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0180": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/quantization_pipeline.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0181": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/search_tests.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0182": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/step3_verification.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0183": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/step4_verification.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0184": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/storage_lifecycle.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0185": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/tokenizer_tests.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0186": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/trace_id_write_seam.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0187": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: semantic-memory/tests/vector_only_hnsw.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0188": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: stack-ids/AGENTS.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0189": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: stack-ids/Cargo.lock",
+    "status": "deferred"
+  },
+  "SM-AUD-0190": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: stack-ids/Cargo.toml",
+    "status": "deferred"
+  },
+  "SM-AUD-0191": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: stack-ids/src/digest.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0192": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: stack-ids/src/lib.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0193": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: stack-ids/src/scope.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0194": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "permissions: Non-script file is executable: stack-ids/src/trace.rs",
+    "status": "deferred"
+  },
+  "SM-AUD-0195": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Root markdown prompt candidate should be archived: CLAUDE_CODE_PROMPT.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0196": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Root markdown prompt candidate should be archived: IMPLEMENTATION_PROMPT.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0197": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Root markdown prompt candidate should be archived: PATCH_PROMPT.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0198": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Root markdown prompt candidate should be archived: V2_PATCH_PROMPT.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0199": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: HNSWLIB_RS_REFERENCE.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0200": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: SPEC.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0201": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: TESTING.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0202": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: UPGRADE_SPEC.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0203": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: V1_1_AGENTS_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0204": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: V1_1_SPEC_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0205": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: V1_1_TESTING_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0206": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: V2_AGENTS_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0207": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: V2_SPEC_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0208": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: V2_TESTING_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0209": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: V3_AGENTS_ADDENDUM.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0210": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: V3_CHANGE_MAP.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0211": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: V3_SPEC.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0212": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: V3_TESTING.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0213": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: semantic-memory-generic-rust-next-codex-context-20260507.report.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0214": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "docs: Ambiguous root markdown file needs source-of-truth decision: semantic-memory-spec.md",
+    "status": "deferred"
+  },
+  "SM-AUD-0215": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0216": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0217": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0218": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0219": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0220": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0221": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0222": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0223": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0224": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0225": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0226": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0227": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0228": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0229": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0230": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0231": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0232": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0233": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0234": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0235": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0236": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0237": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0238": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0239": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0240": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0241": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0242": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0243": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0244": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0245": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0246": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0247": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0248": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0249": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0250": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0251": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0252": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0253": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0254": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0255": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0256": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0257": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0258": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0259": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0260": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0261": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0262": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0263": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0264": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0265": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0266": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0267": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0268": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0269": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0270": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0271": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0272": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0273": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0274": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0275": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0276": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0277": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0278": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0279": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0280": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0281": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0282": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0283": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0284": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0285": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0286": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0287": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0288": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0289": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0290": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0291": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0292": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0293": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0294": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0295": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0296": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0297": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0298": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0299": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0300": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0301": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0302": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0303": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0304": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0305": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0306": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0307": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0308": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0309": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0310": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0311": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0312": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0313": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0314": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0315": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0316": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0317": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0318": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0319": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0320": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0321": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0322": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0323": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0324": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0325": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0326": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0327": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0328": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0329": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0330": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0331": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0332": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0333": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0334": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0335": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0336": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0337": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0338": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0339": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0340": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0341": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0342": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0343": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0344": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0345": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0346": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0347": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0348": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 insert-or-ignore: INSERT OR IGNORE can hide duplicate/constraint bugs",
+    "status": "deferred"
+  },
+  "SM-AUD-0349": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 insert-or-ignore: INSERT OR IGNORE can hide duplicate/constraint bugs",
+    "status": "deferred"
+  },
+  "SM-AUD-0350": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0351": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0352": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 insert-or-ignore: INSERT OR IGNORE can hide duplicate/constraint bugs",
+    "status": "deferred"
+  },
+  "SM-AUD-0353": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0354": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0355": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0356": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0357": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0358": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0359": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0360": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0361": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0362": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0363": {
+    "evidence": "db::bytes_to_embedding now uses explicit little-endian decode for persisted blobs.",
+    "notes": "Storage byte cast is alignment/endian fragile",
+    "status": "fixed"
+  },
+  "SM-AUD-0364": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0365": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0366": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0367": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0368": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0369": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0370": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0371": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0372": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0373": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0374": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0375": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0376": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0377": {
+    "evidence": "document chunk/id insertion already checks lengths before zip; retained and covered by existing tests.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0378": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0379": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0380": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0381": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0382": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0383": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0384": {
+    "evidence": "document ingest batch zip is guarded by embed_batch_internal count validation.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0385": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0386": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0387": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0388": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0389": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0390": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0391": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0392": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0393": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0394": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0395": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 insert-or-ignore: INSERT OR IGNORE can hide duplicate/constraint bugs",
+    "status": "deferred"
+  },
+  "SM-AUD-0396": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0397": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0398": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0399": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0400": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0401": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0402": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0403": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0404": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0405": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0406": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0407": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0408": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0409": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0410": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0411": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0412": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0413": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0414": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0415": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0416": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0417": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0418": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0419": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0420": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0421": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0422": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0423": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0424": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0425": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0426": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0427": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0428": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0429": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0430": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0431": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0432": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0433": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0434": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0435": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0436": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0437": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0438": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0439": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0440": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0441": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0442": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0443": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0444": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0445": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0446": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "unwrap-expect: unwrap/expect occurrence should be reviewed",
+    "status": "deferred"
+  },
+  "SM-AUD-0447": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0448": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0449": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0450": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0451": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0452": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0453": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0454": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0455": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0456": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0457": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0458": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0459": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0460": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0461": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0462": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0463": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0464": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0465": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0466": {
+    "evidence": "public batch embedding path validates counts before zips can truncate.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0467": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0468": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0469": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0470": {
+    "evidence": "fact reembed zip guarded by embed_batch_internal count validation.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0471": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0472": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0473": {
+    "evidence": "chunk reembed zip guarded by embed_batch_internal count validation.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0474": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0475": {
+    "evidence": "message reembed zip guarded by embed_batch_internal count validation.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0476": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0477": {
+    "evidence": "episode reembed zip guarded by embed_batch_internal count validation.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0478": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0479": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0480": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0481": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0482": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0483": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0484": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0485": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0486": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0487": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0488": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0489": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0490": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0491": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0492": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0493": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0494": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0495": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0496": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0497": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0498": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0499": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0500": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0501": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0502": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0503": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0504": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0505": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0506": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 insert-or-ignore: INSERT OR IGNORE can hide duplicate/constraint bugs",
+    "status": "deferred"
+  },
+  "SM-AUD-0507": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0508": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0509": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0510": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0511": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0512": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0513": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0514": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0515": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0516": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0517": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0518": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0519": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0520": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0521": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0522": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0523": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0524": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0525": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0526": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0527": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0528": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0529": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0530": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0531": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0532": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0533": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0534": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0535": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0536": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0537": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0538": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0539": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0540": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0541": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0542": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0543": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0544": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0545": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0546": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0547": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0548": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0549": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "error-default: Error/default swallowing should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0550": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0551": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0552": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0553": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0554": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0555": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0556": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0557": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0558": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0559": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0560": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0561": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0562": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0563": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0564": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0565": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0566": {
+    "evidence": "cosine length invariant is a runtime Result error, not debug_assert.",
+    "notes": "debug_assert is not a release invariant",
+    "status": "fixed"
+  },
+  "SM-AUD-0567": {
+    "evidence": "cosine zip is preceded by runtime length validation.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0568": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0569": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0570": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0571": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0572": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0573": {
+    "evidence": "search vector scan uses explicit little-endian decode for persisted blobs.",
+    "notes": "Storage byte cast is alignment/endian fragile",
+    "status": "fixed"
+  },
+  "SM-AUD-0574": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0575": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0576": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0577": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0578": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0579": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0580": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0581": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0582": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0583": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0584": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0585": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0586": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0587": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0588": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0589": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0590": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0591": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0592": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0593": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0594": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0595": {
+    "evidence": "Reviewed as test-only zip use; production truncation paths are guarded. Existing quantization/db tests compare lengths or use equal constructed vectors.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0596": {
+    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "notes": "P1 dynamic-sql: Dynamic SQL construction should be whitelisted",
+    "status": "deferred"
+  },
+  "SM-AUD-0597": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0598": {
+    "evidence": "Reviewed as test-only zip use; production truncation paths are guarded. Existing quantization/db tests compare lengths or use equal constructed vectors.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0599": {
+    "evidence": "Reviewed as test-only zip use; production truncation paths are guarded. Existing quantization/db tests compare lengths or use equal constructed vectors.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0600": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0601": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "numeric-cast: Unchecked numeric cast should be audited",
+    "status": "deferred"
+  },
+  "SM-AUD-0602": {
+    "evidence": "Reviewed as test-only zip use; production truncation paths are guarded. Existing quantization/db tests compare lengths or use equal constructed vectors.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0603": {
+    "evidence": "Reviewed as test-only zip use; production truncation paths are guarded. Existing quantization/db tests compare lengths or use equal constructed vectors.",
+    "notes": "zip iteration can silently truncate mismatched collections",
+    "status": "fixed"
+  },
+  "SM-AUD-0604": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0605": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "runtime-clock: Runtime clock use affects replay/determinism",
+    "status": "deferred"
+  },
+  "SM-AUD-0606": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0607": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  },
+  "SM-AUD-0608": {
+    "evidence": "Grouped backlog retained in docs/audits/semantic-memory-fix-pass-20260511.md; not fully processed in this partial stabilization turn.",
+    "notes": "hashmap-order: HashMap order should be audited in deterministic surfaces",
+    "status": "deferred"
+  }
+}

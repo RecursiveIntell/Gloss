@@ -1,0 +1,30 @@
+[package]
+name = "turbo-quant"
+version = "0.2.0-alpha.1"
+edition = "2021"
+rust-version = "1.75.0"
+description = "Rust implementation of TurboQuant, PolarQuant, and QJL-style vector quantization for semantic search and KV cache compression experiments"
+license = "MIT"
+repository = "https://github.com/RecursiveIntell/turbo-quant"
+keywords = ["quantization", "vector-search", "compression", "embeddings", "machine-learning"]
+categories = ["science", "algorithms", "compression", "mathematics"]
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+schemars = "0.8"
+rand = "0.8"
+rand_chacha = "0.3"
+rand_distr = "0.4"
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
+
+[dev-dependencies]
+criterion = "0.5"
+serde_json = "1"
+
+[[bench]]
+name = "turbo_quant_search"
+harness = false

@@ -1,7 +1,8 @@
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
-const APP_SCHEMA_VERSION: i32 = 1;
-const NOTEBOOK_SCHEMA_VERSION: i32 = 2;
+const APP_SCHEMA_VERSION: i32 = 2;
+const NOTEBOOK_SCHEMA_VERSION: i32 = 3;
 
 /// Apply pragmas for performance and correctness.
 pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
@@ -54,6 +55,9 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
                 parameter_size  TEXT,
                 context_window  INTEGER,
                 capabilities    TEXT,
+                available       INTEGER DEFAULT 1,
+                stale           INTEGER DEFAULT 0,
+                last_error      TEXT,
                 PRIMARY KEY (id, provider_id)
             );
 
@@ -69,6 +73,12 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
              INSERT OR IGNORE INTO settings (key, value) VALUES ('default_model', 'qwen3:8b');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('default_embedding_model', 'NomicEmbedTextV15');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('summary_mode', 'manual');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend', 'gloss-local');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend_fallback', 'true');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_url', 'http://localhost:11434');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_model', 'nomic-embed-text');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_timeout_secs', '10');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_search_timeout_ms', '8000');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('ollama_url', 'http://localhost:11434');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('theme', 'system');",
         )?;
@@ -82,7 +92,38 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
         set_schema_version(conn, APP_SCHEMA_VERSION)?;
     }
 
+    if version < 2 {
+        if !table_has_column(conn, "models", "available")? {
+            conn.execute(
+                "ALTER TABLE models ADD COLUMN available INTEGER DEFAULT 1",
+                [],
+            )?;
+        }
+        if !table_has_column(conn, "models", "stale")? {
+            conn.execute("ALTER TABLE models ADD COLUMN stale INTEGER DEFAULT 0", [])?;
+        }
+        if !table_has_column(conn, "models", "last_error")? {
+            conn.execute("ALTER TABLE models ADD COLUMN last_error TEXT", [])?;
+        }
+        set_schema_version(conn, APP_SCHEMA_VERSION)?;
+    }
+
+    ensure_provider_rows(conn)?;
+
     Ok(())
+}
+
+fn ensure_provider_rows(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO providers (id, enabled, base_url)
+         VALUES ('ollama', 1, 'http://localhost:11434');
+         INSERT OR IGNORE INTO providers (id, enabled, base_url)
+         VALUES ('openai', 0, 'https://api.openai.com/v1');
+         INSERT OR IGNORE INTO providers (id, enabled, base_url)
+         VALUES ('anthropic', 0, 'https://api.anthropic.com/v1');
+         INSERT OR IGNORE INTO providers (id, enabled, base_url)
+         VALUES ('llamacpp', 0, 'http://localhost:8080/v1');",
+    )
 }
 
 /// Create or migrate a per-notebook database schema.
@@ -146,6 +187,11 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
 
             CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
                 INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF content ON chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+                INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
             END;
 
             CREATE TABLE IF NOT EXISTS conversations (
@@ -226,10 +272,152 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chunks_embedding_id ON chunks(embedding_id);",
         )?;
+        set_schema_version(conn, 2)?;
+    }
+
+    if version < 3 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS semantic_memory_links (
+                chunk_id TEXT PRIMARY KEY,
+                notebook_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                sm_document_id TEXT,
+                sm_chunk_id TEXT,
+                sm_episode_id TEXT,
+                content_digest TEXT NOT NULL,
+                backend_version TEXT NOT NULL,
+                sync_status TEXT NOT NULL,
+                sync_error TEXT,
+                synced_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_semantic_memory_links_source
+            ON semantic_memory_links (notebook_id, source_id);",
+        )?;
         set_schema_version(conn, NOTEBOOK_SCHEMA_VERSION)?;
     }
 
+    ensure_notebook_fts(conn)?;
+    ensure_semantic_memory_links(conn)?;
+
     Ok(())
+}
+
+fn ensure_semantic_memory_links(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS semantic_memory_links (
+            chunk_id TEXT PRIMARY KEY,
+            notebook_id TEXT,
+            source_id TEXT,
+            sm_document_id TEXT,
+            sm_chunk_id TEXT,
+            sm_episode_id TEXT,
+            content_digest TEXT,
+            backend_version TEXT,
+            sync_status TEXT,
+            sync_error TEXT,
+            synced_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_semantic_memory_links_source
+        ON semantic_memory_links (notebook_id, source_id);",
+    )?;
+
+    for (column, definition) in [
+        ("notebook_id", "TEXT"),
+        ("source_id", "TEXT"),
+        ("sm_document_id", "TEXT"),
+        ("sm_chunk_id", "TEXT"),
+        ("sm_episode_id", "TEXT"),
+        ("content_digest", "TEXT"),
+        ("backend_version", "TEXT"),
+        ("sync_status", "TEXT"),
+        ("sync_error", "TEXT"),
+        ("synced_at", "TEXT"),
+    ] {
+        if !table_has_column(conn, "semantic_memory_links", column)? {
+            conn.execute(
+                &format!("ALTER TABLE semantic_memory_links ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+
+    backfill_semantic_memory_content_digests(conn)?;
+    conn.execute(
+        "UPDATE semantic_memory_links
+         SET sync_status = 'degraded-missing-exact-backpointer',
+             sync_error = COALESCE(sync_error, 'missing exact semantic chunk identity'),
+             synced_at = COALESCE(synced_at, datetime('now'))
+         WHERE sync_status = 'synced'
+           AND (sm_chunk_id IS NULL OR trim(sm_chunk_id) = '')",
+        [],
+    )?;
+
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn backfill_semantic_memory_content_digests(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT l.chunk_id, c.content
+         FROM semantic_memory_links l
+         JOIN chunks c ON c.id = l.chunk_id
+         WHERE l.content_digest IS NULL OR trim(l.content_digest) = ''",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (chunk_id, content) in rows {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        conn.execute(
+            "UPDATE semantic_memory_links SET content_digest = ?1 WHERE chunk_id = ?2",
+            rusqlite::params![digest, chunk_id],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn ensure_notebook_fts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            content,
+            content='chunks',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF content ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+            INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+        END;
+
+        INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild');",
+    )
 }
 
 fn get_schema_version(conn: &Connection) -> i32 {
@@ -250,4 +438,234 @@ fn set_schema_version(conn: &Connection, version: i32) -> rusqlite::Result<()> {
         [version.to_string()],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notebook_migration_repairs_missing_fts_for_existing_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO _meta (key, value) VALUES ('schema_version', '3');
+
+            CREATE TABLE sources (
+                id                TEXT PRIMARY KEY,
+                source_type       TEXT NOT NULL,
+                title             TEXT NOT NULL,
+                original_filename TEXT,
+                file_hash         TEXT,
+                url               TEXT,
+                file_path         TEXT,
+                content_text      TEXT,
+                word_count        INTEGER,
+                metadata          TEXT,
+                summary           TEXT,
+                summary_model     TEXT,
+                status            TEXT DEFAULT 'pending',
+                error_message     TEXT,
+                selected          INTEGER DEFAULT 1,
+                created_at        TEXT DEFAULT (datetime('now')),
+                updated_at        TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE chunks (
+                id              TEXT PRIMARY KEY,
+                source_id       TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                chunk_index     INTEGER NOT NULL,
+                content         TEXT NOT NULL,
+                token_count     INTEGER,
+                start_offset    INTEGER,
+                end_offset      INTEGER,
+                metadata        TEXT,
+                embedding_id    INTEGER,
+                embedding_model TEXT,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );
+
+            INSERT INTO sources (id, source_type, title, status)
+            VALUES ('s1', 'text', 'Source', 'ready');
+            INSERT INTO chunks (id, source_id, chunk_index, content)
+            VALUES ('c1', 's1', 0, 'repairtoken original');",
+        )
+        .unwrap();
+
+        migrate_notebook_db(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'repairtoken'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        conn.execute(
+            "UPDATE chunks SET content = 'repairtoken updatedtoken' WHERE id = 'c1'",
+            [],
+        )
+        .unwrap();
+        let updated_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'updatedtoken'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_count, 1);
+    }
+
+    #[test]
+    fn notebook_migration_repairs_legacy_semantic_memory_links() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO _meta (key, value) VALUES ('schema_version', '3');
+
+            CREATE TABLE sources (
+                id                TEXT PRIMARY KEY,
+                source_type       TEXT NOT NULL,
+                title             TEXT NOT NULL,
+                original_filename TEXT,
+                file_hash         TEXT,
+                url               TEXT,
+                file_path         TEXT,
+                content_text      TEXT,
+                word_count        INTEGER,
+                metadata          TEXT,
+                summary           TEXT,
+                summary_model     TEXT,
+                status            TEXT DEFAULT 'pending',
+                error_message     TEXT,
+                selected          INTEGER DEFAULT 1,
+                created_at        TEXT DEFAULT (datetime('now')),
+                updated_at        TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE chunks (
+                id              TEXT PRIMARY KEY,
+                source_id       TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                chunk_index     INTEGER NOT NULL,
+                content         TEXT NOT NULL,
+                token_count     INTEGER,
+                start_offset    INTEGER,
+                end_offset      INTEGER,
+                metadata        TEXT,
+                embedding_id    INTEGER,
+                embedding_model TEXT,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE semantic_memory_links (
+                chunk_id TEXT PRIMARY KEY,
+                notebook_id TEXT,
+                source_id TEXT,
+                sm_document_id TEXT,
+                content_digest TEXT,
+                backend_version TEXT,
+                sync_status TEXT,
+                sync_error TEXT,
+                synced_at TEXT
+            );
+
+            INSERT INTO sources (id, source_type, title, status)
+            VALUES ('s1', 'text', 'Source', 'ready');
+            INSERT INTO chunks (id, source_id, chunk_index, content)
+            VALUES ('c1', 's1', 0, 'semantic link repair content');
+            INSERT INTO semantic_memory_links (
+                chunk_id, notebook_id, source_id, sm_document_id, content_digest,
+                backend_version, sync_status, synced_at
+            )
+            VALUES ('c1', 'nb1', 's1', 'doc1', '', 'legacy', 'synced', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        migrate_notebook_db(&conn).unwrap();
+
+        assert!(table_has_column(&conn, "semantic_memory_links", "sm_chunk_id").unwrap());
+        assert!(table_has_column(&conn, "semantic_memory_links", "sm_episode_id").unwrap());
+
+        let (digest, status, error): (String, String, String) = conn
+            .query_row(
+                "SELECT content_digest, sync_status, sync_error
+                 FROM semantic_memory_links
+                 WHERE chunk_id = 'c1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(digest.len(), 64);
+        assert_eq!(status, "degraded-missing-exact-backpointer");
+        assert_eq!(error, "missing exact semantic chunk identity");
+    }
+
+    #[test]
+    fn notebook_migration_creates_missing_semantic_memory_links_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO _meta (key, value) VALUES ('schema_version', '3');
+
+            CREATE TABLE sources (
+                id                TEXT PRIMARY KEY,
+                source_type       TEXT NOT NULL,
+                title             TEXT NOT NULL,
+                original_filename TEXT,
+                file_hash         TEXT,
+                url               TEXT,
+                file_path         TEXT,
+                content_text      TEXT,
+                word_count        INTEGER,
+                metadata          TEXT,
+                summary           TEXT,
+                summary_model     TEXT,
+                status            TEXT DEFAULT 'pending',
+                error_message     TEXT,
+                selected          INTEGER DEFAULT 1,
+                created_at        TEXT DEFAULT (datetime('now')),
+                updated_at        TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE chunks (
+                id              TEXT PRIMARY KEY,
+                source_id       TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                chunk_index     INTEGER NOT NULL,
+                content         TEXT NOT NULL,
+                token_count     INTEGER,
+                start_offset    INTEGER,
+                end_offset      INTEGER,
+                metadata        TEXT,
+                embedding_id    INTEGER,
+                embedding_model TEXT,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        migrate_notebook_db(&conn).unwrap();
+
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'semantic_memory_links'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+        assert!(table_has_column(&conn, "semantic_memory_links", "sm_chunk_id").unwrap());
+    }
 }

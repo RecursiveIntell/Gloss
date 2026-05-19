@@ -38,6 +38,9 @@ pub struct ModelRecord {
     pub parameter_size: Option<String>,
     pub context_window: Option<i32>,
     pub capabilities: Option<String>,
+    pub available: bool,
+    pub stale: bool,
+    pub last_error: Option<String>,
 }
 
 impl AppDb {
@@ -236,8 +239,8 @@ impl AppDb {
         self.conn
             .execute("DELETE FROM models WHERE provider_id = ?1", [provider_id])?;
         let mut stmt = self.conn.prepare(
-            "INSERT INTO models (id, provider_id, display_name, parameter_size, context_window, capabilities)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO models (id, provider_id, display_name, parameter_size, context_window, capabilities, available, stale, last_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
         for m in models {
             stmt.execute(rusqlite::params![
@@ -247,6 +250,9 @@ impl AppDb {
                 m.parameter_size,
                 m.context_window,
                 m.capabilities,
+                m.available,
+                m.stale,
+                m.last_error,
             ])?;
         }
         self.conn.execute(
@@ -256,10 +262,27 @@ impl AppDb {
         Ok(())
     }
 
+    /// Mark a provider's cached models unavailable after a failed refresh.
+    pub fn mark_models_unavailable(
+        &self,
+        provider_id: &str,
+        error: &str,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "UPDATE models
+             SET available = 0,
+                 stale = 1,
+                 last_error = ?2
+             WHERE provider_id = ?1",
+            rusqlite::params![provider_id, error],
+        )?;
+        Ok(())
+    }
+
     /// Get all cached models.
     pub fn get_all_models(&self) -> Result<Vec<ModelRecord>, GlossError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, provider_id, display_name, parameter_size, context_window, capabilities
+            "SELECT id, provider_id, display_name, parameter_size, context_window, capabilities, available, stale, last_error
              FROM models ORDER BY provider_id, display_name",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -270,6 +293,9 @@ impl AppDb {
                 parameter_size: row.get(3)?,
                 context_window: row.get(4)?,
                 capabilities: row.get(5)?,
+                available: row.get(6)?,
+                stale: row.get(7)?,
+                last_error: row.get(8)?,
             })
         })?;
         let mut models = Vec::new();
@@ -413,6 +439,9 @@ mod tests {
             parameter_size: Some("8.2B".to_string()),
             context_window: Some(32768),
             capabilities: None,
+            available: true,
+            stale: false,
+            last_error: None,
         }];
         db.replace_models("ollama", &models).unwrap();
         let all = db.get_all_models().unwrap();

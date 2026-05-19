@@ -1,0 +1,89 @@
+{
+  "schema": "CHAT_RUNTIME_FIX_FINAL_RECEIPT_V1",
+  "run_id": "CHAT_RUNTIME_FIX_20260518",
+  "chat_no_response_fixed": false,
+  "code_level_chat_no_response_fix_applied": true,
+  "provider_only_smoke_cogito_3b": "passed",
+  "provider_only_smoke_qwen_3_5_4b": "passed",
+  "desktop_smoke_cogito_3b": "skipped",
+  "desktop_smoke_qwen_3_5_4b": "skipped",
+  "frontend_event_routing_fixed": true,
+  "provider_config_single_source": true,
+  "chat_attempt_trace_added": true,
+  "rag_fail_open_added": true,
+  "ollama_stream_error_hardened": true,
+  "release_ready": false,
+  "commands": [
+    {
+      "command": "python3 scripts/chat_runtime_static_audit.py --repo . | tee docs/codex-runs/CHAT_RUNTIME_FIX_20260518/STATIC_AUDIT_FINAL.txt",
+      "status": "passed",
+      "log": "STATIC_AUDIT_FINAL.txt"
+    },
+    {
+      "command": "python3 scripts/chat_runtime_preflight.py --repo . | tee docs/codex-runs/CHAT_RUNTIME_FIX_20260518/PREFLIGHT_FINAL.txt",
+      "status": "passed",
+      "log": "PREFLIGHT_FINAL.txt"
+    },
+    {
+      "command": "cargo fmt --check | tee docs/codex-runs/CHAT_RUNTIME_FIX_20260518/cargo_fmt_check.log",
+      "status": "failed_structural",
+      "log": "cargo_fmt_check.log",
+      "reason": "No Cargo.toml exists at repo root /home/sikmindz/Coding/Gloss; the Tauri crate manifest is src-tauri/Cargo.toml."
+    },
+    {
+      "command": "cargo fmt --manifest-path src-tauri/Cargo.toml --check | tee docs/codex-runs/CHAT_RUNTIME_FIX_20260518/cargo_fmt_check_manifest.log",
+      "status": "passed",
+      "log": "cargo_fmt_check_manifest.log"
+    },
+    {
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml | tee docs/codex-runs/CHAT_RUNTIME_FIX_20260518/cargo_test_tauri.log",
+      "status": "passed",
+      "log": "cargo_test_tauri.log",
+      "summary": "71 tests passed"
+    },
+    {
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml providers::ollama::tests -- --nocapture | tee docs/codex-runs/CHAT_RUNTIME_FIX_20260518/cargo_test_ollama_provider.log",
+      "status": "passed",
+      "log": "cargo_test_ollama_provider.log",
+      "summary": "3 targeted Ollama provider tests passed"
+    },
+    {
+      "command": "npm run build | tee docs/codex-runs/CHAT_RUNTIME_FIX_20260518/npm_run_build.log",
+      "status": "passed",
+      "log": "npm_run_build.log"
+    },
+    {
+      "command": "git status --short | tee docs/codex-runs/CHAT_RUNTIME_FIX_20260518/GIT_STATUS_FINAL.txt",
+      "status": "passed",
+      "log": "GIT_STATUS_FINAL.txt"
+    },
+    {
+      "command": "timeout 90 npm run tauri dev 2>&1 | tee docs/codex-runs/CHAT_RUNTIME_FIX_20260518/tauri_dev_launch_attempt.log",
+      "status": "partial",
+      "log": "tauri_dev_launch_attempt.log",
+      "summary": "Tauri dev compiled and Gloss initialized; Vite/esbuild EPIPE occurred before this could count as interactive desktop smoke."
+    }
+  ],
+  "provider_smoke_evidence": [
+    {
+      "model": "cogito:3b",
+      "status": "passed",
+      "log": "provider_only_smoke_cogito_3b.json",
+      "proof": "message.content was gloss smoke ok"
+    },
+    {
+      "model": "qwen3.5:4b",
+      "status": "passed",
+      "log": "provider_only_smoke_qwen3_5_4b_think_false.json",
+      "proof": "message.content was gloss smoke ok with Ollama think:false"
+    }
+  ],
+  "unresolved_risks": [
+    "Live desktop smoke was not executed, so the live desktop no-response defect is not release-certified.",
+    "No desktop screenshot, UI event counters, backend desktop logs, or persisted assistant-message proof were captured.",
+    "Bounded Tauri launch initialized the app but did not provide an interactive/captured chat attempt.",
+    "Required root cargo fmt command is invalid for this repo layout; manifest-path fmt check passed instead.",
+    "The worktree was already dirty before this pass and still contains many unrelated modified/untracked files.",
+    "Bad semantic-memory embedding URL fallback-enabled/fallback-disabled desktop smoke was not executed."
+  ]
+}

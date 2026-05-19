@@ -1,0 +1,38 @@
+{
+  "generated_utc": "2026-05-19T04:24:01Z",
+  "uploaded_package": "turbo-quant-generic-rust-next-codex-context-20260506.zip",
+  "observed_files": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "README.md",
+    "docs/codex-runs/ARCHIVAL_POLICY.md",
+    "docs/codex-runs/CODEX_RUN_INDEX.md",
+    "docs/codex-runs/CURRENT_RUN.md",
+    "src/error.rs",
+    "src/kv.rs",
+    "src/lib.rs",
+    "src/polar.rs",
+    "src/qjl.rs",
+    "src/rotation.rs",
+    "src/turbo.rs",
+    "tests/determinism.rs",
+    "tests/inner_product.rs",
+    "z.py"
+  ],
+  "observed_from_static_inspection": {
+    "Cargo.toml_version": "0.1.0",
+    "Cargo.toml_description_contains_zero_overhead": true,
+    "README_contains_zero_accuracy_loss_claim": true,
+    "src/lib_contains_zero_accuracy_loss_claim": true,
+    "PolarCode_uses_radii_vec_f32_and_angle_indices_vec_u16": true,
+    "QjlSketch_uses_signs_vec_i8": true,
+    "StoredRotation_dense_qr_present": true,
+    "TurboCode_contains_polar_code_and_residual_sketch": true,
+    "KvCacheConfig_symmetric_bits_projections_seed": true,
+    "existing_tests": [
+      "tests/determinism.rs",
+      "tests/inner_product.rs"
+    ]
+  },
+  "caveat": "Codex must re-inspect current repo before editing; this file reflects the uploaded May 6 context package only."
+}

@@ -1,0 +1,25 @@
+[package]
+name = "semantic-memory-forge"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.75.0"
+description = "Forge verification truth: evidence bundles, export envelopes, and causal estimation substrate"
+license = "Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+stack-ids = { version = "0.1.1", path = "../stack-ids" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["v4"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+schemars = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+# LIB-005: inherit workspace lint policy
+[lints]
+workspace = true

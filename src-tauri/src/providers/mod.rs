@@ -3,9 +3,9 @@ pub mod llamacpp;
 pub mod ollama;
 pub mod openai;
 
-use crate::db::app_db::{AppDb, ModelRecord};
+use crate::db::app_db::{AppDb, ModelRecord, Provider};
 use crate::error::GlossError;
-use crate::secrets::SecretStore;
+use crate::provider_config_store::SecretStore;
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,15 @@ impl ProviderType {
             ProviderType::OpenAI => Some("openai_api_key"),
             ProviderType::Anthropic => Some("anthropic_api_key"),
             ProviderType::Ollama | ProviderType::LlamaCpp => None,
+        }
+    }
+
+    pub fn default_base_url(&self) -> &'static str {
+        match self {
+            ProviderType::Ollama => "http://localhost:11434",
+            ProviderType::OpenAI => "https://api.openai.com/v1",
+            ProviderType::Anthropic => "https://api.anthropic.com/v1",
+            ProviderType::LlamaCpp => "http://localhost:8080/v1",
         }
     }
 }
@@ -125,6 +134,54 @@ pub fn build_provider(config: &ProviderConfig) -> Box<dyn LlmProvider> {
     }
 }
 
+fn provider_row<'a>(
+    providers: &'a [Provider],
+    provider_type: ProviderType,
+) -> Option<&'a Provider> {
+    providers
+        .iter()
+        .find(|provider| provider.id == provider_type.as_str())
+}
+
+fn provider_base_url(row: &Provider, provider_type: ProviderType) -> String {
+    row.base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| provider_type.default_base_url())
+        .to_string()
+}
+
+pub fn provider_config_from_db(
+    app_db: &AppDb,
+    secret_store: &SecretStore,
+    provider_type: ProviderType,
+) -> Result<ProviderConfig, GlossError> {
+    let providers = app_db.list_providers()?;
+    let row = provider_row(&providers, provider_type).ok_or_else(|| {
+        GlossError::Config(format!(
+            "Provider '{}' is missing from the provider table",
+            provider_type.as_str()
+        ))
+    })?;
+    if !row.enabled {
+        return Err(GlossError::Config(format!(
+            "Provider '{}' is disabled",
+            provider_type.as_str()
+        )));
+    }
+
+    Ok(ProviderConfig {
+        provider_type,
+        base_url: provider_base_url(row, provider_type),
+        api_key: provider_type
+            .api_key_setting_key()
+            .map(|key| secret_store.get(key))
+            .transpose()?
+            .flatten(),
+    })
+}
+
 /// Registry of all configured LLM providers and cached models.
 pub struct ModelRegistry {
     pub ollama: Option<ollama::OllamaProvider>,
@@ -137,50 +194,68 @@ pub struct ModelRegistry {
 impl ModelRegistry {
     /// Create registry from app database config.
     pub fn new(app_db: &AppDb, secret_store: &SecretStore) -> Result<Self, GlossError> {
-        let ollama_url = app_db
-            .get_setting("ollama_url")?
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
-        let ollama = Some(ollama::OllamaProvider::new(&ollama_url));
+        let providers = app_db.list_providers()?;
+        let ollama = provider_row(&providers, ProviderType::Ollama)
+            .filter(|row| row.enabled)
+            .map(|row| ollama::OllamaProvider::new(&provider_base_url(row, ProviderType::Ollama)));
 
-        let openai = {
-            let key = secret_store.get("openai_api_key")?.unwrap_or_default();
-            let url = app_db
-                .get_setting("openai_base_url")?
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-            if !key.is_empty() {
-                Some(openai::OpenAIProvider::new(&url, &key))
-            } else {
-                None
+        let openai = match provider_row(&providers, ProviderType::OpenAI) {
+            Some(row) if row.enabled => {
+                let key = secret_store.get("openai_api_key")?.unwrap_or_default();
+                if key.is_empty() {
+                    None
+                } else {
+                    Some(openai::OpenAIProvider::new(
+                        &provider_base_url(row, ProviderType::OpenAI),
+                        &key,
+                    ))
+                }
             }
+            _ => None,
         };
 
-        let anthropic = {
-            let key = secret_store.get("anthropic_api_key")?.unwrap_or_default();
-            let url = app_db
-                .get_setting("anthropic_base_url")?
-                .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
-            if !key.is_empty() {
-                Some(anthropic::AnthropicProvider::new(&url, &key))
-            } else {
-                None
+        let anthropic = match provider_row(&providers, ProviderType::Anthropic) {
+            Some(row) if row.enabled => {
+                let key = secret_store.get("anthropic_api_key")?.unwrap_or_default();
+                if key.is_empty() {
+                    None
+                } else {
+                    Some(anthropic::AnthropicProvider::new(
+                        &provider_base_url(row, ProviderType::Anthropic),
+                        &key,
+                    ))
+                }
             }
+            _ => None,
         };
 
-        let llamacpp = {
-            let url = app_db.get_setting("llamacpp_url")?.unwrap_or_default();
-            if !url.is_empty() {
-                Some(llamacpp::LlamaCppProvider::new(&url))
-            } else {
-                None
-            }
-        };
+        let llamacpp = provider_row(&providers, ProviderType::LlamaCpp)
+            .filter(|row| row.enabled)
+            .map(|row| {
+                llamacpp::LlamaCppProvider::new(&provider_base_url(row, ProviderType::LlamaCpp))
+            });
+
+        let cached_models = app_db
+            .get_all_models()?
+            .into_iter()
+            .filter(|m| m.available && !m.stale)
+            .filter_map(|m| {
+                ProviderType::from_str(&m.provider_id).map(|provider| ModelInfo {
+                    id: m.id,
+                    display_name: m.display_name,
+                    provider,
+                    parameter_size: m.parameter_size,
+                    context_window: m.context_window,
+                })
+            })
+            .collect();
 
         Ok(Self {
             ollama,
             openai,
             anthropic,
             llamacpp,
-            cached_models: Vec::new(),
+            cached_models,
         })
     }
 
@@ -199,8 +274,7 @@ impl ModelRegistry {
                 };
             }
         }
-        // Default: try Ollama (backward compat for models not yet refreshed)
-        self.ollama.as_ref().map(|p| p as &dyn LlmProvider)
+        None
     }
 
     /// Get a ProviderConfig for constructing a provider outside the lock.
@@ -210,45 +284,31 @@ impl ModelRegistry {
         app_db: &AppDb,
         secret_store: &SecretStore,
     ) -> Result<ProviderConfig, GlossError> {
-        let provider_type = self
+        let selected_provider = app_db
+            .get_setting("default_provider")?
+            .and_then(|provider_id| ProviderType::from_str(provider_id.trim()));
+        let candidates = self
             .cached_models
             .iter()
-            .find(|m| m.id == model_id)
-            .map(|m| m.provider)
-            .unwrap_or(ProviderType::Ollama);
+            .filter(|m| m.id == model_id)
+            .collect::<Vec<_>>();
+        let provider_type = if let Some(provider_type) = selected_provider {
+            candidates
+                .iter()
+                .find(|m| m.provider == provider_type)
+                .map(|m| m.provider)
+        } else if candidates.len() == 1 {
+            candidates.first().map(|m| m.provider)
+        } else {
+            None
+        }
+        .ok_or_else(|| {
+            GlossError::Config(format!(
+                "Selected chat model '{model_id}' is not available in the model registry"
+            ))
+        })?;
 
-        let (base_url, api_key) = match provider_type {
-            ProviderType::Ollama => (
-                app_db
-                    .get_setting("ollama_url")?
-                    .unwrap_or_else(|| "http://localhost:11434".to_string()),
-                None,
-            ),
-            ProviderType::OpenAI => (
-                app_db
-                    .get_setting("openai_base_url")?
-                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-                secret_store.get("openai_api_key")?,
-            ),
-            ProviderType::Anthropic => (
-                app_db
-                    .get_setting("anthropic_base_url")?
-                    .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
-                secret_store.get("anthropic_api_key")?,
-            ),
-            ProviderType::LlamaCpp => (
-                app_db
-                    .get_setting("llamacpp_url")?
-                    .unwrap_or_else(|| "http://localhost:8080/v1".to_string()),
-                None,
-            ),
-        };
-
-        Ok(ProviderConfig {
-            provider_type,
-            base_url,
-            api_key,
-        })
+        provider_config_from_db(app_db, secret_store, provider_type)
     }
 
     /// Refresh models from all enabled providers.
@@ -298,6 +358,9 @@ impl ModelRegistry {
                 parameter_size: m.parameter_size.clone(),
                 context_window: m.context_window,
                 capabilities: None,
+                available: true,
+                stale: false,
+                last_error: None,
             })
             .collect()
     }

@@ -1,0 +1,17 @@
+{
+  "manifest_version": "SCRAutoPhaseManifestV1",
+  "run_id": "P0-completion-automated-phases",
+  "master_prompt": ".codex/prompts/MASTER_AUTOMATED_COMPLETION.md",
+  "manual_injections_required": false,
+  "auto_injections_required": true,
+  "receipt_dir": ".codex/runs/P0-completion",
+  "phases": [
+    {"id":"phase_00","name":"current-state failure proof","prompt":".codex/prompts/phase_00_current_state_and_failure_proof.md","auto_injection":".codex/auto_gates/phase_00_gate.md","required_commands":["python -m pytest -q || true","python scripts/validate_codex_pack.py || true"]},
+    {"id":"phase_01","name":"restore active Codex pack","prompt":".codex/prompts/phase_01_restore_active_codex_pack.md","auto_injection":".codex/auto_gates/phase_01_gate.md","required_commands":["python scripts/assert_codex_active_pack.py"]},
+    {"id":"phase_02","name":"automated phase runner","prompt":".codex/prompts/phase_02_auto_phase_runner.md","auto_injection":".codex/auto_gates/phase_02_gate.md","required_commands":["python .codex/tools/auto_phase_runner.py --dry-run --print-prompts --receipt .codex/runs/P0-completion/auto_phase_dry_run.json"]},
+    {"id":"phase_03","name":"packaging policy","prompt":".codex/prompts/phase_03_packaging_policy.md","auto_injection":".codex/auto_gates/phase_03_gate.md","required_commands":["python scripts/zip_source_certifier.py --mode next-codex-context --no-archive-codex-runs --no-strict --output /tmp/scr-runtime-phase-03-packaging.zip && python scripts/assert_archive_includes_codex.py /tmp/scr-runtime-phase-03-packaging.zip && rm -f /tmp/scr-runtime-phase-03-packaging.zip"]},
+    {"id":"phase_04","name":"tests and release gates","prompt":".codex/prompts/phase_04_tests_and_release_gates.md","auto_injection":".codex/auto_gates/phase_04_gate.md","required_commands":["python -m pytest -q","bash scripts/run_all_checks.sh","python scripts/validate_codex_pack.py"]},
+    {"id":"phase_05","name":"fresh unzip certification","prompt":".codex/prompts/phase_05_fresh_unzip_certification.md","auto_injection":".codex/auto_gates/phase_05_gate.md","required_commands":["bash scripts/run_completion_checks.sh"]},
+    {"id":"phase_06","name":"hostile audit handoff","prompt":".codex/prompts/phase_06_hostile_audit_handoff.md","auto_injection":".codex/auto_gates/phase_06_gate.md","required_commands":["test -f docs/P31_COMPLETION_AUTOMATED_PHASES.md"]}
+  ]
+}

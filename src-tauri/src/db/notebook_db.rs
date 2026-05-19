@@ -31,6 +31,12 @@ pub struct Source {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceSummaryCandidate {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
     pub id: String,
     pub source_id: String,
@@ -333,6 +339,35 @@ impl NotebookDb {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Insert chunks in one transaction so source ingestion does not autocommit
+    /// each chunk row independently.
+    pub fn insert_chunks(&self, chunks: &[Chunk]) -> Result<(), GlossError> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO chunks (id, source_id, chunk_index, content, token_count,
+                                     start_offset, end_offset, metadata, embedding_id, embedding_model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for chunk in chunks {
+                stmt.execute(rusqlite::params![
+                    chunk.id,
+                    chunk.source_id,
+                    chunk.chunk_index,
+                    chunk.content,
+                    chunk.token_count,
+                    chunk.start_offset,
+                    chunk.end_offset,
+                    chunk.metadata,
+                    chunk.embedding_id,
+                    chunk.embedding_model,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Update chunk embedding_id after HNSW insertion.
     pub fn update_chunk_embedding(
         &self,
@@ -531,6 +566,70 @@ impl NotebookDb {
         let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
         })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// FTS5 search for chunks constrained to a resolved source scope.
+    pub fn fts_search_chunks_in_sources(
+        &self,
+        query: &str,
+        source_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<(Chunk, f64)>, GlossError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut sql = String::from(
+            "SELECT c.id, c.source_id, c.chunk_index, c.content, c.token_count,
+                    c.start_offset, c.end_offset, c.metadata, c.embedding_id,
+                    c.embedding_model, chunks_fts.rank
+             FROM chunks_fts
+             JOIN chunks c ON c.rowid = chunks_fts.rowid
+             WHERE chunks_fts MATCH ?1",
+        );
+        if !source_ids.is_empty() {
+            let placeholders = (0..source_ids.len())
+                .map(|idx| format!("?{}", idx + 3))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(" AND c.source_id IN (");
+            sql.push_str(&placeholders);
+            sql.push(')');
+        }
+        sql.push_str(
+            " ORDER BY chunks_fts.rank ASC, c.source_id ASC, c.chunk_index ASC, c.id ASC LIMIT ?2",
+        );
+
+        let limit_i64 = limit as i64;
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&query, &limit_i64];
+        for source_id in source_ids {
+            params.push(source_id);
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((
+                Chunk {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    chunk_index: row.get(2)?,
+                    content: row.get(3)?,
+                    token_count: row.get(4)?,
+                    start_offset: row.get(5)?,
+                    end_offset: row.get(6)?,
+                    metadata: row.get(7)?,
+                    embedding_id: row.get(8)?,
+                    embedding_model: row.get(9)?,
+                },
+                row.get::<_, f64>(10)?,
+            ))
+        })?;
+
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -861,6 +960,29 @@ impl NotebookDb {
         Ok(sources)
     }
 
+    /// List ready sources missing summaries without loading `content_text`.
+    pub fn list_source_headers_needing_summary(
+        &self,
+    ) -> Result<Vec<SourceSummaryCandidate>, GlossError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title
+             FROM sources
+             WHERE status = 'ready' AND summary IS NULL
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SourceSummaryCandidate {
+                id: row.get(0)?,
+                title: row.get(1)?,
+            })
+        })?;
+        let mut sources = Vec::new();
+        for row in rows {
+            sources.push(row?);
+        }
+        Ok(sources)
+    }
+
     /// Check if a source with the given file hash already exists.
     pub fn source_exists_by_hash(&self, hash: &str) -> Result<bool, GlossError> {
         let count: i64 = self.conn.query_row(
@@ -1057,6 +1179,76 @@ mod tests {
         // FTS search
         let results = db.fts_search("rust programming", 10).unwrap();
         assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn scoped_fts_search_filters_sources_limits_and_orders_deterministically() {
+        let db = test_db();
+        for id in ["a", "b"] {
+            db.insert_source(&Source {
+                id: id.to_string(),
+                source_type: "text".to_string(),
+                title: id.to_string(),
+                original_filename: None,
+                file_hash: None,
+                url: None,
+                file_path: None,
+                content_text: None,
+                word_count: None,
+                metadata: None,
+                summary: None,
+                summary_model: None,
+                status: "ready".to_string(),
+                error_message: None,
+                selected: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+        }
+
+        for (id, source_id, chunk_index, content) in [
+            ("a-02", "a", 2, "tie"),
+            ("a-01", "a", 1, "tie"),
+            ("b-00", "b", 0, "tie tie tie outside scope"),
+            ("a-03", "a", 3, "tie"),
+        ] {
+            db.insert_chunk(&Chunk {
+                id: id.to_string(),
+                source_id: source_id.to_string(),
+                chunk_index,
+                content: content.to_string(),
+                token_count: None,
+                start_offset: None,
+                end_offset: None,
+                metadata: None,
+                embedding_id: None,
+                embedding_model: None,
+            })
+            .unwrap();
+        }
+
+        let source_ids = vec!["a".to_string()];
+        let limited = db
+            .fts_search_chunks_in_sources("tie", &source_ids, 2)
+            .unwrap();
+        let limited_ids = limited
+            .iter()
+            .map(|(chunk, _rank)| chunk.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(limited_ids, vec!["a-01", "a-02"]);
+        assert!(limited.iter().all(|(chunk, _rank)| chunk.source_id == "a"));
+
+        let all_scoped = db
+            .fts_search_chunks_in_sources("tie", &source_ids, 10)
+            .unwrap();
+        let all_ids = all_scoped
+            .iter()
+            .map(|(chunk, _rank)| chunk.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(all_ids, vec!["a-01", "a-02", "a-03"]);
     }
 
     #[test]

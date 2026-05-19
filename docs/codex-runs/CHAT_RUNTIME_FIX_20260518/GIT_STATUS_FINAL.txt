@@ -1,0 +1,159 @@
+ M AGENTS.md
+ M README.md
+ M package-lock.json
+ M src-tauri/Cargo.lock
+ M src-tauri/Cargo.toml
+ M src-tauri/capabilities/default.json
+ M src-tauri/src/commands/chat.rs
+ M src-tauri/src/commands/notebooks.rs
+ M src-tauri/src/commands/notes.rs
+ M src-tauri/src/commands/settings.rs
+ M src-tauri/src/commands/sources.rs
+ M src-tauri/src/db/app_db.rs
+ M src-tauri/src/db/migrations.rs
+ M src-tauri/src/db/notebook_db.rs
+ M src-tauri/src/jobs/mod.rs
+ M src-tauri/src/lib.rs
+ M src-tauri/src/providers/mod.rs
+ M src-tauri/src/providers/ollama.rs
+ M src-tauri/src/retrieval/citations.rs
+ M src-tauri/src/retrieval/context.rs
+ M src-tauri/src/retrieval/hybrid_search.rs
+ M src-tauri/src/retrieval/source_scope.rs
+ D src-tauri/src/secrets.rs
+ M src-tauri/src/state.rs
+ M src-tauri/tauri.conf.json
+ M src-tauri/vendor/job-queue/src/executor.rs
+ M src/App.tsx
+ M src/components/chat/ChatPanel.tsx
+ M src/components/layout/PanelLayout.tsx
+ M src/components/layout/StatusBar.tsx
+ M src/components/settings/SettingsDialog.tsx
+ M src/components/sources/SourcesPanel.tsx
+ M src/lib/events.ts
+ M src/lib/tauri.ts
+ M src/lib/types.ts
+ M src/stores/chatStore.ts
+ M src/stores/sourceStore.ts
+?? .agents/
+?? .codex/
+?? ACCEPTANCE_GATES.md
+?? AUDITOR_HANDOFF_TEMPLATE.md
+?? AUDIT_BASIS_AND_FINDINGS.md
+?? AUDIT_FINDINGS.md
+?? AUDIT_TO_PASS_BRIEFING.md
+?? Archive.zip
+?? BACKEND_COMPLETION_SPEC.md
+?? BUNDLE_MANIFEST.json
+?? COMMAND_BAR.md
+?? COPY_PASTE_SEQUENCE.md
+?? FEATURE_COVERAGE_MATRIX.md
+?? FINAL_AUDITOR_HANDOFF.md
+?? FINISHLINE_SPEC.md
+?? Gloss-generic-next-codex-context-20260512-hardening.codex-archive.json
+?? Gloss-generic-next-codex-context-20260512-hardening.excluded.json
+?? Gloss-generic-next-codex-context-20260512-hardening.findings.json
+?? Gloss-generic-next-codex-context-20260512-hardening.manifest.json
+?? Gloss-generic-next-codex-context-20260512-hardening.report.md
+?? Gloss-generic-next-codex-context-20260512-hardening.zip
+?? Gloss-generic-next-codex-context-20260512.codex-archive.json
+?? Gloss-generic-next-codex-context-20260512.excluded.json
+?? Gloss-generic-next-codex-context-20260512.findings.json
+?? Gloss-generic-next-codex-context-20260512.manifest.json
+?? Gloss-generic-next-codex-context-20260512.report.md
+?? Gloss-generic-next-codex-context-20260512.zip
+?? Gloss-generic-next-codex-context-20260513.codex-archive.json
+?? Gloss-generic-next-codex-context-20260513.excluded.json
+?? Gloss-generic-next-codex-context-20260513.findings.json
+?? Gloss-generic-next-codex-context-20260513.manifest.json
+?? Gloss-generic-next-codex-context-20260513.report.md
+?? Gloss-generic-next-codex-context-20260513.zip
+?? Gloss-generic-next-codex-context-20260515.codex-archive.json
+?? Gloss-generic-next-codex-context-20260515.excluded.json
+?? Gloss-generic-next-codex-context-20260515.findings.json
+?? Gloss-generic-next-codex-context-20260515.manifest.json
+?? Gloss-generic-next-codex-context-20260515.report.md
+?? Gloss-generic-next-codex-context-20260515.zip
+?? Gloss-generic-next-codex-context-20260516.codex-archive.json
+?? Gloss-generic-next-codex-context-20260516.excluded.json
+?? Gloss-generic-next-codex-context-20260516.findings.json
+?? Gloss-generic-next-codex-context-20260516.manifest.json
+?? Gloss-generic-next-codex-context-20260516.report.md
+?? Gloss-generic-next-codex-context-20260516.zip
+?? Gloss-generic-next-codex-context-20260517.codex-archive.json
+?? Gloss-generic-next-codex-context-20260517.excluded.json
+?? Gloss-generic-next-codex-context-20260517.findings.json
+?? Gloss-generic-next-codex-context-20260517.manifest.json
+?? Gloss-generic-next-codex-context-20260517.report.md
+?? Gloss-generic-next-codex-context-20260517.zip
+?? Gloss-generic-next-codex-context-20260518.codex-archive.json
+?? Gloss-generic-next-codex-context-20260518.excluded.json
+?? Gloss-generic-next-codex-context-20260518.findings.json
+?? Gloss-generic-next-codex-context-20260518.manifest.json
+?? Gloss-generic-next-codex-context-20260518.report.md
+?? Gloss-generic-next-codex-context-20260518.zip
+?? Gloss-sources-20260309-035541.zip
+?? Gloss-sources-20260310-032829.zip
+?? Gloss-sources-20260312-152352.zip
+?? Gloss-sources-20260318-232129.zip
+?? IMPLEMENTATION_PLAN.md
+?? ISSUE_MATRIX.csv
+?? ISSUE_MATRIX.md
+?? ISSUE_MATRIX_P32R3.csv
+?? ISSUE_MATRIX_P32R3.md
+?? MANUAL_INJECTIONS/
+?? MASTER_CODEX_PROMPT.md
+?? MASTER_ISSUE_MATRIX.csv
+?? MASTER_ISSUE_MATRIX.md
+?? MASTER_ISSUE_MATRIX.xlsx
+?? P32R3_ACCEPTANCE_GATES.md
+?? P32R3_FINAL_AUDITOR_HANDOFF_TEMPLATE.md
+?? P32R3_PARALLEL_AGENT_TASKS.csv
+?? P32R3_PHASE_PLAN.md
+?? P32R3_ROLLBACK_AND_QUARANTINE.md
+?? P32R3_RUNTIME_SMOKE_TESTS.md
+?? P32R3_SOURCE_BASIS.md
+?? PACKAGE_SCOPE_POLICY.md
+?? PASS_SPEC.md
+?? PATCH_ORDER_AND_TEST_PLAN.md
+?? PATCH_SPEC.md
+?? PHASE_INJECTION_PROTOCOL.md
+?? PHASE_ORDER.md
+?? PHASE_PROMPTS/
+?? PLANS.md
+?? RECEIPT_SCHEMA.json
+?? RELEASE_CRITERIA.md
+?? RELEASE_GATES.md
+?? REPORT_TEMPLATES/
+?? ROLLBACK_AND_QUARANTINE.md
+?? ROLLBACK_AND_QUARANTINE_PLAN.md
+?? SECURITY_AND_PRIVACY.md
+?? SOURCE_BASIS.md
+?? START_HERE_CHAT_RUNTIME_FIX_MASTER_PROMPT.md
+?? START_HERE_MASTER_PROMPT.md
+?? START_HERE_SM_TQ_MASTER_PROMPT.md
+?? STOP_RULES.md
+?? TEST_AND_REPLAY_PLAN.md
+?? UI_UX_SPEC.md
+?? __pycache__/
+?? bebop.zip
+?? checklists/
+?? docs/
+?? fixtures/
+?? install_into_gloss.sh
+?? install_into_repo.py
+?? libraries-source-clean-20260318.zip
+?? phase_prompts/
+?? product_docs/
+?? repo_scaffold/
+?? run_codex_p32r3.sh
+?? schemas/
+?? scripts/
+?? src-tauri/src/memory/
+?? src-tauri/src/provider_config_store.rs
+?? src-tauri/vendor/crates/
+?? src/stores/forge.db
+?? src/stores/memory/
+?? templates/
+?? z.py
+?? zip.py

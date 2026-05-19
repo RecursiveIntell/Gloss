@@ -5,7 +5,10 @@ import { useChatStore } from './chatStore';
 import { useToastStore } from './toastStore';
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
-let persistSelectedSourcesChain = Promise.resolve();
+const SELECTION_PERSIST_DEBOUNCE_MS = 350;
+let persistSelectedSourcesTimer: ReturnType<typeof setTimeout> | null = null;
+let persistSelectedSourcesInFlight = false;
+let persistSelectedSourcesPending: { notebookId: string; ids: string[] } | null = null;
 
 async function refreshNotebookList() {
   const { useNotebookStore } = await import('./notebookStore');
@@ -32,13 +35,30 @@ function clearSuggestedQuestions() {
 function persistSelectedSources(selectedSourceIds: Set<string>) {
   const notebookId = localStorage.getItem(ACTIVE_NB_KEY);
   if (!notebookId) return;
-  const snapshot = Array.from(selectedSourceIds);
-  persistSelectedSourcesChain = persistSelectedSourcesChain
-    .catch(() => {})
-    .then(() => api.setSelectedSources(notebookId, snapshot))
-    .catch((e) => {
-      console.error('Failed to persist selected sources:', e);
-    });
+  persistSelectedSourcesPending = { notebookId, ids: Array.from(selectedSourceIds) };
+  if (persistSelectedSourcesTimer) {
+    clearTimeout(persistSelectedSourcesTimer);
+  }
+  persistSelectedSourcesTimer = setTimeout(() => {
+    void flushSelectedSources();
+  }, SELECTION_PERSIST_DEBOUNCE_MS);
+}
+
+async function flushSelectedSources(): Promise<void> {
+  if (persistSelectedSourcesInFlight || !persistSelectedSourcesPending) return;
+  persistSelectedSourcesInFlight = true;
+  const snapshot = persistSelectedSourcesPending;
+  persistSelectedSourcesPending = null;
+  try {
+    await api.setSelectedSources(snapshot.notebookId, snapshot.ids);
+  } catch (e) {
+    console.error('Failed to persist selected sources:', e);
+  } finally {
+    persistSelectedSourcesInFlight = false;
+    if (persistSelectedSourcesPending) {
+      void flushSelectedSources();
+    }
+  }
 }
 
 interface SourceStore {
@@ -48,10 +68,14 @@ interface SourceStore {
   stats: NotebookStats | null;
   loadSources: (notebookId: string) => Promise<void>;
   addSourceFile: (notebookId: string, path: string) => Promise<void>;
+  addSourceFiles: (notebookId: string, paths: string[]) => Promise<void>;
   addSourceFolder: (notebookId: string, path: string) => Promise<void>;
   addSourcePaste: (notebookId: string, title: string, text: string) => Promise<void>;
   deleteSource: (notebookId: string, sourceId: string) => Promise<void>;
   retrySource: (notebookId: string, sourceId: string) => Promise<void>;
+  reindexSource: (notebookId: string, sourceId: string) => Promise<void>;
+  reindexNotebook: (notebookId: string) => Promise<void>;
+  bulkDeleteSelected: (notebookId: string) => Promise<void>;
   toggleSource: (sourceId: string) => void;
   toggleGroup: (group: string) => void;
   selectAll: () => void;
@@ -94,6 +118,30 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       await refreshNotebookList();
       await get().loadSources(notebookId);
       await get().loadStats(notebookId);
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Import Failed',
+        message: String(e),
+        duration: 5000,
+      });
+    }
+  },
+
+  addSourceFiles: async (notebookId, paths) => {
+    if (paths.length === 0) return;
+    try {
+      clearSuggestedQuestions();
+      await api.addSourceFiles(notebookId, paths);
+      await refreshNotebookList();
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'Import Started',
+        message: `${paths.length} files queued for ingestion.`,
+        duration: 3000,
+      });
     } catch (e) {
       useToastStore.getState().addToast({
         type: 'error',
@@ -170,6 +218,67 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         title: 'Retry Failed',
         message: String(e),
         duration: 5000,
+      });
+    }
+  },
+
+  reindexSource: async (notebookId, sourceId) => {
+    try {
+      await api.semanticMemoryReindexSource(notebookId, sourceId);
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'Reindex Complete',
+        message: 'Source projected to semantic-memory preview.',
+        duration: 3000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Reindex Failed',
+        message: String(e),
+        duration: 6000,
+      });
+    }
+  },
+
+  reindexNotebook: async (notebookId) => {
+    try {
+      const receipts = await api.semanticMemoryReindexNotebook(notebookId);
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'Notebook Reindexed',
+        message: `${receipts.length} sources processed for semantic-memory preview.`,
+        duration: 4000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Notebook Reindex Failed',
+        message: String(e),
+        duration: 7000,
+      });
+    }
+  },
+
+  bulkDeleteSelected: async (notebookId) => {
+    const ids = Array.from(get().selectedSourceIds);
+    if (ids.length === 0) return;
+    try {
+      clearSuggestedQuestions();
+      await api.deleteSources(notebookId, ids);
+      await refreshNotebookList();
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Bulk Delete Failed',
+        message: String(e),
+        duration: 6000,
       });
     }
   },

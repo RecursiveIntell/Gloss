@@ -1,0 +1,311 @@
+{
+  "pass_name": "codex-giga-pass-20260511",
+  "date_time": "2026-05-11T22:27:03-05:00",
+  "branch": "master",
+  "starting_commit": "8bf62c552d7201457e78d242439e09594284bdbe",
+  "ending_commit": "8bf62c552d7201457e78d242439e09594284bdbe",
+  "workspace_dirty_at_start": true,
+  "workspace_dirty_at_end": true,
+  "phases": {
+    "layer_0_baseline_ledger_agents": {
+      "status": "completed",
+      "evidence": [
+        "AGENTS.md already existed",
+        "created docs/audits/codex-giga-pass-20260511.md",
+        "created docs/audits/codex-giga-pass-20260511-status.json"
+      ]
+    },
+    "layer_1_hnsw_vector_index_truth": {
+      "status": "partial_completed",
+      "closed": [
+        "key_level_parity",
+        "fixed_width_versioned_sidecar_header",
+        "sidecar_version_dimension_graph_data_validation",
+        "unsupported_or_corrupt_sidecar_rebuild_on_open",
+        "filtered_under_return_exact_fallback_trigger",
+        "pending_mutation_failure_rebuild_or_disable_policy"
+      ],
+      "remaining": [
+        "injectable pending sidecar save-failure test seam"
+      ]
+    },
+    "layer_2_deterministic_search_receipts": {
+      "status": "completed",
+      "closed": [
+        "explicit_search_context",
+        "evaluation_time_threaded_through_recency_scoring",
+        "context_aware_search_api",
+        "context_aware_explained_search_api",
+        "context_aware_vector_only_api",
+        "vector_search_receipt_v1",
+        "filtered_hnsw_underreturn_exact_fallback_receipt",
+        "prefer_exact_profile_bypasses_hnsw"
+      ],
+      "remaining": [
+        "replay verification requires caller-supplied query text and filters by design"
+      ]
+    },
+    "layer_3_boundary_defaulting_cleanup": {
+      "status": "completed_focused",
+      "closed": [
+        "embedder_non_2xx_body_read_failure_no_longer_defaults_empty",
+        "legacy_projection_episode_json_serialization_no_longer_defaults_empty",
+        "projection_optional_relation_and_evidence_ids_preserve_absence",
+        "bridge_receipt_and_control_plane_optional_vectors_use_explicit_empty_policy"
+      ],
+      "remaining": [
+        "non-boundary internal unwrap_or_default calls left unchanged"
+      ]
+    },
+    "layer_4_codec_abstraction_without_turboquant": {
+      "status": "completed",
+      "closed": [
+        "vector_codec_profile_v1",
+        "vector_artifact_v1",
+        "object_safe_vector_codec_trait",
+        "raw_f32_codec_reference_implementation",
+        "sq8_codec_existing_q8_wrapper",
+        "stable_profile_digest_tests",
+        "profile_mismatch_rejection_tests"
+      ],
+      "remaining": [
+        "codec artifacts are not yet wired into retrieval receipts",
+        "raw-vs-codec drift harness remains for TurboQuant/SQ8 scoring analysis"
+      ]
+    },
+    "layer_5_turboquant_optional_backend": {
+      "status": "prototype_completed_not_default_eligible",
+      "closed": [
+        "optional_turbo_quant_codec_feature",
+        "turbo_quant_codec_behind_vector_codec_trait",
+        "turbo_code_encoded_as_vector_artifact_bytes",
+        "deterministic_turbo_code_digest_tests",
+        "seed_changes_profile_and_code_digest_test",
+        "profile_mismatch_rejects_turbo_scoring",
+        "fixed_corpus_raw_vs_turbo_quant_drift_harness",
+        "receipt_schema_has_codec_family_profile_digest_and_approximate_fields"
+      ],
+      "metrics": {
+        "fixed_corpus": {
+          "recall_at_5": 1.0,
+          "mean_rank_drift": 0.792,
+          "mean_absolute_score_error": 0.076,
+          "p95_absolute_score_error": 0.152,
+          "storage_bytes_per_vector": 393.3
+        }
+      },
+      "remaining": [
+        "turbo_quant_not_wired_into_live_retrieval",
+        "turbo_quant_retrieval_receipts_not_emitted_from_search_path",
+        "benchmark_suite_not_added"
+      ]
+    },
+    "layer_6_product_facing_receipt_ux_api": {
+      "status": "completed_api_surface",
+      "closed": [
+        "receipt_answers_surface",
+        "replay_receipt_id_and_evaluation_time_visible",
+        "backend_codec_profile_exactness_visible",
+        "fallback_degradation_exact_rerank_visible",
+        "result_ids_visible_for_source_grounding",
+        "per_result_why_this_result_answers",
+        "per_result_source_kind_and_source_id_visible",
+        "durable_receipt_lookup_by_replay_id",
+        "durable_receipt_replay_verification_report"
+      ],
+      "remaining": [
+        "replay verification requires caller-supplied query text and filters by design",
+        "TurboQuant retrieval receipts are not emitted from the live search path"
+      ]
+    },
+    "layer_7_docs_release_portfolio_story": {
+      "status": "completed_focused",
+      "closed": [
+        "README_leads_with_trustworthy_local_first_ai_memory",
+        "README_mentions_receipts_replay_source_grounding_approximation_and_rebuildability",
+        "public_story_pitch_updated",
+        "release_checklist_reflects_closed_hnsw_search_receipt_raw_codec_turboquant_gates"
+      ],
+      "remaining": [
+        "portfolio_case_study_copy_not_written",
+        "benchmark_harness_still_roadmap_only"
+      ]
+    },
+    "durable_search_receipt_continuation": {
+      "status": "completed_metadata_persistence_and_replay_verification",
+      "closed": [
+        "migration_v18_search_receipts_table",
+        "versioned_stored_search_receipt_json",
+        "fixed_width_count_conversion_for_on_disk_receipts",
+        "receipt_digest_storage",
+        "idempotent_same_digest_duplicate_receipts",
+        "search_receipt_conflict_on_same_id_different_payload",
+        "unsupported_receipt_schema_version_fails_closed",
+        "MemoryStore_get_search_receipt_api",
+        "MemoryStore_replay_search_receipt_api",
+        "replay_query_embedding_digest_comparison",
+        "replay_result_id_order_comparison",
+        "replay_missing_and_added_result_ids",
+        "replay_missing_receipt_id_typed_error"
+      ],
+      "remaining": [
+        "replay requires caller-supplied query text and filters because receipts do not store them",
+        "receipt retention/pruning policy not implemented",
+        "TurboQuant live retrieval profile evidence still not emitted"
+      ]
+    }
+  },
+  "commands": [
+    {
+      "command": "cargo fmt --all --check",
+      "result": "pass",
+      "notes": "baseline and final pass"
+    },
+    {
+      "command": "cargo check --workspace --all-targets --all-features",
+      "result": "pass",
+      "notes": "re-run after Layer 5; pre-existing warnings in sibling property tests"
+    },
+    {
+      "command": "cargo test -p semantic-memory --all-features --test hnsw_persistence -- --nocapture",
+      "result": "pass",
+      "notes": "11 tests passed"
+    },
+    {
+      "command": "cargo test -p semantic-memory --all-features --test search_tests -- --nocapture",
+      "result": "pass",
+      "notes": "replay API re-run: 51 tests passed, including receipt-answer, durable lookup, duplicate-ID conflict, replay match/drift, missing receipt, unsupported receipt version, and per-result explanation-answer coverage"
+    },
+    {
+      "command": "cargo test -p semantic-memory --all-features",
+      "result": "pass",
+      "notes": "replay API re-run: full semantic-memory package suite and doc-tests passed with TurboQuant feature enabled; one earlier run failed only because /tmp was full during doctest linking"
+    },
+    {
+      "command": "cargo test -p semantic-memory --all-features --test db_tests --test projection_v11_tests -- --nocapture",
+      "result": "pass",
+      "notes": "14 db tests and 17 projection tests passed"
+    },
+    {
+      "command": "cargo test -p semantic-memory --all-features --test db_tests --test projection_v11_tests --test search_tests -- --nocapture",
+      "result": "pass",
+      "notes": "re-run after clippy cleanups: 14 db, 17 projection, and 45 search tests passed"
+    },
+    {
+      "command": "cargo test -p semantic-memory --all-features --test vector_codec -- --nocapture",
+      "result": "pass",
+      "notes": "9 codec tests passed; corrected TurboQuant drift metrics: recall@5=1.000, mean_rank_drift=0.792, mean_abs_score_error=0.076, p95_abs_score_error=0.152, storage_bytes_per_vector=393.3"
+    },
+    {
+      "command": "cargo check -p semantic-memory --all-targets --no-default-features --features brute-force",
+      "result": "pass",
+      "notes": "brute-force/no-default package check passed"
+    },
+    {
+      "command": "cargo check -p semantic-memory --all-targets --features turbo-quant-codec",
+      "result": "pass",
+      "notes": "optional TurboQuant feature check passed"
+    },
+    {
+      "command": "cargo test -p semantic-memory --no-default-features --features brute-force --test vector_codec -- --nocapture",
+      "result": "pass",
+      "notes": "raw/SQ8 codec tests pass without default HNSW"
+    },
+    {
+      "command": "cargo test -p semantic-memory --features turbo-quant-codec --test vector_codec -- --nocapture",
+      "result": "pass",
+      "notes": "feature-gated TurboQuant codec tests pass"
+    },
+    {
+      "command": "cargo test -p forge-memory-bridge --all-features",
+      "result": "pass",
+      "notes": "27 unit tests, 17 integration tests, and doc-tests passed"
+    },
+    {
+      "command": "cargo clippy -p semantic-memory --lib --all-features -- -D warnings",
+      "result": "pass",
+      "notes": "semantic-memory plus optional TurboQuant dependency lint clean after local turbo-quant lint cleanup"
+    },
+    {
+      "command": "cargo check -p semantic-memory --all-targets --all-features",
+      "result": "pass",
+      "notes": "re-run after Layer 6 public receipt/explanation API changes"
+    },
+    {
+      "command": "cargo clippy -p semantic-memory --lib --all-features -- -D warnings",
+      "result": "pass",
+      "notes": "re-run after Layer 6 public receipt/explanation API changes"
+    },
+    {
+      "command": "cargo fmt --all --check",
+      "result": "pass",
+      "notes": "re-run after durable receipt persistence"
+    },
+    {
+      "command": "cargo check -p semantic-memory --all-targets --all-features",
+      "result": "pass",
+      "notes": "re-run after replay API"
+    },
+    {
+      "command": "cargo clippy -p semantic-memory --lib --all-features -- -D warnings",
+      "result": "pass",
+      "notes": "re-run after replay API"
+    },
+    {
+      "command": "cargo clippy -p semantic-memory --all-targets --all-features -- -D warnings",
+      "result": "fail",
+      "notes": "still blocked by pre-existing expect_used violations in semantic-memory tests; first reported files include tests/step4_verification.rs, tests/step3_verification.rs, tests/knowledge_tests.rs, tests/import_boundary_tests.rs, and tests/import_ugly_cases.rs"
+    },
+    {
+      "command": "cargo doc -p semantic-memory --all-features --no-deps",
+      "result": "pass",
+      "notes": "re-run after durable receipts; warning only: pre-existing redundant explicit link target"
+    },
+    {
+      "command": "cargo test -p turbo-quant",
+      "result": "pass",
+      "notes": "42 unit tests, 12 integration tests, and 2 doc-tests passed after QJL scale and batch stats fixes"
+    },
+    {
+      "command": "cargo test --workspace --all-features",
+      "result": "fail",
+      "notes": "re-run after TurboQuant fixes; still fails in unrelated contract-schema-gen schema drift for schemas/verification-case-v1.schema.json"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "result": "fail",
+      "notes": "pre-existing expect_used violations in sibling tests"
+    },
+    {
+      "command": "cargo clippy -p semantic-memory --all-targets --all-features -- -D warnings",
+      "result": "fail",
+      "notes": "new library lints fixed; command now stops on pre-existing expect_used violations in semantic-memory tests"
+    },
+    {
+      "command": "cargo doc --workspace --all-features --no-deps",
+      "result": "pass",
+      "notes": "warnings only"
+    },
+    {
+      "command": "cargo doc -p semantic-memory --all-features --no-deps",
+      "result": "pass",
+      "notes": "re-run after Layer 5; warning only: pre-existing redundant explicit link target"
+    },
+    {
+      "command": "cargo doc -p semantic-memory -p forge-memory-bridge --all-features --no-deps",
+      "result": "pass",
+      "notes": "warning only: pre-existing redundant explicit link target in semantic-memory crate docs"
+    }
+  ],
+  "turboquant_eligibility": "prototype_implemented_not_default_retrieval_eligible",
+  "remaining_risks": [
+    "pending sidecar save-failure path needs an injectable test seam",
+    "workspace test gate blocked by contract-schema-gen schema drift",
+    "workspace clippy gate blocked by pre-existing expect_used violations",
+    "replay verification requires caller-supplied query text and filters because receipts intentionally do not store them",
+    "TurboQuant backend is implemented only as an optional codec, not wired into search/index persistence",
+    "Drift harness is a fixed test fixture, not a benchmark suite",
+    "TurboQuant retrieval receipts are not emitted from the live search path",
+    "Layer 3 was focused on audited semantic-boundary defaulting sites; remaining non-boundary unwrap_or_default calls were left unchanged"
+  ]
+}

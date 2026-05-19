@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GlossP2PromotionDecision",
+  "type": "object",
+  "required": [
+    "run_id",
+    "decision",
+    "default_backend_after_pass",
+    "semantic_memory_status",
+    "hard_gates",
+    "ranking_metrics",
+    "command_bar_status",
+    "package_status",
+    "extracted_replay_status",
+    "reasons"
+  ],
+  "properties": {
+    "run_id": {
+      "const": "GLOSS_SEMANTIC_MEMORY_P2_PARITY_AND_UX_PROMOTION_20260513"
+    },
+    "decision": {
+      "enum": [
+        "not_promoted",
+        "promotable_preview",
+        "safe_to_default_candidate",
+        "blocked"
+      ]
+    },
+    "default_backend_after_pass": {
+      "const": "gloss-local"
+    },
+    "semantic_memory_status": {
+      "enum": [
+        "preview",
+        "blocked",
+        "unavailable"
+      ]
+    },
+    "hard_gates": {
+      "type": "object"
+    },
+    "ranking_metrics": {
+      "type": "object"
+    },
+    "command_bar_status": {
+      "enum": [
+        "pass",
+        "fail",
+        "blocked",
+        "partial"
+      ]
+    },
+    "package_status": {
+      "enum": [
+        "pass",
+        "fail",
+        "blocked",
+        "not_run"
+      ]
+    },
+    "extracted_replay_status": {
+      "enum": [
+        "pass",
+        "fail",
+        "blocked",
+        "not_run"
+      ]
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

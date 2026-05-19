@@ -1,0 +1,3 @@
+# SCR P31: intentionally empty valid Starlark file.
+# Do not put prose here. Human-readable policy belongs in AGENTS.md,
+# prompts/, docs/, auto_gates/, or executable scripts.

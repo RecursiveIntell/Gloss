@@ -25,6 +25,24 @@ pub struct ProcessedJob {
     pub error: Option<String>,
 }
 
+struct HeartbeatStopGuard {
+    stop: Arc<AtomicBool>,
+}
+
+impl HeartbeatStopGuard {
+    fn new(stop: &Arc<AtomicBool>) -> Self {
+        Self {
+            stop: Arc::clone(stop),
+        }
+    }
+}
+
+impl Drop for HeartbeatStopGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The background job executor.
 ///
 /// Polls the database for pending jobs and processes them using the
@@ -396,6 +414,7 @@ impl QueueExecutor {
         };
 
         let heartbeat_stop = Arc::new(AtomicBool::new(false));
+        let _heartbeat_guard = HeartbeatStopGuard::new(&heartbeat_stop);
         if !self.config.heartbeat_interval.is_zero() {
             let db = Arc::clone(&self.db);
             let job_id = job_id.to_string();
@@ -423,7 +442,6 @@ impl QueueExecutor {
 
         // Execute job
         let result = job_handler.execute(&ctx).await;
-        heartbeat_stop.store(true, Ordering::Relaxed);
 
         // Check cancellation before deciding what to write to DB
         let jid = job_id.to_string();
@@ -627,6 +645,16 @@ impl QueueExecutor {
     where
         H: JobHandler,
     {
+        let stale_after_secs = self.config.stale_after.as_secs();
+        if stale_after_secs > 0 {
+            let reclaimed = self
+                .with_db(move |conn| db::reclaim_stale(conn, stale_after_secs))
+                .await?;
+            if reclaimed > 0 {
+                tracing::warn!(reclaimed, "Reclaimed stale queue jobs before foreground claim");
+            }
+        }
+
         let worker_id = self.config.worker_id.clone();
         let visibility_timeout_secs = self.config.stale_after.as_secs();
         let claimed = self
@@ -763,6 +791,56 @@ mod tests {
             EXECUTION_CALLS.fetch_add(1, Ordering::SeqCst);
             Ok(JobResult::success())
         }
+    }
+
+    #[test]
+    fn heartbeat_stop_guard_finalizes_on_drop() {
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = HeartbeatStopGuard::new(&stop);
+            assert!(!stop.load(Ordering::Relaxed));
+        }
+        assert!(stop.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn foreground_process_one_reclaims_stale_processing_job() {
+        EXECUTION_CALLS.store(0, Ordering::SeqCst);
+
+        let conn = db::open_database(None).unwrap();
+        db::insert_job(&conn, "job-stale", 2, &serde_json::to_value(CountingJob).unwrap()).unwrap();
+        db::claim(&conn, "dead-worker").unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET heartbeat_at = ?1 WHERE id = 'job-stale'",
+            rusqlite::params![
+                (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+
+        let db = Arc::new(Mutex::new(conn));
+        let config = QueueConfig::builder()
+            .with_worker_id("worker-test")
+            .with_stale_after(std::time::Duration::from_secs(1))
+            .build();
+        let executor = QueueExecutor::new(config, Arc::clone(&db));
+        let emitter_trait: Arc<dyn QueueEventEmitter> = Arc::new(RecordingEmitter::default());
+
+        let processed = executor
+            .process_one::<CountingJob>(&emitter_trait)
+            .await
+            .unwrap()
+            .expect("stale job should be reclaimed and processed");
+        assert_eq!(processed.job_id, "job-stale");
+        assert!(processed.success);
+        assert_eq!(EXECUTION_CALLS.load(Ordering::SeqCst), 1);
+
+        let conn = db.lock().unwrap();
+        let details = db::get_job_details(&conn, "job-stale")
+            .unwrap()
+            .expect("job details");
+        assert_eq!(details.status.as_str(), "completed");
+        assert_eq!(details.worker_id.as_deref(), Some("worker-test"));
     }
 
     #[tokio::test]

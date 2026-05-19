@@ -182,10 +182,6 @@ pub async fn set_active_notebook(
 
                 if let Err(e) = state.with_notebook_db(&nb_id, |_db| Ok(())) {
                     tracing::warn!(notebook_id = %nb_id, "Background notebook DB open failed: {}", e);
-                    return;
-                }
-                if !state.is_active_notebook_epoch(&nb_id, active_epoch) {
-                    return;
                 }
             })
             .await;

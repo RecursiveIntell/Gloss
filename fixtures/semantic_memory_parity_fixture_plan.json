@@ -1,0 +1,54 @@
+{
+  "run_id": "GLOSS_SEMANTIC_MEMORY_P2_PARITY_AND_UX_PROMOTION_20260513",
+  "classes": {
+    "small_exact": {
+      "notebooks": 1,
+      "sources": "3-5",
+      "queries": [
+        "exact phrase",
+        "source-bounded exact"
+      ]
+    },
+    "medium_mixed": {
+      "notebooks": 3,
+      "sources": "25-50",
+      "properties": [
+        "duplicate titles",
+        "overlapping terms",
+        "renamed source",
+        "deleted source"
+      ]
+    },
+    "large_ranked": {
+      "notebooks": "5+",
+      "sources": "100+",
+      "chunks": "1000+ if feasible",
+      "properties": [
+        "deterministic pseudo-content",
+        "no LLM dependency"
+      ]
+    },
+    "hostile_scope": {
+      "cases": [
+        "invalid IDs",
+        "duplicate IDs",
+        "empty IDs",
+        "cross-notebook IDs",
+        "deleted IDs",
+        "SQL-looking payloads",
+        "missing backpointers"
+      ]
+    }
+  },
+  "metrics": [
+    "overlap@3",
+    "overlap@5",
+    "overlap@10",
+    "MRR@10",
+    "top1 exact-source hit",
+    "citation anchor validity",
+    "scope preservation",
+    "fail-closed rate",
+    "fallback disclosure rate"
+  ]
+}

@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useToastStore } from "../../stores/toastStore";
+import { useNotebookStore } from "../../stores/notebookStore";
+import * as api from "../../lib/tauri";
+import type { MemoryBackendStatus, SemanticMemoryLinkStatus } from "../../lib/types";
 import {
   X,
   RefreshCw,
@@ -15,6 +18,7 @@ import {
   EyeOff,
   Image,
   Wrench,
+  Database,
 } from "lucide-react";
 
 interface SettingsDialogProps {
@@ -248,6 +252,9 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     setActiveModel,
     loadExternalTools,
   } = useSettingsStore();
+  const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
+  const [memoryStatus, setMemoryStatus] = useState<MemoryBackendStatus | null>(null);
+  const [linkStatus, setLinkStatus] = useState<SemanticMemoryLinkStatus | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -255,14 +262,16 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       loadProviders();
       loadModels();
       loadExternalTools();
+      api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => setMemoryStatus(null));
+      if (activeNotebookId) {
+        api.semanticMemoryLinkStatus(activeNotebookId).then(setLinkStatus).catch(() => setLinkStatus(null));
+      } else {
+        setLinkStatus(null);
+      }
     }
-  }, [open, loadSettings, loadProviders, loadModels, loadExternalTools]);
+  }, [activeNotebookId, open, loadSettings, loadProviders, loadModels, loadExternalTools]);
 
   const handleProviderSave = async (updates: Record<string, string>) => {
-    for (const [key, value] of Object.entries(updates)) {
-      await updateSetting(key, value);
-    }
-    // Update provider record if URL changed
     if (updates["ollama_url"]) {
       await updateProvider("ollama", true, updates["ollama_url"]);
     }
@@ -285,6 +294,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     if (updates["llamacpp_url"]) {
       await updateProvider("llamacpp", true, updates["llamacpp_url"]);
     }
+    await loadSettings();
   };
 
   const handleRefresh = async () => {
@@ -306,6 +316,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
 
   const handleSelectVisionModel = async (modelId: string) => {
     await updateSetting("vision_model", modelId);
+  };
+
+  const handleSelectMemoryBackend = async (backendId: string) => {
+    await updateSetting("memory_backend", backendId);
   };
 
   const handleBackdropClick = (e: React.MouseEvent) => {
@@ -417,6 +431,44 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
             </p>
           </section>
 
+          <section>
+            <div className="grid grid-cols-2 gap-2">
+              <HealthCard
+                title="Provider"
+                status={activeModel}
+                detail={`Chat provider: ${models.find((model) => model.id === activeModel)?.provider_id ?? settings["default_provider"] ?? "ollama"}`}
+                tone="neutral"
+              />
+              <HealthCard
+                title="Memory"
+                status={memoryStatus?.backend_used ?? "gloss-local"}
+                detail={
+                  memoryStatus?.backend_used !== memoryStatus?.active_backend
+                    ? `Requested ${memoryStatus?.active_backend}; fallback disclosed`
+                    : `Default ${memoryStatus?.default_backend ?? "gloss-local"}`
+                }
+                tone={memoryStatus?.degraded ? "warning" : "success"}
+              />
+              <HealthCard
+                title="Embedding / Index"
+                status={memoryStatus?.index_sync_status ?? "unknown"}
+                detail={linkStatus ? `${linkStatus.synced_links}/${linkStatus.total_links} semantic links synced` : "Native local index stays fallback-safe"}
+                tone={memoryStatus?.index_sync_status === "failed" ? "error" : memoryStatus?.index_sync_status === "degraded" ? "warning" : "neutral"}
+              />
+              <HealthCard
+                title="Preview Backend"
+                status={memoryStatus?.semantic_memory_feature_enabled ? "available" : "feature off"}
+                detail="semantic-memory-preview is preview-only and not the default backend."
+                tone={settings["memory_backend"] === "semantic-memory-preview" ? "warning" : "neutral"}
+              />
+            </div>
+            {memoryStatus?.fallback_reason && (
+              <p className="mt-2 rounded border border-warning/30 bg-warning/5 px-2 py-1 text-xs text-warning">
+                {memoryStatus.fallback_reason}
+              </p>
+            )}
+          </section>
+
           {/* Models Section */}
           <section>
             <div className="flex items-center justify-between mb-3">
@@ -489,6 +541,82 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 )}
               </div>
             )}
+          </section>
+
+          {/* Memory Backend Section */}
+          <section>
+            <div className="flex items-center gap-2 mb-3">
+              <Database className="w-4 h-4 text-text-secondary" />
+              <h3 className="text-xs font-semibold text-text uppercase tracking-wide">
+                Memory Backend
+              </h3>
+            </div>
+            <select
+              value={settings["memory_backend"] || "gloss-local"}
+              onChange={(e) => handleSelectMemoryBackend(e.target.value)}
+              className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+            >
+              <option value="gloss-local">Gloss local</option>
+              <option value="semantic-memory-preview">semantic-memory preview</option>
+            </select>
+            <label className="mt-3 flex items-center gap-2 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={(settings["memory_backend_fallback"] || "true") !== "false"}
+                onChange={(e) =>
+                  updateSetting("memory_backend_fallback", e.target.checked ? "true" : "false")
+                }
+                className="accent-accent"
+              />
+              Fallback to Gloss local when preview retrieval fails
+            </label>
+            <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <label className="text-xs text-text-secondary">
+                <span className="block mb-1">Embedding URL</span>
+                <input
+                  value={settings["semantic_memory_embedding_url"] || "http://localhost:11434"}
+                  onChange={(e) => updateSetting("semantic_memory_embedding_url", e.target.value)}
+                  className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+                />
+              </label>
+              <label className="text-xs text-text-secondary">
+                <span className="block mb-1">Embedding model</span>
+                <input
+                  value={settings["semantic_memory_embedding_model"] || "nomic-embed-text"}
+                  onChange={(e) => updateSetting("semantic_memory_embedding_model", e.target.value)}
+                  className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+                />
+              </label>
+              <label className="text-xs text-text-secondary">
+                <span className="block mb-1">Embedding timeout seconds</span>
+                <input
+                  type="number"
+                  min="1"
+                  value={settings["semantic_memory_embedding_timeout_secs"] || "10"}
+                  onChange={(e) =>
+                    updateSetting("semantic_memory_embedding_timeout_secs", e.target.value)
+                  }
+                  className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+                />
+              </label>
+              <label className="text-xs text-text-secondary">
+                <span className="block mb-1">Search timeout ms</span>
+                <input
+                  type="number"
+                  min="1"
+                  value={settings["semantic_memory_search_timeout_ms"] || "8000"}
+                  onChange={(e) =>
+                    updateSetting("semantic_memory_search_timeout_ms", e.target.value)
+                  }
+                  className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+                />
+              </label>
+            </div>
+            <p className="mt-2 text-xs text-text-muted">
+              Gloss local remains the release default. Preview can be selected
+              for testing, but fallback and degraded states are disclosed in chat
+              evidence and the status bar.
+            </p>
           </section>
 
           {/* Summary Model Section */}
@@ -586,6 +714,34 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
           </section>
         </div>
       </div>
+    </div>
+  );
+}
+
+function HealthCard({
+  title,
+  status,
+  detail,
+  tone,
+}: {
+  title: string;
+  status: string;
+  detail: string;
+  tone: "success" | "warning" | "error" | "neutral";
+}) {
+  const toneClass =
+    tone === "success"
+      ? "border-success/30 bg-success/5"
+      : tone === "warning"
+        ? "border-warning/30 bg-warning/5"
+        : tone === "error"
+          ? "border-error/30 bg-error/5"
+          : "border-border bg-bg-tertiary";
+  return (
+    <div className={`rounded border px-3 py-2 ${toneClass}`}>
+      <p className="text-[10px] uppercase tracking-wide text-text-muted">{title}</p>
+      <p className="truncate text-xs font-medium text-text">{status}</p>
+      <p className="mt-1 line-clamp-2 text-[11px] text-text-secondary">{detail}</p>
     </div>
   );
 }

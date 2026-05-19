@@ -13,6 +13,10 @@ import type {
   QueueStatus,
   SourceScope,
   QueueSummariesResult,
+  MemoryBackendStatus,
+  SemanticMemoryLinkStatus,
+  IndexSourceReceipt,
+  ChatAttemptTraceV1,
 } from "./types";
 
 // === Notebooks ===
@@ -57,6 +61,13 @@ export async function addSourceFile(
   return invoke("add_source_file", { notebookId, path });
 }
 
+export async function addSourceFiles(
+  notebookId: string,
+  paths: string[]
+): Promise<string[]> {
+  return invoke("add_source_files", { notebookId, paths });
+}
+
 export async function addSourceFolder(
   notebookId: string,
   path: string
@@ -77,6 +88,13 @@ export async function deleteSource(
   sourceId: string
 ): Promise<void> {
   return invoke("delete_source", { notebookId, sourceId });
+}
+
+export async function deleteSources(
+  notebookId: string,
+  sourceIds: string[]
+): Promise<void> {
+  return invoke("delete_sources", { notebookId, sourceIds });
 }
 
 export async function getSourceContent(
@@ -145,10 +163,26 @@ export async function sendMessage(
   });
 }
 
+export async function stopChat(notebookId: string): Promise<void> {
+  return invoke("stop_chat", { notebookId });
+}
+
 export async function getSuggestedQuestions(
   notebookId: string
 ): Promise<string[]> {
   return invoke("get_suggested_questions", { notebookId });
+}
+
+export async function debugChatProviderSmoke(
+  providerId: string,
+  model: string,
+  prompt?: string
+): Promise<ChatAttemptTraceV1> {
+  return invoke("debug_chat_provider_smoke", { providerId, model, prompt });
+}
+
+export async function getLastChatAttemptTrace(): Promise<ChatAttemptTraceV1 | null> {
+  return invoke("get_last_chat_attempt_trace");
 }
 
 // === Notes ===
@@ -262,4 +296,33 @@ export async function resumeSummaries(): Promise<void> {
 
 export async function getQueueStatus(): Promise<QueueStatus> {
   return invoke("get_queue_status");
+}
+
+export async function memoryBackendStatus(
+  notebookId?: string | null
+): Promise<MemoryBackendStatus> {
+  return invoke("memory_backend_status", { notebookId });
+}
+
+export async function semanticMemoryLinkStatus(
+  notebookId: string
+): Promise<SemanticMemoryLinkStatus> {
+  return invoke("semantic_memory_link_status", { notebookId });
+}
+
+export async function semanticMemoryReindexSource(
+  notebookId: string,
+  sourceId: string
+): Promise<IndexSourceReceipt> {
+  return invoke("semantic_memory_reindex_source", {
+    notebookId,
+    sourceId,
+    traceId: crypto.randomUUID(),
+  });
+}
+
+export async function semanticMemoryReindexNotebook(
+  notebookId: string
+): Promise<IndexSourceReceipt[]> {
+  return invoke("semantic_memory_reindex_notebook", { notebookId });
 }

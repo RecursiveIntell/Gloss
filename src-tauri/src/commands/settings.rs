@@ -9,6 +9,27 @@ fn secret_setting_key(provider_type: ProviderType) -> Option<&'static str> {
     provider_type.api_key_setting_key()
 }
 
+fn provider_type_from_id(provider_id: &str) -> Result<ProviderType, GlossError> {
+    ProviderType::from_str(provider_id.trim())
+        .ok_or_else(|| GlossError::Config(format!("Unknown provider id '{provider_id}'")))
+}
+
+fn model_records_to_infos(records: Vec<ModelRecord>) -> Vec<ModelInfo> {
+    records
+        .into_iter()
+        .filter(|m| m.available && !m.stale)
+        .filter_map(|m| {
+            ProviderType::from_str(&m.provider_id).map(|provider| ModelInfo {
+                id: m.id,
+                display_name: m.display_name,
+                provider,
+                parameter_size: m.parameter_size,
+                context_window: m.context_window,
+            })
+        })
+        .collect()
+}
+
 fn rebuild_model_registry(state: &AppState) -> Result<(), GlossError> {
     let app_db = state
         .app_db
@@ -19,9 +40,7 @@ fn rebuild_model_registry(state: &AppState) -> Result<(), GlossError> {
         .model_registry
         .lock()
         .map_err(|e| GlossError::Other(e.to_string()))?;
-    let cached = std::mem::take(&mut registry.cached_models);
     *registry = new_registry;
-    registry.cached_models = cached;
     Ok(())
 }
 
@@ -85,40 +104,8 @@ pub async fn test_provider(
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        let provider_type = ProviderType::from_str(&provider_id).unwrap_or(ProviderType::Ollama);
-
-        let (base_url, api_key) = match provider_type {
-            ProviderType::Ollama => (
-                app_db
-                    .get_setting("ollama_url")?
-                    .unwrap_or_else(|| "http://localhost:11434".to_string()),
-                None,
-            ),
-            ProviderType::OpenAI => (
-                app_db
-                    .get_setting("openai_base_url")?
-                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-                state.secret_store.get("openai_api_key")?,
-            ),
-            ProviderType::Anthropic => (
-                app_db
-                    .get_setting("anthropic_base_url")?
-                    .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
-                state.secret_store.get("anthropic_api_key")?,
-            ),
-            ProviderType::LlamaCpp => (
-                app_db
-                    .get_setting("llamacpp_url")?
-                    .unwrap_or_else(|| "http://localhost:8080/v1".to_string()),
-                None,
-            ),
-        };
-
-        providers::ProviderConfig {
-            provider_type,
-            base_url,
-            api_key,
-        }
+        let provider_type = provider_type_from_id(&provider_id)?;
+        providers::provider_config_from_db(&app_db, &state.secret_store, provider_type)?
     };
 
     let provider = providers::build_provider(&config);
@@ -127,119 +114,129 @@ pub async fn test_provider(
 
 #[tauri::command]
 pub async fn refresh_models(
-    _provider_id: Option<String>,
+    provider_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<ModelInfo>, GlossError> {
-    // Build all provider configs without holding lock across await
+    let requested_provider = provider_id
+        .as_deref()
+        .map(provider_type_from_id)
+        .transpose()?;
+
+    // Build requested/enabled provider configs without holding lock across await
     let configs: Vec<providers::ProviderConfig> = {
         let app_db = state
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
+        let providers = app_db.list_providers()?;
 
         let mut cfgs = Vec::new();
+        let provider_types = if let Some(provider_type) = requested_provider {
+            vec![provider_type]
+        } else {
+            vec![
+                ProviderType::Ollama,
+                ProviderType::OpenAI,
+                ProviderType::Anthropic,
+                ProviderType::LlamaCpp,
+            ]
+        };
 
-        // Ollama (always)
-        cfgs.push(providers::ProviderConfig {
-            provider_type: ProviderType::Ollama,
-            base_url: app_db
-                .get_setting("ollama_url")?
-                .unwrap_or_else(|| "http://localhost:11434".to_string()),
-            api_key: None,
-        });
+        for provider_type in provider_types {
+            let provider_row = providers
+                .iter()
+                .find(|provider| provider.id == provider_type.as_str());
+            if provider_row.is_some_and(|provider| !provider.enabled) {
+                if requested_provider.is_some() {
+                    return Err(GlossError::Config(format!(
+                        "Provider '{}' is disabled",
+                        provider_type.as_str()
+                    )));
+                }
+                continue;
+            }
 
-        // OpenAI (if key set)
-        let openai_key = state
-            .secret_store
-            .get("openai_api_key")?
-            .unwrap_or_default();
-        if !openai_key.is_empty() {
-            cfgs.push(providers::ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                base_url: app_db
-                    .get_setting("openai_base_url")?
-                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-                api_key: Some(openai_key),
-            });
-        }
-
-        // Anthropic (if key set)
-        let anthropic_key = state
-            .secret_store
-            .get("anthropic_api_key")?
-            .unwrap_or_default();
-        if !anthropic_key.is_empty() {
-            cfgs.push(providers::ProviderConfig {
-                provider_type: ProviderType::Anthropic,
-                base_url: app_db
-                    .get_setting("anthropic_base_url")?
-                    .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
-                api_key: Some(anthropic_key),
-            });
-        }
-
-        // LlamaCpp (if URL set)
-        let llamacpp_url = app_db.get_setting("llamacpp_url")?.unwrap_or_default();
-        if !llamacpp_url.is_empty() {
-            cfgs.push(providers::ProviderConfig {
-                provider_type: ProviderType::LlamaCpp,
-                base_url: llamacpp_url,
-                api_key: None,
-            });
+            let config =
+                providers::provider_config_from_db(&app_db, &state.secret_store, provider_type)?;
+            let missing_secret = matches!(
+                provider_type,
+                ProviderType::OpenAI | ProviderType::Anthropic
+            ) && config.api_key.as_deref().unwrap_or("").is_empty();
+            let missing_url = matches!(provider_type, ProviderType::LlamaCpp)
+                && config.base_url.trim().is_empty();
+            if missing_secret || missing_url {
+                if requested_provider.is_some() {
+                    return Err(GlossError::Config(format!(
+                        "Provider '{}' is not fully configured",
+                        provider_type.as_str()
+                    )));
+                }
+                continue;
+            }
+            cfgs.push(config);
         }
 
         cfgs
     };
 
     // Fetch models from each provider (no locks held)
-    let mut all_models = Vec::new();
+    let mut refreshed_models = Vec::new();
+    let mut failed_providers = Vec::new();
     for config in &configs {
         let provider = providers::build_provider(config);
         match provider.list_models().await {
-            Ok(models) => all_models.extend(models),
-            Err(e) => tracing::warn!(
-                provider = config.provider_type.as_str(),
-                "Failed to refresh models: {}",
-                e
-            ),
+            Ok(models) => refreshed_models.extend(models),
+            Err(e) => {
+                tracing::warn!(
+                    provider = config.provider_type.as_str(),
+                    "Failed to refresh models: {}",
+                    e
+                );
+                failed_providers.push((config.provider_type, e.to_string()));
+            }
         }
     }
 
     // Store in DB and update registry (lock held briefly, no await)
-    {
+    let available_models = {
         let app_db = state
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        let records = ModelRegistry::to_model_records(&all_models);
+        let records = ModelRegistry::to_model_records(&refreshed_models);
 
-        // Group by provider and replace each
-        for provider_type in &[
-            ProviderType::Ollama,
-            ProviderType::OpenAI,
-            ProviderType::Anthropic,
-            ProviderType::LlamaCpp,
-        ] {
+        for config in &configs {
+            let provider_type = config.provider_type;
             let provider_records: Vec<ModelRecord> = records
                 .iter()
                 .filter(|r| r.provider_id == provider_type.as_str())
                 .cloned()
                 .collect();
-            if !provider_records.is_empty() {
-                app_db.replace_models(provider_type.as_str(), &provider_records)?;
+            if failed_providers
+                .iter()
+                .any(|(failed_type, _)| *failed_type == provider_type)
+            {
+                continue;
             }
+            app_db.replace_models(provider_type.as_str(), &provider_records)?;
         }
-    }
+
+        for (provider_type, error) in &failed_providers {
+            app_db.mark_models_unavailable(provider_type.as_str(), error)?;
+        }
+
+        model_records_to_infos(app_db.get_all_models()?)
+    };
 
     {
         let mut registry = state
             .model_registry
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        registry.cached_models = all_models.clone();
+        registry.cached_models = available_models.clone();
     }
 
-    Ok(all_models)
+    Ok(available_models)
 }
 
 #[tauri::command]
@@ -260,7 +257,40 @@ pub async fn get_settings(
         .lock()
         .map_err(|e| GlossError::Other(e.to_string()))?;
     let mut settings = app_db.get_settings()?;
+    let providers = app_db.list_providers()?;
     drop(app_db);
+
+    for (provider_id, setting_key, default_url) in [
+        (
+            ProviderType::Ollama.as_str(),
+            "ollama_url",
+            ProviderType::Ollama.default_base_url(),
+        ),
+        (
+            ProviderType::OpenAI.as_str(),
+            "openai_base_url",
+            ProviderType::OpenAI.default_base_url(),
+        ),
+        (
+            ProviderType::Anthropic.as_str(),
+            "anthropic_base_url",
+            ProviderType::Anthropic.default_base_url(),
+        ),
+        (
+            ProviderType::LlamaCpp.as_str(),
+            "llamacpp_url",
+            ProviderType::LlamaCpp.default_base_url(),
+        ),
+    ] {
+        let base_url = providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .and_then(|provider| provider.base_url.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default_url);
+        settings.insert(setting_key.to_string(), base_url.to_string());
+    }
 
     for secret_key in ["openai_api_key", "anthropic_api_key"] {
         settings.insert(secret_key.to_string(), String::new());
@@ -283,6 +313,15 @@ pub async fn update_setting(
     value: String,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
+    if matches!(
+        key.as_str(),
+        "ollama_url" | "openai_base_url" | "anthropic_base_url" | "llamacpp_url"
+    ) {
+        return Err(GlossError::Config(format!(
+            "Provider URL setting '{key}' is read from the provider table; use update_provider"
+        )));
+    }
+
     if matches!(key.as_str(), "openai_api_key" | "anthropic_api_key") {
         state.secret_store.set(&key, Some(&value))?;
         let app_db = state
@@ -307,23 +346,22 @@ pub async fn update_setting(
 pub async fn check_external_tools() -> Result<HashMap<String, bool>, GlossError> {
     let mut tools = HashMap::new();
 
-    tools.insert(
-        "ffmpeg".to_string(),
-        std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false),
-    );
-
-    tools.insert(
-        "ffprobe".to_string(),
-        std::process::Command::new("ffprobe")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false),
-    );
+    for tool in ["ffmpeg", "ffprobe"] {
+        let available = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::process::Command::new(tool)
+                .arg("-version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|status| status.success())
+        .unwrap_or(false);
+        tools.insert(tool.to_string(), available);
+    }
 
     Ok(tools)
 }

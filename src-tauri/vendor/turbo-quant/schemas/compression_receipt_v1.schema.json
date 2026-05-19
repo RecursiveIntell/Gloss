@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://recursiveintell.local/schemas/turbo-quant/compression_receipt_v1.schema.json",
+  "title": "CompressionReceiptV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "profile",
+    "input_dim",
+    "encoded_bytes",
+    "fp32_baseline_bytes",
+    "compression_ratio_vs_fp32"
+  ],
+  "properties": {
+    "schema": {
+      "const": "CompressionReceiptV1"
+    },
+    "profile": {
+      "$ref": "codec_profile_v1.schema.json"
+    },
+    "source_digest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "input_dim": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "encoded_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "fp16_baseline_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "fp32_baseline_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "compression_ratio_vs_fp16": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "compression_ratio_vs_fp32": {
+      "type": "number"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

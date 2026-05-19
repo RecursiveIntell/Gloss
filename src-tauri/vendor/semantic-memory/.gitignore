@@ -1,0 +1,64 @@
+# Build artifacts
+/target/
+
+# SQLite databases (runtime data)
+*.db
+*.db-shm
+*.db-wal
+
+# HNSW sidecar files (runtime data)
+*.hnsw.graph
+*.hnsw.data
+
+# Archives
+*.tar.gz
+*.zip
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project context docs (local development only)
+AGENTS.md
+CLAUDE.md
+START_HERE.md
+
+# Internal spec / prompt docs (development-only)
+SPEC.md
+IMPLEMENTATION_PROMPT.md
+PATCH_PROMPT.md
+TESTING.md
+UPGRADE_SPEC.md
+V1_1_AGENTS_ADDENDUM.md
+V1_1_SPEC_ADDENDUM.md
+V1_1_TESTING_ADDENDUM.md
+V2_AGENTS_ADDENDUM.md
+V2_PATCH_PROMPT.md
+V2_SPEC_ADDENDUM.md
+V2_TESTING_ADDENDUM.md
+V3_AGENTS_ADDENDUM.md
+V3_CHANGE_MAP.md
+V3_SPEC.md
+V3_TESTING.md
+HNSWLIB_RS_REFERENCE.md
+CLAUDE_CODE_PROMPT.md
+semantic-memory-spec.md
+
+# Backup files
+*.bak
+
+# Agent context (local tooling)
+.agent_context/
+
+# Reference files (local development only)
+/reference/
+
+# Claude config
+.claude/

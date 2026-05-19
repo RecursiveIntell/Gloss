@@ -14,13 +14,14 @@
 //! 00-{32 hex chars}-{16 hex chars}-{2 hex chars}
 //! ```
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// In-process trace context for cross-crate correlation.
 ///
 /// Wraps a W3C-compatible trace ID and optional parent span ID.
 /// Additional bounded baggage can be attached for cross-boundary metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct TraceCtx {
     /// The trace ID (W3C: 32 hex chars, or any opaque string for legacy compat).
     pub trace_id: String,
@@ -40,7 +41,7 @@ pub const MAX_BAGGAGE_ENTRIES: usize = 16;
 pub const MAX_BAGGAGE_ITEM_BYTES: usize = 256;
 
 /// A single baggage entry (key-value pair).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct BaggageEntry {
     pub key: String,
     pub value: String,
@@ -104,11 +105,6 @@ impl TraceCtx {
         let key = key.into();
         let value = value.into();
 
-        if self.baggage.len() >= MAX_BAGGAGE_ENTRIES {
-            return Err(TraceError::BaggageLimitExceeded {
-                max: MAX_BAGGAGE_ENTRIES,
-            });
-        }
         if key.len() > MAX_BAGGAGE_ITEM_BYTES {
             return Err(TraceError::BaggageItemTooLarge {
                 field: "key".into(),
@@ -121,6 +117,15 @@ impl TraceCtx {
                 field: "value".into(),
                 len: value.len(),
                 max: MAX_BAGGAGE_ITEM_BYTES,
+            });
+        }
+        if let Some(existing) = self.baggage.iter_mut().find(|entry| entry.key == key) {
+            existing.value = value;
+            return Ok(());
+        }
+        if self.baggage.len() >= MAX_BAGGAGE_ENTRIES {
+            return Err(TraceError::BaggageLimitExceeded {
+                max: MAX_BAGGAGE_ENTRIES,
             });
         }
 
@@ -199,6 +204,12 @@ impl TraceCtx {
                 reason: "parent-id must be 16 hex characters".into(),
             });
         }
+        let flags = parts[3];
+        if flags.len() != 2 || !flags.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(TraceError::InvalidTraceparent {
+                reason: "trace-flags must be 2 hex characters".into(),
+            });
+        }
 
         let parent = if parent_id == "0000000000000000" {
             None
@@ -227,6 +238,16 @@ pub enum TraceError {
     },
     /// Invalid traceparent header format.
     InvalidTraceparent { reason: String },
+}
+
+impl TraceError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::BaggageLimitExceeded { .. } => "baggage_limit_exceeded",
+            Self::BaggageItemTooLarge { .. } => "baggage_item_too_large",
+            Self::InvalidTraceparent { .. } => "invalid_traceparent",
+        }
+    }
 }
 
 impl std::fmt::Display for TraceError {
@@ -371,11 +392,39 @@ mod tests {
     }
 
     #[test]
+    fn traceparent_rejects_malformed_flags() {
+        let err =
+            TraceCtx::from_traceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-zz")
+                .unwrap_err();
+        assert!(matches!(err, TraceError::InvalidTraceparent { .. }));
+    }
+
+    #[test]
     fn baggage_add_and_get() {
         let mut ctx = TraceCtx::generate();
         ctx.add_baggage("env", "prod").unwrap();
         assert_eq!(ctx.baggage_value("env"), Some("prod"));
         assert_eq!(ctx.baggage_value("missing"), None);
+    }
+
+    #[test]
+    fn baggage_duplicate_key_updates_existing_entry() {
+        let mut ctx = TraceCtx::generate();
+        ctx.add_baggage("env", "dev").unwrap();
+        ctx.add_baggage("env", "prod").unwrap();
+        assert_eq!(ctx.baggage.len(), 1);
+        assert_eq!(ctx.baggage_value("env"), Some("prod"));
+    }
+
+    #[test]
+    fn baggage_duplicate_key_updates_even_when_entry_limit_is_full() {
+        let mut ctx = TraceCtx::generate();
+        for i in 0..MAX_BAGGAGE_ENTRIES {
+            ctx.add_baggage(format!("k{i}"), "v").unwrap();
+        }
+        ctx.add_baggage("k0", "updated").unwrap();
+        assert_eq!(ctx.baggage.len(), MAX_BAGGAGE_ENTRIES);
+        assert_eq!(ctx.baggage_value("k0"), Some("updated"));
     }
 
     #[test]

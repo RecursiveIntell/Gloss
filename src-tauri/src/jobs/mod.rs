@@ -529,7 +529,8 @@ async fn execute_describe_image(
         serde_json::json!({
             "notebook_id": notebook_id,
             "source_id": source_id,
-            "job_type": "DescribeImage"
+            "job_type": "DescribeImage",
+            "needs_finalization": true
         })
         .to_string(),
     ))
@@ -593,14 +594,19 @@ async fn execute_describe_video(
     let full_path = nb_dir.join("sources").join(file_path);
 
     // Check that ffmpeg is available (async process)
-    let ffmpeg_ok = tokio::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let ffmpeg_ok = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(|s| s.success())
+    .unwrap_or(false);
     if !ffmpeg_ok {
         let msg = "ffmpeg not found — install ffmpeg to enable video frame analysis";
         let _ = db.update_source_status(source_id, "error", Some(msg));
@@ -616,14 +622,16 @@ async fn execute_describe_video(
     }
 
     // Get video duration with ffprobe
-    let duration_secs = get_video_duration(&full_path).await.unwrap_or(60.0);
-    let frame_interval = (duration_secs / MAX_VIDEO_FRAMES as f64).max(1.0);
+    let duration_secs = get_video_duration(&full_path).await;
+    let frame_interval = duration_secs
+        .map(|duration_secs| (duration_secs / MAX_VIDEO_FRAMES as f64).max(1.0))
+        .unwrap_or(10.0);
 
     tracing::info!(
         source_id,
         source_title,
         model,
-        duration_secs,
+        duration_secs = ?duration_secs,
         frame_interval,
         "Extracting frames from video"
     );
@@ -638,37 +646,47 @@ async fn execute_describe_video(
 
     // Extract frames with ffmpeg (async process)
     let frame_pattern = temp_dir.join("frame_%04d.jpg");
-    let ffmpeg_result = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-i",
-            &full_path.to_string_lossy(),
-            "-vf",
-            &format!("fps=1/{}", frame_interval as u32),
-            "-frames:v",
-            &MAX_VIDEO_FRAMES.to_string(),
-            "-q:v",
-            "2", // high quality JPEG
-            &frame_pattern.to_string_lossy(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .status()
-        .await;
+    let ffmpeg_result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::process::Command::new("ffmpeg")
+            .args([
+                "-i",
+                &full_path.to_string_lossy(),
+                "-vf",
+                &format!("fps=1/{}", frame_interval as u32),
+                "-frames:v",
+                &MAX_VIDEO_FRAMES.to_string(),
+                "-q:v",
+                "2", // high quality JPEG
+                &frame_pattern.to_string_lossy(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .status(),
+    )
+    .await;
 
     match ffmpeg_result {
-        Ok(status) if !status.success() => {
+        Ok(Ok(status)) if !status.success() => {
             let td = temp_dir.clone();
             let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
             let msg = format!("ffmpeg exited with status {}", status);
             let _ = db.update_source_status(source_id, "error", Some(&msg));
             return Err(QueueError::Execution(msg));
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let td = temp_dir.clone();
             let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
             let msg = format!("Failed to run ffmpeg: {}", e);
             let _ = db.update_source_status(source_id, "error", Some(&msg));
             return Err(QueueError::Execution(msg));
+        }
+        Err(_) => {
+            let td = temp_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
+            let msg = "ffmpeg timed out while extracting video frames";
+            let _ = db.update_source_status(source_id, "error", Some(msg));
+            return Err(QueueError::Execution(msg.to_string()));
         }
         _ => {}
     }
@@ -770,10 +788,13 @@ async fn execute_describe_video(
     let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
 
     // Combine into full description
+    let duration_label = duration_secs
+        .map(|duration_secs| format!("duration: {:.0}s", duration_secs))
+        .unwrap_or_else(|| "duration: unknown".to_string());
     let description = format!(
-        "Video: {} (duration: {:.0}s, {} frames analyzed)\n\n{}",
+        "Video: {} ({}, {} frames analyzed)\n\n{}",
         source_title,
-        duration_secs,
+        duration_label,
         frame_descriptions.len(),
         frame_descriptions.join("\n\n")
     );
@@ -817,7 +838,8 @@ async fn execute_describe_video(
         serde_json::json!({
             "notebook_id": notebook_id,
             "source_id": source_id,
-            "job_type": "DescribeVideo"
+            "job_type": "DescribeVideo",
+            "needs_finalization": true
         })
         .to_string(),
     ))
@@ -825,19 +847,23 @@ async fn execute_describe_video(
 
 /// Get video duration in seconds using ffprobe (async).
 async fn get_video_duration(path: &std::path::Path) -> Option<f64> {
-    let output = tokio::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            &path.to_string_lossy(),
-        ])
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "quiet",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                &path.to_string_lossy(),
+            ])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
 
     if !output.status.success() {
         return None;

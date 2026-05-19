@@ -1,54 +1,162 @@
 # Gloss
 
-Gloss is a local-first desktop notebook for grounded chat over local sources. It is built with Tauri 2, Rust, React, TypeScript, SQLite/FTS5, `usearch`, and local model providers, with Ollama as the primary runtime target.
+Gloss is a local-first desktop notebook for asking questions about your own sources. It is built as a Tauri app with a Rust backend and a React/TypeScript frontend. The primary model path is local Ollama, with provider records for OpenAI, Anthropic, and llama.cpp also present in the app.
 
-The current repository state includes chat runtime reliability work from `CHAT_RUNTIME_FIX_20260518`. The code-level fixes are present, provider-only Ollama smoke passed in prior evidence, and automated build/tests passed in that run. The app is not release-certified yet because live desktop chat smoke was blocked and still needs to be completed.
+Gloss keeps notebook data on the machine, stores source files per notebook, indexes text into SQLite/FTS5 and vector search, then streams grounded chat answers with citations and diagnostic traces.
 
-## What Works
+## Project Status
 
-- Create and manage local notebooks.
-- Import sources into per-notebook storage.
-- Build local retrieval context with SQLite/FTS5 and vector search.
-- Chat with configured models through the provider registry.
-- Stream chat events with durable attempt tracing for no-response diagnosis.
-- Configure Ollama, OpenAI, Anthropic, and llama.cpp provider records.
-- Use `gloss-local` memory by default.
-- Build optional `semantic-memory-preview` support from vendored source crates.
+The app is an active local desktop project. The latest automated validation in this repo passes for the frontend build, Rust tests, chat-runtime static checks, and optional semantic-memory feature builds. A manual desktop smoke checklist is included for proving the interactive Tauri UI path on a real desktop session.
 
-## Current Limits
+Current defaults:
 
-- Release readiness is blocked until a live desktop smoke proves visible streamed tokens, visible errors, visible timeouts, or persisted `ChatAttemptTraceV1` for real chat attempts.
-- `semantic-memory-preview` is preview-only and not the default backend.
-- TurboQuant remains optional candidate acceleration inside semantic-memory and must remain exact-reranked.
-- Ollama model availability is external to the repo; users need a running Ollama server and pulled models.
-- CI/build checks do not prove the interactive desktop path.
+- Local memory backend: `gloss-local`
+- Primary local provider: Ollama at `http://localhost:11434`
+- Optional preview backend: `semantic-memory-preview`
+- Optional TurboQuant path: candidate acceleration only, exact-reranked
 
-## Repository Layout
+## Features
+
+- Notebook CRUD with per-notebook storage.
+- File, folder, and paste imports.
+- Source selection for scoped chat.
+- Local text chunking with code-aware splitting for common programming languages.
+- SQLite notebook databases with FTS5 search.
+- Vector search through `usearch`.
+- CPU embedding through `fastembed`.
+- RAG chat with streamed tokens, citations, status events, errors, and stop support.
+- Durable `ChatAttemptTraceV1` diagnostics for chat attempts.
+- Conversation history and message persistence.
+- Suggested questions for notebooks.
+- Notes, pinned notes, and saving assistant responses as notes.
+- Background summary jobs with pause/resume controls.
+- Provider configuration, provider health checks, and model refresh.
+- Image description jobs for vision-capable models.
+- Video frame-description jobs when `ffmpeg`/`ffprobe` are available.
+- Optional semantic-memory preview indexing, link status, and reindex commands.
+
+## Architecture
 
 ```text
-src/                         React frontend
-src-tauri/                   Tauri/Rust backend
-src-tauri/vendor/            Vendored local path crates used by Cargo
-src-tauri/vendor/semantic-memory
-src-tauri/vendor/forge-memory-bridge
-src-tauri/vendor/semantic-memory-forge
-src-tauri/vendor/turbo-quant
-src-tauri/vendor/stack-ids
-scripts/                     Validation, smoke, package, and audit helpers
+src/                         React 19 + TypeScript frontend
+src/components/              Notebook, source, chat, note, settings, status UI
+src/stores/                  Zustand state stores
+src/lib/tauri.ts             Tauri invoke wrapper
+
+src-tauri/                   Rust backend and Tauri app
+src-tauri/src/commands/      Notebook, source, chat, notes, settings commands
+src-tauri/src/db/            App DB and per-notebook DB layers
+src-tauri/src/ingestion/     Extraction, chunking, embeddings, summaries, vision
+src-tauri/src/memory/        gloss-local and semantic-memory preview adapters
+src-tauri/src/providers/     Ollama, OpenAI, Anthropic, llama.cpp providers
+src-tauri/src/retrieval/     Search, source scope, context assembly, citations
+src-tauri/vendor/            Vendored path crates needed by Cargo
+
+scripts/                     Validation, smoke, packaging, and audit helpers
 fixtures/                    Test and audit fixtures
 schemas/                     Receipt and validation schemas
-docs/codex-runs/CHAT_RUNTIME_FIX_20260518/
-                             Latest chat runtime fix receipts and blockers
+docs/                        Runtime evidence and smoke checklists
 ```
 
-Generated archives, local databases, build output, Cargo vendor cache, and historical extracted run archives are intentionally ignored.
+## Data Model
 
-## Prerequisites
+Gloss uses an app-level SQLite database plus one SQLite database per notebook.
+
+The app data directory is created through `directories::ProjectDirs::from("com", "sikmindz", "Gloss")`. On Linux this normally resolves under the user data directory, for example:
+
+```text
+~/.local/share/com.sikmindz.Gloss/
+  gloss.db
+  notebooks/
+    <notebook-id>/
+      notebook.db
+      sources/
+      embeddings/
+      audio/
+```
+
+Source files are copied into the notebook directory. Chat conversations, messages, chunks, source metadata, notes, and semantic-memory link rows live in the notebook database.
+
+## Supported Source Imports
+
+Text-oriented sources:
+
+- Plain text: `txt`
+- Markdown/reStructuredText: `md`, `markdown`, `rst`
+- Paste sources entered through the UI
+- Code and config files, including Rust, Python, JavaScript, TypeScript, Go, Java, C/C++, C#, Ruby, PHP, Swift, Kotlin, Scala, Lua, R, SQL, shell, CSS, HTML, XML, JSON, YAML, TOML, Terraform/HCL, Dockerfile, Makefile, GraphQL, protobuf, and related formats
+- Files without extensions, such as `LICENSE`, `Makefile`, and similar text files
+
+Media sources:
+
+- Images: `png`, `jpg`, `jpeg`, `gif`, `webp`, `bmp`, `tiff`, `tif`
+- Videos: `mp4`, `webm`, `mov`, `avi`, `mkv`
+
+Known import limits:
+
+- Audio files are skipped.
+- PDF, DOC/DOCX, XLS/XLSX, and PPT/PPTX files are currently skipped by the importer.
+- Archives, binaries, model files, local databases, lockfiles, and generated indexes are skipped.
+- Images and videos need a configured vision model to become useful text context. Videos also need `ffmpeg` and `ffprobe`.
+
+## Providers And Models
+
+Gloss has provider records for:
+
+- Ollama
+- OpenAI
+- Anthropic
+- llama.cpp-compatible local servers
+
+Provider rows are the source of truth for base URLs and enabled state. API keys for cloud providers are stored through the secret store instead of the app database.
+
+Default provider URLs:
+
+```text
+Ollama:    http://localhost:11434
+OpenAI:    https://api.openai.com/v1
+Anthropic: https://api.anthropic.com/v1
+llama.cpp: http://localhost:8080/v1
+```
+
+For local use, start Ollama and pull at least one chat model:
+
+```bash
+ollama serve
+ollama pull cogito:3b
+ollama pull qwen3.5:4b
+```
+
+Then open Settings, configure or test the provider, refresh models, and choose the model to use for chat. Vision and summary settings can be configured separately.
+
+## Memory Backends
+
+`gloss-local` is the default backend. It uses local notebook chunks, SQLite/FTS5, vector search, source-scope filtering, and citation validation.
+
+`semantic-memory-preview` is optional. It is compiled with:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-backend
+```
+
+TurboQuant support is compiled with:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant
+```
+
+The semantic-memory crates required for these features are vendored under `src-tauri/vendor/`, so a clone of this repo does not need a sibling `Libraries/semantic-memory` checkout.
+
+## Requirements
 
 - Node.js 22 or newer
 - npm
 - Rust stable with `rustfmt`
-- Linux Tauri build dependencies:
+- Ollama for local model use
+- Linux Tauri/WebKit build dependencies when building on Linux
+- `ffmpeg` and `ffprobe` for video source processing
+
+Ubuntu/Debian build dependencies:
 
 ```bash
 sudo apt-get update
@@ -57,29 +165,13 @@ sudo apt-get install -y \
   libssl-dev libwebkit2gtk-4.1-dev libxdo-dev pkg-config wget
 ```
 
-- Ollama for local chat, for example:
-
-```bash
-ollama serve
-ollama pull cogito:3b
-ollama pull qwen3.5:4b
-```
-
 ## Install
 
 ```bash
 npm ci
 ```
 
-No sibling checkout is required for the optional semantic-memory feature. The local path crates needed by Cargo are vendored under `src-tauri/vendor/`.
-
-## Development
-
-Run the web frontend:
-
-```bash
-npm run dev
-```
+## Run
 
 Run the Tauri desktop app:
 
@@ -87,19 +179,29 @@ Run the Tauri desktop app:
 npm run tauri dev
 ```
 
+Run only the web frontend:
+
+```bash
+npm run dev
+```
+
+The frontend-only dev server is useful for UI work, but the real app behavior depends on the Tauri backend.
+
+## Build
+
 Build the frontend:
 
 ```bash
 npm run build
 ```
 
-Build a Tauri bundle:
+Build a Tauri package:
 
 ```bash
 npm run tauri build
 ```
 
-The Tauri config currently targets RPM packaging on Linux.
+The current Tauri bundle target is RPM on Linux.
 
 ## Validation
 
@@ -111,40 +213,68 @@ cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Chat runtime static checks:
+Chat runtime checks:
 
 ```bash
 python3 scripts/chat_runtime_static_audit.py --repo .
 python3 scripts/chat_runtime_preflight.py --repo .
 ```
 
-Optional semantic-memory checks:
+Optional backend checks:
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-backend
 cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant
 ```
 
-Manual desktop smoke remains required before claiming release readiness:
+Manual desktop smoke:
 
 ```bash
 scripts/chat_runtime_smoke_manual.sh
 ```
 
-Use `docs/codex-runs/CHAT_RUNTIME_FIX_20260518/DESKTOP_SMOKE_BLOCKER.md` and `FINAL_RECEIPT.json` for the exact remaining proof gap.
+The desktop smoke proves the actual UI path: prompt submission, streamed tokens or visible error, persisted assistant message or durable trace, provider settings, and semantic-memory fallback behavior.
 
-## Provider Configuration
+## Chat Runtime Diagnostics
 
-Provider records are the source of truth for provider base URLs and API-key references. The legacy setting keys may still appear in UI compatibility paths, but chat/model refresh/provider test should resolve through provider rows.
+Every chat attempt should produce one of these observable outcomes:
 
-Default local Ollama URL:
+- streamed assistant tokens
+- visible provider or retrieval error
+- visible timeout
+- durable `ChatAttemptTraceV1`
 
-```text
-http://localhost:11434
-```
+Useful diagnostic entry points:
 
-For remote Ollama over a LAN or VPN, configure the Ollama provider base URL in Settings, refresh models, then select the model.
+- `debug_chat_provider_smoke`
+- `get_last_chat_attempt_trace`
+- `docs/codex-runs/CHAT_RUNTIME_FIX_20260518/`
+- `docs/CHAT_RUNTIME_SMOKE_CHECKLIST.md`
+
+## Repository Hygiene
+
+Tracked:
+
+- Source code
+- Lockfiles
+- Validation scripts
+- Schemas and fixtures
+- Current chat-runtime evidence
+- Curated vendored path crates needed to build optional features
+
+Ignored:
+
+- `node_modules/`
+- `dist/`
+- `src-tauri/target/`
+- local app databases
+- generated source archives and sidecars
+- Python caches
+- large generated Cargo vendor cache at `src-tauri/vendor/crates/`
+- historical extracted run archives
 
 ## License
 
-Gloss is licensed under `AGPL-3.0-only`. Some vendored crates carry their own licenses; see each crate under `src-tauri/vendor/`.
+Gloss is licensed under `AGPL-3.0-only`.
+
+Vendored crates under `src-tauri/vendor/` may carry their own licenses. Check each vendored crate directory for details.

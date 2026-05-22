@@ -1,24 +1,40 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import type React from "react";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useToastStore } from "../../stores/toastStore";
 import { useNotebookStore } from "../../stores/notebookStore";
 import * as api from "../../lib/tauri";
-import type { MemoryBackendStatus, SemanticMemoryLinkStatus } from "../../lib/types";
 import {
-  X,
-  RefreshCw,
-  Check,
+  canUseSemanticMemoryPreview,
+  EXPERIMENTAL_FEATURES_ENABLED,
+  featureById,
+  featureSections,
+  FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED,
+  FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+} from "../../lib/features";
+import type {
+  FeatureFlagStatus,
+  MemoryBackendStatus,
+  SemanticMemoryLinkStatus,
+} from "../../lib/types";
+import {
   AlertCircle,
-  Loader2,
-  Server,
-  Cpu,
   BookOpen,
-  Key,
+  Check,
+  Cpu,
+  Database,
   Eye,
   EyeOff,
   Image,
+  Key,
+  Loader2,
+  RefreshCw,
+  Server,
+  Settings2,
+  ShieldCheck,
+  TestTube2,
   Wrench,
-  Database,
+  X,
 } from "lucide-react";
 
 interface SettingsDialogProps {
@@ -54,6 +70,26 @@ function isVisionCapableModel(model: {
     "vision",
     "vl",
   ].some((needle) => fingerprint.includes(needle));
+}
+
+function SettingsSection({
+  title,
+  icon,
+  children,
+}: {
+  title: string;
+  icon: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="space-y-3">
+      <div className="flex items-center gap-2">
+        <span className="text-text-secondary">{icon}</span>
+        <h3 className="text-xs font-semibold text-text uppercase tracking-wide">{title}</h3>
+      </div>
+      {children}
+    </section>
+  );
 }
 
 function ProviderSection({
@@ -110,129 +146,123 @@ function ProviderSection({
     setTestStatus("testing");
     const ok = await testProvider(id);
     setTestStatus(ok ? "success" : "error");
-    if (ok) {
-      useToastStore.getState().addToast({
-        type: "success",
-        title: `${label} Connected`,
-        message: "Provider is reachable",
-        duration: 3000,
-      });
-    } else {
-      useToastStore.getState().addToast({
-        type: "error",
-        title: `${label} Failed`,
-        message: "Could not connect to provider",
-        duration: 5000,
-      });
-    }
+    useToastStore.getState().addToast({
+      type: ok ? "success" : "error",
+      title: ok ? `${label} Connected` : `${label} Failed`,
+      message: ok ? "Provider is reachable" : "Could not connect to provider",
+      duration: ok ? 3000 : 5000,
+    });
     setTimeout(() => setTestStatus("idle"), 3000);
   };
 
   return (
-    <section>
-      <div className="flex items-center gap-2 mb-3">
-        <Server className="w-4 h-4 text-text-secondary" />
-        <h3 className="text-xs font-semibold text-text uppercase tracking-wide">
-          {label}
-        </h3>
-      </div>
-      <div className="space-y-2">
-        <label className="block text-xs text-text-secondary">Server URL</label>
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={url}
-            onChange={(e) => {
-              setUrl(e.target.value);
-              setDirty(true);
-            }}
-            className="flex-1 px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
-            placeholder={urlDefault}
-          />
-          <button
-            onClick={handleSave}
-            disabled={!dirty}
-            className="px-3 py-1.5 text-xs bg-accent text-white rounded hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            Save
-          </button>
-        </div>
-
-        {apiKeyKey && (
-          <>
-            <label className="block text-xs text-text-secondary">
-              <Key className="w-3 h-3 inline mr-1" />
-              API Key
-            </label>
-            <div className="flex gap-2">
-              <div className="flex-1 relative">
-                <input
-                  type={showKey ? "text" : "password"}
-                  value={apiKey}
-                  onChange={(e) => {
-                    setApiKey(e.target.value);
-                    setDirty(true);
-                  }}
-                  className="w-full px-2 py-1.5 pr-8 text-sm bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
-                  placeholder={
-                    hasStoredSecret
-                      ? "Stored securely on this device"
-                      : "sk-..."
-                  }
-                />
-                <button
-                  onClick={() => setShowKey(!showKey)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-text-muted hover:text-text"
-                >
-                  {showKey ? (
-                    <EyeOff className="w-3.5 h-3.5" />
-                  ) : (
-                    <Eye className="w-3.5 h-3.5" />
-                  )}
-                </button>
-              </div>
-              {hasStoredSecret && (
-                <button
-                  onClick={handleClearKey}
-                  className="px-3 py-1.5 text-xs bg-bg-tertiary rounded hover:bg-border text-text-secondary hover:text-text"
-                >
-                  Clear
-                </button>
-              )}
-            </div>
-            {hasStoredSecret && !apiKey && (
-              <p className="text-[11px] text-text-muted">
-                Leave the field blank to keep the stored key.
-              </p>
-            )}
-          </>
-        )}
-
+    <div className="space-y-2 rounded border border-border bg-bg-tertiary/40 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs font-medium text-text">{label}</p>
         <button
           onClick={handleTest}
           disabled={testStatus === "testing"}
-          className="flex items-center gap-1.5 px-2 py-1 text-xs bg-bg-tertiary rounded hover:bg-border text-text-secondary hover:text-text disabled:opacity-50"
+          className="flex items-center gap-1.5 rounded bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text disabled:opacity-50"
         >
-          {testStatus === "testing" && (
-            <Loader2 className="w-3 h-3 animate-spin" />
-          )}
-          {testStatus === "success" && (
-            <Check className="w-3 h-3 text-success" />
-          )}
-          {testStatus === "error" && (
-            <AlertCircle className="w-3 h-3 text-error" />
-          )}
-          {testStatus === "idle" && <Server className="w-3 h-3" />}
+          {testStatus === "testing" && <Loader2 className="h-3 w-3 animate-spin" />}
+          {testStatus === "success" && <Check className="h-3 w-3 text-success" />}
+          {testStatus === "error" && <AlertCircle className="h-3 w-3 text-error" />}
+          {testStatus === "idle" && <Server className="h-3 w-3" />}
           {testStatus === "testing"
             ? "Testing..."
             : testStatus === "success"
               ? "Connected"
               : testStatus === "error"
-                ? "Connection failed"
-                : "Test Connection"}
+                ? "Failed"
+                : "Test"}
         </button>
       </div>
-    </section>
+      <label className="block text-xs text-text-secondary">Server URL</label>
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={url}
+          onChange={(e) => {
+            setUrl(e.target.value);
+            setDirty(true);
+          }}
+          className="min-w-0 flex-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+          placeholder={urlDefault}
+        />
+        <button
+          onClick={handleSave}
+          disabled={!dirty}
+          className="rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Save
+        </button>
+      </div>
+      {apiKeyKey && (
+        <>
+          <label className="block text-xs text-text-secondary">
+            <Key className="mr-1 inline h-3 w-3" />
+            API Key
+          </label>
+          <div className="flex gap-2">
+            <div className="relative min-w-0 flex-1">
+              <input
+                type={showKey ? "text" : "password"}
+                value={apiKey}
+                onChange={(e) => {
+                  setApiKey(e.target.value);
+                  setDirty(true);
+                }}
+                className="w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 pr-8 text-sm text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+                placeholder={hasStoredSecret ? "Stored securely on this device" : "sk-..."}
+              />
+              <button
+                onClick={() => setShowKey(!showKey)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-text-muted hover:text-text"
+              >
+                {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+            {hasStoredSecret && (
+              <button
+                onClick={handleClearKey}
+                className="rounded bg-bg-tertiary px-3 py-1.5 text-xs text-text-secondary hover:bg-border hover:text-text"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function FeatureToggleRow({
+  flag,
+  onToggle,
+  mutable,
+}: {
+  flag: FeatureFlagStatus;
+  onToggle: (id: string, enabled: boolean) => Promise<void>;
+  mutable: boolean;
+}) {
+  const disabled = !mutable || !flag.available;
+  return (
+    <div className="flex items-center justify-between gap-3 rounded border border-border bg-bg-tertiary/40 px-3 py-2">
+      <div className="min-w-0">
+        <p className="truncate text-xs font-medium text-text">{flag.label}</p>
+        <p className="truncate text-[11px] text-text-muted">
+          {flag.unavailable_reason || (flag.active ? "Active" : flag.enabled ? "Enabled" : "Off")}
+        </p>
+      </div>
+      <input
+        type="checkbox"
+        checked={flag.enabled}
+        disabled={disabled}
+        onChange={(e) => onToggle(flag.id, e.target.checked)}
+        className="h-4 w-4 shrink-0 accent-accent disabled:opacity-40"
+      />
+    </div>
   );
 }
 
@@ -240,27 +270,32 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const {
     models,
     settings,
+    featureFlags,
     activeModel,
     loading,
     externalTools,
     loadSettings,
     loadProviders,
     loadModels,
+    loadFeatureFlags,
     refreshModels,
     updateSetting,
     updateProvider,
+    updateFeatureFlag,
     setActiveModel,
     loadExternalTools,
   } = useSettingsStore();
   const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
   const [memoryStatus, setMemoryStatus] = useState<MemoryBackendStatus | null>(null);
   const [linkStatus, setLinkStatus] = useState<SemanticMemoryLinkStatus | null>(null);
+  const [reindexingSemanticMemory, setReindexingSemanticMemory] = useState(false);
 
   useEffect(() => {
     if (open) {
       loadSettings();
       loadProviders();
       loadModels();
+      loadFeatureFlags();
       loadExternalTools();
       api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => setMemoryStatus(null));
       if (activeNotebookId) {
@@ -269,64 +304,22 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
         setLinkStatus(null);
       }
     }
-  }, [activeNotebookId, open, loadSettings, loadProviders, loadModels, loadExternalTools]);
+  }, [
+    activeNotebookId,
+    open,
+    loadSettings,
+    loadProviders,
+    loadModels,
+    loadFeatureFlags,
+    loadExternalTools,
+  ]);
 
-  const handleProviderSave = async (updates: Record<string, string>) => {
-    if (updates["ollama_url"]) {
-      await updateProvider("ollama", true, updates["ollama_url"]);
-    }
-    if ("openai_api_key" in updates || "openai_base_url" in updates) {
-      await updateProvider(
-        "openai",
-        true,
-        updates["openai_base_url"],
-        updates["openai_api_key"]
-      );
-    }
-    if ("anthropic_api_key" in updates || "anthropic_base_url" in updates) {
-      await updateProvider(
-        "anthropic",
-        true,
-        updates["anthropic_base_url"],
-        updates["anthropic_api_key"]
-      );
-    }
-    if (updates["llamacpp_url"]) {
-      await updateProvider("llamacpp", true, updates["llamacpp_url"]);
-    }
-    await loadSettings();
-  };
+  const sections = useMemo(() => featureSections(featureFlags), [featureFlags]);
+  const experimentalMaster = featureById(featureFlags, EXPERIMENTAL_FEATURES_ENABLED);
+  const semanticPreview = featureById(featureFlags, FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED);
+  const turboQuant = featureById(featureFlags, FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED);
+  const semanticPreviewSelectable = canUseSemanticMemoryPreview(featureFlags);
 
-  const handleRefresh = async () => {
-    await refreshModels();
-  };
-
-  const handleSelectModel = async (modelId: string) => {
-    setActiveModel(modelId);
-    await updateSetting("default_model", modelId);
-    const providerId = models.find((model) => model.id === modelId)?.provider_id;
-    if (providerId) {
-      await updateSetting("default_provider", providerId);
-    }
-  };
-
-  const handleSelectSummaryModel = async (modelId: string) => {
-    await updateSetting("summary_model", modelId);
-  };
-
-  const handleSelectVisionModel = async (modelId: string) => {
-    await updateSetting("vision_model", modelId);
-  };
-
-  const handleSelectMemoryBackend = async (backendId: string) => {
-    await updateSetting("memory_backend", backendId);
-  };
-
-  const handleBackdropClick = (e: React.MouseEvent) => {
-    if (e.target === e.currentTarget) onClose();
-  };
-
-  // Group models by provider_id for display
   const providerGroups: Record<string, typeof models> = {};
   for (const m of models) {
     const group = m.provider_id || "unknown";
@@ -344,20 +337,111 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const visionModels = summaryModels.filter(isVisionCapableModel);
 
   useEffect(() => {
-    if (!open || models.length === 0) {
-      return;
-    }
-
+    if (!open || models.length === 0) return;
     const summaryModel = settings["summary_model"];
     if (summaryModel && !summaryModels.some((model) => model.id === summaryModel)) {
       void updateSetting("summary_model", "");
     }
-
     const visionModel = settings["vision_model"];
     if (visionModel && !visionModels.some((model) => model.id === visionModel)) {
       void updateSetting("vision_model", "");
     }
   }, [models, open, settings, summaryModels, updateSetting, visionModels]);
+
+  const handleProviderSave = async (updates: Record<string, string>) => {
+    if (updates["ollama_url"]) {
+      await updateProvider("ollama", true, updates["ollama_url"]);
+    }
+    if ("openai_api_key" in updates || "openai_base_url" in updates) {
+      await updateProvider("openai", true, updates["openai_base_url"], updates["openai_api_key"]);
+    }
+    if ("anthropic_api_key" in updates || "anthropic_base_url" in updates) {
+      await updateProvider(
+        "anthropic",
+        true,
+        updates["anthropic_base_url"],
+        updates["anthropic_api_key"]
+      );
+    }
+    if (updates["llamacpp_url"]) {
+      await updateProvider("llamacpp", true, updates["llamacpp_url"]);
+    }
+    await loadSettings();
+  };
+
+  const handleSelectModel = async (modelId: string) => {
+    setActiveModel(modelId);
+    await updateSetting("default_model", modelId);
+    const providerId = models.find((model) => model.id === modelId)?.provider_id;
+    if (providerId) await updateSetting("default_provider", providerId);
+  };
+
+  const handleSelectMemoryBackend = async (backendId: string) => {
+    try {
+      await updateSetting("memory_backend", backendId);
+      await api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => setMemoryStatus(null));
+    } catch (error) {
+      await loadSettings();
+      useToastStore.getState().addToast({
+        type: "error",
+        title: "Memory backend not changed",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 6000,
+      });
+    }
+  };
+
+  const refreshMemoryEvidence = async () => {
+    await api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => setMemoryStatus(null));
+    if (activeNotebookId) {
+      await api.semanticMemoryLinkStatus(activeNotebookId).then(setLinkStatus).catch(() => setLinkStatus(null));
+    } else {
+      setLinkStatus(null);
+    }
+  };
+
+  const handleReindexSemanticMemoryNotebook = async () => {
+    if (!activeNotebookId) return;
+    setReindexingSemanticMemory(true);
+    try {
+      const receipts = await api.semanticMemoryReindexNotebook(activeNotebookId);
+      await refreshMemoryEvidence();
+      useToastStore.getState().addToast({
+        type: "success",
+        title: "semantic-memory reindex complete",
+        message: `${receipts.length} source receipts emitted.`,
+        duration: 5000,
+      });
+    } catch (error) {
+      await refreshMemoryEvidence();
+      useToastStore.getState().addToast({
+        type: "error",
+        title: "semantic-memory reindex failed",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 7000,
+      });
+    } finally {
+      setReindexingSemanticMemory(false);
+    }
+  };
+
+  const handleFeatureToggle = async (id: string, enabled: boolean) => {
+    try {
+      await updateFeatureFlag(id, enabled);
+    } catch (error) {
+      useToastStore.getState().addToast({
+        type: "error",
+        title: "Feature flag not changed",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 6000,
+      });
+      await loadFeatureFlags();
+    }
+  };
+
+  const handleBackdropClick = (e: React.MouseEvent) => {
+    if (e.target === e.currentTarget) onClose();
+  };
 
   if (!open) return null;
 
@@ -366,79 +450,128 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
       onClick={handleBackdropClick}
     >
-      <div className="w-[560px] max-h-[80vh] bg-bg-secondary border border-border rounded-lg shadow-xl flex flex-col">
-        {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+      <div className="flex max-h-[84vh] w-[680px] max-w-[calc(100vw-24px)] flex-col rounded-lg border border-border bg-bg-secondary shadow-xl">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <h2 className="text-sm font-semibold text-text">Settings</h2>
           <button
             onClick={onClose}
-            className="p-1 rounded hover:bg-bg-tertiary text-text-secondary hover:text-text"
+            className="rounded p-1 text-text-secondary hover:bg-bg-tertiary hover:text-text"
           >
-            <X className="w-4 h-4" />
+            <X className="h-4 w-4" />
           </button>
         </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-6">
-          {/* Ollama */}
-          <ProviderSection
-            id="ollama"
-            label="Ollama"
-            urlKey="ollama_url"
-            urlDefault="http://localhost:11434"
-            settings={settings}
-            onSave={handleProviderSave}
-          />
+        <div className="flex-1 space-y-7 overflow-y-auto p-4">
+          <SettingsSection title="Providers" icon={<Server className="h-4 w-4" />}>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <ProviderSection
+                id="ollama"
+                label="Ollama"
+                urlKey="ollama_url"
+                urlDefault="http://localhost:11434"
+                settings={settings}
+                onSave={handleProviderSave}
+              />
+              <ProviderSection
+                id="openai"
+                label="OpenAI"
+                urlKey="openai_base_url"
+                urlDefault="https://api.openai.com/v1"
+                apiKeyKey="openai_api_key"
+                settings={settings}
+                onSave={handleProviderSave}
+              />
+              <ProviderSection
+                id="anthropic"
+                label="Anthropic"
+                urlKey="anthropic_base_url"
+                urlDefault="https://api.anthropic.com/v1"
+                apiKeyKey="anthropic_api_key"
+                settings={settings}
+                onSave={handleProviderSave}
+              />
+              <ProviderSection
+                id="llamacpp"
+                label="llama.cpp"
+                urlKey="llamacpp_url"
+                urlDefault="http://localhost:8080/v1"
+                settings={settings}
+                onSave={handleProviderSave}
+              />
+            </div>
+          </SettingsSection>
 
-          {/* OpenAI */}
-          <ProviderSection
-            id="openai"
-            label="OpenAI"
-            urlKey="openai_base_url"
-            urlDefault="https://api.openai.com/v1"
-            apiKeyKey="openai_api_key"
-            settings={settings}
-            onSave={handleProviderSave}
-          />
+          <SettingsSection title="Models" icon={<Cpu className="h-4 w-4" />}>
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-text-secondary">Default chat model</p>
+              <button
+                onClick={refreshModels}
+                disabled={loading}
+                className="flex items-center gap-1 rounded bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text disabled:opacity-50"
+              >
+                <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
+                Refresh
+              </button>
+            </div>
+            {models.length === 0 ? (
+              <p className="rounded border border-border bg-bg-tertiary/40 px-3 py-3 text-center text-xs text-text-muted">
+                No models found.
+              </p>
+            ) : (
+              <div className="max-h-64 space-y-1 overflow-y-auto">
+                {Object.entries(providerGroups).map(([providerId, groupModels]) => (
+                  <div key={providerId}>
+                    <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-text-muted">
+                      {providerLabels[providerId] || providerId}
+                    </div>
+                    {groupModels.map((model) => (
+                      <button
+                        key={`${model.provider_id}:${model.id}`}
+                        onClick={() => handleSelectModel(model.id)}
+                        className={`flex w-full items-center gap-3 rounded border px-3 py-2 text-left ${
+                          activeModel === model.id
+                            ? "border-accent/30 bg-accent/10"
+                            : "border-transparent hover:bg-bg-tertiary"
+                        }`}
+                      >
+                        <div
+                          className={`h-3 w-3 shrink-0 rounded-full border-2 ${
+                            activeModel === model.id ? "border-accent bg-accent" : "border-text-muted"
+                          }`}
+                        />
+                        <p className="min-w-0 flex-1 truncate text-xs text-text">{model.display_name}</p>
+                        {model.parameter_size && (
+                          <span className="shrink-0 rounded bg-bg-tertiary px-1.5 py-0.5 text-[10px] text-text-muted">
+                            {model.parameter_size}
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+          </SettingsSection>
 
-          {/* Anthropic */}
-          <ProviderSection
-            id="anthropic"
-            label="Anthropic"
-            urlKey="anthropic_base_url"
-            urlDefault="https://api.anthropic.com/v1"
-            apiKeyKey="anthropic_api_key"
-            settings={settings}
-            onSave={handleProviderSave}
-          />
-
-          {/* llama.cpp */}
-          <ProviderSection
-            id="llamacpp"
-            label="llama.cpp"
-            urlKey="llamacpp_url"
-            urlDefault="http://localhost:8080/v1"
-            settings={settings}
-            onSave={handleProviderSave}
-          />
-
-          <section className="rounded-lg border border-warning/30 bg-warning/5 px-3 py-2">
-            <p className="text-xs text-text-secondary">
-              Chat can use multiple providers, but background summaries and
-              image/video analysis still run through the Ollama-compatible job
-              pipeline. Keep Ollama configured if you want those background
-              features to work reliably.
-            </p>
-          </section>
-
-          <section>
-            <div className="grid grid-cols-2 gap-2">
+          <SettingsSection title="Chat" icon={<Settings2 className="h-4 w-4" />}>
+            <div className="grid gap-2 sm:grid-cols-2">
               <HealthCard
                 title="Provider"
                 status={activeModel}
                 detail={`Chat provider: ${models.find((model) => model.id === activeModel)?.provider_id ?? settings["default_provider"] ?? "ollama"}`}
                 tone="neutral"
               />
+              <HealthCard
+                title="Diagnostics"
+                status={featureById(featureFlags, "feature_chat_diagnostics_enabled")?.active ? "active" : "off"}
+                detail="ChatAttemptTraceV1 evidence is backend-owned."
+                tone={featureById(featureFlags, "feature_chat_diagnostics_enabled")?.active ? "success" : "warning"}
+              />
+            </div>
+          </SettingsSection>
+
+          <SettingsSection title="Memory & Retrieval" icon={<Database className="h-4 w-4" />}>
+            <div className="grid gap-2 sm:grid-cols-2">
               <HealthCard
                 title="Memory"
                 status={memoryStatus?.backend_used ?? "gloss-local"}
@@ -452,114 +585,54 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               <HealthCard
                 title="Embedding / Index"
                 status={memoryStatus?.index_sync_status ?? "unknown"}
-                detail={linkStatus ? `${linkStatus.synced_links}/${linkStatus.total_links} semantic links synced` : "Native local index stays fallback-safe"}
-                tone={memoryStatus?.index_sync_status === "failed" ? "error" : memoryStatus?.index_sync_status === "degraded" ? "warning" : "neutral"}
-              />
-              <HealthCard
-                title="Preview Backend"
-                status={memoryStatus?.semantic_memory_feature_enabled ? "available" : "feature off"}
-                detail="semantic-memory-preview is preview-only and not the default backend."
-                tone={settings["memory_backend"] === "semantic-memory-preview" ? "warning" : "neutral"}
+                detail={
+                  linkStatus
+                    ? `${linkStatus.synced_links}/${linkStatus.total_links} semantic links synced`
+                    : "Gloss local index remains available"
+                }
+                tone={
+                  memoryStatus?.index_sync_status === "failed"
+                    ? "error"
+                    : memoryStatus?.index_sync_status === "degraded"
+                      ? "warning"
+                      : "neutral"
+                }
               />
             </div>
-            {memoryStatus?.fallback_reason && (
-              <p className="mt-2 rounded border border-warning/30 bg-warning/5 px-2 py-1 text-xs text-warning">
-                {memoryStatus.fallback_reason}
-              </p>
-            )}
-          </section>
-
-          {/* Models Section */}
-          <section>
-            <div className="flex items-center justify-between mb-3">
-              <div className="flex items-center gap-2">
-                <Cpu className="w-4 h-4 text-text-secondary" />
-                <h3 className="text-xs font-semibold text-text uppercase tracking-wide">
-                  Models
-                </h3>
-              </div>
-              <button
-                onClick={handleRefresh}
-                disabled={loading}
-                className="flex items-center gap-1 px-2 py-1 text-xs bg-bg-tertiary rounded hover:bg-border text-text-secondary hover:text-text disabled:opacity-50"
-              >
-                <RefreshCw
-                  className={`w-3 h-3 ${loading ? "animate-spin" : ""}`}
-                />
-                Refresh
-              </button>
-            </div>
-
-            {models.length === 0 ? (
-              <p className="text-xs text-text-muted py-4 text-center">
-                No models found. Configure a provider above and click Refresh.
-              </p>
-            ) : (
-              <div className="space-y-1 max-h-64 overflow-y-auto">
-                {Object.entries(providerGroups).map(
-                  ([providerId, groupModels]) => (
-                    <div key={providerId}>
-                      <div className="px-3 py-1 text-[10px] font-semibold text-text-muted uppercase tracking-wider">
-                        {providerLabels[providerId] || providerId}
-                      </div>
-                      {groupModels.map((model) => (
-                        <button
-                          key={model.id}
-                          onClick={() => handleSelectModel(model.id)}
-                          className={`w-full flex items-center gap-3 px-3 py-2 rounded text-left ${
-                            activeModel === model.id
-                              ? "bg-accent/10 border border-accent/30"
-                              : "hover:bg-bg-tertiary border border-transparent"
-                          }`}
-                        >
-                          <div
-                            className={`w-3 h-3 rounded-full border-2 shrink-0 ${
-                              activeModel === model.id
-                                ? "border-accent bg-accent"
-                                : "border-text-muted"
-                            }`}
-                          />
-                          <div className="flex-1 min-w-0">
-                            <p className="text-xs text-text truncate">
-                              {model.display_name}
-                            </p>
-                          </div>
-                          {model.parameter_size && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-bg-tertiary rounded text-text-muted shrink-0">
-                              {model.parameter_size}
-                            </span>
-                          )}
-                          {model.context_window && (
-                            <span className="text-[10px] text-text-muted shrink-0">
-                              {(model.context_window / 1024).toFixed(0)}k ctx
-                            </span>
-                          )}
-                        </button>
-                      ))}
-                    </div>
-                  )
+            {linkStatus && (
+              <div className="rounded border border-border bg-bg-tertiary/40 px-3 py-2 text-xs text-text-secondary">
+                <div className="grid gap-1 sm:grid-cols-3">
+                  <span>Stale {linkStatus.stale_links}</span>
+                  <span>Failed {linkStatus.failed_links}</span>
+                  <span>Degraded {linkStatus.degraded_links}</span>
+                </div>
+                {linkStatus.reason_codes.length > 0 && (
+                  <p className="mt-1 text-[11px] text-text-muted">
+                    {linkStatus.reason_codes.join(", ")}
+                  </p>
+                )}
+                {linkStatus.last_sync_error && (
+                  <p className="mt-1 text-[11px] text-warning">{linkStatus.last_sync_error}</p>
                 )}
               </div>
             )}
-          </section>
-
-          {/* Memory Backend Section */}
-          <section>
-            <div className="flex items-center gap-2 mb-3">
-              <Database className="w-4 h-4 text-text-secondary" />
-              <h3 className="text-xs font-semibold text-text uppercase tracking-wide">
-                Memory Backend
-              </h3>
-            </div>
+            {memoryStatus?.fallback_reason && (
+              <p className="rounded border border-warning/30 bg-warning/5 px-2 py-1 text-xs text-warning">
+                {memoryStatus.fallback_reason}
+              </p>
+            )}
             <select
               value={settings["memory_backend"] || "gloss-local"}
               onChange={(e) => handleSelectMemoryBackend(e.target.value)}
-              className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+              className="w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
             >
               <option value="gloss-local">Gloss local</option>
-              <option value="semantic-memory-preview">semantic-memory preview</option>
+              <option value="semantic-memory-preview" disabled={!semanticPreviewSelectable}>
+                semantic-memory preview
+                {semanticPreviewSelectable ? "" : ` (${semanticPreview?.unavailable_reason || "unavailable"})`}
+              </option>
             </select>
-            <label className="mt-3 flex items-center gap-2 text-xs text-text-secondary">
+            <label className="flex items-center gap-2 text-xs text-text-secondary">
               <input
                 type="checkbox"
                 checked={(settings["memory_backend_fallback"] || "true") !== "false"}
@@ -570,72 +643,73 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               />
               Fallback to Gloss local when preview retrieval fails
             </label>
-            <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
-              <label className="text-xs text-text-secondary">
-                <span className="block mb-1">Embedding URL</span>
-                <input
-                  value={settings["semantic_memory_embedding_url"] || "http://localhost:11434"}
-                  onChange={(e) => updateSetting("semantic_memory_embedding_url", e.target.value)}
-                  className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
-                />
-              </label>
-              <label className="text-xs text-text-secondary">
-                <span className="block mb-1">Embedding model</span>
-                <input
-                  value={settings["semantic_memory_embedding_model"] || "nomic-embed-text"}
-                  onChange={(e) => updateSetting("semantic_memory_embedding_model", e.target.value)}
-                  className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
-                />
-              </label>
-              <label className="text-xs text-text-secondary">
-                <span className="block mb-1">Embedding timeout seconds</span>
-                <input
-                  type="number"
-                  min="1"
-                  value={settings["semantic_memory_embedding_timeout_secs"] || "10"}
-                  onChange={(e) =>
-                    updateSetting("semantic_memory_embedding_timeout_secs", e.target.value)
-                  }
-                  className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
-                />
-              </label>
-              <label className="text-xs text-text-secondary">
-                <span className="block mb-1">Search timeout ms</span>
-                <input
-                  type="number"
-                  min="1"
-                  value={settings["semantic_memory_search_timeout_ms"] || "8000"}
-                  onChange={(e) =>
-                    updateSetting("semantic_memory_search_timeout_ms", e.target.value)
-                  }
-                  className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
-                />
-              </label>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={handleReindexSemanticMemoryNotebook}
+                disabled={
+                  !activeNotebookId ||
+                  !semanticPreview?.active ||
+                  reindexingSemanticMemory
+                }
+                className="inline-flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {reindexingSemanticMemory ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" />
+                )}
+                Reindex semantic-memory
+              </button>
+              <button
+                onClick={refreshMemoryEvidence}
+                className="inline-flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                Refresh evidence
+              </button>
             </div>
-            <p className="mt-2 text-xs text-text-muted">
-              Gloss local remains the release default. Preview can be selected
-              for testing, but fallback and degraded states are disclosed in chat
-              evidence and the status bar.
-            </p>
-          </section>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <input
+                value={settings["semantic_memory_embedding_url"] || "http://localhost:11434"}
+                onChange={(e) => updateSetting("semantic_memory_embedding_url", e.target.value)}
+                className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
+                aria-label="Embedding URL"
+              />
+              <input
+                value={settings["semantic_memory_embedding_model"] || "nomic-embed-text"}
+                onChange={(e) => updateSetting("semantic_memory_embedding_model", e.target.value)}
+                className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
+                aria-label="Embedding model"
+              />
+              <input
+                type="number"
+                min="1"
+                value={settings["semantic_memory_embedding_timeout_secs"] || "10"}
+                onChange={(e) => updateSetting("semantic_memory_embedding_timeout_secs", e.target.value)}
+                className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
+                aria-label="Embedding timeout seconds"
+              />
+              <input
+                type="number"
+                min="1"
+                value={settings["semantic_memory_search_timeout_ms"] || "8000"}
+                onChange={(e) => updateSetting("semantic_memory_search_timeout_ms", e.target.value)}
+                className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
+                aria-label="Search timeout milliseconds"
+              />
+            </div>
+          </SettingsSection>
 
-          {/* Summary Model Section */}
-          <section>
-            <div className="flex items-center gap-2 mb-3">
-              <BookOpen className="w-4 h-4 text-text-secondary" />
-              <h3 className="text-xs font-semibold text-text uppercase tracking-wide">
-                Summary Model
-              </h3>
-            </div>
-            <p className="text-xs text-text-muted mb-2">
-              Background summaries run through the Ollama backend. Choose an
-              Ollama model here or leave this empty to reuse the chat model when
-              it is also an Ollama model.
-            </p>
+          <SettingsSection title="Sources & Ingestion" icon={<BookOpen className="h-4 w-4" />}>
+            <FeatureStatusGrid flags={sections["Sources & Ingestion"] || []} />
+          </SettingsSection>
+
+          <SettingsSection title="Summaries" icon={<BookOpen className="h-4 w-4" />}>
+            <FeatureStatusGrid flags={sections["Summaries"] || []} />
             <select
               value={settings["summary_model"] || ""}
-              onChange={(e) => handleSelectSummaryModel(e.target.value)}
-              className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+              onChange={(e) => updateSetting("summary_model", e.target.value)}
+              className="w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
             >
               <option value="">Same as chat model ({activeModel})</option>
               {summaryModels.map((model) => (
@@ -645,25 +719,14 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 </option>
               ))}
             </select>
-          </section>
+          </SettingsSection>
 
-          {/* Vision Model Section */}
-          <section>
-            <div className="flex items-center gap-2 mb-3">
-              <Image className="w-4 h-4 text-text-secondary" />
-              <h3 className="text-xs font-semibold text-text uppercase tracking-wide">
-                Vision Model
-              </h3>
-            </div>
-            <p className="text-xs text-text-muted mb-2">
-              Image and video background jobs require a vision-capable Ollama
-              model. Images are base64-encoded and sent to this model for
-              description.
-            </p>
+          <SettingsSection title="Vision & Media" icon={<Image className="h-4 w-4" />}>
+            <FeatureStatusGrid flags={sections["Vision & Media"] || []} />
             <select
               value={settings["vision_model"] || ""}
-              onChange={(e) => handleSelectVisionModel(e.target.value)}
-              className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+              onChange={(e) => updateSetting("vision_model", e.target.value)}
+              className="w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
             >
               <option value="">Same as chat model ({activeModel})</option>
               {visionModels.map((model) => (
@@ -673,47 +736,71 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 </option>
               ))}
             </select>
-          </section>
+          </SettingsSection>
 
-          {/* External Tools Section */}
-          <section>
-            <div className="flex items-center gap-2 mb-3">
-              <Wrench className="w-4 h-4 text-text-secondary" />
-              <h3 className="text-xs font-semibold text-text uppercase tracking-wide">
-                External Tools
-              </h3>
-            </div>
-            <div className="space-y-1.5">
-              <div className="flex items-center gap-2 text-xs">
-                {externalTools["ffmpeg"] ? (
-                  <Check className="w-3.5 h-3.5 text-success" />
-                ) : (
-                  <AlertCircle className="w-3.5 h-3.5 text-warning" />
-                )}
-                <span className="text-text">ffmpeg</span>
-                <span className="text-text-muted">
-                  {externalTools["ffmpeg"]
-                    ? "Installed — video frame analysis enabled"
-                    : "Not found — video import requires ffmpeg"}
-                </span>
-              </div>
-              <div className="flex items-center gap-2 text-xs">
-                {externalTools["ffprobe"] ? (
-                  <Check className="w-3.5 h-3.5 text-success" />
-                ) : (
-                  <AlertCircle className="w-3.5 h-3.5 text-warning" />
-                )}
-                <span className="text-text">ffprobe</span>
-                <span className="text-text-muted">
-                  {externalTools["ffprobe"]
-                    ? "Installed"
-                    : "Not found — needed for video duration detection"}
-                </span>
-              </div>
-            </div>
-          </section>
+          <SettingsSection title="External Tools" icon={<Wrench className="h-4 w-4" />}>
+            <FeatureStatusGrid flags={sections["External Tools"] || []} />
+            <ToolStatus name="ffmpeg" ready={externalTools["ffmpeg"]} />
+            <ToolStatus name="ffprobe" ready={externalTools["ffprobe"]} />
+          </SettingsSection>
+
+          <SettingsSection title="Diagnostics" icon={<TestTube2 className="h-4 w-4" />}>
+            <FeatureStatusGrid flags={sections["Diagnostics"] || []} />
+          </SettingsSection>
+
+          <SettingsSection title="Experimental Features" icon={<ShieldCheck className="h-4 w-4" />}>
+            {experimentalMaster && (
+              <FeatureToggleRow flag={experimentalMaster} mutable onToggle={handleFeatureToggle} />
+            )}
+            {[semanticPreview, turboQuant, ...(sections["Experimental Features"] || [])]
+              .filter((flag): flag is FeatureFlagStatus => Boolean(flag))
+              .filter((flag, index, flags) => flags.findIndex((item) => item.id === flag.id) === index)
+              .filter((flag) => flag.id !== EXPERIMENTAL_FEATURES_ENABLED)
+              .map((flag) => (
+                <FeatureToggleRow key={flag.id} flag={flag} mutable onToggle={handleFeatureToggle} />
+              ))}
+          </SettingsSection>
+
+          <SettingsSection title="Release / Validation" icon={<ShieldCheck className="h-4 w-4" />}>
+            {(sections["Release / Validation"] || []).map((flag) => (
+              <FeatureToggleRow key={flag.id} flag={flag} mutable onToggle={handleFeatureToggle} />
+            ))}
+          </SettingsSection>
         </div>
       </div>
+    </div>
+  );
+}
+
+function FeatureStatusGrid({ flags }: { flags: FeatureFlagStatus[] }) {
+  if (flags.length === 0) {
+    return (
+      <p className="rounded border border-border bg-bg-tertiary/40 px-3 py-2 text-xs text-text-muted">
+        No backend feature flags registered for this section.
+      </p>
+    );
+  }
+  return (
+    <div className="grid gap-2 sm:grid-cols-2">
+      {flags.map((flag) => (
+        <HealthCard
+          key={flag.id}
+          title={flag.label}
+          status={flag.active ? "active" : flag.enabled ? "enabled" : "off"}
+          detail={flag.unavailable_reason || (flag.stable ? "Release default surface" : "Experimental surface")}
+          tone={flag.active ? "success" : flag.available ? "neutral" : "warning"}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ToolStatus({ name, ready }: { name: string; ready?: boolean }) {
+  return (
+    <div className="flex items-center gap-2 text-xs">
+      {ready ? <Check className="h-3.5 w-3.5 text-success" /> : <AlertCircle className="h-3.5 w-3.5 text-warning" />}
+      <span className="text-text">{name}</span>
+      <span className="text-text-muted">{ready ? "Installed" : "Not found"}</span>
     </div>
   );
 }

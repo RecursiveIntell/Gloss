@@ -7,53 +7,46 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+RUN_ID = "GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519"
 
 REQUIRED_ROOT_FILES = [
-    ".codex/config.toml",
-    ".codex/hooks.json",
-    ".codex/prompt_manifest.json",
-    ".codex/prompts/MASTER_AUTOMATED_COMPLETION.md",
-    ".codex/prompts/phase_00_current_state_and_failure_proof.md",
-    ".codex/prompts/phase_01_restore_active_codex_pack.md",
-    ".codex/prompts/phase_02_auto_phase_runner.md",
-    ".codex/prompts/phase_03_packaging_policy.md",
-    ".codex/prompts/phase_04_tests_and_release_gates.md",
-    ".codex/prompts/phase_05_fresh_unzip_certification.md",
-    ".codex/prompts/phase_06_hostile_audit_handoff.md",
-    ".codex/auto_gates/phase_00_gate.md",
-    ".codex/auto_gates/phase_01_gate.md",
-    ".codex/auto_gates/phase_02_gate.md",
-    ".codex/auto_gates/phase_03_gate.md",
-    ".codex/auto_gates/phase_04_gate.md",
-    ".codex/auto_gates/phase_05_gate.md",
-    ".codex/auto_gates/phase_06_gate.md",
-    ".codex/rules/safety.rules",
-    ".codex/tools/auto_phase_runner.py",
-    ".codex/tools/phase_prompt_builder.py",
-    ".codex/tools/inspect_codex_setup.py",
-    ".codex/skills/codex-control-pack/SKILL.md",
-    ".codex/skills/phase-gate/SKILL.md",
-    ".codex/skills/hostile-audit/SKILL.md",
-    ".codex/skills/run-certifier/SKILL.md",
-    ".codex/skills/source-of-truth-map/SKILL.md",
-    ".agents/skills/codex-control-pack/SKILL.md",
-    ".agents/skills/phase-gate/SKILL.md",
-    ".agents/skills/hostile-audit/SKILL.md",
-    ".agents/skills/run-certifier/SKILL.md",
-    ".agents/skills/source-of-truth-map/SKILL.md",
+    "AGENTS.md",
+    f"codex/prompts/{RUN_ID}/MASTER_PROMPT.md",
+    f"codex/prompts/{RUN_ID}/PHASE_00_PREFLIGHT_AND_SOURCE_TRUTH.md",
+    f"codex/prompts/{RUN_ID}/PHASE_01_ACTIVE_VALIDATION_REPAIR.md",
+    f"codex/prompts/{RUN_ID}/PHASE_02_SM_TQ_RUNTIME_SETTING_CONTROL.md",
+    f"codex/prompts/{RUN_ID}/PHASE_03_RETRIEVAL_AND_BACKPOINTER_PROOF.md",
+    f"codex/prompts/{RUN_ID}/PHASE_04_SETTINGS_UI_AND_DISCLOSURE.md",
+    f"codex/prompts/{RUN_ID}/PHASE_05_DESKTOP_SMOKE_HARNESS.md",
+    f"codex/prompts/{RUN_ID}/PHASE_06_GUI_REDESIGN_PORT.md",
+    f"codex/prompts/{RUN_ID}/PHASE_07_SECURITY_AND_PACKAGE_WARNING_CLEANUP.md",
+    f"codex/prompts/{RUN_ID}/PHASE_08_TEST_EXPANSION_AND_PARITY.md",
+    f"codex/prompts/{RUN_ID}/PHASE_09_DOCS_PUBLIC_RELEASE_TRUTH.md",
+    f"codex/prompts/{RUN_ID}/PHASE_10_PACKAGE_AND_FRESH_UNZIP_REPLAY.md",
+    f"codex/prompts/{RUN_ID}/PHASE_11_PARALLEL_HOSTILE_SUBAGENTS.md",
+    f"codex/prompts/{RUN_ID}/PHASE_12_FINAL_AUDIT_RELEASE_DECISION.md",
+    f"codex/schemas/{RUN_ID}/final_receipt.schema.json",
+    f"docs/codex-runs/{RUN_ID}/PHASE_ORDER.md",
+    f"docs/codex-runs/{RUN_ID}/ACCEPTANCE_GATES.md",
 ]
 
 EXPECTED_PHASE_IDS = [
-    "phase_00",
-    "phase_01",
-    "phase_02",
-    "phase_03",
-    "phase_04",
-    "phase_05",
-    "phase_06",
+    "PHASE_00",
+    "PHASE_01",
+    "PHASE_02",
+    "PHASE_03",
+    "PHASE_04",
+    "PHASE_05",
+    "PHASE_06",
+    "PHASE_07",
+    "PHASE_08",
+    "PHASE_09",
+    "PHASE_10",
+    "PHASE_11",
+    "PHASE_12",
 ]
 
-PHASE_ID_RE = re.compile(r"^phase_\d+$")
+PHASE_PROMPT_RE = re.compile(r"^PHASE_(\d{2})_.*\.md$")
 
 
 def validate() -> list[str]:
@@ -63,36 +56,23 @@ def validate() -> list[str]:
     if missing:
         errors.extend(f"missing required file: {path}" for path in missing)
 
-    manifest_path = ROOT / ".codex/prompt_manifest.json"
-    if not manifest_path.exists():
-        errors.append("missing required file: .codex/prompt_manifest.json")
-    else:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("manual_injections_required") is not False:
-            errors.append("manual_injections_required must be false")
-        if manifest.get("auto_injections_required") is not True:
-            errors.append("auto_injections_required must be true")
-        if manifest.get("master_prompt") != ".codex/prompts/MASTER_AUTOMATED_COMPLETION.md":
-            errors.append("master prompt path must be .codex/prompts/MASTER_AUTOMATED_COMPLETION.md")
+    prompt_dir = ROOT / "codex" / "prompts" / RUN_ID
+    phase_prompt_ids = sorted(
+        f"PHASE_{match.group(1)}"
+        for path in prompt_dir.glob("PHASE_*.md")
+        if (match := PHASE_PROMPT_RE.match(path.name))
+    )
+    if phase_prompt_ids != EXPECTED_PHASE_IDS:
+        errors.append(
+            f"unexpected P33 phase prompt ordering or membership: {phase_prompt_ids}"
+        )
 
-        phases = manifest.get("phases")
-        if not isinstance(phases, list) or not phases:
-            errors.append("manifest phases missing or invalid")
-        else:
-            phase_ids = [phase.get("id") for phase in phases]
-            if any(not isinstance(pid, str) or not PHASE_ID_RE.match(pid) for pid in phase_ids):
-                errors.append("manifest contains invalid phase id(s)")
-            elif phase_ids != EXPECTED_PHASE_IDS:
-                errors.append("unexpected phase id ordering or membership")
-
-            for idx, phase in enumerate(phases):
-                for field in ("id", "name", "prompt", "auto_injection"):
-                    if field not in phase:
-                        errors.append(f"phase {idx} missing {field}")
-                for field in ("prompt", "auto_injection"):
-                    rel = phase.get(field)
-                    if rel and not (ROOT / rel).exists():
-                        errors.append(f"phase {phase.get('id')} missing {field}: {rel}")
+    phase_order_path = ROOT / "docs" / "codex-runs" / RUN_ID / "PHASE_ORDER.md"
+    if phase_order_path.exists():
+        phase_order = phase_order_path.read_text(encoding="utf-8", errors="replace")
+        for phase_id in EXPECTED_PHASE_IDS:
+            if phase_id not in phase_order:
+                errors.append(f"PHASE_ORDER.md missing {phase_id}")
 
     for path in [
         "scripts/validate_codex_pack.py",
@@ -101,14 +81,6 @@ def validate() -> list[str]:
     ]:
         if not (ROOT / path).exists():
             errors.append(f"missing required repository command/script: {path}")
-
-    agents_skill_dirs = sorted(d.name for d in (ROOT / ".agents/skills").iterdir() if d.is_dir())
-    codex_skill_dirs = sorted(d.name for d in (ROOT / ".codex/skills").iterdir() if d.is_dir())
-    if agents_skill_dirs != codex_skill_dirs:
-        errors.append(
-            "agent and codex skill directories out of sync: "
-            f"agents={agents_skill_dirs}, codex={codex_skill_dirs}"
-        )
 
     return errors
 

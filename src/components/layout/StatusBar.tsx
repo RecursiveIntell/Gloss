@@ -177,7 +177,7 @@ export function StatusBar() {
   const summaryModelLabel = queueStatus?.summary_backend.model ?? "Not configured";
 
   return (
-    <div className="h-7 bg-bg-secondary border-t border-border flex items-center px-3 text-xs text-text-muted gap-4">
+    <div className="gloss-mono flex h-[var(--statusbar-h)] items-center gap-4 border-t border-border bg-bg-secondary px-3 text-[10px] text-text-muted">
       <div className="flex items-center gap-1.5">
         {chatConnected ? (
           <Wifi className="w-3 h-3 text-success" />
@@ -222,7 +222,7 @@ export function StatusBar() {
             ` (${memoryStatus.index_sync_status})`}
         </span>
         {healthOpen && (
-          <div className="absolute bottom-6 left-0 z-40 w-80 rounded border border-border bg-bg-secondary p-3 text-left text-xs shadow-xl">
+          <div className="absolute bottom-7 left-0 z-40 w-80 rounded border border-border bg-bg-secondary p-3 text-left text-xs shadow-xl">
             <div className="mb-2 font-medium text-text">Health</div>
             <div className="space-y-1 text-text-secondary">
               <HealthLine label="Backend requested" value={memoryStatus?.active_backend ?? "gloss-local"} />

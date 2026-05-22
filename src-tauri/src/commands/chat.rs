@@ -2,12 +2,14 @@
 use crate::db::notebook_db::NotebookDb;
 use crate::db::notebook_db::{Conversation, Message, Source};
 use crate::error::GlossError;
+use crate::features;
 use crate::jobs;
 use crate::memory::backend::MemorySearchBackend;
 use crate::memory::gloss_local::GlossLocalMemoryBackend;
 #[cfg(feature = "semantic-memory-backend")]
 use crate::memory::semantic_memory_adapter;
 use crate::memory::MemorySearchRequest;
+use crate::memory::{RetrievalMode, RetrievalOutcome, RetrievalReasonCode};
 use crate::memory::{MEMORY_BACKEND_GLOSS_LOCAL, MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW};
 use crate::providers::{self, ChatMessage, ChatRequest, ChatToken, LlmProvider};
 use crate::retrieval::citations;
@@ -72,6 +74,7 @@ struct ChatEvidenceDisclosure {
     exact_rerank_count: Option<usize>,
     approximate_candidate_count: Option<usize>,
     semantic_memory_fallback_reason: Option<String>,
+    retrieval_outcome: Option<RetrievalOutcome>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,6 +127,8 @@ pub struct ChatAttemptTraceV1 {
     pub done_seen: bool,
     pub assistant_persisted: bool,
     pub error: Option<String>,
+    pub retrieval_trace_ref: Option<String>,
+    pub retrieval_outcome: Option<RetrievalOutcome>,
     pub events: Vec<ChatAttemptTraceEvent>,
 }
 
@@ -152,6 +157,8 @@ fn new_chat_attempt_trace(
         done_seen: false,
         assistant_persisted: false,
         error: None,
+        retrieval_trace_ref: None,
+        retrieval_outcome: None,
         events: Vec::new(),
     }
 }
@@ -805,16 +812,13 @@ pub async fn send_message(
         );
     }
 
-    let hybrid_search_ready = crate::state::NATIVE_SEMANTIC_INDEXING_ENABLED
-        && !resolved_scope.is_none()
-        && state.with_notebook_db(&notebook_id, |db| {
-            db.can_run_hybrid_search(resolved_scope.source_ids())
-        })?;
+    let native_dense_possible =
+        crate::state::NATIVE_SEMANTIC_INDEXING_ENABLED && !resolved_scope.is_none();
 
     // 3. Only initialize semantic search infrastructure when the selected
-    // sources are fully indexed. Otherwise we go straight to the DB/raw
-    // fallback path and avoid loading native embedder/index code unnecessarily.
-    if hybrid_search_ready {
+    // sources can use native dense retrieval. BM25/FTS5 still runs even when
+    // dense retrieval is unavailable or only partially covered.
+    if native_dense_possible {
         if let Err(e) = state.ensure_embedder(Some(&app_handle)) {
             tracing::warn!(
                 "Embedder init failed (will fall back to raw context): {}",
@@ -831,7 +835,7 @@ pub async fn send_message(
         tracing::info!(
             notebook_id = %notebook_id,
             selected_sources = resolved_scope.source_count(),
-            "Skipping semantic search warmup because selected sources are not fully indexed"
+            "Skipping native dense search warmup because native indexing is disabled or scope is empty"
         );
     }
 
@@ -866,6 +870,7 @@ pub async fn send_message(
                 app_db.get_setting("semantic_memory_embedding_url")?,
                 app_db.get_setting("semantic_memory_embedding_model")?,
                 app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+                features::turbo_quant_active(&app_db)?,
             ),
             semantic_memory_search_timeout_from_setting(
                 app_db.get_setting("semantic_memory_search_timeout_ms")?,
@@ -900,6 +905,25 @@ pub async fn send_message(
     if !invalid_source_ids.is_empty() {
         retrieval_degradation_markers.push("source-scope-partial-invalid".to_string());
     }
+    let semantic_preview_gate_open = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        features::semantic_memory_preview_active(&app_db)?
+    };
+    let memory_backend = if memory_backend == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
+        && !semantic_preview_gate_open
+    {
+        retrieval_fallback_reason = Some(
+            "semantic-memory-preview is disabled by the experimental feature gate".to_string(),
+        );
+        retrieval_degradation_markers.push("memory-backend-feature-gate-fallback".to_string());
+        force_gloss_local_retrieval = true;
+        MEMORY_BACKEND_GLOSS_LOCAL.to_string()
+    } else {
+        memory_backend
+    };
 
     let semantic_preview_context: Option<Vec<ContextPassage>> = if memory_backend
         == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
@@ -912,6 +936,45 @@ pub async fn send_message(
                 let nb_db = NotebookDb::connect(&db_path)?;
                 semantic_memory_adapter::load_links(&nb_db)?
             };
+            let scoped_links = links
+                .iter()
+                .filter(|link| resolved_scope.allows(&link.source_id))
+                .collect::<Vec<_>>();
+            let healthy_scoped_links = scoped_links
+                .iter()
+                .filter(|link| {
+                    link.sync_status == "synced"
+                        && link
+                            .sm_document_id
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty())
+                        && link
+                            .sm_chunk_id
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty())
+                        && !link.content_digest.trim().is_empty()
+                })
+                .count();
+            if scoped_links.is_empty() {
+                retrieval_degradation_markers.push(
+                    RetrievalReasonCode::SemanticMemoryLinksMissing
+                        .as_str()
+                        .to_string(),
+                );
+                retrieval_fallback_reason.get_or_insert_with(|| {
+                    "semantic-memory links are missing for selected scope".to_string()
+                });
+            } else if healthy_scoped_links < scoped_links.len() {
+                retrieval_degradation_markers.push(
+                    RetrievalReasonCode::SemanticMemoryLinksDegraded
+                        .as_str()
+                        .to_string(),
+                );
+                retrieval_fallback_reason.get_or_insert_with(|| {
+                    "semantic-memory links are stale, failed, or missing exact backpointers"
+                        .to_string()
+                });
+            }
             let preview_request = MemorySearchRequest {
                 notebook_id: notebook_id.clone(),
                 source_scope: source_scope.clone(),
@@ -1312,187 +1375,281 @@ pub async fn send_message(
     };
 
     // 4. Hybrid search with multi-tier fallback
+    let mut retrieval_outcome_for_evidence: Option<RetrievalOutcome> = None;
     let source_context: Vec<ContextPassage> = if let Some(context) = semantic_preview_context {
         context
     } else if resolved_scope.is_none() {
         Vec::new()
     } else {
-        let local_hybrid_results = if force_gloss_local_retrieval {
-            None
-        } else {
-            state.try_hybrid_search(&notebook_id, &query, &resolved_scope, top_k)?
-        };
-        match local_hybrid_results {
-            Some(results) if !results.is_empty() => {
-                retrieval_mode = "native-hybrid".to_string();
-                retrieval_backend_used = "native-hybrid".to_string();
-                // Resolve source titles for each unique source_id
-                let unique_source_ids: Vec<String> = results
-                    .iter()
-                    .map(|r| r.chunk.source_id.clone())
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect();
-
-                let title_map: HashMap<String, String> =
-                    state.with_notebook_db(&notebook_id, |db| {
-                        let mut map = HashMap::new();
-                        for sid in &unique_source_ids {
-                            if let Ok(source) = db.get_source(sid) {
-                                map.insert(sid.clone(), source.title);
-                            }
-                        }
-                        Ok(map)
-                    })?;
-
-                tracing::info!(
-                    results = results.len(),
-                    top_k,
-                    "Hybrid search returned results"
-                );
-
-                results
-                    .iter()
-                    .map(|r| ContextPassage {
-                        source_id: r.chunk.source_id.clone(),
-                        chunk_id: Some(r.chunk.id.clone()),
-                        title: title_map
-                            .get(&r.chunk.source_id)
-                            .cloned()
-                            .unwrap_or_else(|| r.chunk.source_id.clone()),
-                        content: r.chunk.content.clone(),
-                    })
-                    .collect()
+        let mut local_outcome = state.local_retrieval_outcome(
+            &notebook_id,
+            &query,
+            &resolved_scope,
+            top_k,
+            retrieval_receipt_id.clone(),
+        )?;
+        if force_gloss_local_retrieval {
+            local_outcome.degraded = true;
+            if !local_outcome
+                .fallback_chain
+                .contains(&RetrievalReasonCode::SemanticMemoryFeatureDisabled)
+            {
+                local_outcome
+                    .fallback_chain
+                    .push(RetrievalReasonCode::SemanticMemoryFeatureDisabled);
             }
-            other => {
-                // Fallback: first try chunks from DB, then raw content_text
-                let reason = match &other {
-                    None => "embedder/index not available",
-                    Some(_) => "search returned empty results",
-                };
-                if retrieval_fallback_reason.is_none() {
-                    retrieval_fallback_reason = Some(format!("local retrieval fallback: {reason}"));
+            local_outcome.user_visible_summary = format!(
+                "{} semantic-memory preview fell back to local retrieval.",
+                local_outcome.user_visible_summary
+            );
+        }
+        if !local_outcome.fallback_chain.is_empty() {
+            for reason in &local_outcome.fallback_chain {
+                let marker = reason.as_str().to_string();
+                if !retrieval_degradation_markers.contains(&marker) {
+                    retrieval_degradation_markers.push(marker);
                 }
-                if !retrieval_degradation_markers
-                    .iter()
-                    .any(|marker| marker == "local-retrieval-fallback")
-                {
-                    retrieval_degradation_markers.push("local-retrieval-fallback".to_string());
-                }
-                tracing::info!(reason, "Hybrid search unavailable, using fallback context");
+            }
+        }
+        if local_outcome.degraded && retrieval_fallback_reason.is_none() {
+            retrieval_fallback_reason = Some(local_outcome.user_visible_summary.clone());
+        }
+        retrieval_mode = local_outcome.mode.as_str().to_string();
+        retrieval_backend_used = match local_outcome.mode {
+            RetrievalMode::HybridRrf => "native-hybrid",
+            RetrievalMode::DenseOnly => "native-dense",
+            RetrievalMode::Bm25Only => MEMORY_BACKEND_GLOSS_LOCAL,
+            _ => MEMORY_BACKEND_GLOSS_LOCAL,
+        }
+        .to_string();
 
-                let local_response = state.with_notebook_db(&notebook_id, |db| {
-                    let backend =
-                        GlossLocalMemoryBackend::new(notebook_id.clone(), db, &all_sources);
-                    backend.search(MemorySearchRequest {
-                        notebook_id: notebook_id.clone(),
-                        source_scope: source_scope.clone(),
-                        query: query.clone(),
-                        limit: top_k,
-                        trace_id: Some(retrieval_receipt_id.clone()),
-                        allow_fallback: true,
-                    })
+        if !local_outcome.results.is_empty() {
+            let unique_source_ids: Vec<String> = local_outcome
+                .results
+                .iter()
+                .map(|r| r.source_id.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            let title_map: HashMap<String, String> =
+                state.with_notebook_db(&notebook_id, |db| {
+                    let mut map = HashMap::new();
+                    for sid in &unique_source_ids {
+                        if let Ok(source) = db.get_source(sid) {
+                            map.insert(sid.clone(), source.title);
+                        }
+                    }
+                    Ok(map)
                 })?;
 
-                if let Some(reason) = local_response.fallback_reason.clone() {
-                    retrieval_fallback_reason.get_or_insert(reason);
-                }
-                if let Some(mode) = local_response
-                    .provenance
-                    .get("retrieval_mode")
-                    .and_then(|value| value.as_str())
-                {
-                    retrieval_mode = mode.to_string();
-                }
-                for marker in &local_response.degradation_markers {
-                    if !retrieval_degradation_markers.contains(marker) {
-                        retrieval_degradation_markers.push(marker.clone());
-                    }
-                }
+            local_outcome
+                .results
+                .iter_mut()
+                .for_each(|result| result.title = title_map.get(&result.source_id).cloned());
+            record_chat_attempt_trace(
+                &attempt_trace,
+                &trace_data_dir,
+                "retrieval_outcome",
+                Some(Duration::ZERO),
+                Some(&local_outcome.user_visible_summary),
+                None,
+                |trace| {
+                    trace.retrieval_trace_ref = Some(local_outcome.trace_ref.clone());
+                    trace.retrieval_outcome = Some(local_outcome.clone());
+                },
+            );
+            retrieval_outcome_for_evidence = Some(local_outcome.clone());
+            local_outcome
+                .results
+                .iter()
+                .map(|result| ContextPassage {
+                    source_id: result.source_id.clone(),
+                    chunk_id: result.chunk_id.clone(),
+                    title: result
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| result.source_id.clone()),
+                    content: result.content.clone(),
+                })
+                .collect()
+        } else {
+            if !retrieval_degradation_markers
+                .iter()
+                .any(|marker| marker == "source_order_fallback")
+            {
+                retrieval_degradation_markers.push("source_order_fallback".to_string());
+            }
+            tracing::info!(
+                reason = %local_outcome.user_visible_summary,
+                "Indexed retrieval unavailable, using fallback context"
+            );
 
-                let ranked_ctx = local_response
-                    .candidates
-                    .into_iter()
-                    .map(|candidate| ContextPassage {
-                        source_id: candidate.source_id,
-                        chunk_id: Some(candidate.chunk_id),
-                        title: candidate
-                            .source_title
-                            .unwrap_or_else(|| "Untitled source".to_string()),
-                        content: candidate.content,
+            let local_response = state.with_notebook_db(&notebook_id, |db| {
+                let backend = GlossLocalMemoryBackend::new(notebook_id.clone(), db, &all_sources);
+                backend.search(MemorySearchRequest {
+                    notebook_id: notebook_id.clone(),
+                    source_scope: source_scope.clone(),
+                    query: query.clone(),
+                    limit: top_k,
+                    trace_id: Some(retrieval_receipt_id.clone()),
+                    allow_fallback: true,
+                })
+            })?;
+
+            if let Some(reason) = local_response.fallback_reason.clone() {
+                retrieval_fallback_reason.get_or_insert(reason);
+            }
+            for marker in &local_response.degradation_markers {
+                if !retrieval_degradation_markers.contains(marker) {
+                    retrieval_degradation_markers.push(marker.clone());
+                }
+            }
+
+            let ranked_ctx = local_response
+                .candidates
+                .into_iter()
+                .map(|candidate| ContextPassage {
+                    source_id: candidate.source_id,
+                    chunk_id: Some(candidate.chunk_id),
+                    title: candidate
+                        .source_title
+                        .unwrap_or_else(|| "Untitled source".to_string()),
+                    content: candidate.content,
+                })
+                .collect::<Vec<_>>();
+
+            if !ranked_ctx.is_empty() {
+                retrieval_mode = RetrievalMode::SourceOrderFallback.as_str().to_string();
+                local_outcome.mode = RetrievalMode::SourceOrderFallback;
+                local_outcome.results = ranked_ctx
+                    .iter()
+                    .map(|passage| crate::memory::RetrievalResult {
+                        chunk_id: passage.chunk_id.clone(),
+                        source_id: passage.source_id.clone(),
+                        title: Some(passage.title.clone()),
+                        content: passage.content.clone(),
+                        score: 0.0,
+                        engine: "source_order_fallback".to_string(),
                     })
-                    .collect::<Vec<_>>();
+                    .collect();
+                local_outcome
+                    .fallback_chain
+                    .push(RetrievalReasonCode::SourceOrderFallback);
+                local_outcome.degraded = true;
+                local_outcome.user_visible_summary =
+                    "Source-order fallback used after indexed retrieval produced no context"
+                        .to_string();
+                record_chat_attempt_trace(
+                    &attempt_trace,
+                    &trace_data_dir,
+                    "retrieval_outcome",
+                    Some(Duration::ZERO),
+                    Some(&local_outcome.user_visible_summary),
+                    None,
+                    |trace| {
+                        trace.retrieval_trace_ref = Some(local_outcome.trace_ref.clone());
+                        trace.retrieval_outcome = Some(local_outcome.clone());
+                    },
+                );
+                retrieval_outcome_for_evidence = Some(local_outcome.clone());
+                ranked_ctx
+            } else {
+                retrieval_mode = RetrievalMode::RawContentFallback.as_str().to_string();
+                retrieval_backend_used = "raw-content-text-fallback".to_string();
+                retrieval_fallback_reason.get_or_insert_with(|| {
+                    "gloss-local ranked retrieval returned no context; raw content_text fallback"
+                        .to_string()
+                });
+                if !retrieval_degradation_markers
+                    .iter()
+                    .any(|marker| marker == "raw_content_fallback")
+                {
+                    retrieval_degradation_markers.push("raw_content_fallback".to_string());
+                }
 
-                if !ranked_ctx.is_empty() {
-                    tracing::info!(
-                        chunks = ranked_ctx.len(),
-                        "Fallback: using gloss-local FTS5/BM25 retrieval"
-                    );
-                    ranked_ctx
-                } else {
-                    retrieval_mode = "raw-content-text-fallback".to_string();
-                    retrieval_backend_used = "raw-content-text-fallback".to_string();
-                    retrieval_fallback_reason.get_or_insert_with(|| {
-                        "gloss-local ranked retrieval returned no context; raw content_text fallback"
-                            .to_string()
-                    });
-                    if !retrieval_degradation_markers
-                        .iter()
-                        .any(|marker| marker == "raw-content-text-fallback")
-                    {
-                        retrieval_degradation_markers.push("raw-content-text-fallback".to_string());
-                    }
-
-                    // Last resort: raw content_text for paste sources or sources without chunks.
-                    tracing::info!("Fallback: using raw content_text");
-                    state.with_notebook_db(&notebook_id, |db| {
-                        let mut ctx = Vec::new();
-                        let mut total_chars = 0usize;
-                        let mut seen_hashes = HashSet::new();
-                        for sid in resolved_scope.source_ids() {
-                            if total_chars >= MAX_TOTAL_CONTEXT_CHARS {
-                                break;
-                            }
-                            if let Ok(source) = db.get_source(sid) {
-                                if let Some(ref hash) = source.file_hash {
-                                    if !seen_hashes.insert(hash.clone()) {
-                                        continue;
-                                    }
+                // Last resort: raw content_text for paste sources or sources without chunks.
+                tracing::info!("Fallback: using raw content_text");
+                let raw_ctx = state.with_notebook_db(&notebook_id, |db| {
+                    let mut ctx = Vec::new();
+                    let mut total_chars = 0usize;
+                    let mut seen_hashes = HashSet::new();
+                    for sid in resolved_scope.source_ids() {
+                        if total_chars >= MAX_TOTAL_CONTEXT_CHARS {
+                            break;
+                        }
+                        if let Ok(source) = db.get_source(sid) {
+                            if let Some(ref hash) = source.file_hash {
+                                if !seen_hashes.insert(hash.clone()) {
+                                    continue;
                                 }
-                                if let Some(ref text) = source.content_text {
-                                    if !text.is_empty() {
-                                        let remaining =
-                                            MAX_TOTAL_CONTEXT_CHARS.saturating_sub(total_chars);
-                                        let limit = remaining.min(MAX_SOURCE_CHARS).min(text.len());
-                                        let truncated = if limit < text.len() {
-                                            let mut safe = limit.min(text.len());
-                                            while safe > 0 && !text.is_char_boundary(safe) {
-                                                safe -= 1;
-                                            }
-                                            let slice = &text[..safe];
-                                            let end = slice.rfind(' ').unwrap_or(safe);
-                                            format!(
-                                                "{}...\n[truncated, {} chars total]",
-                                                &text[..end],
-                                                text.len()
-                                            )
-                                        } else {
-                                            text.clone()
-                                        };
-                                        total_chars += truncated.len();
-                                        ctx.push(ContextPassage {
-                                            source_id: source.id.clone(),
-                                            chunk_id: None,
-                                            title: source.title.clone(),
-                                            content: truncated,
-                                        });
-                                    }
+                            }
+                            if let Some(ref text) = source.content_text {
+                                if !text.is_empty() {
+                                    let remaining =
+                                        MAX_TOTAL_CONTEXT_CHARS.saturating_sub(total_chars);
+                                    let limit = remaining.min(MAX_SOURCE_CHARS).min(text.len());
+                                    let truncated = if limit < text.len() {
+                                        let mut safe = limit.min(text.len());
+                                        while safe > 0 && !text.is_char_boundary(safe) {
+                                            safe -= 1;
+                                        }
+                                        let slice = &text[..safe];
+                                        let end = slice.rfind(' ').unwrap_or(safe);
+                                        format!(
+                                            "{}...\n[truncated, {} chars total]",
+                                            &text[..end],
+                                            text.len()
+                                        )
+                                    } else {
+                                        text.clone()
+                                    };
+                                    total_chars += truncated.len();
+                                    ctx.push(ContextPassage {
+                                        source_id: source.id.clone(),
+                                        chunk_id: None,
+                                        title: source.title.clone(),
+                                        content: truncated,
+                                    });
                                 }
                             }
                         }
-                        Ok(ctx)
-                    })?
-                }
+                    }
+                    Ok(ctx)
+                })?;
+                local_outcome.mode = RetrievalMode::RawContentFallback;
+                local_outcome.results = raw_ctx
+                    .iter()
+                    .map(|passage| crate::memory::RetrievalResult {
+                        chunk_id: None,
+                        source_id: passage.source_id.clone(),
+                        title: Some(passage.title.clone()),
+                        content: passage.content.clone(),
+                        score: 0.0,
+                        engine: "raw_content_fallback".to_string(),
+                    })
+                    .collect();
+                local_outcome
+                    .fallback_chain
+                    .push(RetrievalReasonCode::RawContentFallback);
+                local_outcome.degraded = true;
+                local_outcome.user_visible_summary =
+                    "Raw content fallback used after indexed retrieval produced no context"
+                        .to_string();
+                record_chat_attempt_trace(
+                    &attempt_trace,
+                    &trace_data_dir,
+                    "retrieval_outcome",
+                    Some(Duration::ZERO),
+                    Some(&local_outcome.user_visible_summary),
+                    None,
+                    |trace| {
+                        trace.retrieval_trace_ref = Some(local_outcome.trace_ref.clone());
+                        trace.retrieval_outcome = Some(local_outcome.clone());
+                    },
+                );
+                retrieval_outcome_for_evidence = Some(local_outcome.clone());
+                raw_ctx
             }
         }
     };
@@ -1580,8 +1737,8 @@ pub async fn send_message(
         source_scope_preserved: true,
         index_status: if resolved_scope.is_none() {
             "scope-none".to_string()
-        } else if hybrid_search_ready {
-            "indexed".to_string()
+        } else if native_dense_possible {
+            "native-dense-enabled".to_string()
         } else {
             "fallback".to_string()
         },
@@ -1599,6 +1756,7 @@ pub async fn send_message(
         exact_rerank_count,
         approximate_candidate_count,
         semantic_memory_fallback_reason,
+        retrieval_outcome: retrieval_outcome_for_evidence,
     };
 
     if !state.is_active_notebook_epoch(&notebook_id, request_epoch) {

@@ -1,5 +1,6 @@
 use crate::db::migrations;
 use crate::error::GlossError;
+use crate::memory::types::RetrievalCoverage;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -524,6 +525,137 @@ impl NotebookDb {
             .conn
             .query_row(&missing_sql, params.as_slice(), |row| row.get(0))?;
         Ok(missing == 0)
+    }
+
+    pub fn retrieval_coverage(
+        &self,
+        source_ids: &[String],
+    ) -> Result<RetrievalCoverage, GlossError> {
+        let (chunk_clause, params): (String, Vec<&dyn rusqlite::types::ToSql>) =
+            if source_ids.is_empty() {
+                ("".to_string(), Vec::new())
+            } else {
+                let placeholders = (0..source_ids.len())
+                    .map(|idx| format!("?{}", idx + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!(" WHERE source_id IN ({placeholders})"),
+                    source_ids
+                        .iter()
+                        .map(|id| id as &dyn rusqlite::types::ToSql)
+                        .collect(),
+                )
+            };
+
+        let total_chunks: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM chunks{chunk_clause}"),
+            params.as_slice(),
+            |row| row.get(0),
+        )?;
+        let embedded_chunks: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM chunks{chunk_clause}{}",
+                if chunk_clause.is_empty() {
+                    " WHERE embedding_id IS NOT NULL"
+                } else {
+                    " AND embedding_id IS NOT NULL"
+                }
+            ),
+            params.as_slice(),
+            |row| row.get(0),
+        )?;
+        let fts_indexed_chunks: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*)
+                 FROM chunks c
+                 JOIN chunks_fts fts ON fts.rowid = c.rowid{}",
+                if source_ids.is_empty() {
+                    String::new()
+                } else {
+                    let placeholders = (0..source_ids.len())
+                        .map(|idx| format!("?{}", idx + 1))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(" WHERE c.source_id IN ({placeholders})")
+                }
+            ),
+            params.as_slice(),
+            |row| row.get(0),
+        )?;
+
+        let (semantic_links_total, semantic_links_healthy, semantic_links_degraded) = if self
+            .table_exists("semantic_memory_links")?
+        {
+            let link_scope = if source_ids.is_empty() {
+                ("".to_string(), Vec::new())
+            } else {
+                let placeholders = (0..source_ids.len())
+                    .map(|idx| format!("?{}", idx + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!(" WHERE source_id IN ({placeholders})"),
+                    source_ids
+                        .iter()
+                        .map(|id| id as &dyn rusqlite::types::ToSql)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let total: i64 = self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM semantic_memory_links{}", link_scope.0),
+                link_scope.1.as_slice(),
+                |row| row.get(0),
+            )?;
+            let healthy: i64 = self.conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM semantic_memory_links{}{}",
+                        link_scope.0,
+                        if link_scope.0.is_empty() {
+                            " WHERE sync_status = 'synced' AND sm_document_id IS NOT NULL AND sm_chunk_id IS NOT NULL AND content_digest != ''"
+                        } else {
+                            " AND sync_status = 'synced' AND sm_document_id IS NOT NULL AND sm_chunk_id IS NOT NULL AND content_digest != ''"
+                        }
+                    ),
+                    link_scope.1.as_slice(),
+                    |row| row.get(0),
+                )?;
+            (
+                total.max(0) as usize,
+                healthy.max(0) as usize,
+                total.saturating_sub(healthy).max(0) as usize,
+            )
+        } else {
+            (0, 0, 0)
+        };
+
+        let total_chunks = total_chunks.max(0) as usize;
+        let embedded_chunks = embedded_chunks.max(0) as usize;
+        let missing_embeddings = total_chunks.saturating_sub(embedded_chunks);
+        Ok(RetrievalCoverage {
+            selected_sources: source_ids.len(),
+            total_chunks,
+            fts_indexed_chunks: fts_indexed_chunks.max(0) as usize,
+            embedded_chunks,
+            missing_embeddings,
+            semantic_links_total,
+            semantic_links_healthy,
+            semantic_links_degraded,
+            dense_coverage_ratio: if total_chunks == 0 {
+                0.0
+            } else {
+                embedded_chunks as f64 / total_chunks as f64
+            },
+        })
+    }
+
+    fn table_exists(&self, table: &str) -> Result<bool, GlossError> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        Ok(exists > 0)
     }
 
     /// Get chunk by embedding_id (HNSW label).

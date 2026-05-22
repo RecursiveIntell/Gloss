@@ -1,6 +1,7 @@
 use crate::db::app_db::ModelRecord;
 use crate::db::notebook_db::{Chunk, NotebookStats, Source};
 use crate::error::GlossError;
+use crate::features;
 use crate::ingestion::chunk::chunk_text_with_title;
 use crate::ingestion::extract::extract_text;
 use crate::jobs::{self, GlossJob};
@@ -10,7 +11,7 @@ use crate::memory::gloss_local::GlossLocalMemoryBackend;
 use crate::memory::semantic_memory_adapter;
 use crate::memory::{
     compare_memory_backends_for_notebook, MemoryBackendComparison, MemoryBackendStatus,
-    MemorySearchRequest, SemanticMemoryLinkStatus, MEMORY_BACKEND_GLOSS_LOCAL,
+    MemorySearchRequest, RetrievalCoverage, SemanticMemoryLinkStatus, MEMORY_BACKEND_GLOSS_LOCAL,
 };
 use crate::retrieval::source_scope::SourceScope;
 use crate::state::{ActiveCounterGuard, AppState, SUMMARY_MODE_AUTO, SUMMARY_MODE_MANUAL};
@@ -1898,6 +1899,17 @@ pub async fn get_notebook_stats(
     state.with_notebook_db(&notebook_id, |db| db.get_stats())
 }
 
+#[tauri::command]
+pub async fn diagnose_retrieval_coverage(
+    notebook_id: String,
+    source_ids: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<RetrievalCoverage, GlossError> {
+    state.with_notebook_db(&notebook_id, |db| {
+        db.retrieval_coverage(source_ids.as_deref().unwrap_or(&[]))
+    })
+}
+
 /// Queue summary jobs for all sources that are ready but have no summary.
 #[tauri::command]
 pub async fn regenerate_missing_summaries(
@@ -2045,9 +2057,15 @@ fn active_memory_backend(state: &AppState) -> Result<String, GlossError> {
         .app_db
         .lock()
         .map_err(|e| GlossError::Other(e.to_string()))?;
-    Ok(app_db
+    let backend = app_db
         .get_setting("memory_backend")?
-        .unwrap_or_else(|| MEMORY_BACKEND_GLOSS_LOCAL.to_string()))
+        .unwrap_or_else(|| MEMORY_BACKEND_GLOSS_LOCAL.to_string());
+    if backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
+        && !features::semantic_memory_preview_active(&app_db)?
+    {
+        return Ok(MEMORY_BACKEND_GLOSS_LOCAL.to_string());
+    }
+    Ok(backend)
 }
 
 fn link_status_for_notebook(
@@ -2086,6 +2104,16 @@ fn link_status_for_notebook(
             },
         )?;
 
+        let degraded_links =
+            stale.max(0) as usize + failed.max(0) as usize + missing_docs.max(0) as usize;
+        let mut reason_codes = Vec::new();
+        if total == 0 {
+            reason_codes.push("semantic_memory_links_missing".to_string());
+        }
+        if stale > 0 || failed > 0 || missing_docs > 0 {
+            reason_codes.push("semantic_memory_links_degraded".to_string());
+        }
+
         Ok(SemanticMemoryLinkStatus {
             notebook_id: notebook_id.to_string(),
             total_links: total.max(0) as usize,
@@ -2093,6 +2121,8 @@ fn link_status_for_notebook(
             stale_links: stale.max(0) as usize,
             failed_links: failed.max(0) as usize,
             missing_document_links: missing_docs.max(0) as usize,
+            degraded_links,
+            reason_codes,
             last_sync_error: last_error,
         })
     })
@@ -2104,9 +2134,19 @@ pub async fn memory_backend_status(
     state: State<'_, AppState>,
 ) -> Result<MemoryBackendStatus, GlossError> {
     let active_backend = active_memory_backend(&state)?;
-    let semantic_memory_feature_enabled = cfg!(feature = "semantic-memory-backend");
-    let semantic_memory_available = semantic_memory_feature_enabled
-        && active_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW;
+    let (requested_backend, semantic_memory_feature_enabled, semantic_memory_available) = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        (
+            app_db
+                .get_setting("memory_backend")?
+                .unwrap_or_else(|| MEMORY_BACKEND_GLOSS_LOCAL.to_string()),
+            cfg!(feature = "semantic-memory-backend"),
+            features::semantic_memory_preview_active(&app_db)?,
+        )
+    };
     let link_status = notebook_id
         .as_deref()
         .map(|id| link_status_for_notebook(&state, id))
@@ -2129,12 +2169,14 @@ pub async fn memory_backend_status(
         .to_string();
     let mut degradation_markers = Vec::new();
     let mut fallback_reason = None;
-    if active_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
-        && !semantic_memory_feature_enabled
+    if requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
+        && !semantic_memory_available
     {
-        fallback_reason =
-            Some("semantic-memory preview selected but feature is not enabled".to_string());
-        degradation_markers.push("semantic-memory-feature-disabled".to_string());
+        fallback_reason = Some(
+            "semantic-memory preview selected but experimental feature gate is not open"
+                .to_string(),
+        );
+        degradation_markers.push("semantic-memory-feature-gated".to_string());
     }
     if index_sync_status == "failed" || index_sync_status == "degraded" {
         degradation_markers.push(format!("semantic-memory-sync-{index_sync_status}"));
@@ -2143,9 +2185,9 @@ pub async fn memory_backend_status(
     let degraded = fallback_reason.is_some() || !degradation_markers.is_empty();
 
     Ok(MemoryBackendStatus {
-        backend_id: active_backend.clone(),
+        backend_id: requested_backend.clone(),
         default_backend: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
-        active_backend: active_backend.clone(),
+        active_backend: requested_backend.clone(),
         backend_used: if fallback_reason.is_some() {
             MEMORY_BACKEND_GLOSS_LOCAL.to_string()
         } else {
@@ -2192,10 +2234,12 @@ pub async fn semantic_memory_reindex_source(
                 .app_db
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
+            features::require_semantic_memory_preview_enabled(&app_db)?;
             semantic_memory_adapter::runtime_config_from_settings(
                 app_db.get_setting("semantic_memory_embedding_url")?,
                 app_db.get_setting("semantic_memory_embedding_model")?,
                 app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+                features::turbo_quant_active(&app_db)?,
             )
         };
         semantic_memory_adapter::reindex_source(
@@ -2239,10 +2283,12 @@ pub async fn semantic_memory_reindex_notebook(
                 .app_db
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
+            features::require_semantic_memory_preview_enabled(&app_db)?;
             semantic_memory_adapter::runtime_config_from_settings(
                 app_db.get_setting("semantic_memory_embedding_url")?,
                 app_db.get_setting("semantic_memory_embedding_model")?,
                 app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+                features::turbo_quant_active(&app_db)?,
             )
         };
         let mut receipts = Vec::new();
@@ -2288,10 +2334,12 @@ pub async fn compare_memory_backends(
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
+        features::require_semantic_memory_preview_enabled(&app_db)?;
         semantic_memory_adapter::runtime_config_from_settings(
             app_db.get_setting("semantic_memory_embedding_url")?,
             app_db.get_setting("semantic_memory_embedding_model")?,
             app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+            features::turbo_quant_active(&app_db)?,
         )
     };
     let (all_sources, local_backend_result, local_latency_ms, semantic_links) = {

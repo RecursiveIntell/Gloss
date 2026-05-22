@@ -4,6 +4,7 @@
 mod commands;
 mod db;
 mod error;
+mod features;
 mod ingestion;
 mod jobs;
 mod memory;
@@ -135,6 +136,7 @@ pub fn run() {
             commands::sources::get_source_content,
             commands::sources::retry_source_ingestion,
             commands::sources::get_notebook_stats,
+            commands::sources::diagnose_retrieval_coverage,
             commands::sources::regenerate_missing_summaries,
             commands::sources::pause_summaries,
             commands::sources::resume_summaries,
@@ -166,6 +168,8 @@ pub fn run() {
             commands::settings::get_all_models,
             commands::settings::get_settings,
             commands::settings::update_setting,
+            commands::settings::get_feature_flags,
+            commands::settings::update_feature_flag,
             commands::settings::check_external_tools,
         ])
         .run(tauri::generate_context!())

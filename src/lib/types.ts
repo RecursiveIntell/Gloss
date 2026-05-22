@@ -91,6 +91,7 @@ export interface ChatEvidenceDisclosure {
   exact_rerank_count?: number | null;
   approximate_candidate_count?: number | null;
   semantic_memory_fallback_reason?: string | null;
+  retrieval_outcome?: RetrievalOutcome | null;
 }
 
 export interface ChatEvidencePayload {
@@ -158,6 +159,20 @@ export interface Provider {
   last_refreshed?: string;
 }
 
+export interface FeatureFlagStatus {
+  id: string;
+  label: string;
+  section: string;
+  description: string;
+  enabled: boolean;
+  active: boolean;
+  available: boolean;
+  stable: boolean;
+  default_enabled: boolean;
+  requires_experimental: boolean;
+  unavailable_reason?: string | null;
+}
+
 export interface SourceContent {
   content_text?: string;
   word_count?: number;
@@ -218,7 +233,80 @@ export interface ChatAttemptTraceV1 {
   done_seen: boolean;
   assistant_persisted: boolean;
   error?: string | null;
+  retrieval_trace_ref?: string | null;
+  retrieval_outcome?: RetrievalOutcome | null;
   events: ChatAttemptTraceEvent[];
+}
+
+export type RetrievalMode =
+  | "bm25_only"
+  | "dense_only"
+  | "hybrid_rrf"
+  | "semantic_memory"
+  | "source_order_fallback"
+  | "raw_content_fallback"
+  | "unavailable";
+
+export type RetrievalReasonCode =
+  | "native_indexing_disabled"
+  | "dense_engine_unavailable"
+  | "embedder_unavailable"
+  | "index_missing"
+  | "no_embedded_chunks"
+  | "partial_embedding_coverage"
+  | "scope_has_missing_embeddings"
+  | "semantic_memory_feature_disabled"
+  | "semantic_memory_build_feature_missing"
+  | "semantic_memory_links_missing"
+  | "semantic_memory_links_degraded"
+  | "semantic_memory_timeout"
+  | "bm25_query_sanitized_empty"
+  | "bm25_no_matches"
+  | "source_order_fallback"
+  | "raw_content_fallback"
+  | "no_retrieval_context";
+
+export interface RetrievalEngineStatus {
+  engine: string;
+  attempted: boolean;
+  available: boolean;
+  contributed: boolean;
+  candidate_count: number;
+  elapsed_ms: number;
+  reason_code?: RetrievalReasonCode | null;
+  detail?: string | null;
+}
+
+export interface RetrievalCoverage {
+  selected_sources: number;
+  total_chunks: number;
+  fts_indexed_chunks: number;
+  embedded_chunks: number;
+  missing_embeddings: number;
+  semantic_links_total: number;
+  semantic_links_healthy: number;
+  semantic_links_degraded: number;
+  dense_coverage_ratio: number;
+}
+
+export interface RetrievalResult {
+  chunk_id?: string | null;
+  source_id: string;
+  title?: string | null;
+  content: string;
+  score: number;
+  engine: string;
+}
+
+export interface RetrievalOutcome {
+  mode: RetrievalMode;
+  results: RetrievalResult[];
+  engines: RetrievalEngineStatus[];
+  coverage: RetrievalCoverage;
+  degraded: boolean;
+  fallback_chain: RetrievalReasonCode[];
+  user_visible_summary: string;
+  trace_ref: string;
 }
 
 export interface SourceStatusPayload {
@@ -325,6 +413,8 @@ export interface SemanticMemoryLinkStatus {
   stale_links: number;
   failed_links: number;
   missing_document_links: number;
+  degraded_links: number;
+  reason_codes: string[];
   last_sync_error?: string | null;
 }
 

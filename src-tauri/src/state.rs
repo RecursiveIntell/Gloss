@@ -1,10 +1,12 @@
 use crate::db::app_db::AppDb;
 use crate::db::notebook_db::NotebookDb;
 use crate::error::GlossError;
+use crate::features;
 use crate::ingestion::embed::{EmbeddingService, HnswIndex};
+use crate::memory::types::RetrievalOutcome;
 use crate::provider_config_store::SecretStore;
 use crate::providers::ModelRegistry;
-use crate::retrieval::hybrid_search::{self, SearchResult};
+use crate::retrieval::hybrid_search;
 use crate::retrieval::source_scope::ResolvedSourceScope;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -209,6 +211,7 @@ impl AppState {
         {
             app_db.set_setting("semantic_memory_search_timeout_ms", "8000")?;
         }
+        features::ensure_default_feature_settings(&app_db)?;
         let secret_store = SecretStore::new(&data_dir)?;
         Self::migrate_legacy_secrets(&app_db, &secret_store)?;
         Self::reconcile_notebook_source_counts(&app_db)?;
@@ -565,61 +568,34 @@ impl AppState {
         f(&db)
     }
 
-    /// Try to perform hybrid search using HNSW + FTS5. Returns `Ok(None)` if
-    /// the embedder or HNSW index is not available (e.g., no embeddings yet).
-    pub fn try_hybrid_search(
+    /// Build a truthful local retrieval outcome. BM25/FTS5 always remains the
+    /// stable baseline; native dense retrieval contributes only when available.
+    pub fn local_retrieval_outcome(
         &self,
         notebook_id: &str,
         query: &str,
         scope: &ResolvedSourceScope,
         top_k: usize,
-    ) -> Result<Option<Vec<SearchResult>>, GlossError> {
-        if !NATIVE_SEMANTIC_INDEXING_ENABLED {
-            return Ok(None);
-        }
-
-        if scope.is_none() {
-            return Ok(None);
-        }
-
-        // Use try_lock to avoid blocking if locks are held by ingestion
-        let embedder_guard = match self.embedder.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                tracing::warn!("Embedder lock busy during search, falling back to raw context");
-                return Ok(None);
-            }
-        };
-        let embedder = match embedder_guard.as_ref() {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-
-        let indices_guard = match self.hnsw_indices.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                tracing::warn!("HNSW index lock busy during search, falling back to raw context");
-                return Ok(None);
-            }
-        };
-        let index = match indices_guard.get(notebook_id) {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-
+        trace_ref: String,
+    ) -> Result<RetrievalOutcome, GlossError> {
         let db_path = self.notebook_db_path(notebook_id)?;
         let nb_db = NotebookDb::connect(&db_path)?;
-        if !nb_db.can_run_hybrid_search(scope.source_ids())? {
-            tracing::debug!(
-                notebook_id,
-                selected = scope.source_ids().len(),
-                "Hybrid search skipped because the selected scope is not fully indexed"
-            );
-            return Ok(None);
-        }
-
-        let results = hybrid_search::hybrid_search(query, &nb_db, embedder, index, scope, top_k)?;
-        Ok(Some(results))
+        let embedder_guard = self.embedder.try_lock().ok();
+        let embedder = embedder_guard.as_ref().and_then(|guard| guard.as_ref());
+        let indices_guard = self.hnsw_indices.try_lock().ok();
+        let index = indices_guard
+            .as_ref()
+            .and_then(|indices| indices.get(notebook_id));
+        hybrid_search::local_retrieval_outcome(
+            query,
+            &nb_db,
+            embedder,
+            index,
+            NATIVE_SEMANTIC_INDEXING_ENABLED,
+            scope,
+            top_k,
+            trace_ref,
+        )
     }
 }
 

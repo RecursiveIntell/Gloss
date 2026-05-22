@@ -1,9 +1,0 @@
-# Optional managed-style constraints for this repo. Project-local requirements may not be enforced in all Codex modes,
-# but this documents the expected safety envelope for the pass.
-[features]
-hooks = true
-
-allowed_approval_policies = ["on-request", "granular"]
-allowed_approvals_reviewers = ["user", "auto_review"]
-allowed_sandbox_modes = ["workspace-write"]
-allowed_web_search_modes = ["disabled", "cached"]

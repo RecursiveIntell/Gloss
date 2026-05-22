@@ -43,40 +43,46 @@ export function NotebookSidebar() {
   };
 
   return (
-    <div className="w-56 bg-bg-secondary border-r border-border flex flex-col h-full">
-      <div className="p-3 border-b border-border flex items-center justify-between">
-        <h1 className="text-sm font-semibold text-text">Notebooks</h1>
+    <div className="gloss-panel flex h-full w-56 shrink-0 flex-col border-r border-border">
+      <div className="gloss-panel-header flex items-center justify-between p-3">
+        <div>
+          <h1 className="gloss-serif text-[17px] text-text">Notebooks</h1>
+          <p className="gloss-mono text-[10px] uppercase tracking-[0.03em] text-text-muted">
+            Local library
+          </p>
+        </div>
         <button
           onClick={() => setShowCreate(!showCreate)}
-          className="p-1 rounded hover:bg-bg-tertiary text-text-secondary hover:text-text"
+          className="rounded border border-border p-1 text-text-secondary hover:bg-bg-tertiary hover:text-text"
+          title="Create notebook"
         >
           <Plus className="w-4 h-4" />
         </button>
       </div>
 
       {showCreate && (
-        <div className="p-2 border-b border-border">
+        <div className="border-b border-border p-2">
           <input
             type="text"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleCreate()}
             placeholder="Notebook name..."
-            className="w-full px-2 py-1 text-sm bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
+            className="w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-sm text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
             autoFocus
           />
         </div>
       )}
 
-      <div className="flex-1 overflow-y-auto p-1">
+      <div className="flex-1 overflow-y-auto p-1.5">
         {notebooks.map((nb) => (
           <div
             key={nb.id}
             onClick={() => setActive(nb.id)}
-            className={`group flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer text-sm ${
+            className={`group flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm ${
               activeNotebookId === nb.id
-                ? "bg-accent/10 text-accent"
-                : "text-text-secondary hover:bg-bg-tertiary hover:text-text"
+                ? "border border-accent/35 bg-accent/15 text-accent"
+                : "border border-transparent text-text-secondary hover:bg-bg-tertiary hover:text-text"
             }`}
           >
             <BookOpen className="w-4 h-4 shrink-0" />
@@ -94,24 +100,26 @@ export function NotebookSidebar() {
                     cancelRename();
                   }
                 }}
-                className="flex-1 min-w-0 px-1.5 py-0.5 text-xs bg-bg-tertiary border border-border rounded text-text focus:outline-none focus:border-accent"
+                className="min-w-0 flex-1 rounded border border-border bg-bg-tertiary px-1.5 py-0.5 text-xs text-text focus:border-accent focus:outline-none"
                 autoFocus
               />
             ) : (
               <span className="truncate flex-1">{nb.name}</span>
             )}
-            <span className="text-xs text-text-muted">{nb.source_count}</span>
+            <span className="gloss-mono text-[10px] text-text-muted">{nb.source_count}</span>
             {editingNotebookId === nb.id ? (
               <>
                 <button
                   onClick={(e) => { e.stopPropagation(); void handleRename(nb.id); }}
-                  className="p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent"
+                  className="rounded p-0.5 text-text-muted hover:bg-accent/20 hover:text-accent"
+                  title="Save name"
                 >
                   <Save className="w-3 h-3" />
                 </button>
                 <button
                   onClick={(e) => { e.stopPropagation(); cancelRename(); }}
-                  className="p-0.5 rounded hover:bg-bg-tertiary text-text-muted hover:text-text"
+                  className="rounded p-0.5 text-text-muted hover:bg-bg-tertiary hover:text-text"
+                  title="Cancel rename"
                 >
                   <X className="w-3 h-3" />
                 </button>
@@ -120,13 +128,15 @@ export function NotebookSidebar() {
               <>
                 <button
                   onClick={(e) => { e.stopPropagation(); startRename(nb.id, nb.name); }}
-                  className="hidden group-hover:block p-0.5 rounded hover:bg-bg-tertiary text-text-muted hover:text-text"
+                  className="hidden rounded p-0.5 text-text-muted hover:bg-bg-tertiary hover:text-text group-hover:block"
+                  title="Rename notebook"
                 >
                   <Pencil className="w-3 h-3" />
                 </button>
                 <button
                   onClick={(e) => { e.stopPropagation(); deleteNotebook(nb.id); }}
-                  className="hidden group-hover:block p-0.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
+                  className="hidden rounded p-0.5 text-text-muted hover:bg-error/20 hover:text-error group-hover:block"
+                  title="Delete notebook"
                 >
                   <Trash2 className="w-3 h-3" />
                 </button>
@@ -136,7 +146,7 @@ export function NotebookSidebar() {
         ))}
 
         {notebooks.length === 0 && (
-          <p className="text-xs text-text-muted text-center mt-4 px-2">
+          <p className="mt-4 px-2 text-center text-xs text-text-muted">
             No notebooks yet. Click + to create one.
           </p>
         )}
@@ -146,7 +156,7 @@ export function NotebookSidebar() {
       <div className="border-t border-border p-2">
         <button
           onClick={() => setShowSettings(true)}
-          className="flex items-center gap-2 w-full px-2 py-1.5 rounded text-sm text-text-secondary hover:bg-bg-tertiary hover:text-text"
+          className="flex w-full items-center gap-2 rounded border border-transparent px-2 py-1.5 text-sm text-text-secondary hover:border-border hover:bg-bg-tertiary hover:text-text"
         >
           <Settings className="w-4 h-4" />
           <span>Settings</span>

@@ -98,6 +98,125 @@ pub struct MemorySearchResponse {
     pub degraded: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalMode {
+    Bm25Only,
+    DenseOnly,
+    HybridRrf,
+    SemanticMemory,
+    SourceOrderFallback,
+    RawContentFallback,
+    Unavailable,
+}
+
+impl RetrievalMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bm25Only => "bm25_only",
+            Self::DenseOnly => "dense_only",
+            Self::HybridRrf => "hybrid_rrf",
+            Self::SemanticMemory => "semantic_memory",
+            Self::SourceOrderFallback => "source_order_fallback",
+            Self::RawContentFallback => "raw_content_fallback",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalReasonCode {
+    NativeIndexingDisabled,
+    DenseEngineUnavailable,
+    EmbedderUnavailable,
+    IndexMissing,
+    NoEmbeddedChunks,
+    PartialEmbeddingCoverage,
+    ScopeHasMissingEmbeddings,
+    SemanticMemoryFeatureDisabled,
+    SemanticMemoryBuildFeatureMissing,
+    SemanticMemoryLinksMissing,
+    SemanticMemoryLinksDegraded,
+    SemanticMemoryTimeout,
+    Bm25QuerySanitizedEmpty,
+    Bm25NoMatches,
+    SourceOrderFallback,
+    RawContentFallback,
+    NoRetrievalContext,
+}
+
+impl RetrievalReasonCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NativeIndexingDisabled => "native_indexing_disabled",
+            Self::DenseEngineUnavailable => "dense_engine_unavailable",
+            Self::EmbedderUnavailable => "embedder_unavailable",
+            Self::IndexMissing => "index_missing",
+            Self::NoEmbeddedChunks => "no_embedded_chunks",
+            Self::PartialEmbeddingCoverage => "partial_embedding_coverage",
+            Self::ScopeHasMissingEmbeddings => "scope_has_missing_embeddings",
+            Self::SemanticMemoryFeatureDisabled => "semantic_memory_feature_disabled",
+            Self::SemanticMemoryBuildFeatureMissing => "semantic_memory_build_feature_missing",
+            Self::SemanticMemoryLinksMissing => "semantic_memory_links_missing",
+            Self::SemanticMemoryLinksDegraded => "semantic_memory_links_degraded",
+            Self::SemanticMemoryTimeout => "semantic_memory_timeout",
+            Self::Bm25QuerySanitizedEmpty => "bm25_query_sanitized_empty",
+            Self::Bm25NoMatches => "bm25_no_matches",
+            Self::SourceOrderFallback => "source_order_fallback",
+            Self::RawContentFallback => "raw_content_fallback",
+            Self::NoRetrievalContext => "no_retrieval_context",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalEngineStatus {
+    pub engine: String,
+    pub attempted: bool,
+    pub available: bool,
+    pub contributed: bool,
+    pub candidate_count: usize,
+    pub elapsed_ms: u128,
+    pub reason_code: Option<RetrievalReasonCode>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RetrievalCoverage {
+    pub selected_sources: usize,
+    pub total_chunks: usize,
+    pub fts_indexed_chunks: usize,
+    pub embedded_chunks: usize,
+    pub missing_embeddings: usize,
+    pub semantic_links_total: usize,
+    pub semantic_links_healthy: usize,
+    pub semantic_links_degraded: usize,
+    pub dense_coverage_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalResult {
+    pub chunk_id: Option<String>,
+    pub source_id: String,
+    pub title: Option<String>,
+    pub content: String,
+    pub score: f64,
+    pub engine: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalOutcome {
+    pub mode: RetrievalMode,
+    pub results: Vec<RetrievalResult>,
+    pub engines: Vec<RetrievalEngineStatus>,
+    pub coverage: RetrievalCoverage,
+    pub degraded: bool,
+    pub fallback_chain: Vec<RetrievalReasonCode>,
+    pub user_visible_summary: String,
+    pub trace_ref: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticMemoryLinkStatus {
     pub notebook_id: String,
@@ -106,6 +225,10 @@ pub struct SemanticMemoryLinkStatus {
     pub stale_links: usize,
     pub failed_links: usize,
     pub missing_document_links: usize,
+    #[serde(default)]
+    pub degraded_links: usize,
+    #[serde(default)]
+    pub reason_codes: Vec<String>,
     pub last_sync_error: Option<String>,
 }
 

@@ -28,6 +28,7 @@ pub struct SemanticMemoryRuntimeConfig {
     pub embedding_ollama_url: String,
     pub embedding_model: String,
     pub embedding_timeout_secs: u64,
+    pub turbo_quant_enabled: bool,
 }
 
 impl Default for SemanticMemoryRuntimeConfig {
@@ -36,6 +37,7 @@ impl Default for SemanticMemoryRuntimeConfig {
             embedding_ollama_url: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL.to_string(),
             embedding_model: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL.to_string(),
             embedding_timeout_secs: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS,
+            turbo_quant_enabled: false,
         }
     }
 }
@@ -44,6 +46,7 @@ pub fn runtime_config_from_settings(
     embedding_ollama_url: Option<String>,
     embedding_model: Option<String>,
     embedding_timeout_secs: Option<String>,
+    turbo_quant_enabled: bool,
 ) -> SemanticMemoryRuntimeConfig {
     let defaults = SemanticMemoryRuntimeConfig::default();
     SemanticMemoryRuntimeConfig {
@@ -57,6 +60,7 @@ pub fn runtime_config_from_settings(
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(defaults.embedding_timeout_secs),
+        turbo_quant_enabled,
     }
 }
 
@@ -95,9 +99,11 @@ fn open_store(
     }
     #[cfg(feature = "semantic-memory-turbo-quant")]
     {
-        config.search.derived_vector_backend =
-            semantic_memory::DerivedVectorBackendPolicy::TurboQuantCandidateOnly;
-        config.search.turbo_quant_require_exact_rerank = true;
+        if runtime_config.is_some_and(|config| config.turbo_quant_enabled) {
+            config.search.derived_vector_backend =
+                semantic_memory::DerivedVectorBackendPolicy::TurboQuantCandidateOnly;
+            config.search.turbo_quant_require_exact_rerank = true;
+        }
     }
     MemoryStore::open(config).map_err(|e| GlossError::Search(format!("semantic-memory: {e}")))
 }
@@ -105,7 +111,11 @@ fn open_store(
 #[cfg(feature = "semantic-memory-turbo-quant")]
 async fn rebuild_vector_artifacts_receipt(
     store: &MemoryStore,
+    runtime_config: Option<&SemanticMemoryRuntimeConfig>,
 ) -> Result<Option<serde_json::Value>, GlossError> {
+    if !runtime_config.is_some_and(|config| config.turbo_quant_enabled) {
+        return Ok(None);
+    }
     let receipt = store.rebuild_vector_artifacts().await.map_err(|e| {
         GlossError::Search(format!("semantic-memory TurboQuant rebuild failed: {e}"))
     })?;
@@ -117,6 +127,7 @@ async fn rebuild_vector_artifacts_receipt(
 #[cfg(not(feature = "semantic-memory-turbo-quant"))]
 async fn rebuild_vector_artifacts_receipt(
     _store: &MemoryStore,
+    _runtime_config: Option<&SemanticMemoryRuntimeConfig>,
 ) -> Result<Option<serde_json::Value>, GlossError> {
     Ok(None)
 }
@@ -371,7 +382,8 @@ pub async fn reindex_source(
             &mappings,
         )?;
     }
-    let vector_artifact_receipt = rebuild_vector_artifacts_receipt(&store).await?;
+    let vector_artifact_receipt =
+        rebuild_vector_artifacts_receipt(&store, runtime_config.as_ref()).await?;
 
     Ok(IndexSourceReceipt {
         backend_id: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
@@ -544,6 +556,9 @@ pub async fn search_preview(
             "receipt_id": receipt_id,
             "backend": MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
             "semantic_memory_receipt": response.receipt,
+            "turbo_quant_enabled": runtime_config
+                .as_ref()
+                .is_some_and(|config| config.turbo_quant_enabled),
             "source_scope_violations": source_scope_violations,
             "unmapped_semantic_candidates": unmapped_semantic_candidates,
             "fallback_used": false,
@@ -557,4 +572,41 @@ pub async fn search_preview(
         fallback_used: false,
         degraded,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_config_defaults_turbo_quant_off() {
+        let config = runtime_config_from_settings(None, None, None, false);
+        assert_eq!(
+            config.embedding_ollama_url,
+            DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL
+        );
+        assert_eq!(
+            config.embedding_model,
+            DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL
+        );
+        assert_eq!(
+            config.embedding_timeout_secs,
+            DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS
+        );
+        assert!(!config.turbo_quant_enabled);
+    }
+
+    #[test]
+    fn runtime_config_carries_explicit_turbo_quant_consent() {
+        let config = runtime_config_from_settings(
+            Some("http://localhost:11435".to_string()),
+            Some("embed-model".to_string()),
+            Some("12".to_string()),
+            true,
+        );
+        assert_eq!(config.embedding_ollama_url, "http://localhost:11435");
+        assert_eq!(config.embedding_model, "embed-model");
+        assert_eq!(config.embedding_timeout_secs, 12);
+        assert!(config.turbo_quant_enabled);
+    }
 }

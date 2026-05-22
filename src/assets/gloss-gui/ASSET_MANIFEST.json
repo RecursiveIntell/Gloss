@@ -1,0 +1,22 @@
+{
+  "assets": [
+    {
+      "source": "docs/design/GLOSS_GUI_REFERENCE_20260519/screenshots/canvas-overview.png",
+      "dest": "src/assets/gloss-gui/canvas-overview.jpg",
+      "magic": "jpg",
+      "sha256": "da8ca51ece0a7417c9238846ef11f18d8615e5fe6d54b4fe8251c2787beaa905"
+    },
+    {
+      "source": "docs/design/GLOSS_GUI_REFERENCE_20260519/uploads/pasted-1779172952776-0.png",
+      "dest": "src/assets/gloss-gui/pasted-1779172952776-0.png",
+      "magic": "png",
+      "sha256": "e86a7e3916c80c08c65c75faf7ed21296a6b8e7f624c316951b72fa800c4ae32"
+    },
+    {
+      "source": "docs/design/GLOSS_GUI_REFERENCE_20260519/uploads/profile pic",
+      "dest": "src/assets/gloss-gui/profile pic.jpg",
+      "magic": "jpg",
+      "sha256": "d9cde4c6f375fc09d6d263b698379eb7bd7fbdd236b4e8665ca531e7f8fcb1a3"
+    }
+  ]
+}

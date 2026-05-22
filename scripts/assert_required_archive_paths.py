@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""Assert required SCR handoff paths in an archive match active workflow claims."""
+"""Assert required Gloss handoff paths in an archive match active workflow claims."""
 import sys
 import zipfile
 from pathlib import Path
 
 BASE_REQUIRED = {
     "AGENTS.md",
-    "Cargo.toml",
     "README.md",
-    "crates/scr-kernel/src/lib.rs",
-    "crates/scr-reference/src/lib.rs",
-    "crates/scr-reference/src/policy.rs",
-    "crates/scr-cli/src/main.rs",
-    "schemas/generated/control-evaluation-input-v1.schema.json",
-    "schemas/generated/control-decision-receipt-v1.schema.json",
-    "policies/audit_policy_v1.toml",
-    "scripts/run_p31_completion_checks.sh",
+    "package.json",
+    "src/App.tsx",
+    "src/lib/tauri.ts",
+    "src/components/settings/SettingsDialog.tsx",
+    "src-tauri/Cargo.toml",
+    "src-tauri/src/lib.rs",
+    "src-tauri/src/features.rs",
+    "scripts/check_feature_flags_static.py",
+    "scripts/check_gloss_active_validation_scope.py",
+    "scripts/check_release_eligibility_current.py",
+    "scripts/gloss_button_up_gate.py",
     "scripts/verify_archive_manifest_parity.py",
-    "docs/SOURCE_BASIS.md",
-    "docs/EXTERNAL_CRATE_BOUNDARY_MAP.md",
+    "docs/codex-runs/CURRENT_RUN.md",
+    "docs/codex-runs/GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519/FINAL_RECEIPT.json",
 }
 
 FORBIDDEN_PREFIXES = (
@@ -50,13 +52,13 @@ def main() -> int:
         if p in FORBIDDEN_PATHS
         or p.startswith(FORBIDDEN_PREFIXES)
         or p.startswith("docs/root-markdown-archive/")
-        or p.startswith("scr-runtime-generic-rust-next-codex-context-")
+        or p.startswith("generic-rust-next-codex-context-")
         or p.endswith(FORBIDDEN_SUFFIXES)
     )
     # If .codex is present, require the active automation basics. If absent, do not fail here.
     has_codex = any(p.startswith(".codex/") for p in names)
     if has_codex:
-        for p in [".codex/tools/auto_phase_runner.py", ".codex/prompt_manifest.json"]:
+        for p in [".codex/prompt_manifest.json"]:
             if p not in names:
                 missing.append(p)
     if missing or forbidden:

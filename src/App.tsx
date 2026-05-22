@@ -10,12 +10,19 @@ import { useToastStore } from "./stores/toastStore";
 import { onChatToken, onChatStatus, onChatError, onChatEvidence, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
 import { useSourceStore } from "./stores/sourceStore";
 import { setActiveNotebook } from "./lib/tauri";
+import { BookOpen, Database, Search, Sparkles } from "lucide-react";
 
 const EAGER_BATCH_SOURCE_LOAD_LIMIT = 200;
 
 export function App() {
-  const { activeNotebookId, loadNotebooks } = useNotebookStore();
-  const { loadSettings, loadProviders, loadModels } = useSettingsStore();
+  const { notebooks, activeNotebookId, loadNotebooks } = useNotebookStore();
+  const { activeModel, models, settings, loadSettings, loadProviders, loadModels } = useSettingsStore();
+  const stats = useSourceStore((s) => s.stats);
+  const activeNotebook = notebooks.find((notebook) => notebook.id === activeNotebookId) ?? null;
+  const activeProvider =
+    settings["default_provider"] ||
+    models.find((model) => model.id === activeModel)?.provider_id ||
+    null;
 
   // --- Batching/debouncing refs ---
   const pendingStatusRef = useRef<Map<string, { status: string; errorMessage?: string }>>(new Map());
@@ -263,7 +270,14 @@ export function App() {
   }, []);
 
   return (
-    <div className="flex flex-col h-screen bg-bg">
+    <div className="gloss-root flex h-screen flex-col bg-bg">
+      <GlossTopBar
+        activeNotebookName={activeNotebook?.name ?? null}
+        activeModel={activeModel}
+        activeProvider={activeProvider}
+        sourceCount={stats?.source_count ?? activeNotebook?.source_count ?? 0}
+        chunkCount={stats?.chunk_count ?? 0}
+      />
       <div className="flex flex-1 overflow-hidden">
         <NotebookSidebar />
         {activeNotebookId ? (
@@ -281,6 +295,60 @@ export function App() {
       </div>
       <StatusBar />
       <ToastContainer />
+    </div>
+  );
+}
+
+function GlossTopBar({
+  activeNotebookName,
+  activeModel,
+  activeProvider,
+  sourceCount,
+  chunkCount,
+}: {
+  activeNotebookName: string | null;
+  activeModel: string;
+  activeProvider: string | null;
+  sourceCount: number;
+  chunkCount: number;
+}) {
+  return (
+    <div className="gloss-topbar flex shrink-0 items-center gap-3 px-3 text-xs text-text-muted">
+      <div className="flex items-center gap-2">
+        <span className="gloss-mark">
+          <Sparkles className="h-3.5 w-3.5" />
+        </span>
+        <span className="gloss-serif text-[18px] text-text">Gloss</span>
+      </div>
+
+      <div className="gloss-pill max-w-[260px]">
+        <BookOpen className="h-3.5 w-3.5 text-accent" />
+        <span className="truncate text-text-secondary">
+          {activeNotebookName ?? "No notebook selected"}
+        </span>
+        <span className="text-text-muted">{sourceCount} sources</span>
+      </div>
+
+      <div className="hidden h-7 max-w-[520px] flex-1 items-center gap-2 rounded border border-border bg-bg-secondary px-3 text-text-muted md:flex">
+        <Search className="h-3.5 w-3.5" />
+        <span className="truncate">Search across notebook</span>
+        <span className="gloss-mono ml-auto rounded border border-border px-1.5 py-0.5 text-[10px] text-text-muted">
+          Cmd K
+        </span>
+      </div>
+
+      <span className="flex-1" />
+
+      <div className="gloss-pill gloss-pill-accent max-w-[320px]">
+        <span className="gloss-status-dot ok" />
+        <span className="truncate text-text-secondary">{activeModel}</span>
+        {activeProvider && <span className="text-text-muted">{activeProvider}</span>}
+      </div>
+
+      <div className="gloss-pill hidden lg:inline-flex">
+        <Database className="h-3.5 w-3.5" />
+        <span>{chunkCount.toLocaleString()} chunks</span>
+      </div>
     </div>
   );
 }

@@ -3,28 +3,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+RUN_ID = "GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519"
 REQUIRED = [
-    ".codex/config.toml",
-    ".codex/hooks.json",
-    ".codex/prompt_manifest.json",
-    ".codex/prompts/MASTER_AUTOMATED_COMPLETION.md",
-    ".codex/tools/auto_phase_runner.py",
-    ".codex/tools/phase_prompt_builder.py",
-    ".codex/rules/safety.rules",
-    ".agents/skills/phase-gate/SKILL.md",
-    ".agents/skills/run-certifier/SKILL.md",
-    ".agents/skills/hostile-audit/SKILL.md",
-    ".agents/skills/source-of-truth-map/SKILL.md",
-    ".agents/skills/codex-control-pack/SKILL.md",
-    ".codex/skills/codex-control-pack/SKILL.md",
-    ".codex/skills/phase-gate/SKILL.md",
-    ".codex/skills/hostile-audit/SKILL.md",
-    ".codex/skills/run-certifier/SKILL.md",
-    ".codex/skills/source-of-truth-map/SKILL.md",
+    "AGENTS.md",
+    f"codex/prompts/{RUN_ID}/MASTER_PROMPT.md",
+    f"codex/prompts/{RUN_ID}/PHASE_12_FINAL_AUDIT_RELEASE_DECISION.md",
+    f"codex/schemas/{RUN_ID}/final_receipt.schema.json",
+    f"docs/codex-runs/{RUN_ID}/PHASE_ORDER.md",
+    f"docs/codex-runs/{RUN_ID}/ACCEPTANCE_GATES.md",
 ]
+EXPECTED_PHASE_IDS = [f"PHASE_{idx:02d}" for idx in range(13)]
+PHASE_PROMPT_RE = re.compile(r"^PHASE_(\d{2})_.*\.md$")
 
 
 def main() -> int:
@@ -35,20 +28,23 @@ def main() -> int:
     errors: list[str] = []
     errors.extend(f"missing required file: {p}" for p in missing)
 
-    manifest_path = ROOT / ".codex/prompt_manifest.json"
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("manual_injections_required") is not False:
-            errors.append("manual_injections_required must be false")
-        if manifest.get("auto_injections_required") is not True:
-            errors.append("auto_injections_required must be true")
-        for phase in manifest.get("phases", []):
-            for key in ("prompt", "auto_injection"):
-                rel = phase.get(key)
-                if not rel or not (ROOT / rel).exists():
-                    errors.append(f"phase {phase.get('id')} missing {key}: {rel}")
-    else:
-        errors.append("cannot inspect manifest because it is missing")
+    prompt_dir = ROOT / "codex" / "prompts" / RUN_ID
+    phase_prompt_ids = sorted(
+        f"PHASE_{match.group(1)}"
+        for path in prompt_dir.glob("PHASE_*.md")
+        if (match := PHASE_PROMPT_RE.match(path.name))
+    )
+    if phase_prompt_ids != EXPECTED_PHASE_IDS:
+        errors.append(
+            f"unexpected P33 phase prompt ordering or membership: {phase_prompt_ids}"
+        )
+
+    phase_order_path = ROOT / "docs" / "codex-runs" / RUN_ID / "PHASE_ORDER.md"
+    if phase_order_path.exists():
+        phase_order = phase_order_path.read_text(encoding="utf-8", errors="replace")
+        for phase_id in EXPECTED_PHASE_IDS:
+            if phase_id not in phase_order:
+                errors.append(f"PHASE_ORDER.md missing {phase_id}")
 
     if errors:
         if not args.quiet:
@@ -57,7 +53,7 @@ def main() -> int:
                 print(f"- {error}")
         return 1
     if not args.quiet:
-        print("OK: active Codex pack present and automated phase manifest is valid")
+        print("OK: active P33 Codex pack present and phase prompts are valid")
     return 0
 
 

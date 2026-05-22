@@ -150,14 +150,14 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         : "explicit";
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex h-full flex-col">
       {/* Header */}
-      <div className="p-2 border-b border-border flex items-center justify-between">
+      <div className="gloss-panel-header flex items-center justify-between gap-3 px-4 py-2">
         <div className="flex items-center gap-2">
           <button
             onClick={() => createConversation(notebookId)}
             disabled={isStreaming}
-            className="flex items-center gap-1 px-2 py-1 text-xs bg-bg-tertiary rounded hover:bg-border text-text-secondary hover:text-text disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-1 rounded border border-accent/35 bg-accent/15 px-2 py-1 text-xs text-accent hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Plus className="w-3 h-3" /> New Chat
           </button>
@@ -172,7 +172,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                   loadMessages(notebookId, id);
                 }
               }}
-              className="text-xs bg-bg-tertiary border border-border rounded px-2 py-1 text-text focus:outline-none focus:border-accent disabled:opacity-50 disabled:cursor-not-allowed"
+              className="rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             >
               <option value="">Select conversation</option>
               {conversations.map((c) => (
@@ -186,7 +186,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             <button
               onClick={handleDeleteConversation}
               disabled={isStreaming}
-              className="flex items-center gap-1 px-2 py-1 text-xs bg-bg-tertiary rounded hover:bg-error/15 text-text-secondary hover:text-error disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex items-center gap-1 rounded border border-border bg-bg-secondary px-2 py-1 text-xs text-text-secondary hover:bg-error/15 hover:text-error disabled:cursor-not-allowed disabled:opacity-50"
               title="Delete conversation"
             >
               <Trash2 className="w-3 h-3" /> Delete
@@ -204,7 +204,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             }
             setActiveModel(nextModel);
           }}
-          className="text-xs bg-bg-tertiary border border-border rounded px-2 py-1 text-text focus:outline-none focus:border-accent"
+          className="min-w-0 max-w-[320px] rounded-full border border-border bg-bg-tertiary px-3 py-1 text-xs text-text focus:border-accent focus:outline-none"
         >
           {models.length > 0 ? (
             models.map((m) => (
@@ -223,11 +223,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         </select>
       </div>
 
-      <div className="border-b border-border bg-bg-secondary px-3 py-2">
+      <div className="border-b border-border bg-bg-secondary/80 px-4 py-2">
         <div className="flex flex-wrap items-center gap-2 text-xs">
-          <span className="font-medium text-text">Scope</span>
+          <span className="gloss-mono text-[10px] uppercase tracking-[0.04em] text-text-muted">Scope</span>
           <span className={`rounded px-1.5 py-0.5 ${
-            scopeMode === "none" ? "bg-warning/15 text-warning" : "bg-bg-tertiary text-text-secondary"
+            scopeMode === "none" ? "bg-warning/15 text-warning" : "gloss-pill-accent text-text-secondary"
           }`}>
             {scopeMode}
           </span>
@@ -258,11 +258,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <div className="gloss-chat-scroll flex-1 space-y-4 overflow-y-auto px-5 py-4">
         {messages.length === 0 && !isStreaming && (
-          <div className="text-center mt-8">
-            <MessageSquare className="w-10 h-10 text-text-muted mx-auto mb-3" />
-            <p className="text-sm text-text-secondary mb-4">
+          <div className="mx-auto mt-12 max-w-[680px] text-center">
+            <MessageSquare className="mx-auto mb-3 h-10 w-10 text-text-muted" />
+            <p className="gloss-serif mb-4 text-xl text-text">
               Ask a question about your sources
             </p>
             {suggestedQuestions.length > 0 && (
@@ -271,7 +271,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                   <button
                     key={i}
                     onClick={() => handleSuggestionClick(q)}
-                    className="px-3 py-1.5 text-xs bg-bg-tertiary rounded-full hover:bg-border text-text-secondary hover:text-text"
+                    className="rounded-full border border-border bg-bg-secondary px-3 py-1.5 text-xs text-text-secondary hover:bg-bg-tertiary hover:text-text"
                   >
                     {q}
                   </button>
@@ -290,24 +290,29 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           return (
             <div
               key={msg.id}
-              className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+              className={`mx-auto flex max-w-[900px] ${msg.role === "user" ? "justify-end" : "justify-start"}`}
             >
               <div
-                className={`max-w-[80%] rounded-lg px-3 py-2 text-sm ${
+                className={`max-w-[82%] px-3 py-2 text-sm ${
                   msg.role === "user"
-                    ? "bg-accent text-white"
-                    : "bg-bg-tertiary text-text"
+                    ? "gloss-user-bubble text-white"
+                    : "gloss-assistant-bubble text-text"
                 }`}
               >
                 {msg.role === "assistant" ? (
                   <>
+                    <div className="mb-2 flex items-center gap-2 text-[11px] text-text-muted">
+                      <span className="gloss-serif text-sm text-text-secondary">Gloss</span>
+                      <span>·</span>
+                      <span className="gloss-mono">{activeModel}</span>
+                    </div>
                     <div className="prose prose-invert prose-sm max-w-none">
                       <ReactMarkdown>{msg.content}</ReactMarkdown>
                     </div>
-                    <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px]">
+                    <div className="gloss-mono mt-2 flex flex-wrap items-center gap-1.5 text-[10px] uppercase tracking-[0.03em]">
                       <button
                         onClick={() => void handleCopy(msg.content)}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 bg-bg-secondary text-text-muted hover:text-text hover:bg-border"
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text"
                         title="Copy markdown"
                       >
                         <Copy className="w-2.5 h-2.5" />
@@ -316,7 +321,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                       <button
                         onClick={() => void handleRegenerate(messageIndex)}
                         disabled={isStreaming}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 bg-bg-secondary text-text-muted hover:text-text hover:bg-border disabled:opacity-60"
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text disabled:opacity-60"
                         title="Regenerate"
                       >
                         <RotateCcw className="w-2.5 h-2.5" />
@@ -325,14 +330,14 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                       <button
                         onClick={() => handleSaveResponse(msg.id)}
                         disabled={savingMessageId === msg.id}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 bg-bg-secondary text-text-muted hover:text-text hover:bg-border disabled:opacity-60"
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text disabled:opacity-60"
                       >
                         <BookmarkPlus className="w-2.5 h-2.5" />
                         {savingMessageId === msg.id ? "Saving..." : "Save to notes"}
                       </button>
                       <button
                         onClick={() => toggleEvidence(msg.id)}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 bg-bg-secondary text-text-muted hover:text-text hover:bg-border"
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text"
                         title="Evidence"
                         aria-expanded={evidenceOpen}
                         aria-controls={`evidence-${msg.id}`}
@@ -349,13 +354,13 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                       <EvidenceDrawer id={`evidence-${msg.id}`} evidence={evidence} />
                     )}
                     {parsedCitations.length > 0 && (
-                      <div className="mt-2 pt-2 border-t border-border/40 flex flex-wrap gap-1.5">
+                      <div className="mt-2 flex flex-wrap gap-1.5 border-t border-border/40 pt-2">
                         {parsedCitations.map((c, i) => (
                           <button
                             key={i}
                             title={c.quote || c.source_title}
                             onClick={() => setActiveCitation(c)}
-                            className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] bg-accent/15 text-accent rounded hover:bg-accent/25 transition-colors"
+                            className="inline-flex items-center gap-1 rounded border border-accent/25 bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent transition-colors hover:bg-accent/25"
                           >
                             <BookMarked className="w-2.5 h-2.5" />
                             [{i + 1}] {c.source_title}
@@ -371,7 +376,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                       <button
                         onClick={() => handleEditUserMessage(msg)}
                         disabled={isStreaming}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] bg-white/10 text-white/80 hover:bg-white/15 disabled:opacity-60"
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-white/80 hover:bg-white/10 disabled:opacity-60"
                         title="Edit and rerun"
                       >
                         <FileEdit className="w-2.5 h-2.5" />
@@ -386,8 +391,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         })}
 
         {isStreaming && streamingContent && (
-          <div className="flex justify-start">
-            <div className="max-w-[80%] rounded-lg px-3 py-2 text-sm bg-bg-tertiary text-text">
+          <div className="mx-auto flex max-w-[900px] justify-start">
+            <div className="gloss-assistant-bubble max-w-[82%] px-3 py-2 text-sm text-text">
               <div className="prose prose-invert prose-sm max-w-none">
                 <ReactMarkdown>{streamingContent}</ReactMarkdown>
               </div>
@@ -396,8 +401,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         )}
 
         {isStreaming && !streamingContent && (
-          <div className="flex justify-start">
-            <div className="rounded-lg px-3 py-2 bg-bg-tertiary text-sm text-text-secondary flex items-center gap-2">
+          <div className="mx-auto flex max-w-[900px] justify-start">
+            <div className="gloss-assistant-bubble flex items-center gap-2 px-3 py-2 text-sm text-text-secondary">
               <Loader2 className="w-4 h-4 text-text-muted animate-spin" />
               <span>{streamingStatusLabel}</span>
             </div>
@@ -405,16 +410,16 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         )}
 
         {isStreaming && streamingContent && streamingStatus && streamingStatus.phase !== "streaming" && (
-          <div className="flex justify-start">
-            <div className="rounded px-2 py-1 bg-bg-secondary text-xs text-text-muted">
+          <div className="mx-auto flex max-w-[900px] justify-start">
+            <div className="rounded border border-border bg-bg-secondary px-2 py-1 text-xs text-text-muted">
               {streamingStatusLabel}
             </div>
           </div>
         )}
 
         {streamingError && (
-          <div className="flex justify-start">
-            <div className="max-w-[80%] rounded-lg px-3 py-2 text-sm bg-error/10 border border-error/30 text-error flex items-start gap-2">
+          <div className="mx-auto flex max-w-[900px] justify-start">
+            <div className="flex max-w-[82%] items-start gap-2 rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
               <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
               <span>{streamingError}</span>
             </div>
@@ -425,8 +430,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       </div>
 
       {/* Input */}
-      <div className="p-3 border-t border-border">
-        <div className="flex items-center gap-2">
+      <div className="gloss-input-dock px-5 py-3">
+        <div className="gloss-input-shell mx-auto flex max-w-[900px] items-center gap-2 p-2">
           <input
             type="text"
             value={input}
@@ -434,19 +439,19 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}
             placeholder="Ask about your sources..."
             disabled={isStreaming}
-            className="flex-1 px-3 py-2 text-sm bg-bg-tertiary border border-border rounded-lg text-text placeholder:text-text-muted focus:outline-none focus:border-accent disabled:opacity-50"
+            className="flex-1 rounded bg-transparent px-2 py-1.5 text-sm text-text placeholder:text-text-muted focus:outline-none disabled:opacity-50"
           />
           <button
             onClick={isStreaming ? handleStop : handleSend}
             disabled={!isStreaming && !input.trim()}
-            className="p-2 rounded-lg bg-accent text-white hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
+            className="rounded-lg bg-accent p-2 text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
             title={isStreaming ? "Stop generation" : editingUserMessageId ? "Rerun edited message" : "Send"}
           >
             {isStreaming ? <StopCircle className="w-4 h-4" /> : <Send className="w-4 h-4" />}
           </button>
         </div>
         {editingUserMessageId && (
-          <div className="mt-1 text-[10px] text-text-muted">
+          <div className="mx-auto mt-1 max-w-[900px] text-[10px] text-text-muted">
             Editing a previous question; sending will rerun it as a new turn.
           </div>
         )}
@@ -514,6 +519,7 @@ function nullEvidence(citationCount = 0): ChatEvidenceDisclosure {
     exact_rerank_count: null,
     approximate_candidate_count: null,
     semantic_memory_fallback_reason: null,
+    retrieval_outcome: null,
   };
 }
 
@@ -552,7 +558,45 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
         {evidence.turbo_quant_generation_id && (
           <EvidenceRow label="TurboQuant generation" value={evidence.turbo_quant_generation_id} />
         )}
+        {evidence.retrieval_outcome && (
+          <>
+            <EvidenceRow label="Retrieval mode" value={evidence.retrieval_outcome.mode} />
+            <EvidenceRow
+              label="Dense coverage"
+              value={`${Math.round(evidence.retrieval_outcome.coverage.dense_coverage_ratio * 100)}% (${evidence.retrieval_outcome.coverage.embedded_chunks}/${evidence.retrieval_outcome.coverage.total_chunks})`}
+            />
+            <EvidenceRow
+              label="Engines"
+              value={evidence.retrieval_outcome.engines
+                .map((engine) =>
+                  `${engine.engine}:${engine.contributed ? "contributed" : engine.reason_code || "no candidates"}`
+                )
+                .join(", ")}
+            />
+          </>
+        )}
       </div>
+      {evidence.retrieval_outcome && (
+        <div className="mt-2 rounded border border-border/60 bg-bg-tertiary/50 p-2">
+          <p className="text-text-secondary">{evidence.retrieval_outcome.user_visible_summary}</p>
+          {evidence.retrieval_outcome.fallback_chain.length > 0 && (
+            <p className="mt-1 text-warning">
+              Retrieval reasons: {evidence.retrieval_outcome.fallback_chain.join(", ")}
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              void navigator.clipboard?.writeText(
+                JSON.stringify(evidence.retrieval_outcome, null, 2),
+              );
+            }}
+            className="mt-2 rounded border border-border px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-tertiary hover:text-text"
+          >
+            Copy retrieval diagnostics JSON
+          </button>
+        </div>
+      )}
       {evidence.semantic_memory_fallback_reason && (
         <p className="mt-2 text-warning">semantic-memory fallback: {evidence.semantic_memory_fallback_reason}</p>
       )}

@@ -55,12 +55,12 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
   };
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="p-3 border-b border-border flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-text">Notes</h2>
+    <div className="flex h-full flex-col">
+      <div className="flex items-center justify-end border-b border-border p-2">
         <button
           onClick={() => setShowCreate(!showCreate)}
-          className="p-1 rounded hover:bg-bg-tertiary text-text-secondary hover:text-text"
+          className="rounded border border-border p-1 text-text-secondary hover:bg-bg-tertiary hover:text-text"
+          title="Create note"
         >
           <Plus className="w-4 h-4" />
         </button>

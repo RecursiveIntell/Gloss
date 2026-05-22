@@ -1,56 +1,58 @@
-# AGENTS.md — Gloss Chat Runtime Fix
+# AGENTS.md — Gloss Release Candidate Governance
 
-## Scope
+## Project purpose
 
-This repo is Gloss. Current task scope is **chat runtime reliability**. The current user-facing defect is that sending a prompt to chat does not visibly produce a response for local Ollama models.
+Gloss is a local-first Tauri + React notebook/RAG desktop application. Release work must preserve local-first behavior, truthful retrieval status, source citations, and explicit degradation/receipt evidence.
 
-## Do not broaden scope
+## Current run
 
-Do not perform broad redesign, product README rewrite, semantic-memory promotion, TurboQuant promotion, UI restyling, packaging overhaul, or general cleanup unless directly required to make chat respond or make the failure observable.
+Active release-candidate run: `GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519`.
 
-## Source-of-truth hierarchy
+Codex must use `docs/codex-runs/CURRENT_RUN.md` and `docs/codex-runs/GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519/FINAL_RECEIPT.json` as run truth. Historical run folders are evidence only.
 
-1. Current files in the repository.
-2. Latest package/run evidence under `docs/codex-runs/`.
-3. This pass bundle.
-4. Prior docs/specs.
-5. Memory or prior prose.
+## Canonical owners
+
+- Feature definitions: `src-tauri/src/features.rs`.
+- Settings commands/persistence: `src-tauri/src/commands/settings.rs`, `src-tauri/src/db/app_db.rs`.
+- semantic-memory adapter: `src-tauri/src/memory/semantic_memory_adapter.rs`.
+- TurboQuant policy: semantic-memory runtime config only when user setting is active.
+- Retrieval outcome: `src-tauri/src/retrieval/hybrid_search.rs::local_retrieval_outcome`.
+- Source scope: `src-tauri/src/retrieval/source_scope.rs` and SQL-scoped DB queries.
+- Chat evidence: `ChatAttemptTraceV1` and retrieval outcome receipts.
+- GUI production wiring: existing React/Zustand/Tauri files under `src/`; GUI reference under `docs/design/GLOSS_GUI_REFERENCE_20260519` is reference only.
 
 ## Hard rules
 
-- Every chat attempt must produce visible streamed tokens, visible error, visible timeout, or durable trace.
-- No silent no-response path is allowed.
-- Provider config must have one source of truth.
-- Frontend chat events must be routed by stream identity, not only by current active notebook.
-- Semantic-memory failures must not block provider streaming when fallback is enabled.
-- TurboQuant must remain candidate-only and exact-reranked.
-- Release readiness requires live desktop smoke.
-- Done without receipts is forbidden.
+- Gloss local remains default.
+- Experimental features, semantic-memory preview, and TurboQuant default off.
+- Build feature availability is not runtime consent.
+- TurboQuant is candidate-only and exact rerank remains required.
+- Do not claim dense hybrid unless dense+BM25 actually ran.
+- Do not silently widen source scope.
+- Do not use provider-only smoke as full RAG proof.
+- Do not paste standalone prototype HTML/Babel/global React into production.
+- Do not claim release readiness without final receipt and all gates.
 
-## Required evidence
+## Validation commands
 
-For each phase, write a phase report under:
+Run relevant commands before final handoff:
 
-```text
-docs/codex-runs/CHAT_RUNTIME_FIX_20260518/
+```bash
+python3 scripts/p33_release_preflight.py --repo . --run-id GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519
+python3 scripts/p33_current_run_gate.py --repo . --run-id GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519
+python3 scripts/p33_sm_tq_settings_gate.py --repo .
+python3 scripts/p33_gui_asset_gate.py --repo .
+npm ci
+npm run build
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-backend
+cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant
+python3 scripts/p33_desktop_smoke_gate.py --repo . --receipt docs/codex-runs/GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519/desktop_smoke/final_desktop_smoke.json
+bash scripts/p33_package_replay_gate.sh .
+python3 scripts/p33_release_final_gate.py --repo . --run-id GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519
 ```
 
-Include:
+## Final response requirement
 
-- files inspected;
-- files changed;
-- commands run;
-- tests passed/failed/skipped;
-- unresolved risks;
-- exact blockers.
-
-## Manual stop conditions
-
-Stop and report if:
-
-- provider URL source-of-truth cannot be resolved safely;
-- chat stream events cannot be associated to message/conversation identity;
-- provider-only smoke cannot be implemented;
-- desktop smoke cannot run and no substitute proof exists;
-- any fix would disable TurboQuant or weaken exact rerank;
-- any change would hide semantic-memory failure instead of disclosing fallback.
+The final response must include changed files, commands run, pass/fail/skipped checks with reasons, release decision, blockers, rollback path, and exact next pass if needed.

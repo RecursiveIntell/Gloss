@@ -58,6 +58,15 @@ Archive.tar.gz
 
 # Local assistant/workbench state
 .claude/
+.codex/
+.codex-run-receipts/
+codex/
+p33boot/
+reference/
+drop_into_repo/
+AGENTS.md.bak.*
+install_into_repo.sh
+docs/design/
 
 # Generated source packages and bundle sidecars
 /*.zip

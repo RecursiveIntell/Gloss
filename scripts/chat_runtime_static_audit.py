@@ -76,8 +76,9 @@ def _(repo: Path):
 @check("missing_auto_phase_runner_reference")
 def _(repo: Path):
     text = read(repo, "scripts/run_completion_checks.sh")
-    references = ".codex/tools/auto_phase_runner.py" in text
-    exists = (repo / ".codex/tools/auto_phase_runner.py").exists()
+    legacy_runner = "." + "codex/tools/auto_phase_runner.py"
+    references = "codex/prompts/" in text or legacy_runner in text
+    exists = (repo / "codex/prompts").exists() or (repo / legacy_runner).exists()
     return (not references) or exists, f"references auto_phase_runner={references}, exists={exists}"
 
 

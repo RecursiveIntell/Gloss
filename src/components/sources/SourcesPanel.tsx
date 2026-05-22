@@ -267,31 +267,30 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
       onDragLeave={() => setDragActive(false)}
       onDrop={handleDrop}
     >
-      <div className="p-3 border-b border-border">
-        <h2 className="text-sm font-semibold text-text mb-2">Sources</h2>
+      <div className="border-b border-border p-2">
         <div className="flex gap-1">
           <button
             onClick={handleFileUpload}
-            className="flex items-center gap-1 px-2 py-1 text-xs bg-bg-tertiary rounded hover:bg-border text-text-secondary hover:text-text"
+            className="flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
           >
             <Upload className="w-3 h-3" /> Upload
           </button>
           <button
             onClick={handleFolderUpload}
-            className="flex items-center gap-1 px-2 py-1 text-xs bg-bg-tertiary rounded hover:bg-border text-text-secondary hover:text-text"
+            className="flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
           >
             <FolderOpen className="w-3 h-3" /> Folder
           </button>
           <button
             onClick={() => setShowPaste(!showPaste)}
-            className="flex items-center gap-1 px-2 py-1 text-xs bg-bg-tertiary rounded hover:bg-border text-text-secondary hover:text-text"
+            className="flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
           >
             <ClipboardPaste className="w-3 h-3" /> Paste
           </button>
         </div>
 
         {sources.length > 0 && (
-          <div className="flex flex-wrap gap-2 mt-2 text-xs text-text-muted">
+          <div className="mt-2 flex flex-wrap gap-2 text-xs text-text-muted">
             <button onClick={selectAll} className="hover:text-text">
               Select all
             </button>
@@ -309,7 +308,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             <button onClick={handleSummarize} className="hover:text-accent" disabled={summarizing}>
               {summarizing ? "Queuing..." : "Summarize missing"}
             </button>
-            <span className="ml-auto">{sources.length} sources</span>
+            <span className="gloss-mono ml-auto text-[10px]">{sources.length} sources</span>
           </div>
         )}
         <div className="mt-2 space-y-1.5">

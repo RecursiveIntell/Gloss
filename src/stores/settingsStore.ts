@@ -1,19 +1,22 @@
 import { create } from 'zustand';
-import type { Provider, ModelRecord } from '../lib/types';
+import type { Provider, ModelRecord, FeatureFlagStatus } from '../lib/types';
 import * as api from '../lib/tauri';
 
 interface SettingsStore {
   providers: Provider[];
   models: ModelRecord[];
   settings: Record<string, string>;
+  featureFlags: FeatureFlagStatus[];
   activeModel: string;
   loading: boolean;
   externalTools: Record<string, boolean>;
   loadSettings: () => Promise<void>;
+  loadFeatureFlags: () => Promise<void>;
   loadProviders: () => Promise<void>;
   loadModels: () => Promise<void>;
   refreshModels: () => Promise<void>;
   updateSetting: (key: string, value: string) => Promise<void>;
+  updateFeatureFlag: (id: string, enabled: boolean) => Promise<void>;
   updateProvider: (id: string, enabled: boolean, baseUrl?: string, apiKey?: string) => Promise<void>;
   setActiveModel: (model: string) => void;
   testProvider: (providerId: string) => Promise<boolean>;
@@ -24,6 +27,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   providers: [],
   models: [],
   settings: {},
+  featureFlags: [],
   activeModel: 'qwen3:8b',
   loading: false,
   externalTools: {},
@@ -37,6 +41,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       });
     } catch (e) {
       console.error('Failed to load settings:', e);
+    }
+  },
+
+  loadFeatureFlags: async () => {
+    try {
+      const featureFlags = await api.getFeatureFlags();
+      set({ featureFlags });
+    } catch (e) {
+      console.error('Failed to load feature flags:', e);
     }
   },
 
@@ -82,6 +95,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       }
       return { settings: nextSettings };
     });
+    if (key === 'memory_backend') {
+      await get().loadFeatureFlags();
+    }
+  },
+
+  updateFeatureFlag: async (id, enabled) => {
+    const featureFlags = await api.updateFeatureFlag(id, enabled);
+    set({ featureFlags });
+    await get().loadSettings();
   },
 
   updateProvider: async (id, enabled, baseUrl, apiKey) => {

@@ -6,12 +6,12 @@ import zipfile
 from pathlib import Path
 
 REQUIRED = [
-    ".codex/config.toml",
-    ".codex/hooks.json",
-    ".codex/prompt_manifest.json",
-    ".codex/prompts/MASTER_AUTOMATED_COMPLETION.md",
-    ".codex/tools/auto_phase_runner.py",
-    ".agents/skills/phase-gate/SKILL.md",
+    "AGENTS.md",
+    "codex/prompts/GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519/MASTER_PROMPT.md",
+    "codex/prompts/GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519/PHASE_12_FINAL_AUDIT_RELEASE_DECISION.md",
+    "codex/schemas/GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519/final_receipt.schema.json",
+    "docs/codex-runs/CURRENT_RUN.md",
+    "docs/codex-runs/GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519/FINAL_RECEIPT.json",
 ]
 
 

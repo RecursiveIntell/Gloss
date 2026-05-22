@@ -3137,7 +3137,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--root-markdown-archive-dry-run", action="store_true", help="Do not write root Markdown archive moves.")
     parser.add_argument("--include-root-markdown-archive", action="store_true", help="Include root Markdown archive directory in package collection.")
     parser.add_argument("--include-codex-archive", action="store_true", help="Include docs/codex-runs/archive history deliberately.")
-    parser.add_argument("--codex-current-run", default="P30", help="Current Codex run identifier allowed to remain active where explicitly permitted.")
+    parser.add_argument("--codex-current-run", default="GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519", help="Current Codex run identifier allowed to remain active where explicitly permitted.")
     parser.add_argument("--codex-archive-root", default="docs/codex-runs/archive", help="Archive root for stale Codex-run artifacts. Relative paths are resolved under --root.")
     parser.add_argument("--codex-archive-report-out", default=None, help="Codex archival normalization report JSON path. Use '-' to disable. Default: <archive>.codex-archive.json")
 

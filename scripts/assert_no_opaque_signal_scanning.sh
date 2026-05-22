@@ -7,25 +7,22 @@ if ! command -v rg >/dev/null 2>&1; then
 fi
 
 violations=0
-# Signal extraction must not tokenize opaque refs/IDs. Explicit ref_kind == "signal" handling is allowed.
+# Chat stream routing must not fall back to active-notebook-only identity.
 patterns=(
-  'collect_text\(&mut values, &input\.input_id\)'
-  'collect_text\(&mut values, input\.actor_ref\.ref_value\.as_str\(\)\)'
-  'collect_text\(&mut values, input\.permit_ref\.ref_value\.as_str\(\)\)'
-  'collect_text\(&mut values, input\.subject_ref\.ref_value\.as_str\(\)\)'
-  'collect_text\(&mut values, input\.environment_ref\.ref_value\.as_str\(\)\)'
-  'collect_text\(&mut values, &evidence_ref\.ref_value\)'
+  'activeNotebookId.*chat-token'
+  'activeNotebookId.*chat-status'
+  'activeNotebookId.*chat-error'
 )
 for pattern in "${patterns[@]}"; do
-  if rg -n "$pattern" crates/scr-reference crates/scr-kernel >/tmp/scr_opaque_signal_scan.txt 2>/dev/null; then
-    cat /tmp/scr_opaque_signal_scan.txt >&2
+  if rg -n "$pattern" src >/tmp/gloss_opaque_stream_scan.txt 2>/dev/null; then
+    cat /tmp/gloss_opaque_stream_scan.txt >&2
     violations=1
   fi
 done
 
 if [[ "$violations" -ne 0 ]]; then
-  echo "opaque ref/id token scanning is forbidden" >&2
+  echo "active-notebook-only chat event routing is forbidden" >&2
   exit 1
 fi
 
-echo "ok no opaque signal scanning"
+echo "ok chat events are not routed by active notebook only"

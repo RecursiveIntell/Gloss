@@ -1,5 +1,6 @@
 use crate::db::app_db::{ModelRecord, Provider};
 use crate::error::GlossError;
+use crate::features::{self, FeatureFlagStatus};
 use crate::providers::{self, ModelInfo, ModelRegistry, ProviderType};
 use crate::state::AppState;
 use std::collections::HashMap;
@@ -338,7 +339,35 @@ pub async fn update_setting(
         .app_db
         .lock()
         .map_err(|e| GlossError::Other(e.to_string()))?;
-    app_db.set_setting(&key, &value)
+    features::validate_setting_update(&app_db, &key, &value)?;
+    app_db.set_setting(&key, &value)?;
+    features::apply_setting_update_side_effects(&app_db, &key, &value)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_feature_flags(
+    state: State<'_, AppState>,
+) -> Result<Vec<FeatureFlagStatus>, GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    features::feature_flag_statuses(&app_db)
+}
+
+#[tauri::command]
+pub async fn update_feature_flag(
+    id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<FeatureFlagStatus>, GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    features::update_feature_flag(&app_db, &id, enabled)?;
+    features::feature_flag_statuses(&app_db)
 }
 
 /// Check availability of external tools (ffmpeg, etc.)

@@ -8,6 +8,7 @@ import type {
   ModelInfo,
   ModelRecord,
   Provider,
+  FeatureFlagStatus,
   SourceContent,
   NotebookStats,
   QueueStatus,
@@ -17,6 +18,7 @@ import type {
   SemanticMemoryLinkStatus,
   IndexSourceReceipt,
   ChatAttemptTraceV1,
+  RetrievalCoverage,
 } from "./types";
 
 // === Notebooks ===
@@ -115,6 +117,13 @@ export async function getNotebookStats(
   notebookId: string
 ): Promise<NotebookStats> {
   return invoke("get_notebook_stats", { notebookId });
+}
+
+export async function diagnoseRetrievalCoverage(
+  notebookId: string,
+  sourceIds?: string[]
+): Promise<RetrievalCoverage> {
+  return invoke("diagnose_retrieval_coverage", { notebookId, sourceIds });
 }
 
 // === Chat ===
@@ -272,6 +281,17 @@ export async function updateSetting(
   value: string
 ): Promise<void> {
   return invoke("update_setting", { key, value });
+}
+
+export async function getFeatureFlags(): Promise<FeatureFlagStatus[]> {
+  return invoke("get_feature_flags");
+}
+
+export async function updateFeatureFlag(
+  id: string,
+  enabled: boolean
+): Promise<FeatureFlagStatus[]> {
+  return invoke("update_feature_flag", { id, enabled });
 }
 
 export async function checkExternalTools(): Promise<Record<string, boolean>> {

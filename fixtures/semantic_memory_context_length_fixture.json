@@ -1,0 +1,14 @@
+{
+  "schema": "GlossProjectionBudgetFixtureV1",
+  "purpose": "Force projection subchunking without relying on live Ollama failure.",
+  "source_id": "fixture-long-source",
+  "chunk_id": "fixture-long-source-chunk-0001",
+  "content_pattern": "Repeat a 500-word paragraph enough times to exceed the configured projection item budget.",
+  "required_assertions": [
+    "projection creates more than one ProjectionSubchunk for the source chunk",
+    "each projection subchunk has a parent_gloss_chunk_id backpointer",
+    "no projection request item exceeds max_projection_chars_per_item",
+    "receipt context_length_failures == 0",
+    "silent_truncation == false"
+  ]
+}

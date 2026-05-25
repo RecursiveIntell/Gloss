@@ -293,6 +293,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const [reindexingSemanticMemory, setReindexingSemanticMemory] = useState(false);
   const [rebuildingTurboQuant, setRebuildingTurboQuant] = useState(false);
   const [runningRetrievalProbe, setRunningRetrievalProbe] = useState(false);
+  const [runningEmbeddingDiagnostics, setRunningEmbeddingDiagnostics] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -501,6 +502,28 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     }
   };
 
+  const handleRunEmbeddingDiagnostics = async () => {
+    setRunningEmbeddingDiagnostics(true);
+    try {
+      const receipt = await api.runEmbeddingDiagnostics();
+      useToastStore.getState().addToast({
+        type: receipt.native_fastembed.embed_one_ok ? "success" : "error",
+        title: "Embedding diagnostics complete",
+        message: `${receipt.semantic_memory_provider.provider}: ${receipt.semantic_memory_provider.dims} dims`,
+        duration: 6000,
+      });
+    } catch (error) {
+      useToastStore.getState().addToast({
+        type: "error",
+        title: "Embedding diagnostics failed",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 7000,
+      });
+    } finally {
+      setRunningEmbeddingDiagnostics(false);
+    }
+  };
+
   const handleFeatureToggle = async (id: string, enabled: boolean) => {
     try {
       await updateFeatureFlag(id, enabled);
@@ -697,6 +720,18 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 {memoryStatus.fallback_reason}
               </p>
             )}
+            <button
+              onClick={handleRunEmbeddingDiagnostics}
+              disabled={runningEmbeddingDiagnostics}
+              className="inline-flex items-center gap-2 rounded border border-border bg-bg-tertiary px-3 py-2 text-xs text-text hover:bg-border disabled:opacity-50"
+            >
+              {runningEmbeddingDiagnostics ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <TestTube2 className="h-3.5 w-3.5" />
+              )}
+              Run embedding diagnostics
+            </button>
             {profileStatus?.projection_summary && (
               <div className="rounded border border-border bg-bg-tertiary/40 px-3 py-2 text-xs text-text-secondary">
                 <div className="grid gap-1 sm:grid-cols-4">

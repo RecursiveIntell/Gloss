@@ -191,9 +191,9 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
 
   const statusNote = (source: Source) => {
     if (source.source_type === "image" || source.source_type === "video") {
-      if (source.status === "pending") return " \u00B7 Queued for vision analysis";
-      if (source.status === "describing") return " \u00B7 Describing with vision model...";
-      if (source.status === "described") return " \u00B7 Embedding...";
+      if (source.status === "pending") return " · Queued for vision analysis";
+      if (source.status === "describing") return " · Describing with vision model...";
+      if (source.status === "described") return " · Embedding...";
     }
     return "";
   };
@@ -231,7 +231,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
           <span className={statusColor(source.status)}>
             {source.status}
           </span>
-          {source.word_count ? ` \u00B7 ${source.word_count} words` : ""}
+          {source.word_count ? ` · ${source.word_count} words` : ""}
           {statusNote(source)}
           {source.status === "error" && source.error_message && (
             <span title={source.error_message}>
@@ -239,7 +239,13 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             </span>
           )}
           {!source.summary && source.status === "ready" && (
-            <span className="text-warning"> \u00B7 no summary</span>
+            <span className="text-warning"> · no summary</span>
+          )}
+          {source.processing_state && (
+            <span className="text-text-muted">
+              {" "}· dense {source.processing_state.dense_index_status}
+              {" "}· projection {source.processing_state.semantic_projection_status}
+            </span>
           )}
         </p>
       </div>

@@ -132,8 +132,19 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const invalidSelectedCount = Array.from(selectedSourceIds).filter(
     (id) => !sources.some((source) => source.id === id)
   ).length;
-  const unreadySelectedCount = selectedSources.filter((source) => source.status !== "ready").length;
-  const unindexedSelectedCount = selectedSources.filter((source) => source.status === "pending").length;
+  const sourceLifecycleStatus = (source: (typeof sources)[number]) =>
+    source.processing_state?.lifecycle_status ?? source.status;
+  const sourceDenseStatus = (source: (typeof sources)[number]) =>
+    source.processing_state?.dense_index_status ?? "missing";
+  const sourceProjectionStatus = (source: (typeof sources)[number]) =>
+    source.processing_state?.semantic_projection_status ?? "disabled";
+  const unreadySelectedCount = selectedSources.filter((source) => sourceLifecycleStatus(source) !== "ready").length;
+  const unindexedSelectedCount = selectedSources.filter((source) =>
+    ["missing", "failed", "stale"].includes(sourceDenseStatus(source))
+  ).length;
+  const projectionProblemCount = selectedSources.filter((source) =>
+    ["failed", "partial", "degraded", "stale", "not_projected"].includes(sourceProjectionStatus(source))
+  ).length;
   const streamingStatusLabel = streamingStatus
     ? [
         streamingStatus.message,
@@ -244,7 +255,12 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           )}
           {unindexedSelectedCount > 0 && (
             <span className="rounded bg-warning/15 px-1.5 py-0.5 text-warning">
-              {unindexedSelectedCount} unindexed
+              {unindexedSelectedCount} dense missing
+            </span>
+          )}
+          {projectionProblemCount > 0 && (
+            <span className="rounded bg-warning/15 px-1.5 py-0.5 text-warning">
+              {projectionProblemCount} projection pending
             </span>
           )}
           {scopeMode === "none" && (
@@ -548,6 +564,10 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
         <EvidenceRow label="Retrieval" value={evidence.retrieval_mode} />
         <EvidenceRow label="Fallback" value={evidence.fallback_used ? evidence.fallback_reason || "yes" : "no"} />
         <EvidenceRow label="Scope" value={`${evidence.source_scope_mode} (${evidence.effective_source_count} selected, ${evidence.excluded_source_count} excluded, ${evidence.invalid_source_count} invalid)`} />
+        <EvidenceRow label="Invalid scope IDs" value={`${evidence.invalid_source_ids.length} recorded`} />
+        <EvidenceRow label="Requested source IDs" value={`${evidence.requested_source_ids.length} recorded`} />
+        <EvidenceRow label="Selected source IDs" value={`${evidence.selected_source_ids.length} recorded`} />
+        <EvidenceRow label="Excluded source IDs" value={`${evidence.excluded_source_ids.length} recorded`} />
         <EvidenceRow label="Context" value={`${evidence.context_passage_count} passages, preserved: ${evidence.source_scope_preserved ? "yes" : "no"}`} />
         <EvidenceRow label="Citations" value={`${evidence.citation_valid_count} valid, ${evidence.citation_invalid_count} filtered`} />
         {(evidence.citation_filter_reasons ?? []).length > 0 && (

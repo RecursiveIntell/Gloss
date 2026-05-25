@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 const APP_SCHEMA_VERSION: i32 = 2;
-const NOTEBOOK_SCHEMA_VERSION: i32 = 5;
+const NOTEBOOK_SCHEMA_VERSION: i32 = 6;
 
 /// Apply pragmas for performance and correctness.
 pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
@@ -78,6 +78,7 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_auto_project', 'false');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_strict_testing', 'false');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_provider', 'fastembed');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_url', 'http://localhost:11434');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_model', 'nomic-embed-text');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_timeout_secs', '10');
@@ -315,7 +316,13 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
         set_schema_version(conn, NOTEBOOK_SCHEMA_VERSION)?;
     }
 
+    if version < 6 {
+        ensure_source_processing_state(conn)?;
+        set_schema_version(conn, NOTEBOOK_SCHEMA_VERSION)?;
+    }
+
     ensure_notebook_fts(conn)?;
+    ensure_source_processing_state(conn)?;
     ensure_semantic_memory_links(conn)?;
     ensure_semantic_memory_projection_status(conn)?;
     ensure_semantic_memory_vector_artifact_receipts(conn)?;
@@ -498,6 +505,92 @@ fn ensure_provenance_receipts(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provenance_receipts_subject
         ON provenance_receipts (subject_kind, subject_id, recorded_time DESC);",
     )
+}
+
+fn ensure_source_processing_state(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS source_processing_state (
+            source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+            lifecycle_status TEXT NOT NULL DEFAULT 'pending',
+            summary_status TEXT NOT NULL DEFAULT 'missing',
+            fts_index_status TEXT NOT NULL DEFAULT 'missing',
+            dense_index_status TEXT NOT NULL DEFAULT 'missing',
+            semantic_projection_status TEXT NOT NULL DEFAULT 'disabled',
+            last_summary_receipt_id TEXT,
+            last_dense_index_receipt_id TEXT,
+            last_projection_receipt_id TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_processing_state_lifecycle
+        ON source_processing_state (lifecycle_status);
+
+        CREATE INDEX IF NOT EXISTS idx_source_processing_state_dense
+        ON source_processing_state (dense_index_status);
+
+        CREATE INDEX IF NOT EXISTS idx_source_processing_state_projection
+        ON source_processing_state (semantic_projection_status);",
+    )?;
+
+    for (column, definition) in [
+        ("source_id", "TEXT"),
+        ("lifecycle_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("summary_status", "TEXT NOT NULL DEFAULT 'missing'"),
+        ("fts_index_status", "TEXT NOT NULL DEFAULT 'missing'"),
+        ("dense_index_status", "TEXT NOT NULL DEFAULT 'missing'"),
+        (
+            "semantic_projection_status",
+            "TEXT NOT NULL DEFAULT 'disabled'",
+        ),
+        ("last_summary_receipt_id", "TEXT"),
+        ("last_dense_index_receipt_id", "TEXT"),
+        ("last_projection_receipt_id", "TEXT"),
+        ("last_error", "TEXT"),
+        ("updated_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+    ] {
+        if !table_has_column(conn, "source_processing_state", column)? {
+            conn.execute(
+                &format!("ALTER TABLE source_processing_state ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO source_processing_state (
+            source_id,
+            lifecycle_status,
+            summary_status,
+            fts_index_status,
+            dense_index_status,
+            semantic_projection_status,
+            last_error,
+            updated_at
+        )
+        SELECT
+            s.id,
+            COALESCE(NULLIF(s.status, ''), 'pending'),
+            CASE WHEN s.summary IS NULL OR trim(s.summary) = '' THEN 'missing' ELSE 'ready' END,
+            CASE WHEN EXISTS (SELECT 1 FROM chunks c WHERE c.source_id = s.id) THEN 'indexed' ELSE 'missing' END,
+            CASE
+                WHEN EXISTS (SELECT 1 FROM chunks c WHERE c.source_id = s.id AND c.embedding_id IS NOT NULL) THEN 'indexed'
+                WHEN EXISTS (SELECT 1 FROM chunks c WHERE c.source_id = s.id) THEN 'missing'
+                ELSE 'missing'
+            END,
+            COALESCE((
+                SELECT ps.status
+                FROM semantic_memory_projection_status ps
+                WHERE ps.source_id = s.id
+                ORDER BY ps.updated_at DESC
+                LIMIT 1
+            ), 'disabled'),
+            s.error_message,
+            datetime('now')
+        FROM sources s;",
+    )?;
+
+    Ok(())
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {

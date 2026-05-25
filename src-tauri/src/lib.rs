@@ -169,6 +169,7 @@ pub fn run() {
             commands::settings::refresh_models,
             commands::settings::get_all_models,
             commands::settings::get_settings,
+            commands::settings::run_embedding_diagnostics,
             commands::settings::update_setting,
             commands::settings::get_feature_flags,
             commands::settings::update_feature_flag,

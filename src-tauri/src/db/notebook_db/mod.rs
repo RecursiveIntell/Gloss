@@ -30,6 +30,23 @@ pub struct Source {
     pub selected: bool,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub processing_state: Option<SourceProcessingState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceProcessingState {
+    pub source_id: String,
+    pub lifecycle_status: String,
+    pub summary_status: String,
+    pub fts_index_status: String,
+    pub dense_index_status: String,
+    pub semantic_projection_status: String,
+    pub last_summary_receipt_id: Option<String>,
+    pub last_dense_index_receipt_id: Option<String>,
+    pub last_projection_receipt_id: Option<String>,
+    pub last_error: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +190,25 @@ fn projection_status_from_row(
     })
 }
 
+fn source_processing_state_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<SourceProcessingState> {
+    Ok(SourceProcessingState {
+        source_id: row.get(offset)?,
+        lifecycle_status: row.get(offset + 1)?,
+        summary_status: row.get(offset + 2)?,
+        fts_index_status: row.get(offset + 3)?,
+        dense_index_status: row.get(offset + 4)?,
+        semantic_projection_status: row.get(offset + 5)?,
+        last_summary_receipt_id: row.get(offset + 6)?,
+        last_dense_index_receipt_id: row.get(offset + 7)?,
+        last_projection_receipt_id: row.get(offset + 8)?,
+        last_error: row.get(offset + 9)?,
+        updated_at: row.get(offset + 10)?,
+    })
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudioOutput {
@@ -210,10 +246,25 @@ impl NotebookDb {
     /// List all sources (without content_text — use get_source for full content).
     pub fn list_sources(&self) -> Result<Vec<Source>, GlossError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_type, title, original_filename, file_hash, url, file_path,
-                    word_count, metadata, summary, summary_model,
-                    status, error_message, selected, created_at, updated_at
-             FROM sources ORDER BY title ASC",
+            "SELECT sources.id, sources.source_type, sources.title, sources.original_filename,
+                    sources.file_hash, sources.url, sources.file_path,
+                    sources.word_count, sources.metadata, sources.summary, sources.summary_model,
+                    sources.status, sources.error_message, sources.selected,
+                    sources.created_at, sources.updated_at,
+                    COALESCE(ps.source_id, sources.id),
+                    COALESCE(ps.lifecycle_status, sources.status),
+                    COALESCE(ps.summary_status, CASE WHEN sources.summary IS NULL OR trim(sources.summary) = '' THEN 'missing' ELSE 'ready' END),
+                    COALESCE(ps.fts_index_status, 'missing'),
+                    COALESCE(ps.dense_index_status, 'missing'),
+                    COALESCE(ps.semantic_projection_status, 'disabled'),
+                    ps.last_summary_receipt_id,
+                    ps.last_dense_index_receipt_id,
+                    ps.last_projection_receipt_id,
+                    COALESCE(ps.last_error, sources.error_message),
+                    COALESCE(ps.updated_at, sources.updated_at)
+             FROM sources
+             LEFT JOIN source_processing_state ps ON ps.source_id = sources.id
+             ORDER BY sources.title ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Source {
@@ -234,6 +285,7 @@ impl NotebookDb {
                 selected: row.get(13)?,
                 created_at: row.get(14)?,
                 updated_at: row.get(15)?,
+                processing_state: Some(source_processing_state_from_row(row, 16)?),
             })
         })?;
         let mut sources = Vec::new();
@@ -268,6 +320,23 @@ impl NotebookDb {
                 source.selected,
             ],
         )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO source_processing_state (
+                source_id, lifecycle_status, summary_status, fts_index_status,
+                dense_index_status, semantic_projection_status, last_error, updated_at
+             )
+             VALUES (
+                ?1, ?2,
+                CASE WHEN ?3 IS NULL OR trim(?3) = '' THEN 'missing' ELSE 'ready' END,
+                'missing', 'missing', 'disabled', ?4, datetime('now')
+             )",
+            rusqlite::params![
+                source.id,
+                source.status,
+                source.summary,
+                source.error_message,
+            ],
+        )?;
         Ok(())
     }
 
@@ -283,6 +352,7 @@ impl NotebookDb {
              WHERE id = ?3",
             rusqlite::params![status, error_message, source_id],
         )?;
+        self.update_source_lifecycle_status(source_id, status, error_message)?;
         Ok(())
     }
 
@@ -313,6 +383,15 @@ impl NotebookDb {
              WHERE id = ?3",
             rusqlite::params![summary, model, source_id],
         )?;
+        self.conn.execute(
+            "INSERT INTO source_processing_state (source_id, lifecycle_status, summary_status, updated_at)
+             VALUES (?1, COALESCE((SELECT status FROM sources WHERE id = ?1), 'ready'), 'ready', datetime('now'))
+             ON CONFLICT(source_id) DO UPDATE SET
+                summary_status = 'ready',
+                last_error = NULL,
+                updated_at = excluded.updated_at",
+            [source_id],
+        )?;
         Ok(())
     }
 
@@ -320,10 +399,26 @@ impl NotebookDb {
     pub fn get_source(&self, source_id: &str) -> Result<Source, GlossError> {
         self.conn
             .query_row(
-                "SELECT id, source_type, title, original_filename, file_hash, url, file_path,
-                        content_text, word_count, metadata, summary, summary_model,
-                        status, error_message, selected, created_at, updated_at
-                 FROM sources WHERE id = ?1",
+                "SELECT sources.id, sources.source_type, sources.title, sources.original_filename,
+                        sources.file_hash, sources.url, sources.file_path,
+                        sources.content_text, sources.word_count, sources.metadata,
+                        sources.summary, sources.summary_model,
+                        sources.status, sources.error_message, sources.selected,
+                        sources.created_at, sources.updated_at,
+                        COALESCE(ps.source_id, sources.id),
+                        COALESCE(ps.lifecycle_status, sources.status),
+                        COALESCE(ps.summary_status, CASE WHEN sources.summary IS NULL OR trim(sources.summary) = '' THEN 'missing' ELSE 'ready' END),
+                        COALESCE(ps.fts_index_status, 'missing'),
+                        COALESCE(ps.dense_index_status, 'missing'),
+                        COALESCE(ps.semantic_projection_status, 'disabled'),
+                        ps.last_summary_receipt_id,
+                        ps.last_dense_index_receipt_id,
+                        ps.last_projection_receipt_id,
+                        COALESCE(ps.last_error, sources.error_message),
+                        COALESCE(ps.updated_at, sources.updated_at)
+                 FROM sources
+                 LEFT JOIN source_processing_state ps ON ps.source_id = sources.id
+                 WHERE sources.id = ?1",
                 [source_id],
                 |row| {
                     Ok(Source {
@@ -344,6 +439,7 @@ impl NotebookDb {
                         selected: row.get(14)?,
                         created_at: row.get(15)?,
                         updated_at: row.get(16)?,
+                        processing_state: Some(source_processing_state_from_row(row, 17)?),
                     })
                 },
             )
@@ -443,6 +539,13 @@ impl NotebookDb {
             }
         }
         tx.commit()?;
+        for source_id in chunks
+            .iter()
+            .map(|chunk| chunk.source_id.as_str())
+            .collect::<std::collections::HashSet<_>>()
+        {
+            self.update_source_index_status(source_id, Some("indexed"), None, None)?;
+        }
         Ok(())
     }
 
@@ -456,6 +559,64 @@ impl NotebookDb {
         self.conn.execute(
             "UPDATE chunks SET embedding_id = ?1, embedding_model = ?2 WHERE id = ?3",
             rusqlite::params![embedding_id, model, chunk_id],
+        )?;
+        let source_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT source_id FROM chunks WHERE id = ?1",
+                [chunk_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(source_id) = source_id {
+            self.update_source_index_status(&source_id, None, Some("indexed"), None)?;
+        }
+        Ok(())
+    }
+
+    pub fn update_source_lifecycle_status(
+        &self,
+        source_id: &str,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT INTO source_processing_state (source_id, lifecycle_status, last_error, updated_at)
+             VALUES (?1, ?2, ?3, datetime('now'))
+             ON CONFLICT(source_id) DO UPDATE SET
+                lifecycle_status = excluded.lifecycle_status,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at",
+            rusqlite::params![source_id, status, error_message],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_source_index_status(
+        &self,
+        source_id: &str,
+        fts_index_status: Option<&str>,
+        dense_index_status: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT INTO source_processing_state (
+                source_id, lifecycle_status, fts_index_status, dense_index_status, last_error, updated_at
+             )
+             VALUES (
+                ?1,
+                COALESCE((SELECT status FROM sources WHERE id = ?1), 'pending'),
+                COALESCE(?2, 'missing'),
+                COALESCE(?3, 'missing'),
+                ?4,
+                datetime('now')
+             )
+             ON CONFLICT(source_id) DO UPDATE SET
+                fts_index_status = COALESCE(?2, fts_index_status),
+                dense_index_status = COALESCE(?3, dense_index_status),
+                last_error = COALESCE(?4, last_error),
+                updated_at = datetime('now')",
+            rusqlite::params![source_id, fts_index_status, dense_index_status, error_message],
         )?;
         Ok(())
     }
@@ -775,6 +936,31 @@ impl NotebookDb {
                 update.last_error,
                 update.artifact_generation_id,
                 update.vector_artifact_manifest_digest,
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT INTO source_processing_state (
+                source_id, lifecycle_status, semantic_projection_status,
+                last_projection_receipt_id, last_error, updated_at
+             )
+             VALUES (
+                ?1,
+                COALESCE((SELECT status FROM sources WHERE id = ?1), 'ready'),
+                ?2,
+                ?3,
+                ?4,
+                datetime('now')
+             )
+             ON CONFLICT(source_id) DO UPDATE SET
+                semantic_projection_status = excluded.semantic_projection_status,
+                last_projection_receipt_id = excluded.last_projection_receipt_id,
+                last_error = COALESCE(excluded.last_error, last_error),
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                update.source_id,
+                update.status,
+                update.last_receipt_id,
+                update.last_error,
             ],
         )?;
         Ok(())
@@ -1453,6 +1639,7 @@ impl NotebookDb {
                 selected: row.get(14)?,
                 created_at: row.get(15)?,
                 updated_at: row.get(16)?,
+                processing_state: None,
             })
         })?;
         let mut sources = Vec::new();
@@ -1598,6 +1785,7 @@ mod tests {
             selected: true,
             created_at: String::new(),
             updated_at: String::new(),
+            processing_state: None,
         };
         db.insert_source(&source).unwrap();
         let sources = db.list_sources().unwrap();
@@ -1631,6 +1819,7 @@ mod tests {
                 selected: true,
                 created_at: String::new(),
                 updated_at: String::new(),
+                processing_state: None,
             })
             .unwrap();
         }
@@ -1661,6 +1850,7 @@ mod tests {
             selected: true,
             created_at: String::new(),
             updated_at: String::new(),
+            processing_state: None,
         };
         db.insert_source(&source).unwrap();
 
@@ -1705,6 +1895,7 @@ mod tests {
                 selected: true,
                 created_at: String::new(),
                 updated_at: String::new(),
+                processing_state: None,
             })
             .unwrap();
         }
@@ -1773,6 +1964,7 @@ mod tests {
                 selected: true,
                 created_at: String::new(),
                 updated_at: String::new(),
+                processing_state: None,
             })
             .unwrap();
             db.insert_chunk(&Chunk {
@@ -1873,6 +2065,7 @@ mod tests {
             selected: true,
             created_at: String::new(),
             updated_at: String::new(),
+            processing_state: None,
         };
         db.insert_source(&source).unwrap();
         let chunk = Chunk {
@@ -1915,6 +2108,7 @@ mod tests {
             selected: true,
             created_at: String::new(),
             updated_at: String::new(),
+            processing_state: None,
         };
         db.insert_source(&source).unwrap();
         db.insert_chunk(&Chunk {
@@ -1991,6 +2185,7 @@ mod tests {
             selected: true,
             created_at: String::new(),
             updated_at: String::new(),
+            processing_state: None,
         })
         .unwrap();
 
@@ -2028,6 +2223,7 @@ mod tests {
                 selected: true,
                 created_at: String::new(),
                 updated_at: String::new(),
+                processing_state: None,
             })
             .unwrap();
             db.insert_chunk(&Chunk {

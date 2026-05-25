@@ -34,8 +34,8 @@
       "icons/icon.ico"
     ],
     "category": "Utility",
-    "shortDescription": "A local-first NotebookLM alternative",
-    "longDescription": "Gloss is a local-first AI notebook app with RAG chat, scheduling, summaries, multi-provider support, and vision/video pipelines.",
+    "shortDescription": "A local-first desktop notebook/RAG app",
+    "longDescription": "Gloss is a local-first desktop notebook/RAG app with source ingestion, local/Ollama chat, BM25/FTS5 retrieval, native dense indexing, and optional semantic-memory/TurboQuant validation profiles.",
     "linux": {
       "rpm": {
         "epoch": 0,

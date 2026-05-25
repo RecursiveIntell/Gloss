@@ -1,0 +1,37 @@
+{
+  "schema": "GlossSourceStateFixtureV1",
+  "cases": [
+    {
+      "name": "lifecycle_ready_projection_synced",
+      "legacy_status": "semantic_memory_synced",
+      "processing_state": {
+        "lifecycle_status": "ready",
+        "summary_status": "ready",
+        "fts_index_status": "indexed",
+        "dense_index_status": "indexed",
+        "semantic_projection_status": "synced"
+      },
+      "expected_ui": {
+        "not_ready": false,
+        "dense_problem": false,
+        "projection_problem": false
+      }
+    },
+    {
+      "name": "lifecycle_ready_projection_failed",
+      "legacy_status": "ready",
+      "processing_state": {
+        "lifecycle_status": "ready",
+        "summary_status": "missing",
+        "fts_index_status": "indexed",
+        "dense_index_status": "indexed",
+        "semantic_projection_status": "failed"
+      },
+      "expected_ui": {
+        "not_ready": false,
+        "needs_summary": true,
+        "projection_problem": true
+      }
+    }
+  ]
+}

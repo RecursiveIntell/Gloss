@@ -1,7 +1,7 @@
 [package]
 name = "gloss"
 version = "1.0.0"
-description = "A local-first NotebookLM alternative"
+description = "A local-first desktop notebook/RAG app"
 authors = ["sikmindz"]
 edition = "2021"
 license = "AGPL-3.0-only"
@@ -11,10 +11,10 @@ name = "gloss_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-# Compile semantic-memory into the normal desktop binary so users can enable
-# the preview from Settings without needing a special build. Runtime settings
-# still keep Gloss local as the default and preview features off.
-default = ["semantic-memory-backend"]
+# Release/default builds compile semantic-memory and TurboQuant candidate
+# artifacts. Runtime settings still keep Gloss local as the default unless the
+# user enables the preview profile.
+default = ["semantic-memory-turbo-quant"]
 semantic-memory-backend = ["dep:semantic-memory"]
 semantic-memory-turbo-quant = [
     "semantic-memory-backend",
@@ -25,9 +25,9 @@ semantic-memory-turbo-quant = [
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# === Vendored libraries ===
-llm-pipeline = { path = "vendor/llm-pipeline" }
-tauri-queue = { path = "vendor/tauri-queue" }
+# === Canonical Libraries crates ===
+llm-pipeline = { path = "../../Libraries/llm-pipeline" }
+tauri-queue = { path = "../../Libraries/tauri-queue" }
 
 # === Tauri ===
 tauri = { version = "2", features = [] }
@@ -54,7 +54,7 @@ fastembed = "4"
 
 # === Vector search ===
 usearch = "2"
-semantic-memory = { path = "vendor/semantic-memory", optional = true }
+semantic-memory = { path = "../../Libraries/semantic-memory", optional = true }
 
 # === Database ===
 rusqlite = { version = "0.32", features = ["bundled", "vtab"] }

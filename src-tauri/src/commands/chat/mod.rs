@@ -953,6 +953,7 @@ pub async fn send_message(
                     .unwrap_or_else(|| "gloss-local".to_string()),
                 setting_is_enabled(app_db.get_setting("memory_backend_fallback")?),
                 semantic_memory_adapter::runtime_config_from_settings(
+                    app_db.get_setting("semantic_memory_embedding_provider")?,
                     app_db.get_setting("semantic_memory_embedding_url")?,
                     app_db.get_setting("semantic_memory_embedding_model")?,
                     app_db.get_setting("semantic_memory_embedding_timeout_secs")?,

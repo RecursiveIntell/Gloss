@@ -83,6 +83,36 @@ pub struct MemoryBackendProfileReceipt {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct NativeFastEmbedDiagnostics {
+    pub init_ok: bool,
+    pub embed_one_ok: bool,
+    pub dims: Option<usize>,
+    pub cache_dir: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticMemoryProviderDiagnostics {
+    pub provider: String,
+    pub dims: usize,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OptionalOllamaEmbeddingDiagnostics {
+    pub configured: bool,
+    pub url: Option<String>,
+    pub embed_ok: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingDiagnosticsReceipt {
+    pub native_fastembed: NativeFastEmbedDiagnostics,
+    pub semantic_memory_provider: SemanticMemoryProviderDiagnostics,
+    pub optional_ollama: OptionalOllamaEmbeddingDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SemanticMemoryProfileStatus {
     pub compiled_semantic_memory: bool,
     pub compiled_turbo_quant: bool,
@@ -443,6 +473,83 @@ pub async fn get_settings(
     }
 
     Ok(settings)
+}
+
+#[tauri::command]
+pub async fn run_embedding_diagnostics(
+    state: State<'_, AppState>,
+) -> Result<EmbeddingDiagnosticsReceipt, GlossError> {
+    let cache_dir = state.data_dir.join("models");
+    let native_fastembed = match state.ensure_embedder(None) {
+        Ok(()) => {
+            let embed_result = state
+                .embedder
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?
+                .as_ref()
+                .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))
+                .and_then(|embedder| embedder.embed_one("Gloss embedding diagnostics"));
+            match embed_result {
+                Ok(vector) => NativeFastEmbedDiagnostics {
+                    init_ok: true,
+                    embed_one_ok: true,
+                    dims: Some(vector.len()),
+                    cache_dir: cache_dir.display().to_string(),
+                    error: None,
+                },
+                Err(err) => NativeFastEmbedDiagnostics {
+                    init_ok: true,
+                    embed_one_ok: false,
+                    dims: None,
+                    cache_dir: cache_dir.display().to_string(),
+                    error: Some(err.to_string()),
+                },
+            }
+        }
+        Err(err) => NativeFastEmbedDiagnostics {
+            init_ok: false,
+            embed_one_ok: false,
+            dims: None,
+            cache_dir: cache_dir.display().to_string(),
+            error: Some(err.to_string()),
+        },
+    };
+
+    let (provider, ollama_url) = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        (
+            app_db
+                .get_setting("semantic_memory_embedding_provider")?
+                .unwrap_or_else(|| "fastembed".to_string()),
+            app_db.get_setting("semantic_memory_embedding_url")?,
+        )
+    };
+    let provider = if provider.trim().eq_ignore_ascii_case("ollama") {
+        "ollama"
+    } else {
+        "fastembed"
+    };
+
+    Ok(EmbeddingDiagnosticsReceipt {
+        native_fastembed,
+        semantic_memory_provider: SemanticMemoryProviderDiagnostics {
+            provider: provider.to_string(),
+            dims: 768,
+            model: if provider == "fastembed" {
+                "fastembed:NomicEmbedTextV15".to_string()
+            } else {
+                "nomic-embed-text".to_string()
+            },
+        },
+        optional_ollama: OptionalOllamaEmbeddingDiagnostics {
+            configured: provider == "ollama",
+            url: ollama_url.filter(|url| provider == "ollama" && !url.trim().is_empty()),
+            embed_ok: None,
+        },
+    })
 }
 
 #[tauri::command]

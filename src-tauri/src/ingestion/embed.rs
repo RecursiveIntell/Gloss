@@ -13,9 +13,13 @@ pub struct EmbeddingService {
 }
 
 impl EmbeddingService {
-    /// Initialize the embedding service with NomicEmbedTextV15 (768-dim)
-    /// and BGERerankerBase for cross-encoder reranking.
+    /// Initialize the embedding service with NomicEmbedTextV15 (768-dim).
     pub fn new(cache_dir: &Path) -> Result<Self, GlossError> {
+        Self::new_with_reranker(cache_dir, false)
+    }
+
+    /// Initialize the embedding service and optionally load the cross-encoder reranker.
+    pub fn new_with_reranker(cache_dir: &Path, load_reranker: bool) -> Result<Self, GlossError> {
         let options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15)
             .with_cache_dir(cache_dir.to_path_buf());
 
@@ -23,19 +27,22 @@ impl EmbeddingService {
             GlossError::Embedding(format!("Failed to initialize embedding model: {}", e))
         })?;
 
-        // Non-fatal: fall back to RRF-only if reranker fails to load
-        let reranker = match TextRerank::try_new(
-            RerankInitOptions::new(RerankerModel::BGERerankerBase)
-                .with_cache_dir(cache_dir.to_path_buf()),
-        ) {
-            Ok(r) => {
-                tracing::info!("Reranker (BGERerankerBase) loaded");
-                Some(r)
+        let reranker = if load_reranker {
+            match TextRerank::try_new(
+                RerankInitOptions::new(RerankerModel::BGERerankerBase)
+                    .with_cache_dir(cache_dir.to_path_buf()),
+            ) {
+                Ok(r) => {
+                    tracing::info!("Reranker (BGERerankerBase) loaded");
+                    Some(r)
+                }
+                Err(e) => {
+                    tracing::warn!("Reranker failed to load (falling back to RRF-only): {}", e);
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!("Reranker failed to load (falling back to RRF-only): {}", e);
-                None
-            }
+        } else {
+            None
         };
 
         Ok(Self { model, reranker })

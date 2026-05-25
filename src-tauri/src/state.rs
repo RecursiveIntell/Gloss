@@ -15,10 +15,10 @@ use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
 use tokio::sync::Semaphore;
 
-/// Native semantic indexing (fastembed + usearch) remains an in-process crash
-/// vector during ingestion. Keep it disabled until those calls are isolated from
-/// the desktop process.
-pub const NATIVE_SEMANTIC_INDEXING_ENABLED: bool = false;
+/// Release builds keep native dense indexing enabled. Ingestion still runs
+/// through bounded single-source work and the GPU gate so fallback/degradation
+/// is visible instead of silently skipping dense vectors.
+pub const NATIVE_SEMANTIC_INDEXING_ENABLED: bool = true;
 pub const SUMMARY_MODE_AUTO: &str = "auto";
 pub const SUMMARY_MODE_MANUAL: &str = "manual";
 
@@ -201,6 +201,12 @@ impl AppState {
                 "semantic_memory_turbo_quant_require_fresh_artifacts",
                 "true",
             )?;
+        }
+        if app_db
+            .get_setting("semantic_memory_embedding_provider")?
+            .is_none()
+        {
+            app_db.set_setting("semantic_memory_embedding_provider", "fastembed")?;
         }
         if app_db
             .get_setting("semantic_memory_embedding_url")?
@@ -730,6 +736,7 @@ mod tests {
                     selected: true,
                     created_at: String::new(),
                     updated_at: String::new(),
+                    processing_state: None,
                 })
                 .unwrap();
         }

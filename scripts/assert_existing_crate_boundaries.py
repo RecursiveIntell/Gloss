@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path.cwd()
-LIB_ROOTS = [Path("/home/sikmindz/Coding/Libraries"), Path("/home/sikmindz/Coding/Libraries2")]
+LIB_ROOTS = [Path("/home/sikmindz/Coding/Libraries")]
 KNOWN_OWNERS = {
     "stack-ids": ["id", "digest", "trace", "replay"],
     "contract-schema-gen": ["schema"],

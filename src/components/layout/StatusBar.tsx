@@ -356,9 +356,9 @@ export function StatusBar() {
           <Database className="w-3 h-3" />
           <span>
             {stats.source_count} sources
-            {stats.chunk_count > 0 && ` \u00B7 ${stats.chunk_count} chunks`}
+            {stats.chunk_count > 0 && ` · ${stats.chunk_count} chunks`}
             {stats.total_words > 0 &&
-              ` \u00B7 ${stats.total_words.toLocaleString()} words`}
+              ` · ${stats.total_words.toLocaleString()} words`}
           </span>
           {stats.error_count > 0 && (
             <span className="text-error flex items-center gap-0.5">

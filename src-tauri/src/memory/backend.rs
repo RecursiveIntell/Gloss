@@ -526,6 +526,7 @@ mod tests {
             selected: true,
             created_at: String::new(),
             updated_at: String::new(),
+            processing_state: None,
         }
     }
 

@@ -25,6 +25,7 @@ import type {
   RetrievalProbeReceipt,
   ChatAttemptTraceV1,
   RetrievalCoverage,
+  EmbeddingDiagnosticsReceipt,
 } from "./types";
 
 // === Notebooks ===
@@ -308,6 +309,10 @@ export async function getAllModels(): Promise<ModelRecord[]> {
 
 export async function getSettings(): Promise<Record<string, string>> {
   return invoke("get_settings");
+}
+
+export async function runEmbeddingDiagnostics(): Promise<EmbeddingDiagnosticsReceipt> {
+  return invoke("run_embedding_diagnostics");
 }
 
 export async function updateSetting(

@@ -9,22 +9,111 @@ use crate::memory::types::{
     SemanticLinkRow, MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
 };
 use crate::retrieval::source_scope::ResolvedSourceScope;
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use semantic_memory::embedder::{EmbedBatchFuture, EmbedFuture};
 use semantic_memory::{
-    ChunkManifestEntry, ChunkManifestIngestOptions, EmbeddingConfig, MemoryConfig, MemoryStore,
-    ReceiptMode, SearchContext, SearchSource, SearchSourceType,
+    ChunkManifestEntry, ChunkManifestIngestOptions, Embedder, EmbeddingConfig, MemoryConfig,
+    MemoryError, MemoryStore, ReceiptMode, SearchContext, SearchSource, SearchSourceType,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const BACKEND_VERSION: &str = "semantic-memory 0.5.0";
+const DEFAULT_EMBEDDING_PROVIDER: EmbeddingProviderKind = EmbeddingProviderKind::FastEmbed;
+const FASTEMBED_MODEL_NAME: &str = "fastembed:NomicEmbedTextV15";
+const FASTEMBED_DIMENSIONS: usize = 768;
 const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL: &str = "http://localhost:11434";
 const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL: &str = "nomic-embed-text";
 const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS: u64 = 10;
-const SEMANTIC_MEMORY_PROJECTION_MAX_CHUNKS_PER_BATCH: usize = 12;
-const SEMANTIC_MEMORY_PROJECTION_MAX_CHARS_PER_BATCH: usize = 24_000;
-const SEMANTIC_MEMORY_PROJECTION_MAX_TOKENS_PER_BATCH: usize = 6_000;
+const SEMANTIC_MEMORY_PROJECTION_MAX_CHUNKS_PER_BATCH: usize = 4;
+const SEMANTIC_MEMORY_PROJECTION_MAX_CHARS_PER_BATCH: usize = 8_000;
+const SEMANTIC_MEMORY_PROJECTION_MAX_TOKENS_PER_BATCH: usize = 2_000;
+const SEMANTIC_MEMORY_PROJECTION_MAX_SUBCHUNK_CHARS: usize = 7_200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingProviderKind {
+    FastEmbed,
+    Ollama,
+}
+
+impl EmbeddingProviderKind {
+    fn from_setting(value: Option<String>) -> Self {
+        match value
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("ollama") => Self::Ollama,
+            _ => DEFAULT_EMBEDDING_PROVIDER,
+        }
+    }
+}
+
+struct FastEmbedSemanticMemoryEmbedder {
+    model: Arc<Mutex<TextEmbedding>>,
+    model_name: String,
+    dimensions: usize,
+}
+
+impl FastEmbedSemanticMemoryEmbedder {
+    fn try_new(cache_dir: PathBuf) -> Result<Self, GlossError> {
+        std::fs::create_dir_all(&cache_dir).map_err(|e| {
+            GlossError::Embedding(format!(
+                "Failed to create FastEmbed cache directory {}: {e}",
+                cache_dir.display()
+            ))
+        })?;
+        let options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15).with_cache_dir(cache_dir);
+        let model = TextEmbedding::try_new(options).map_err(|e| {
+            GlossError::Embedding(format!("Failed to initialize FastEmbed model: {e}"))
+        })?;
+        Ok(Self {
+            model: Arc::new(Mutex::new(model)),
+            model_name: FASTEMBED_MODEL_NAME.to_string(),
+            dimensions: FASTEMBED_DIMENSIONS,
+        })
+    }
+}
+
+impl Embedder for FastEmbedSemanticMemoryEmbedder {
+    fn embed<'a>(&'a self, text: &'a str) -> EmbedFuture<'a> {
+        Box::pin(async move {
+            let mut embeddings = self.embed_batch(vec![text.to_string()]).await?;
+            embeddings.pop().ok_or_else(|| {
+                MemoryError::Other("FastEmbed returned empty embeddings for single text".into())
+            })
+        })
+    }
+
+    fn embed_batch<'a>(&'a self, texts: Vec<String>) -> EmbedBatchFuture<'a> {
+        let model = Arc::clone(&self.model);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let model = model.lock().map_err(|e| {
+                    MemoryError::Other(format!("FastEmbed model lock poisoned: {e}"))
+                })?;
+                model
+                    .embed(texts, None)
+                    .map_err(|e| MemoryError::Other(format!("FastEmbed embedding failed: {e}")))
+            })
+            .await
+            .map_err(|e| MemoryError::Other(format!("FastEmbed task failed: {e}")))?
+        })
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProjectionFailureRecordV1 {
@@ -32,6 +121,17 @@ pub struct ProjectionFailureRecordV1 {
     pub chunk_id: String,
     pub reason_code: String,
     pub error: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionSubchunk {
+    parent_chunk_id: String,
+    gloss_subchunk_id: String,
+    source_id: String,
+    chunk_index: i32,
+    ordinal: usize,
+    content: String,
+    token_count_estimate: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +151,7 @@ impl Default for ReindexSourceOptions {
 
 #[derive(Debug, Clone)]
 pub struct SemanticMemoryRuntimeConfig {
+    pub embedding_provider: EmbeddingProviderKind,
     pub embedding_ollama_url: String,
     pub embedding_model: String,
     pub embedding_timeout_secs: u64,
@@ -61,8 +162,9 @@ pub struct SemanticMemoryRuntimeConfig {
 impl Default for SemanticMemoryRuntimeConfig {
     fn default() -> Self {
         Self {
+            embedding_provider: DEFAULT_EMBEDDING_PROVIDER,
             embedding_ollama_url: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL.to_string(),
-            embedding_model: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL.to_string(),
+            embedding_model: FASTEMBED_MODEL_NAME.to_string(),
             embedding_timeout_secs: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS,
             turbo_quant_enabled: false,
             turbo_quant_require_fresh_artifacts: true,
@@ -71,6 +173,7 @@ impl Default for SemanticMemoryRuntimeConfig {
 }
 
 pub fn runtime_config_from_settings(
+    embedding_provider: Option<String>,
     embedding_ollama_url: Option<String>,
     embedding_model: Option<String>,
     embedding_timeout_secs: Option<String>,
@@ -78,13 +181,19 @@ pub fn runtime_config_from_settings(
     turbo_quant_require_fresh_artifacts: bool,
 ) -> SemanticMemoryRuntimeConfig {
     let defaults = SemanticMemoryRuntimeConfig::default();
+    let provider = EmbeddingProviderKind::from_setting(embedding_provider);
     SemanticMemoryRuntimeConfig {
+        embedding_provider: provider,
         embedding_ollama_url: embedding_ollama_url
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(defaults.embedding_ollama_url),
-        embedding_model: embedding_model
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(defaults.embedding_model),
+        embedding_model: if provider == EmbeddingProviderKind::FastEmbed {
+            FASTEMBED_MODEL_NAME.to_string()
+        } else {
+            embedding_model
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL.to_string())
+        },
         embedding_timeout_secs: embedding_timeout_secs
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|value| *value > 0)
@@ -97,6 +206,9 @@ pub fn runtime_config_from_settings(
 pub fn validate_embedding_model_role(
     config: &SemanticMemoryRuntimeConfig,
 ) -> Result<(), GlossError> {
+    if config.embedding_provider == EmbeddingProviderKind::FastEmbed {
+        return Ok(());
+    }
     let model = config.embedding_model.trim().to_ascii_lowercase();
     let looks_embedding_capable = model.contains("embed")
         || model.contains("nomic")
@@ -132,16 +244,25 @@ fn open_store(
     };
     if let Some(runtime_config) = runtime_config {
         let defaults = EmbeddingConfig::default();
+        config.embedding.dimensions =
+            if runtime_config.embedding_provider == EmbeddingProviderKind::FastEmbed {
+                FASTEMBED_DIMENSIONS
+            } else {
+                defaults.dimensions
+            };
         config.embedding.ollama_url = if runtime_config.embedding_ollama_url.trim().is_empty() {
             defaults.ollama_url
         } else {
             runtime_config.embedding_ollama_url.clone()
         };
-        config.embedding.model = if runtime_config.embedding_model.trim().is_empty() {
-            defaults.model
-        } else {
-            runtime_config.embedding_model.clone()
-        };
+        config.embedding.model =
+            if runtime_config.embedding_provider == EmbeddingProviderKind::FastEmbed {
+                FASTEMBED_MODEL_NAME.to_string()
+            } else if runtime_config.embedding_model.trim().is_empty() {
+                defaults.model
+            } else {
+                runtime_config.embedding_model.clone()
+            };
         config.embedding.timeout_secs = runtime_config.embedding_timeout_secs.max(1);
         config.limits.embedding_timeout = Duration::from_secs(config.embedding.timeout_secs);
     }
@@ -153,7 +274,19 @@ fn open_store(
             config.search.turbo_quant_require_exact_rerank = true;
         }
     }
-    MemoryStore::open(config).map_err(|e| GlossError::Search(format!("semantic-memory: {e}")))
+    let provider = runtime_config
+        .map(|config| config.embedding_provider)
+        .unwrap_or(DEFAULT_EMBEDDING_PROVIDER);
+    match provider {
+        EmbeddingProviderKind::FastEmbed => {
+            let embedder =
+                FastEmbedSemanticMemoryEmbedder::try_new(config.base_dir.join("fastembed-cache"))?;
+            MemoryStore::open_with_embedder(config, Box::new(embedder))
+                .map_err(|e| GlossError::Search(format!("semantic-memory: {e}")))
+        }
+        EmbeddingProviderKind::Ollama => MemoryStore::open(config)
+            .map_err(|e| GlossError::Search(format!("semantic-memory: {e}"))),
+    }
 }
 
 #[cfg(feature = "semantic-memory-turbo-quant")]
@@ -351,6 +484,74 @@ fn upsert_synced_link_rows(
     Ok(())
 }
 
+fn upsert_synced_subchunk_link_rows(
+    nb_db: &NotebookDb,
+    notebook_id: &str,
+    source_id: &str,
+    sm_document_id: &str,
+    subchunks: &[ProjectionSubchunk],
+    mappings: &HashMap<String, (String, String)>,
+) -> Result<(), GlossError> {
+    if sm_document_id.trim().is_empty() {
+        return Err(GlossError::Search(
+            "semantic-memory manifest ingest returned empty document id".to_string(),
+        ));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    for subchunk in subchunks {
+        let digest = content_digest(&subchunk.content);
+        let Some((sm_chunk_id, mapped_digest)) = mappings.get(&subchunk.gloss_subchunk_id) else {
+            return Err(GlossError::Search(format!(
+                "semantic-memory manifest ingest returned no mapping for Gloss projection subchunk {}",
+                subchunk.gloss_subchunk_id
+            )));
+        };
+        if sm_chunk_id.trim().is_empty() {
+            return Err(GlossError::Search(format!(
+                "semantic-memory manifest ingest returned empty chunk id for Gloss projection subchunk {}",
+                subchunk.gloss_subchunk_id
+            )));
+        }
+        if mapped_digest != &digest {
+            return Err(GlossError::Search(format!(
+                "semantic-memory manifest digest mismatch for Gloss projection subchunk {}",
+                subchunk.gloss_subchunk_id
+            )));
+        }
+
+        nb_db.conn.execute(
+            "INSERT INTO semantic_memory_links
+             (chunk_id, notebook_id, source_id, sm_document_id, sm_chunk_id, sm_episode_id,
+              content_digest, backend_version, sync_status, sync_error, synced_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'synced', NULL, ?9)
+             ON CONFLICT(chunk_id) DO UPDATE SET
+                notebook_id = excluded.notebook_id,
+                source_id = excluded.source_id,
+                sm_document_id = excluded.sm_document_id,
+                sm_chunk_id = excluded.sm_chunk_id,
+                sm_episode_id = excluded.sm_episode_id,
+                content_digest = excluded.content_digest,
+                backend_version = excluded.backend_version,
+                sync_status = excluded.sync_status,
+                sync_error = excluded.sync_error,
+                synced_at = excluded.synced_at",
+            rusqlite::params![
+                subchunk.gloss_subchunk_id,
+                notebook_id,
+                source_id,
+                sm_document_id,
+                sm_chunk_id,
+                Option::<&str>::None,
+                digest,
+                BACKEND_VERSION,
+                now,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn chunk_manifest_entries(chunks: &[Chunk]) -> Vec<ChunkManifestEntry> {
     chunks
         .iter()
@@ -365,6 +566,70 @@ fn chunk_manifest_entries(chunks: &[Chunk]) -> Vec<ChunkManifestEntry> {
                 "gloss_chunk_id": chunk.id,
                 "gloss_source_id": chunk.source_id,
                 "gloss_chunk_index": chunk.chunk_index
+            })),
+        })
+        .collect()
+}
+
+fn subchunk_id(parent_chunk_id: &str, ordinal: usize) -> String {
+    format!("{parent_chunk_id}::subchunk:{ordinal:04}")
+}
+
+fn deterministic_projection_subchunks(chunk: &Chunk) -> Vec<ProjectionSubchunk> {
+    if chunk.content.len() <= SEMANTIC_MEMORY_PROJECTION_MAX_SUBCHUNK_CHARS
+        && chunk_token_budget(chunk) <= SEMANTIC_MEMORY_PROJECTION_MAX_TOKENS_PER_BATCH
+    {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut ordinal = 0usize;
+    while start < chunk.content.len() {
+        let mut end =
+            (start + SEMANTIC_MEMORY_PROJECTION_MAX_SUBCHUNK_CHARS).min(chunk.content.len());
+        while end < chunk.content.len() && !chunk.content.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end <= start {
+            end = chunk.content[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(idx, _)| start + idx)
+                .unwrap_or(chunk.content.len());
+        }
+        let content = chunk.content[start..end].to_string();
+        out.push(ProjectionSubchunk {
+            parent_chunk_id: chunk.id.clone(),
+            gloss_subchunk_id: subchunk_id(&chunk.id, ordinal),
+            source_id: chunk.source_id.clone(),
+            chunk_index: chunk.chunk_index,
+            ordinal,
+            token_count_estimate: content.len().saturating_div(4).max(1),
+            content,
+        });
+        start = end;
+        ordinal += 1;
+    }
+    out
+}
+
+fn projection_subchunk_manifest_entries(
+    subchunks: &[ProjectionSubchunk],
+) -> Vec<ChunkManifestEntry> {
+    subchunks
+        .iter()
+        .map(|subchunk| ChunkManifestEntry {
+            external_chunk_id: subchunk.gloss_subchunk_id.clone(),
+            content: subchunk.content.clone(),
+            token_count_estimate: Some(subchunk.token_count_estimate),
+            content_digest: Some(content_digest(&subchunk.content)),
+            metadata: Some(serde_json::json!({
+                "gloss_chunk_id": subchunk.gloss_subchunk_id,
+                "gloss_parent_chunk_id": subchunk.parent_chunk_id,
+                "gloss_source_id": subchunk.source_id,
+                "gloss_chunk_index": subchunk.chunk_index,
+                "gloss_projection_subchunk_ordinal": subchunk.ordinal
             })),
         })
         .collect()
@@ -544,6 +809,71 @@ pub async fn reindex_source_with_options(
     }
 
     for batch in projection_batches(&chunks) {
+        if batch.len() == 1 {
+            let subchunks = deterministic_projection_subchunks(&batch[0]);
+            if !subchunks.is_empty() {
+                let subchunk_options = ChunkManifestIngestOptions {
+                    title: source.title.clone(),
+                    namespace: notebook_id.to_string(),
+                    source_path: source.file_path.clone(),
+                    metadata: Some(metadata.clone()),
+                };
+                match ingest_document_chunk_manifest(
+                    &store,
+                    subchunk_options,
+                    projection_subchunk_manifest_entries(&subchunks),
+                )
+                .await
+                {
+                    Ok(receipt) => {
+                        let mappings = receipt
+                            .chunks
+                            .iter()
+                            .map(|mapping| {
+                                (
+                                    mapping.external_chunk_id.clone(),
+                                    (
+                                        mapping.sm_chunk_id.clone(),
+                                        mapping.content_digest.clone().unwrap_or_default(),
+                                    ),
+                                )
+                            })
+                            .collect::<HashMap<_, _>>();
+                        let nb_db = NotebookDb::connect(notebook_db_path)?;
+                        upsert_synced_subchunk_link_rows(
+                            &nb_db,
+                            notebook_id,
+                            source_id,
+                            &receipt.sm_document_id,
+                            &subchunks,
+                            &mappings,
+                        )?;
+                        projected_chunks += 1;
+                    }
+                    Err(error) => {
+                        failure_records.push(projection_failure_record(
+                            source_id,
+                            &batch[0],
+                            if is_context_length_error(&error) {
+                                "context_length_after_subchunk"
+                            } else {
+                                "subchunk_projection_failed"
+                            },
+                            &error,
+                        ));
+                        let nb_db = NotebookDb::connect(notebook_db_path)?;
+                        upsert_failed_link_rows(
+                            &nb_db,
+                            notebook_id,
+                            source_id,
+                            &batch,
+                            &error.to_string(),
+                        )?;
+                    }
+                }
+                continue;
+            }
+        }
         let batch_options = ChunkManifestIngestOptions {
             title: source.title.clone(),
             namespace: notebook_id.to_string(),
@@ -965,20 +1295,19 @@ mod tests {
             selected: true,
             created_at: String::new(),
             updated_at: String::new(),
+            processing_state: None,
         }
     }
 
     #[test]
     fn runtime_config_defaults_turbo_quant_off() {
-        let config = runtime_config_from_settings(None, None, None, false, true);
+        let config = runtime_config_from_settings(None, None, None, None, false, true);
+        assert_eq!(config.embedding_provider, EmbeddingProviderKind::FastEmbed);
         assert_eq!(
             config.embedding_ollama_url,
             DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL
         );
-        assert_eq!(
-            config.embedding_model,
-            DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL
-        );
+        assert_eq!(config.embedding_model, FASTEMBED_MODEL_NAME);
         assert_eq!(
             config.embedding_timeout_secs,
             DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS
@@ -989,6 +1318,7 @@ mod tests {
     #[test]
     fn runtime_config_carries_explicit_turbo_quant_consent() {
         let config = runtime_config_from_settings(
+            Some("ollama".to_string()),
             Some("http://localhost:11435".to_string()),
             Some("embed-model".to_string()),
             Some("12".to_string()),
@@ -1000,6 +1330,21 @@ mod tests {
         assert_eq!(config.embedding_timeout_secs, 12);
         assert!(config.turbo_quant_enabled);
         assert!(config.turbo_quant_require_fresh_artifacts);
+    }
+
+    #[test]
+    fn embedding_provider_defaults_to_fastembed_and_overrides_legacy_model_setting() {
+        let config = runtime_config_from_settings(
+            Some("fastembed".to_string()),
+            Some("http://localhost:11435".to_string()),
+            Some("nomic-embed-text".to_string()),
+            Some("12".to_string()),
+            false,
+            true,
+        );
+        assert_eq!(config.embedding_provider, EmbeddingProviderKind::FastEmbed);
+        assert_eq!(config.embedding_model, FASTEMBED_MODEL_NAME);
+        assert_eq!(config.embedding_timeout_secs, 12);
     }
 
     #[tokio::test]

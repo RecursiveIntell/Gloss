@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse, json, re, sys
 from pathlib import Path
 
-RUN_ID = "GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519"
+RUN_ID = "GLOSS_P36_RELEASE_COMPLETION_DENSE_TQ_RELEASE_20260525"
 
 def read_current_run(repo: Path) -> str | None:
     p = repo / "docs/codex-runs/CURRENT_RUN.md"

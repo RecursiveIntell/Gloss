@@ -382,6 +382,7 @@ fn create_file_source(
         selected: true,
         created_at: String::new(),
         updated_at: String::new(),
+        processing_state: None,
     };
 
     state.with_notebook_db(notebook_id, |db| db.insert_source(&source))?;
@@ -416,8 +417,6 @@ struct IngestionOpts {
     /// Save HNSW index to disk after this source
     save_index: bool,
     /// Run semantic embedding + HNSW indexing for this source.
-    /// Folder imports disable this to avoid crashing the desktop process inside
-    /// native ONNX/usearch code; chat falls back to DB chunks for such sources.
     embed_chunks: bool,
     /// Queue a background summary job after ingestion
     queue_summary: bool,
@@ -427,6 +426,33 @@ struct IngestionOpts {
     /// Batch folder imports suppress these per-source events and rely on the
     /// final list refresh instead to avoid flooding the renderer.
     emit_final_status: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestionTerminalState {
+    Ready,
+    Error,
+    DeletedDuringIngestion,
+    SkippedUnsupported,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct IngestionTerminalCounts {
+    ready: usize,
+    failed: usize,
+    skipped_unsupported: usize,
+    cancelled_superseded: usize,
+}
+
+impl IngestionTerminalCounts {
+    fn record(&mut self, terminal_state: IngestionTerminalState) {
+        match terminal_state {
+            IngestionTerminalState::Ready => self.ready += 1,
+            IngestionTerminalState::Error => self.failed += 1,
+            IngestionTerminalState::DeletedDuringIngestion => self.cancelled_superseded += 1,
+            IngestionTerminalState::SkippedUnsupported => self.skipped_unsupported += 1,
+        }
+    }
 }
 
 impl Default for IngestionOpts {
@@ -450,7 +476,7 @@ fn run_ingestion(
     app_handle: &tauri::AppHandle,
     queue: &Arc<QueueManager>,
 ) {
-    run_ingestion_inner(
+    let _ = run_ingestion_inner(
         notebook_id,
         source_id,
         state,
@@ -467,12 +493,12 @@ fn run_ingestion_inner(
     app_handle: &tauri::AppHandle,
     queue: &Arc<QueueManager>,
     opts: IngestionOpts,
-) {
+) -> IngestionTerminalState {
     // Signal that ingestion is active so the summary loop yields. The guard
     // finalizes the counter on early returns or panic unwind.
     let _ingestion_guard = ActiveCounterGuard::new(&state.ingestion_active, "ingestion_active");
 
-    let result = (|| -> Result<(), GlossError> {
+    let result = (|| -> Result<IngestionTerminalState, GlossError> {
         // Get notebook dir + source record
         let nb_dir = {
             let app_db = state
@@ -500,7 +526,7 @@ fn run_ingestion_inner(
             state.with_notebook_db(notebook_id, |db| {
                 db.update_source_status(source_id, "ready", None)
             })?;
-            return Ok(());
+            return Ok(IngestionTerminalState::SkippedUnsupported);
         }
 
         // 2. Chunk (code-aware splitting for recognized extensions)
@@ -637,7 +663,7 @@ fn run_ingestion_inner(
             chunks = chunks.len(),
             "Ingestion complete"
         );
-        Ok(())
+        Ok(IngestionTerminalState::Ready)
     })();
 
     if let Err(e) = &result {
@@ -647,12 +673,16 @@ fn run_ingestion_inner(
                 source_id,
                 "Source deleted during ingestion, stopping quietly"
             );
-            return;
+            return IngestionTerminalState::DeletedDuringIngestion;
         }
     }
 
     let (status, error_msg) = match &result {
-        Ok(()) => ("ready", None),
+        Ok(IngestionTerminalState::Ready) | Ok(IngestionTerminalState::SkippedUnsupported) => {
+            ("ready", None)
+        }
+        Ok(IngestionTerminalState::DeletedDuringIngestion) => ("deleted_during_ingestion", None),
+        Ok(IngestionTerminalState::Error) => ("error", None),
         Err(e) => ("error", Some(e.to_string())),
     };
 
@@ -671,6 +701,10 @@ fn run_ingestion_inner(
             status,
             error_msg.as_deref(),
         );
+    }
+    match result {
+        Ok(terminal_state) => terminal_state,
+        Err(_) => IngestionTerminalState::Error,
     }
 }
 
@@ -691,6 +725,7 @@ fn semantic_memory_runtime_config_from_app_db(
     app_db: &crate::db::app_db::AppDb,
 ) -> Result<semantic_memory_adapter::SemanticMemoryRuntimeConfig, GlossError> {
     let config = semantic_memory_adapter::runtime_config_from_settings(
+        app_db.get_setting("semantic_memory_embedding_provider")?,
         app_db.get_setting("semantic_memory_embedding_url")?,
         app_db.get_setting("semantic_memory_embedding_model")?,
         app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
@@ -1324,6 +1359,8 @@ fn emit_status(
     status: &str,
     error_message: Option<&str>,
 ) {
+    // `source_processing_state` owns lifecycle/summary/FTS/dense/projection
+    // truth; this legacy event remains a compact display/update hint.
     let mut payload = serde_json::json!({
         "notebook_id": notebook_id,
         "source_id": source_id,
@@ -1508,6 +1545,7 @@ pub async fn add_source_files(
     app_handle: tauri::AppHandle,
 ) -> Result<Vec<String>, GlossError> {
     let mut created = Vec::new();
+    let mut ingestion_sources = Vec::new();
     for path in paths {
         let source_path = PathBuf::from(&path);
         validate_import_size(&source_path)?;
@@ -1534,20 +1572,28 @@ pub async fn add_source_files(
                 Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
             },
             _ => {
-                let nb = notebook_id.clone();
-                let src = source_id.clone();
-                let q = Arc::clone(&queue);
-                let handle = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let state = handle.state::<AppState>();
-                        run_ingestion(&nb, &src, &state, &handle, &q);
-                    })
-                    .await;
-                });
+                ingestion_sources.push(source_id.clone());
             }
         }
         created.push(source_id);
+    }
+
+    if !ingestion_sources.is_empty() {
+        let nb = notebook_id.clone();
+        let q = Arc::clone(&queue);
+        let handle = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            for src in ingestion_sources {
+                let nb = nb.clone();
+                let q = Arc::clone(&q);
+                let handle = handle.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let state = handle.state::<AppState>();
+                    run_ingestion(&nb, &src, &state, &handle, &q);
+                })
+                .await;
+            }
+        });
     }
 
     if !created.is_empty() {
@@ -2011,11 +2057,14 @@ pub async fn add_source_folder(
             return;
         }
 
-        // Phase 2: Ingest one at a time on blocking thread pool.
-        // spawn_blocking isolates panics from ONNX/usearch C++ code.
+        // Phase 2: Ingest one at a time on the blocking thread pool. Dense
+        // indexing and summary jobs remain enabled so folder imports produce
+        // the same release evidence as individual file imports.
         // Images are routed to the vision pipeline (queued jobs) instead.
+        let mut terminal_counts = IngestionTerminalCounts::default();
         for (i, (source_id, source_type)) in sources.into_iter().enumerate() {
             if let Err(reason) = validate_import_batch_notebook(&handle, &nb_id, notebook_epoch) {
+                terminal_counts.cancelled_superseded += total.saturating_sub(i);
                 emit_import_batch_receipt(
                     &handle,
                     &nb_id,
@@ -2025,10 +2074,10 @@ pub async fn add_source_folder(
                     found,
                     total,
                     i,
-                    failed,
+                    failed + terminal_counts.failed,
                     skipped_duplicate,
-                    0,
-                    total.saturating_sub(i),
+                    terminal_counts.skipped_unsupported,
+                    terminal_counts.cancelled_superseded,
                     Some(&reason),
                 );
                 emit_folder_scan_event(
@@ -2050,38 +2099,41 @@ pub async fn add_source_folder(
                     "image" => {
                         let _ =
                             queue_describe_image_job(&q, &state, &nb_id, &source_id, Path::new(""));
+                        IngestionTerminalState::SkippedUnsupported
                     }
                     "video" => {
                         let _ = queue_describe_video_job(&q, &state, &nb_id, &source_id);
+                        IngestionTerminalState::SkippedUnsupported
                     }
-                    _ => {
-                        run_ingestion_inner(
-                            &nb_id,
-                            &source_id,
-                            &state,
-                            &handle,
-                            &q,
-                            IngestionOpts {
-                                save_index: false,
-                                embed_chunks: false,
-                                queue_summary: false,
-                                emit_progress: false,
-                                emit_final_status: false,
-                            },
-                        );
-                    }
+                    _ => run_ingestion_inner(
+                        &nb_id,
+                        &source_id,
+                        &state,
+                        &handle,
+                        &q,
+                        IngestionOpts {
+                            save_index: false,
+                            embed_chunks: crate::state::NATIVE_SEMANTIC_INDEXING_ENABLED,
+                            queue_summary: true,
+                            emit_progress: false,
+                            emit_final_status: false,
+                        },
+                    ),
                 }
             })
             .await;
 
-            if let Err(e) = result {
-                failed += 1;
-                tracing::error!(
-                    index = i,
-                    total,
-                    error = %e,
-                    "Ingestion task panicked, continuing with remaining files"
-                );
+            match result {
+                Ok(terminal_state) => terminal_counts.record(terminal_state),
+                Err(e) => {
+                    failed += 1;
+                    tracing::error!(
+                        index = i,
+                        total,
+                        error = %e,
+                        "Ingestion task panicked, continuing with remaining files"
+                    );
+                }
             }
 
             // Brief pause between sources to let GPU memory settle
@@ -2114,12 +2166,18 @@ pub async fn add_source_folder(
                 "status": "completed",
                 "found": found,
                 "created": total,
-                "ingested_ready": total.saturating_sub(failed),
-                "failed": failed,
+                "ingested_ready": total
+                    .saturating_sub(failed + terminal_counts.failed)
+                    .saturating_sub(terminal_counts.skipped_unsupported)
+                    .saturating_sub(terminal_counts.cancelled_superseded),
+                "failed": failed + terminal_counts.failed,
                 "skipped_duplicate": skipped_duplicate,
-                "skipped_unsupported": 0,
-                "cancelled_superseded": 0,
-                "count": total.saturating_sub(failed),
+                "skipped_unsupported": terminal_counts.skipped_unsupported,
+                "cancelled_superseded": terminal_counts.cancelled_superseded,
+                "count": total
+                    .saturating_sub(failed + terminal_counts.failed)
+                    .saturating_sub(terminal_counts.skipped_unsupported)
+                    .saturating_sub(terminal_counts.cancelled_superseded),
                 "message": null,
             }),
         );
@@ -2173,6 +2231,7 @@ pub async fn add_source_paste(
         selected: true,
         created_at: String::new(),
         updated_at: String::new(),
+        processing_state: None,
     };
 
     state.with_notebook_db(&notebook_id, |db| db.insert_source(&source))?;
@@ -3258,6 +3317,7 @@ pub async fn compare_memory_backends(
             .map_err(|e| GlossError::Other(e.to_string()))?;
         features::require_semantic_memory_preview_enabled(&app_db)?;
         semantic_memory_adapter::runtime_config_from_settings(
+            app_db.get_setting("semantic_memory_embedding_provider")?,
             app_db.get_setting("semantic_memory_embedding_url")?,
             app_db.get_setting("semantic_memory_embedding_model")?,
             app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
@@ -3389,6 +3449,7 @@ mod tests {
             selected: true,
             created_at: String::new(),
             updated_at: String::new(),
+            processing_state: None,
         }
     }
 
@@ -3491,5 +3552,46 @@ mod tests {
         assert!(!result.diagnostics.is_empty());
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.processing, 0);
+    }
+
+    #[test]
+    fn folder_import_counts_ingestion_errors() {
+        let mut counts = IngestionTerminalCounts::default();
+        counts.record(IngestionTerminalState::Error);
+        counts.record(IngestionTerminalState::Error);
+        counts.record(IngestionTerminalState::Ready);
+
+        assert_eq!(counts.ready, 1);
+        assert_eq!(counts.failed, 2);
+    }
+
+    #[test]
+    fn batch_receipt_matches_source_terminal_state() {
+        let mut counts = IngestionTerminalCounts::default();
+        for state in [
+            IngestionTerminalState::Ready,
+            IngestionTerminalState::Error,
+            IngestionTerminalState::SkippedUnsupported,
+            IngestionTerminalState::DeletedDuringIngestion,
+        ] {
+            counts.record(state);
+        }
+
+        assert_eq!(
+            counts,
+            IngestionTerminalCounts {
+                ready: 1,
+                failed: 1,
+                skipped_unsupported: 1,
+                cancelled_superseded: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn add_source_files_uses_bounded_ingestion_scheduler() {
+        let source = include_str!("mod.rs");
+        assert!(source.contains("let mut ingestion_sources = Vec::new();"));
+        assert!(source.contains("for src in ingestion_sources"));
     }
 }

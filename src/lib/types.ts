@@ -27,6 +27,41 @@ export interface Source {
   selected: boolean;
   created_at: string;
   updated_at: string;
+  processing_state?: SourceProcessingState | null;
+}
+
+export interface SourceProcessingState {
+  source_id: string;
+  lifecycle_status: string;
+  summary_status: string;
+  fts_index_status: string;
+  dense_index_status: string;
+  semantic_projection_status: string;
+  last_summary_receipt_id?: string | null;
+  last_dense_index_receipt_id?: string | null;
+  last_projection_receipt_id?: string | null;
+  last_error?: string | null;
+  updated_at: string;
+}
+
+export interface EmbeddingDiagnosticsReceipt {
+  native_fastembed: {
+    init_ok: boolean;
+    embed_one_ok: boolean;
+    dims?: number | null;
+    cache_dir: string;
+    error?: string | null;
+  };
+  semantic_memory_provider: {
+    provider: string;
+    dims: number;
+    model: string;
+  };
+  optional_ollama: {
+    configured: boolean;
+    url?: string | null;
+    embed_ok?: boolean | null;
+  };
 }
 
 export interface Conversation {

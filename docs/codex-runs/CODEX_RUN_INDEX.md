@@ -1,10 +1,12 @@
 # Codex Run Index
 
-Updated UTC: `2026-05-25T08:03:15Z`
+Updated UTC: `2026-05-25T00:00:00Z`
 Archive root: `docs/codex-runs/archive`
 
 ## Archive Manifests
 
+- `docs/codex-runs/GLOSS_RELEASE_PROOF_EMBEDDING_UNIFICATION_CLEANUP_20260525/STALE_PASS_CLEANUP_MANIFEST.json`
+- `docs/codex-runs/archive/stale-root-GLOSS_RELEASE_PROOF_EMBEDDING_UNIFICATION_CLEANUP_20260525/`
 - `docs/codex-runs/archive/P1/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P2/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P3/ARCHIVE_MANIFEST.json`

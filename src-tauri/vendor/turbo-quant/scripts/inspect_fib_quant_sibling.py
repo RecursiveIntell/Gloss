@@ -8,11 +8,10 @@ ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 candidates = []
 if os.environ.get("FIB_QUANT_PATH"):
     candidates.append(Path(os.environ["FIB_QUANT_PATH"]).expanduser())
-for rel in ["../fib-quant", "../fib_quant", "../../fib-quant", "../../Libraries/fib-quant", "../../Libraries2/fib-quant"]:
+for rel in ["../fib-quant", "../fib_quant", "../../fib-quant", "../../Libraries/fib-quant"]:
     candidates.append((ROOT / rel).resolve())
 for abs_path in [
     "~/Coding/Libraries/fib-quant",
-    "~/Coding/Libraries2/fib-quant",
     "~/Coding/fib-quant",
     "~/Documents/fib-quant",
 ]:

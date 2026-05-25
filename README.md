@@ -1,254 +1,273 @@
 # Gloss
 
-Gloss is a local-first desktop research notebook for people who work with dense source material and want AI help without losing control of the evidence.
+Gloss is a local-first desktop notebook for research, source-grounded chat, notes, and retrieval experiments. It is built with Tauri, React, TypeScript, Rust, SQLite, local indexing, and optional semantic-memory integration.
 
-It combines notebooks, source ingestion, retrieval-augmented chat, citations, notes, summaries, media handling, provider configuration, and runtime diagnostics in one Tauri desktop app. The design goal is simple: keep your research workspace on your machine, let you choose the model backend, and make every answer accountable to the sources that produced it.
+The product direction is large: NotebookLM-style workspaces, scoped RAG answers, local-first data ownership, model-provider flexibility, semantic-memory projection, and TurboQuant-assisted retrieval. The current repository is not presented as release-ready. Current source files, active gates, and fresh receipts outrank old README claims and historical run artifacts.
 
-## Why Gloss
+## Current Truth
 
-Most AI chat tools treat your documents as disposable context. Gloss treats them as a durable research library.
+Gloss is in runtime-truth and ingestion repair. Do not ship, promote, or demo it as a completed release unless the current gates and live desktop receipts prove that claim.
 
-- **Local-first by default**: notebooks, source copies, SQLite databases, retrieval indexes, settings, and provider metadata live on the local machine.
-- **Citation-grounded chat**: assistant answers can carry source citations and retrieval evidence, so you can inspect what context was used instead of trusting a black box.
-- **Explicit source scope**: ask over all sources, no sources, or a selected subset when a question needs a tight evidence boundary.
-- **Notebook-native workflow**: collect sources, chat with them, save useful responses as notes, pin important notes, and keep related conversations together.
-- **Model choice without lock-in**: run with local providers like Ollama or llama.cpp-compatible servers, or configure hosted providers when you decide they are appropriate.
-- **Truthful retrieval status**: Gloss reports fallback, degraded retrieval, source scope, backend selection, and citation health instead of claiming dense hybrid search when dense retrieval did not run.
-- **Media-aware ingestion**: import text, code, images, pasted text, folders, and supported video workflows with local tool checks.
-- **Experimental acceleration path**: semantic-memory and TurboQuant candidate generation are available as guarded preview surfaces while the stable app remains conservative and exact-rerank oriented.
+- Operator pass for this work: `GLOSS_P34_RUNTIME_TRUTH_INGESTION_REPAIR_20260524`.
+- `docs/codex-runs/CURRENT_RUN.md` currently reports `P30`, which conflicts with the P34 operator pass and must be resolved before any release claim.
+- P34 and P35 receipts explicitly mark the app as not release-ready while live desktop GUI smoke remains unproven.
+- `docs/CURRENT_FEATURE_MATRIX.md` is the product-surface source of truth for implemented, partial, degraded, deferred, and blocked capabilities.
+- Every user-visible answer must disclose requested backend, effective backend, fallback/degradation, citation validity, source-scope integrity, and receipt identity.
 
-## Core Experience
+## What Gloss Is
 
-### Notebooks
+Gloss is designed for users who want to work with local notebooks and ask questions against their own sources without silently widening source scope or hiding retrieval failures.
 
-Create separate notebooks for projects, clients, papers, codebases, classes, or investigations. Each notebook gets its own local data directory, source store, per-notebook SQLite database, conversations, notes, chunks, summaries, and retrieval state.
+Core surfaces:
 
-### Sources
+- Notebook management with local per-notebook storage.
+- Source import for text-like files, folders, and pasted content.
+- Queue-backed ingestion, chunking, embedding, and summary jobs.
+- Source-scoped chat with streaming provider responses.
+- Citation and evidence envelopes attached to assistant answers.
+- Notes created manually or from assistant responses.
+- Provider settings for local and remote model backends.
+- Runtime diagnostics for chat, retrieval, source scope, and memory backends.
+- Optional semantic-memory preview and TurboQuant candidate acceleration.
 
-Gloss can ingest:
+Current feature boundaries:
 
-- Text and Markdown: `txt`, `md`, `markdown`, `rst`
-- Code and config: TypeScript, JavaScript, Rust, Go, Java, C/C++, Python, SQL, shell, JSON, YAML, TOML, HTML, CSS, Terraform, GraphQL, Dockerfile, Makefile, and related formats
-- Images: `png`, `jpg`, `jpeg`, `gif`, `webp`, `bmp`, `tiff`, `tif`
-- Video: `mp4`, `webm`, `mov`, `avi`, `mkv`
-- Pasted text entered directly in the app
-- Whole folders through recursive import
+- Text, Markdown, and code import are partial but active.
+- BM25/local retrieval is the stable implemented fallback.
+- Semantic-memory preview is opt-in and degraded until runtime smoke proves end-to-end quality.
+- TurboQuant acceleration is partial: it may produce candidates, but exact rerank remains required.
+- PDF, DOCX, XLSX, URL import, YouTube, audio, rich Studio outputs, and portable notebook export/import are deferred unless current source and fresh receipts say otherwise.
 
-Unsupported binaries, archives, model weights, local databases, object files, office documents, and noisy generated artifacts are skipped so the notebook stays focused on usable research material.
+## Runtime Architecture
 
-### Chat With Evidence
+Gloss has four major layers:
 
-Gloss chat is built around source accountability.
+- Frontend: React 19, TypeScript, Zustand stores, Tauri invoke wrappers, and event listeners for chat, ingestion, jobs, and evidence.
+- Desktop host: Tauri 2 command surface for notebooks, sources, chat, notes, settings, provider tests, and memory diagnostics.
+- Rust runtime: SQLite-backed app and notebook databases, local retrieval, ingestion, provider orchestration, summary scheduling, source-scope resolution, and evidence construction.
+- Vendored research/runtime libraries: `llm-pipeline`, `tauri-queue`, `semantic-memory`, and `turbo-quant`.
 
-- Streamed assistant responses
-- Stop and regenerate controls
-- Copy, edit-and-rerun, and save-as-note workflows
-- Suggested questions from the current notebook
-- Source citations attached to answers
-- Evidence drawers showing retrieval backend, retrieval mode, source scope, fallback state, context counts, citation validity, and receipt references
-- Chat attempt traces for diagnosing provider, retrieval, streaming, and persistence behavior
+The default desktop binary compiles semantic-memory support through `semantic-memory-backend`, but runtime activation remains controlled by settings and feature flags. Compiled availability is not treated as consent to use preview behavior.
 
-### Source Scope
+## Answer Contract
 
-Source scope is a first-class control, not an afterthought.
+Gloss must not treat all retrieval paths as equivalent. A normal answer is only trustworthy when the evidence contract is explicit.
 
-- **All sources**: use the whole notebook
-- **Selected sources**: constrain chat to specific files or pasted sources
-- **No sources**: use the model directly when retrieval would be a distraction
+Each answer should make these runtime facts inspectable:
 
-Gloss resolves source scope before retrieval and does not silently widen invalid explicit selections into a broader search.
+- Requested backend: what the user or settings asked for.
+- Effective backend: what actually served retrieval.
+- Fallback and degradation: whether BM25, source-order, raw-content, or provider-only behavior was used.
+- Citation validity: how many citations were anchored, filtered, or invalid.
+- Source scope: whether selected sources were preserved and whether invalid explicit source IDs were excluded.
+- Receipt ID: the traceable runtime receipt for the answer or diagnostic path.
 
-### Notes And Summaries
+Invalid explicit source IDs must resolve to no or partial scoped sources. They must never widen to all sources.
 
-Gloss supports both manual knowledge capture and background synthesis.
+## TurboQuant Backend
 
-- Create and edit manual notes
-- Pin important notes
-- Save assistant responses as notes with citation backlinks
-- Generate source summaries
-- Queue summary work without blocking chat
-- Pause or resume summary processing
+Gloss includes a vendored `turbo-quant` Rust crate under `src-tauri/vendor/turbo-quant`. In Gloss, TurboQuant is used as an experimental candidate accelerator for semantic-memory vector artifacts. It is not the canonical source of evidence, and it does not replace exact `f32` vectors or exact rerank.
 
-### Providers And Models
+What the current crate verifies:
 
-Gloss is provider-flexible.
+- Deterministic PolarQuant-style packed angle payloads.
+- Optional QJL residual sign sketches.
+- Codec profiles and compression receipts.
+- Explicit `TurboMode::PolarOnly` and `TurboMode::PolarWithQjl` behavior.
+- FastHadamard or stored-QR rotation selection depending on dimension support.
+- Asymmetric key/value policy structures for experiments.
+- Benchmark receipt generation for reproducibility, not deployment proof.
 
-- Ollama
-- llama.cpp-compatible local servers
-- OpenAI
-- Anthropic
+Gloss runtime policy:
 
-Provider URLs, enabled state, model refresh results, selected chat model, summary model, vision model, context window, capabilities, and provider errors are tracked locally. Hosted API keys are stored through the local secret store instead of being left in ordinary settings rows.
+- TurboQuant can only be treated as candidate generation.
+- Exact rerank remains required before answer evidence is trusted.
+- Vector artifacts must carry generation IDs and receipts.
+- Stale or missing artifacts are degradation, not invisible success.
+- TurboQuant, semantic-memory, dense retrieval, BM25, source-order fallback, and provider-only answers must be disclosed separately.
 
-### Status You Can Trust
+### Research And Coverage
 
-The UI exposes the runtime details that matter during real work:
+The TurboQuant algorithm family has been discussed in research and technical press. These references describe the broader algorithmic work; they do not prove Gloss's integration or release quality.
 
-- Provider reachability
-- Selected model state
-- Queue state
-- Summary pause/manual mode
-- Runtime gate owners
-- Memory backend selection
-- semantic-memory link health
-- External tool availability
-- Retrieval coverage and fallback state
+- Google Research announced TurboQuant, PolarQuant, and QJL for KV-cache compression and vector search in March 2026: <https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/>
+- The paper "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate" is available on arXiv: <https://arxiv.org/abs/2504.19874>
+- OpenReview lists the TurboQuant paper as an ICLR 2026 conference paper: <https://openreview.net/forum?id=tO3ASKZlok>
+- InfoQ covered Google's TurboQuant memory and inference claims: <https://www.infoq.com/news/2026/04/turboquant-compression-kv-cache/>
+- Tom's Hardware covered TurboQuant's reported KV-cache compression and H100 attention-logit speedups: <https://www.tomshardware.com/tech-industry/artificial-intelligence/googles-turboquant-compresses-llm-kv-caches-to-3-bits-with-no-accuracy-loss>
+- Developer roundups have listed `RecursiveIntell/turbo-quant` as a Rust implementation of the TurboQuant, PolarQuant, and QJL family: <https://aetos.ai/posts/e33eff3a1374b370>
 
-Gloss favors visible degradation over hidden optimism.
+## Repository Layout
 
-## Local-First Architecture
-
-Gloss is built as a Tauri 2 desktop app with a React/TypeScript frontend and Rust backend.
-
-Frontend:
-
-- React 19
-- TypeScript
-- Vite
-- Tailwind CSS
-- Zustand stores
-- Tauri command and event wrappers
-
-Backend:
-
-- Rust and Tauri commands
-- SQLite app database
-- Per-notebook SQLite databases
-- Persistent job queue
-- Local source storage
-- Local secret store for provider keys
-- Provider registry
-- Retrieval and citation pipeline
-- Runtime gates for LLM and GPU-sensitive work
-
-By default, Gloss initializes local app data for notebooks, providers, settings, queue state, copied sources, chunks, generated summaries, and index artifacts under the operating system's application data directory.
-
-## Retrieval
-
-The stable retrieval backend is `gloss-local`.
-
-Gloss uses SQLite FTS5/BM25 as the stable local retriever and records exactly which retrieval engines were attempted, available, and productive. Optional dense and semantic-memory paths are treated as explicit runtime capabilities, not marketing labels.
-
-When retrieval cannot produce indexed context, Gloss records the degraded outcome and fallback chain. When citations are attached to an answer, the evidence payload records how the context was built and what source scope was effective.
-
-## semantic-memory And TurboQuant
-
-Gloss includes guarded experimental integration points for `semantic-memory` and TurboQuant candidate acceleration.
-
-The important rule: preview acceleration is never treated as correctness. TurboQuant is candidate-only in Gloss, and exact rerank remains required. The stable local path remains the default, and build-feature availability does not imply runtime consent.
-
-The TurboQuant-related work in Gloss is connected to the [`RecursiveIntell/turbo-quant`](https://github.com/RecursiveIntell/turbo-quant) Rust crate, an experimental sidecar-oriented implementation inspired by TurboQuant, PolarQuant, and Quantized Johnson-Lindenstrauss sketches. The crate is also published on [docs.rs](https://docs.rs/turbo-quant/latest/turbo_quant/).
-
-External references I verified while preparing this README:
-
-- The [`tonbistudio/turboquant-pytorch`](https://github.com/tonbistudio/turboquant-pytorch) README lists `RecursiveIntell/turbo-quant` as a Rust community implementation.
-- A [Dev.to developer overview](https://dev.to/arshtechpro/turboquant-what-developers-need-to-know-about-googles-kv-cache-compression-eeg) lists `RecursiveIntell/turbo-quant` as a standalone Rust implementation for embeddings and KV cache work.
-- [DevPik coverage](https://www.devpik.com/blog/google-turboquant-pied-piper-ai-compression) also identifies `RecursiveIntell/turbo-quant` as a Rust implementation and describes it as useful for vector-search applications.
-- [ByteIota coverage](https://byteiota.com/google-turboquant-6x-ai-memory-compression-tanks-chip-stocks/) mentions Rust community implementation work alongside PyTorch and vLLM efforts.
-- The TurboQuant research paper is available through [OpenReview](https://openreview.net/pdf/7d33913c9a4f47c8abb294d6beb85d30124747ca.pdf).
-
-Those references are not a claim that Gloss enables TurboQuant by default. In Gloss, TurboQuant remains experimental, opt-in, and subordinate to exact retrieval correctness.
-
-## What Makes Gloss Different
-
-### It is a notebook, not just a chat box
-
-Research work is not one prompt. Gloss gives you a place to build context over time: sources, conversations, saved answers, summaries, and notes all live together.
-
-### It is local-first without being local-only
-
-Gloss starts from local storage and local model workflows, but it does not force a single provider. You can keep sensitive notebooks local and still configure hosted providers for cases where they make sense.
-
-### It treats citations as a runtime contract
-
-Gloss does not just append citation-looking text. It stores citation payloads and retrieval evidence so the app can show what backend ran, what scope was searched, and how the answer was grounded.
-
-### It is honest about retrieval quality
-
-Gloss distinguishes BM25, dense, semantic-memory, source-order fallback, degraded states, missing embeddings, invalid source selections, and unavailable preview features. That matters when the answer is only as good as the context path.
-
-### It is built for long-running local workflows
-
-Background jobs, summary queues, ingestion, provider calls, embedding work, and chat compete for local resources. Gloss uses runtime gates and visible status so foreground chat remains responsive and background work does not quietly starve the app.
+```text
+.
+|-- README.md
+|-- AGENTS.md
+|-- package.json
+|-- docs/
+|   |-- CURRENT_FEATURE_MATRIX.md
+|   `-- codex-runs/
+|-- scripts/
+|-- src/
+|   |-- App.tsx
+|   |-- components/
+|   |-- lib/
+|   `-- stores/
+`-- src-tauri/
+    |-- Cargo.toml
+    |-- src/
+    |   |-- commands/
+    |   |-- db/
+    |   |-- ingestion/
+    |   |-- memory/
+    |   |-- providers/
+    |   `-- retrieval/
+    `-- vendor/
+        |-- llm-pipeline/
+        |-- semantic-memory/
+        |-- tauri-queue/
+        `-- turbo-quant/
+```
 
 ## Development Setup
 
 Prerequisites:
 
-- Node.js and npm
-- Rust toolchain with Cargo
-- Tauri 2 system dependencies for your OS
-- Ollama or another configured provider for runtime chat
-- Optional `ffmpeg` and `ffprobe` for video import paths
-- Optional `tauri-driver` and WebKitWebDriver for desktop smoke validation
+- Node.js and npm.
+- Rust stable and Cargo.
+- Tauri 2 prerequisites for your operating system.
+- Optional local Ollama endpoint for local LLM and embedding flows.
 
-Install dependencies:
+Install frontend dependencies:
 
 ```bash
 npm ci
 ```
 
-Run the frontend:
+Run the web frontend during UI work:
 
 ```bash
 npm run dev
 ```
 
-Run the desktop app:
+Run the Tauri desktop app with semantic-memory compiled:
 
 ```bash
-npm run tauri dev
+npm run tauri:dev:sm
 ```
 
-Build the frontend:
+Run the Tauri desktop app with TurboQuant support compiled:
+
+```bash
+npm run tauri:dev:sm-tq
+```
+
+Build frontend assets:
 
 ```bash
 npm run build
 ```
 
-Build the Tauri app:
+Build desktop bundles with the semantic-memory profiles:
 
 ```bash
-npm run tauri build
+npm run tauri:build:sm
+npm run tauri:build:sm-tq
 ```
 
-Run Rust tests:
+## Validation
+
+Run focused checks before claiming a runtime behavior. Run the broader gate set before making any release statement.
+
+Frontend and contract checks:
 
 ```bash
-cargo test --manifest-path src-tauri/Cargo.toml
+npm run build
+npm test
 ```
 
-Run feature-specific Rust tests:
+Semantic-memory and TurboQuant checks:
+
+```bash
+npm run check:sm-tq-profile
+npm run test:tauri:sm
+npm run test:tauri:sm-tq
+```
+
+Runtime-truth gates:
+
+```bash
+python3 scripts/gloss_current_run_truth_gate.py --repo .
+python3 scripts/gloss_validator_path_gate.py --repo .
+python3 scripts/gloss_receipt_integrity_gate.py --repo .
+python3 scripts/gloss_feature_matrix_gate.py --repo .
+python3 scripts/gloss_release_replay_gate.py --repo . || true
+```
+
+Desktop smoke:
+
+```bash
+npm run desktop-smoke
+```
+
+Current desktop smoke is not release-grade without a live GUI receipt proving import, query, delete, restart, source-scope, citation, fallback, and raw-ID behavior.
+
+Rust checks:
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+If root workspace validation is unavailable or contradicted by current source, use the Tauri manifest explicitly:
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-backend
 cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant
 ```
 
-Run the desktop smoke harness when WebDriver tooling and a local Ollama model are available:
+## Data And Privacy Model
 
-```bash
-npm run desktop-smoke
-```
+Gloss is local-first by design:
 
-## Repository Layout
+- Notebook metadata and source state are stored locally.
+- Per-notebook data lives under local notebook directories.
+- Provider API keys are managed through local settings and secret storage paths.
+- Remote calls happen only through configured providers.
+- Local-first does not mean provider-free: if a remote provider is selected, chat or model calls may leave the machine according to that provider configuration.
 
-```text
-src/                  React frontend
-src/components/       Notebook, source, chat, notes, settings, and layout UI
-src/lib/              Tauri command wrappers, events, and feature helpers
-src/stores/           Zustand state stores
-src-tauri/            Rust/Tauri backend
-src-tauri/src/db/     App and notebook SQLite layers
-src-tauri/src/jobs/   Persistent background job handling
-src-tauri/src/memory/ Memory backend and semantic-memory adapter
-src-tauri/src/providers/
-                      Provider registry and model handling
-src-tauri/src/retrieval/
-                      Local retrieval, source scope, citations, and outcomes
-scripts/              Validation, packaging, smoke, and repository hygiene tools
-docs/                 Runbooks, design references, and release evidence
-```
+The UI and diagnostics should disclose provider, backend, fallback, and evidence state rather than hiding runtime degradation.
+
+## Product Non-Goals For This Pass
+
+These items are intentionally not claimed as release-ready in the current pass:
+
+- Broad file-format support beyond text-like sources.
+- Release-grade PDF, Office, URL, YouTube, audio, or video ingestion.
+- Studio reports, flashcards, quizzes, mind maps, and timelines.
+- Portable notebook package export/import.
+- Production TurboQuant KV-cache runtime.
+- Production semantic-memory default backend.
+- Silent fallback from scoped retrieval to all sources.
+- Raw UUID-heavy normal UI.
+
+See `RELEASE_NON_GOALS.md` and `docs/CURRENT_FEATURE_MATRIX.md` for the active classifications.
+
+## Release Policy
+
+Gloss is not release-ready until the active source, current run file, feature matrix, receipts, validation scripts, and live desktop smoke all agree.
+
+Minimum release proof requires:
+
+- One current run identity.
+- No missing or stale active validation scripts.
+- Fresh-unzip release replay for the exact package being shipped.
+- Live desktop GUI smoke receipt.
+- Runtime evidence showing requested backend, effective backend, fallback/degradation, citation validity, source-scope integrity, and receipt ID.
+- No source-scope widening.
+- No notebook/import jobs running against missing or superseded notebooks.
+- No broad deferred feature presented as implemented.
 
 ## License
 

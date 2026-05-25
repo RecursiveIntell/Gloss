@@ -25,6 +25,7 @@ pub enum GlossError {
     Search(String),
 
     #[error("Studio error ({output_type}): {message}")]
+    #[allow(dead_code)]
     Studio {
         output_type: String,
         message: String,
@@ -37,6 +38,7 @@ pub enum GlossError {
     Config(String),
 
     #[error("External tool not found: {tool}")]
+    #[allow(dead_code)]
     ExternalToolMissing { tool: String },
 
     #[error("Not found: {0}")]

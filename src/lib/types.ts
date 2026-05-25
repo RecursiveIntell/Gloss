@@ -43,7 +43,7 @@ export interface Message {
   conversation_id: string;
   role: "user" | "assistant";
   content: string;
-  citations?: Citation[] | ChatEvidencePayload | string;
+  citations?: ChatEvidencePayload;
   model_used?: string;
   tokens_prompt?: number;
   tokens_response?: number;
@@ -57,6 +57,20 @@ export interface Citation {
   quote?: string;
   page?: number;
   section?: string;
+}
+
+export interface CitationFilterReasonV1 {
+  ref_number: number;
+  reason_code: string;
+  detail: string;
+}
+
+export interface CitationAnchorV1 {
+  ref_number: number;
+  source_id: string;
+  chunk_id: string;
+  quote_digest: string;
+  evidence_class: string;
 }
 
 export interface ChatEvidenceDisclosure {
@@ -78,11 +92,16 @@ export interface ChatEvidenceDisclosure {
   context_passage_count: number;
   citation_valid_count: number;
   citation_invalid_count: number;
+  citation_anchors: CitationAnchorV1[];
+  citation_filter_reasons: CitationFilterReasonV1[];
   omitted_candidate_count: number;
   source_scope_preserved: boolean;
   index_status: string;
   link_status: string;
   receipt_id: string;
+  context_digest: string;
+  source_context_digest: string;
+  prompt_digest?: string | null;
   semantic_memory_receipt_id?: string | null;
   candidate_backend?: string | null;
   turbo_quant_generation_id?: string | null;
@@ -110,11 +129,20 @@ export interface Note {
   title?: string;
   content: string;
   note_type: "manual" | "saved_response";
-  citations?: Citation[] | string;
+  citations?: Citation[];
   pinned: boolean;
   source_id?: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface StudioOutputConfig {
+  mode?: string;
+  model?: string;
+  provider?: string;
+  source_ids?: string[];
+  temperature?: number;
+  max_tokens?: number;
 }
 
 export interface StudioOutput {
@@ -123,7 +151,7 @@ export interface StudioOutput {
   title?: string;
   prompt_used: string;
   raw_content?: string;
-  config?: Record<string, unknown>;
+  config?: StudioOutputConfig;
   source_ids: string[];
   file_path?: string;
   status: string;
@@ -206,7 +234,7 @@ export interface ChatStatusPayload {
   timeout_ms?: number | null;
   truncated: boolean;
   error?: string | null;
-  vector_artifact_receipt?: Record<string, unknown> | null;
+  vector_artifact_receipt?: VectorArtifactReceipt | null;
 }
 
 export interface ChatAttemptTraceEvent {
@@ -364,12 +392,27 @@ export interface RuntimeGateOwner {
 
 export interface SourcesBatchCreatedPayload {
   notebook_id: string;
+  import_batch_id?: string;
+  notebook_epoch?: number;
   count: number;
+  found?: number;
+  created?: number;
 }
 
 export interface BatchIngestionCompletePayload {
   notebook_id: string;
+  import_batch_id?: string;
+  notebook_epoch?: number;
+  status?: 'completed' | 'completed_empty' | 'empty' | 'failed' | 'cancelled_superseded' | string;
   count: number;
+  found?: number;
+  created?: number;
+  ingested_ready?: number;
+  failed?: number;
+  skipped_duplicate?: number;
+  skipped_unsupported?: number;
+  cancelled_superseded?: number;
+  message?: string | null;
 }
 
 export interface BackgroundBackendStatus {
@@ -406,6 +449,145 @@ export interface MemoryBackendStatus {
   diagnostic?: string | null;
 }
 
+export interface MemoryBackendProfileReceipt {
+  profile: string;
+  requested_backend: string;
+  backend_used: string;
+  strict_mode: boolean;
+  semantic_memory_auto_project: boolean;
+  turbo_quant_requested: boolean;
+  turbo_quant_active: boolean;
+  blocked: boolean;
+  next_action?: string | null;
+  blocking_reasons: string[];
+  receipt_id: string;
+  status: MemoryBackendStatus;
+}
+
+export interface SemanticMemoryProjectionSummary {
+  notebook_id: string;
+  total_sources: number;
+  chunk_bearing_sources: number;
+  zero_chunk_sources: number;
+  projected_sources: number;
+  failed_sources: number;
+  skipped_no_chunks: number;
+  stale_sources: number;
+  partial_sources: number;
+  projecting_sources: number;
+  healthy_links: number;
+  degraded_links: number;
+  missing_links: number;
+  total_chunks: number;
+  projected_chunks: number;
+  projection_required: boolean;
+}
+
+export interface VectorArtifactStatus {
+  compiled_turbo_quant: boolean;
+  runtime_turbo_quant_enabled: boolean;
+  candidate_backend?: string | null;
+  artifact_generation_id?: string | null;
+  vector_artifact_manifest_digest?: string | null;
+  vector_artifact_missing_count: number;
+  vector_artifact_stale_count: number;
+  exact_rerank: boolean;
+  exact_rerank_count: number;
+  last_receipt_id?: string | null;
+  last_error?: string | null;
+}
+
+export interface VectorArtifactReceipt {
+  schema?: string;
+  receipt_id?: string;
+  notebook_id?: string;
+  backend_id?: string;
+  candidate_backend?: string;
+  artifact_generation_id?: string;
+  vector_artifact_manifest_digest?: string | null;
+  indexed_chunks?: number;
+  projected_chunks?: number;
+  total_chunks?: number;
+  elapsed_ms?: number;
+  recorded_at?: string;
+  status?: string;
+  error?: string | null;
+}
+
+export interface RetrievalProbeReceipt {
+  receipt_id: string;
+  notebook_id: string;
+  query_digest: string;
+  source_scope_kind: string;
+  scoped_sources: number;
+  scoped_chunks: number;
+  backend_requested: string;
+  backend_used: string;
+  bm25_candidates: number;
+  vector_candidates: number;
+  tq_candidates: number;
+  candidate_backend?: string | null;
+  artifact_generation_id?: string | null;
+  vector_artifact_manifest_digest?: string | null;
+  exact_rerank: boolean;
+  exact_rerank_count: number;
+  fallback_used: boolean;
+  fallback_reason?: string | null;
+  degradation_markers: string[];
+}
+
+export interface SemanticMemoryProfileStatus {
+  compiled_semantic_memory: boolean;
+  compiled_turbo_quant: boolean;
+  experimental_enabled: boolean;
+  semantic_memory_flag_enabled: boolean;
+  turbo_quant_flag_enabled: boolean;
+  selected_backend: string;
+  effective_backend: string;
+  fallback_allowed: boolean;
+  strict_testing: boolean;
+  projection_summary?: SemanticMemoryProjectionSummary | null;
+  turbo_quant_status?: VectorArtifactStatus | null;
+  next_actions: string[];
+  blocking_reasons: string[];
+}
+
+export interface SemanticMemoryBackfillReceipt {
+  notebook_id: string;
+  receipt_id: string;
+  total_sources: number;
+  chunk_bearing_sources: number;
+  projected_sources: number;
+  skipped_no_chunks: number;
+  failed_sources: number;
+  stale_sources: number;
+  total_chunks: number;
+  projected_chunks: number;
+  errors: Array<{ source_id: string; title: string; error: string }>;
+  vector_artifact_receipt?: VectorArtifactReceipt | null;
+  projection_summary: SemanticMemoryProjectionSummary;
+}
+
+export interface RetrievalDiagnostics {
+  query: string;
+  scope_kind: string;
+  scoped_sources: number;
+  scoped_chunks: number;
+  fts_indexed_chunks: number;
+  bm25_hit_count: number;
+  semantic_links_total: number;
+  semantic_links_healthy: number;
+  semantic_links_missing: number;
+  semantic_links_degraded: number;
+  semantic_search_attempted: boolean;
+  semantic_candidate_count: number;
+  candidate_backend?: string | null;
+  fallback_allowed: boolean;
+  fallback_used: boolean;
+  fallback_reason?: string | null;
+  retrieval_mode: string;
+}
+
 export interface SemanticMemoryLinkStatus {
   notebook_id: string;
   total_links: number;
@@ -426,4 +608,5 @@ export interface IndexSourceReceipt {
   indexed_chunks: number;
   sync_status: string;
   error?: string | null;
+  vector_artifact_receipt?: VectorArtifactReceipt | null;
 }

@@ -2,6 +2,7 @@ use crate::retrieval::context::ContextPassage;
 use crate::retrieval::hybrid_search::SearchResult;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// A citation mapping from a numbered reference to a source chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +15,44 @@ pub struct Citation {
     pub section: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationAnchorV1 {
+    pub ref_number: usize,
+    pub source_id: String,
+    pub chunk_id: String,
+    pub quote_digest: String,
+    pub evidence_class: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationFilterReasonV1 {
+    pub ref_number: usize,
+    pub reason_code: String,
+    pub detail: String,
+}
+
+fn quote_digest(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn citation_anchors_for_context(source_context: &[ContextPassage]) -> Vec<CitationAnchorV1> {
+    source_context
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, passage)| {
+            passage.chunk_id.as_ref().map(|chunk_id| CitationAnchorV1 {
+                ref_number: idx + 1,
+                source_id: passage.source_id.clone(),
+                chunk_id: chunk_id.clone(),
+                quote_digest: quote_digest(&passage.content),
+                evidence_class: passage.evidence_class.clone(),
+            })
+        })
+        .collect()
+}
+
 pub fn count_unique_citation_refs(response: &str) -> usize {
     let re = Regex::new(r"\[(\d+)\]").unwrap();
     re.captures_iter(response)
@@ -24,6 +63,7 @@ pub fn count_unique_citation_refs(response: &str) -> usize {
 
 /// Extract citation references [1], [2], etc. from LLM output
 /// and map them to the provided search results.
+#[allow(dead_code)]
 pub fn extract_citations(
     response: &str,
     search_results: &[SearchResult],
@@ -69,43 +109,73 @@ pub fn extract_citations(
 
 /// Extract citations from LLM response using source_context (title, content) pairs.
 /// This matches the [1], [2] ordering in the system prompt exactly.
+#[allow(dead_code)]
 pub fn extract_citations_from_context(
     response: &str,
     source_context: &[ContextPassage],
 ) -> Vec<Citation> {
+    extract_citations_from_context_with_reasons(response, source_context).0
+}
+
+pub fn extract_citations_from_context_with_reasons(
+    response: &str,
+    source_context: &[ContextPassage],
+) -> (Vec<Citation>, Vec<CitationFilterReasonV1>) {
     let re = Regex::new(r"\[(\d+)\]").unwrap();
     let mut citations = Vec::new();
+    let mut filtered = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     for cap in re.captures_iter(response) {
         if let Some(num_str) = cap.get(1) {
             if let Ok(num) = num_str.as_str().parse::<usize>() {
                 if num == 0 {
+                    filtered.push(CitationFilterReasonV1 {
+                        ref_number: num,
+                        reason_code: "missing_ref".to_string(),
+                        detail: "citation refs are 1-based; [0] is invalid".to_string(),
+                    });
                     continue;
                 }
                 let idx = num.saturating_sub(1);
-                if idx < source_context.len() && !seen.contains(&idx) {
-                    let passage = &source_context[idx];
-                    let Some(chunk_id) = passage.chunk_id.as_ref() else {
-                        continue;
-                    };
-                    seen.insert(idx);
-                    let quote: String = passage.content.chars().take(200).collect();
-
-                    citations.push(Citation {
-                        chunk_id: chunk_id.clone(),
-                        source_id: passage.source_id.clone(),
-                        source_title: passage.title.clone(),
-                        quote: Some(quote),
-                        page: None,
-                        section: None,
+                if idx >= source_context.len() {
+                    filtered.push(CitationFilterReasonV1 {
+                        ref_number: num,
+                        reason_code: "out_of_range".to_string(),
+                        detail: format!("citation [{num}] has no matching context passage"),
                     });
+                    continue;
                 }
+                if seen.contains(&idx) {
+                    continue;
+                }
+                let passage = &source_context[idx];
+                let Some(chunk_id) = passage.chunk_id.as_ref() else {
+                    filtered.push(CitationFilterReasonV1 {
+                        ref_number: num,
+                        reason_code: "unanchored_chunk".to_string(),
+                        detail: format!(
+                            "citation [{num}] points at context without chunk identity"
+                        ),
+                    });
+                    continue;
+                };
+                seen.insert(idx);
+                let quote: String = passage.content.chars().take(200).collect();
+
+                citations.push(Citation {
+                    chunk_id: chunk_id.clone(),
+                    source_id: passage.source_id.clone(),
+                    source_title: passage.title.clone(),
+                    quote: Some(quote),
+                    page: None,
+                    section: None,
+                });
             }
         }
     }
 
-    citations
+    (citations, filtered)
 }
 
 #[cfg(test)]
@@ -180,6 +250,7 @@ mod tests {
             chunk_id: Some("c1".to_string()),
             title: "Source One".to_string(),
             content: "anchored evidence".to_string(),
+            evidence_class: "ranked_bm25".to_string(),
         }];
         assert!(
             extract_citations_from_context("[0] should not cite first passage", &context)
@@ -205,12 +276,14 @@ mod tests {
                 chunk_id: Some("c1".to_string()),
                 title: "Source One".to_string(),
                 content: "anchored evidence".to_string(),
+                evidence_class: "ranked_bm25".to_string(),
             },
             ContextPassage {
                 source_id: "s2".to_string(),
                 chunk_id: None,
                 title: "Raw Source".to_string(),
                 content: "raw fallback without chunk identity".to_string(),
+                evidence_class: "raw_fallback".to_string(),
             },
         ];
 

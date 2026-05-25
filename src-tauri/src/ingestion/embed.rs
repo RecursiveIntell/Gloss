@@ -8,6 +8,7 @@ use usearch::ffi::{IndexOptions, MetricKind, ScalarKind};
 /// Wrapper around fastembed TextEmbedding for generating embeddings and reranking.
 pub struct EmbeddingService {
     model: TextEmbedding,
+    #[allow(dead_code)]
     reranker: Option<TextRerank>,
 }
 
@@ -87,6 +88,7 @@ impl EmbeddingService {
     /// Rerank documents against a query using cross-encoder.
     /// Returns (original_index, relevance_score) sorted by score descending.
     /// If reranker is not loaded, returns passthrough indices 0..top_k.
+    #[allow(dead_code)]
     pub fn rerank(
         &self,
         query: &str,
@@ -116,6 +118,7 @@ impl EmbeddingService {
     }
 
     /// Whether the reranker is available.
+    #[allow(dead_code)]
     pub fn has_reranker(&self) -> bool {
         self.reranker.is_some()
     }
@@ -185,6 +188,7 @@ impl HnswIndex {
     }
 
     /// Load an index from disk (convenience — delegates to `load_with_hwm` with no DB hint).
+    #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self, GlossError> {
         Self::load_with_hwm(path, None)
     }
@@ -228,6 +232,7 @@ impl HnswIndex {
     }
 
     /// Get the number of vectors in the index.
+    #[allow(dead_code)]
     pub fn size(&self) -> usize {
         self.index.size()
     }

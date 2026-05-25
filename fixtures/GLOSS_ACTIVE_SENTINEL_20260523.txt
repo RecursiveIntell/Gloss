@@ -1,0 +1,9 @@
+GLOSS_ACTIVE_SENTINEL_20260523
+
+This is the sentinel document for Gloss active/selectable retrieval stack testing.
+
+Expected behavior:
+- Gloss-local BM25 can find this exact token.
+- semantic-memory safe can project and retrieve this chunk.
+- semantic-memory strict can only activate after projection readiness.
+- TurboQuant strict can only activate after artifact rebuild and exact rerank proof.

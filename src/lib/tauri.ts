@@ -15,8 +15,14 @@ import type {
   SourceScope,
   QueueSummariesResult,
   MemoryBackendStatus,
+  MemoryBackendProfileReceipt,
   SemanticMemoryLinkStatus,
   IndexSourceReceipt,
+  SemanticMemoryBackfillReceipt,
+  SemanticMemoryProfileStatus,
+  RetrievalDiagnostics,
+  VectorArtifactStatus,
+  RetrievalProbeReceipt,
   ChatAttemptTraceV1,
   RetrievalCoverage,
 } from "./types";
@@ -121,9 +127,37 @@ export async function getNotebookStats(
 
 export async function diagnoseRetrievalCoverage(
   notebookId: string,
-  sourceIds?: string[]
+  sourceScope?: SourceScope
 ): Promise<RetrievalCoverage> {
-  return invoke("diagnose_retrieval_coverage", { notebookId, sourceIds });
+  return invoke("diagnose_retrieval_coverage", { notebookId, sourceScope });
+}
+
+export async function diagnoseRetrievalQuery(
+  notebookId: string,
+  query: string,
+  sourceScope: SourceScope,
+  limit?: number
+): Promise<RetrievalDiagnostics> {
+  return invoke("diagnose_retrieval_query", {
+    notebookId,
+    query,
+    sourceScope,
+    limit,
+  });
+}
+
+export async function runRetrievalProbe(
+  notebookId: string,
+  query: string,
+  sourceScope: SourceScope,
+  limit?: number
+): Promise<RetrievalProbeReceipt> {
+  return invoke("run_retrieval_probe", {
+    notebookId,
+    query,
+    sourceScope,
+    limit,
+  });
 }
 
 // === Chat ===
@@ -294,6 +328,13 @@ export async function updateFeatureFlag(
   return invoke("update_feature_flag", { id, enabled });
 }
 
+export async function setMemoryBackendProfile(
+  profile: string,
+  notebookId?: string | null
+): Promise<MemoryBackendProfileReceipt> {
+  return invoke("set_memory_backend_profile", { profile, notebookId });
+}
+
 export async function checkExternalTools(): Promise<Record<string, boolean>> {
   return invoke("check_external_tools");
 }
@@ -343,6 +384,31 @@ export async function semanticMemoryReindexSource(
 
 export async function semanticMemoryReindexNotebook(
   notebookId: string
-): Promise<IndexSourceReceipt[]> {
+): Promise<SemanticMemoryBackfillReceipt> {
   return invoke("semantic_memory_reindex_notebook", { notebookId });
+}
+
+export async function semanticMemoryBackfillNotebook(
+  notebookId: string
+): Promise<SemanticMemoryBackfillReceipt> {
+  return invoke("semantic_memory_backfill_notebook", { notebookId });
+}
+
+export async function semanticMemoryRebuildVectorArtifacts(
+  notebookId: string
+): Promise<Record<string, unknown> | null> {
+  return invoke("semantic_memory_rebuild_vector_artifacts", { notebookId });
+}
+
+export async function semanticMemoryVectorArtifactStatus(
+  notebookId: string
+): Promise<VectorArtifactStatus> {
+  return invoke("semantic_memory_vector_artifact_status", { notebookId });
+}
+
+export async function getSemanticMemoryProfileStatus(
+  notebookId?: string | null,
+  sourceScope?: SourceScope | null
+): Promise<SemanticMemoryProfileStatus> {
+  return invoke("get_semantic_memory_profile_status", { notebookId, sourceScope });
 }

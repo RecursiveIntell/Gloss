@@ -153,9 +153,12 @@ impl AppDb {
 
     /// List all providers.
     pub fn list_providers(&self) -> Result<Vec<Provider>, GlossError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, enabled, base_url, api_key, last_refreshed FROM providers")?;
+        let query = if self.table_has_column("providers", "api_key")? {
+            "SELECT id, enabled, base_url, api_key, last_refreshed FROM providers"
+        } else {
+            "SELECT id, enabled, base_url, NULL AS api_key, last_refreshed FROM providers"
+        };
+        let mut stmt = self.conn.prepare(query)?;
         let rows = stmt.query_map([], |row| {
             let api_key: Option<String> = row.get(3)?;
             Ok(Provider {
@@ -183,14 +186,17 @@ impl AppDb {
     ) -> Result<(), GlossError> {
         let _ = api_key;
         self.conn.execute(
-            "INSERT OR REPLACE INTO providers (id, enabled, base_url, api_key)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![id, enabled, base_url, Option::<&str>::None],
+            "INSERT OR REPLACE INTO providers (id, enabled, base_url)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, enabled, base_url],
         )?;
         Ok(())
     }
 
     pub fn get_provider_api_key(&self, id: &str) -> Result<Option<String>, GlossError> {
+        if !self.table_has_column("providers", "api_key")? {
+            return Ok(None);
+        }
         let result =
             self.conn
                 .query_row("SELECT api_key FROM providers WHERE id = ?1", [id], |row| {
@@ -205,12 +211,16 @@ impl AppDb {
     }
 
     pub fn clear_provider_api_key(&self, id: &str) -> Result<(), GlossError> {
+        if !self.table_has_column("providers", "api_key")? {
+            return Ok(());
+        }
         self.conn
             .execute("UPDATE providers SET api_key = NULL WHERE id = ?1", [id])?;
         Ok(())
     }
 
     /// Get a provider's base URL.
+    #[allow(dead_code)]
     pub fn get_provider_url(&self, id: &str) -> Result<Option<String>, GlossError> {
         let url = self
             .conn
@@ -342,6 +352,37 @@ impl AppDb {
             rusqlite::params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Apply a settings profile as one SQLite unit so runtime gate settings do
+    /// not briefly disagree with backend selection.
+    pub fn set_settings_atomically(&self, settings: &[(&str, &str)]) -> Result<(), GlossError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        for (key, value) in settings {
+            if let Err(error) = self.conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            ) {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(GlossError::Database(error));
+            }
+        }
+        if let Err(error) = self.conn.execute_batch("COMMIT") {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(GlossError::Database(error));
+        }
+        Ok(())
+    }
+
+    fn table_has_column(&self, table: &str, column: &str) -> Result<bool, GlossError> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows {
+            if row? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 

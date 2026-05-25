@@ -7,7 +7,7 @@ import sys
 def main() -> int:
     root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     state = (root / "src-tauri/src/state.rs").read_text()
-    sources = (root / "src-tauri/src/commands/sources.rs").read_text()
+    sources = (root / "src-tauri/src/commands/sources/mod.rs").read_text()
     executor = (root / "src-tauri/vendor/job-queue/src/executor.rs").read_text()
     errors = []
     warnings = []

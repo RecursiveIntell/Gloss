@@ -1,0 +1,5 @@
+GLOSS_SM_TQ_SENTINEL_20260523
+
+This fixture exists to test Gloss semantic-memory projection, BM25 retrieval, vector retrieval, RRF fusion, TurboQuant candidate retrieval, and exact rerank evidence.
+
+Expected query: Where is GLOSS_SM_TQ_SENTINEL_20260523?

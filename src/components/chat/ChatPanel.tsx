@@ -51,6 +51,9 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const getSourceScope = useSourceStore((s) => s.getSourceScope);
   const sources = useSourceStore((s) => s.sources);
   const selectedSourceIds = useSourceStore((s) => s.selectedSourceIds);
+  const sourceScopeMode = useSourceStore((s) => s.sourceScopeMode);
+  const sourceListStatus = useSourceStore((s) => s.sourceListStatus);
+  const sourceListError = useSourceStore((s) => s.sourceListError);
   const setActiveModel = useSettingsStore((s) => s.setActiveModel);
   const updateSetting = useSettingsStore((s) => s.updateSetting);
 
@@ -66,7 +69,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   }, [messages, streamingContent]);
 
   const handleSend = async () => {
-    if (!input.trim() || isStreaming) return;
+    if (!input.trim() || isStreaming || sourceListStatus === "loading" || sourceListStatus === "partial" || sourceListStatus === "error") return;
     const query = input.trim();
     setInput("");
     setEditingUserMessageId(null);
@@ -141,13 +144,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         .filter(Boolean)
         .join(" - ")
     : "Starting chat";
-  const scopeMode = sources.length === 0
-    ? "all"
-    : selectedSourceIds.size === 0
-      ? "none"
-      : selectedSourceIds.size === sources.length
-        ? "all"
-        : "explicit";
+  const sourceListBlocked = sourceListStatus === "loading" || sourceListStatus === "partial" || sourceListStatus === "error";
+  const scopeMode = sourceListBlocked ? "none" : sourceScopeMode;
 
   return (
     <div className="flex h-full flex-col">
@@ -251,7 +249,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           )}
           {scopeMode === "none" && (
             <span className="text-warning">
-              Selected scope has no valid sources; retrieval will stay empty.
+              {sourceListStatus === "error"
+                ? sourceListError || "Source list failed to load; chat is disabled."
+                : sourceListStatus === "partial"
+                  ? "Source list is still loading; chat is disabled."
+                : "Selected scope has no valid sources; retrieval will stay empty."}
             </span>
           )}
         </div>
@@ -438,12 +440,12 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}
             placeholder="Ask about your sources..."
-            disabled={isStreaming}
+            disabled={isStreaming || sourceListBlocked}
             className="flex-1 rounded bg-transparent px-2 py-1.5 text-sm text-text placeholder:text-text-muted focus:outline-none disabled:opacity-50"
           />
           <button
             onClick={isStreaming ? handleStop : handleSend}
-            disabled={!isStreaming && !input.trim()}
+            disabled={!isStreaming && (!input.trim() || sourceListBlocked)}
             className="rounded-lg bg-accent p-2 text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
             title={isStreaming ? "Stop generation" : editingUserMessageId ? "Rerun edited message" : "Send"}
           >
@@ -467,7 +469,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   );
 }
 
-function parseAssistantPayload(raw: Message["citations"]): ChatEvidencePayload {
+function parseAssistantPayload(raw: unknown): ChatEvidencePayload {
   if (!raw) return { citations: [], evidence: nullEvidence() };
   try {
     const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
@@ -506,11 +508,16 @@ function nullEvidence(citationCount = 0): ChatEvidenceDisclosure {
     context_passage_count: 0,
     citation_valid_count: citationCount,
     citation_invalid_count: 0,
+    citation_anchors: [],
+    citation_filter_reasons: [],
     omitted_candidate_count: 0,
-    source_scope_preserved: true,
+    source_scope_preserved: false,
     index_status: "unknown",
     link_status: "unknown",
     receipt_id: "not recorded",
+    context_digest: "",
+    source_context_digest: "",
+    prompt_digest: null,
     semantic_memory_receipt_id: null,
     candidate_backend: null,
     turbo_quant_generation_id: null,
@@ -543,6 +550,9 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
         <EvidenceRow label="Scope" value={`${evidence.source_scope_mode} (${evidence.effective_source_count} selected, ${evidence.excluded_source_count} excluded, ${evidence.invalid_source_count} invalid)`} />
         <EvidenceRow label="Context" value={`${evidence.context_passage_count} passages, preserved: ${evidence.source_scope_preserved ? "yes" : "no"}`} />
         <EvidenceRow label="Citations" value={`${evidence.citation_valid_count} valid, ${evidence.citation_invalid_count} filtered`} />
+        {(evidence.citation_filter_reasons ?? []).length > 0 && (
+          <EvidenceRow label="Citation filters" value={(evidence.citation_filter_reasons ?? []).map((r) => `${r.ref_number}:${r.reason_code}`).join(", ")} />
+        )}
         <EvidenceRow label="Omitted" value={`${evidence.omitted_candidate_count} candidates/passages`} />
         <EvidenceRow label="Index" value={evidence.index_status} />
         <EvidenceRow label="Links" value={evidence.link_status} />
@@ -603,17 +613,30 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
       {evidence.vector_artifact_manifest_digest && (
         <p className="mt-2 text-text-muted">Vector artifact manifest: {evidence.vector_artifact_manifest_digest}</p>
       )}
-      {evidence.invalid_source_ids.length > 0 && (
-        <p className="mt-2 text-error">Invalid scope IDs: {evidence.invalid_source_ids.join(", ")}</p>
+      {(evidence.requested_source_ids.length > 0 || evidence.effective_source_ids.length > 0 || evidence.excluded_source_ids.length > 0 || evidence.invalid_source_ids.length > 0) && (
+        <p className="mt-2 text-text-muted">
+          Source scope: {evidence.effective_source_count} effective, {evidence.excluded_source_count} excluded, {evidence.invalid_source_count} invalid
+        </p>
       )}
-      {evidence.requested_source_ids.length > 0 && (
-        <p className="mt-2">Requested source IDs: {evidence.requested_source_ids.join(", ")}</p>
-      )}
-      {evidence.effective_source_ids.length > 0 && (
-        <p className="mt-2">Selected source IDs: {(evidence.selected_source_ids.length ? evidence.selected_source_ids : evidence.effective_source_ids).join(", ")}</p>
-      )}
-      {evidence.excluded_source_ids.length > 0 && (
-        <p className="mt-2 text-text-muted">Excluded source IDs: {evidence.excluded_source_ids.join(", ")}</p>
+      {(evidence.requested_source_ids.length > 0 || evidence.effective_source_ids.length > 0 || evidence.excluded_source_ids.length > 0 || evidence.invalid_source_ids.length > 0) && (
+        <details className="mt-2 rounded border border-border/60 bg-bg-tertiary/40 p-2">
+          <summary className="cursor-pointer text-text-secondary">Source scope diagnostics</summary>
+          <button
+            type="button"
+            onClick={() => {
+              void navigator.clipboard?.writeText(JSON.stringify({
+                requested_source_ids: evidence.requested_source_ids,
+                selected_source_ids: evidence.selected_source_ids,
+                effective_source_ids: evidence.effective_source_ids,
+                excluded_source_ids: evidence.excluded_source_ids,
+                invalid_source_ids: evidence.invalid_source_ids,
+              }, null, 2));
+            }}
+            className="mt-2 rounded border border-border px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-tertiary hover:text-text"
+          >
+            Copy source scope JSON
+          </button>
+        </details>
       )}
       {evidence.degradation_markers.length > 0 && (
         <p className="mt-2 text-warning">Degraded: {evidence.degradation_markers.join(", ")}</p>

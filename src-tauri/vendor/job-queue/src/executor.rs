@@ -90,6 +90,7 @@ impl QueueExecutor {
         .map_err(QueueError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn persist_canonical_lineage_or_fail(
         &self,
         event_emitter: &Arc<dyn QueueEventEmitter>,
@@ -284,7 +285,7 @@ impl QueueExecutor {
             // Build canonical trace/retry primitives for this execution
             let trace_ctx = trace_id
                 .as_ref()
-                .map(|id| stack_ids::TraceCtx::from_legacy_trace_id(id));
+                .map(stack_ids::TraceCtx::from_legacy_trace_id);
             // AttemptId: prefer persisted value from DB, synthesize only for pre-v4 rows
             let attempt_id = job_details
                 .as_ref()
@@ -374,6 +375,7 @@ impl QueueExecutor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_job<H>(
         &self,
         event_emitter: &Arc<dyn QueueEventEmitter>,
@@ -651,7 +653,10 @@ impl QueueExecutor {
                 .with_db(move |conn| db::reclaim_stale(conn, stale_after_secs))
                 .await?;
             if reclaimed > 0 {
-                tracing::warn!(reclaimed, "Reclaimed stale queue jobs before foreground claim");
+                tracing::warn!(
+                    reclaimed,
+                    "Reclaimed stale queue jobs before foreground claim"
+                );
             }
         }
 
@@ -677,7 +682,7 @@ impl QueueExecutor {
         // Build canonical trace/retry primitives for this execution
         let trace_ctx = trace_id
             .as_ref()
-            .map(|id| stack_ids::TraceCtx::from_legacy_trace_id(id));
+            .map(stack_ids::TraceCtx::from_legacy_trace_id);
         // AttemptId: prefer persisted value from DB, synthesize only for pre-v4 rows
         let attempt_id = job_details
             .as_ref()
@@ -808,13 +813,17 @@ mod tests {
         EXECUTION_CALLS.store(0, Ordering::SeqCst);
 
         let conn = db::open_database(None).unwrap();
-        db::insert_job(&conn, "job-stale", 2, &serde_json::to_value(CountingJob).unwrap()).unwrap();
+        db::insert_job(
+            &conn,
+            "job-stale",
+            2,
+            &serde_json::to_value(CountingJob).unwrap(),
+        )
+        .unwrap();
         db::claim(&conn, "dead-worker").unwrap();
         conn.execute(
             "UPDATE queue_jobs SET heartbeat_at = ?1 WHERE id = 'job-stale'",
-            rusqlite::params![
-                (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339()
-            ],
+            rusqlite::params![(chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339()],
         )
         .unwrap();
 
@@ -851,7 +860,9 @@ mod tests {
         db::insert_job(&conn, "job-lineage-fail", 2, &serde_json::json!({})).unwrap();
         conn.execute_batch(
             "CREATE TRIGGER fail_lineage_update
-             BEFORE UPDATE OF attempt_id, trial_id ON queue_jobs
+             BEFORE UPDATE ON queue_jobs
+             WHEN NEW.attempt_id IS NOT OLD.attempt_id
+               OR NEW.trial_id IS NOT OLD.trial_id
              BEGIN
                  SELECT RAISE(FAIL, 'lineage write blocked');
              END;",

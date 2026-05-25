@@ -1,6 +1,3 @@
-// Phase 1: Many modules have code that will be wired in later steps
-#![allow(dead_code)]
-
 mod commands;
 mod db;
 mod error;
@@ -137,14 +134,19 @@ pub fn run() {
             commands::sources::retry_source_ingestion,
             commands::sources::get_notebook_stats,
             commands::sources::diagnose_retrieval_coverage,
+            commands::sources::diagnose_retrieval_query,
+            commands::sources::run_retrieval_probe,
             commands::sources::regenerate_missing_summaries,
             commands::sources::pause_summaries,
             commands::sources::resume_summaries,
             commands::sources::get_queue_status,
             commands::sources::memory_backend_status,
             commands::sources::semantic_memory_link_status,
+            commands::sources::semantic_memory_backfill_notebook,
             commands::sources::semantic_memory_reindex_notebook,
             commands::sources::semantic_memory_reindex_source,
+            commands::sources::semantic_memory_rebuild_vector_artifacts,
+            commands::sources::semantic_memory_vector_artifact_status,
             commands::sources::compare_memory_backends,
             commands::chat::list_conversations,
             commands::chat::create_conversation,
@@ -170,6 +172,8 @@ pub fn run() {
             commands::settings::update_setting,
             commands::settings::get_feature_flags,
             commands::settings::update_feature_flag,
+            commands::settings::set_memory_backend_profile,
+            commands::settings::get_semantic_memory_profile_status,
             commands::settings::check_external_tools,
         ])
         .run(tauri::generate_context!())

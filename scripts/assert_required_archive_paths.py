@@ -10,7 +10,7 @@ BASE_REQUIRED = {
     "package.json",
     "src/App.tsx",
     "src/lib/tauri.ts",
-    "src/components/settings/SettingsDialog.tsx",
+    "src/components/settings/SettingsDialog/index.tsx",
     "src-tauri/Cargo.toml",
     "src-tauri/src/lib.rs",
     "src-tauri/src/features.rs",

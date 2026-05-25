@@ -1,7 +1,8 @@
 use crate::db::migrations;
 use crate::error::GlossError;
 use crate::memory::types::RetrievalCoverage;
-use rusqlite::Connection;
+use crate::retrieval::source_scope::ResolvedSourceScope;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -99,6 +100,81 @@ pub struct NotebookStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticMemoryProjectionStatus {
+    pub notebook_id: String,
+    pub source_id: String,
+    pub status: String,
+    pub chunk_count: usize,
+    pub projected_chunk_count: usize,
+    pub healthy_link_count: usize,
+    pub degraded_link_count: usize,
+    pub last_receipt_id: Option<String>,
+    pub last_error: Option<String>,
+    pub artifact_generation_id: Option<String>,
+    pub vector_artifact_manifest_digest: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticMemoryProjectionStatusUpdate {
+    pub notebook_id: String,
+    pub source_id: String,
+    pub status: String,
+    pub chunk_count: usize,
+    pub projected_chunk_count: usize,
+    pub healthy_link_count: usize,
+    pub degraded_link_count: usize,
+    pub last_receipt_id: Option<String>,
+    pub last_error: Option<String>,
+    pub artifact_generation_id: Option<String>,
+    pub vector_artifact_manifest_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SemanticMemoryProjectionSummary {
+    pub notebook_id: String,
+    pub total_sources: usize,
+    pub chunk_bearing_sources: usize,
+    pub zero_chunk_sources: usize,
+    pub projected_sources: usize,
+    pub failed_sources: usize,
+    pub skipped_no_chunks: usize,
+    pub stale_sources: usize,
+    pub partial_sources: usize,
+    pub projecting_sources: usize,
+    pub healthy_links: usize,
+    pub degraded_links: usize,
+    pub missing_links: usize,
+    pub total_chunks: usize,
+    pub projected_chunks: usize,
+    pub projection_required: bool,
+}
+
+fn projection_status_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SemanticMemoryProjectionStatus> {
+    let chunk_count: i64 = row.get(3)?;
+    let projected_chunk_count: i64 = row.get(4)?;
+    let healthy_link_count: i64 = row.get(5)?;
+    let degraded_link_count: i64 = row.get(6)?;
+    Ok(SemanticMemoryProjectionStatus {
+        notebook_id: row.get(0)?,
+        source_id: row.get(1)?,
+        status: row.get(2)?,
+        chunk_count: chunk_count.max(0) as usize,
+        projected_chunk_count: projected_chunk_count.max(0) as usize,
+        healthy_link_count: healthy_link_count.max(0) as usize,
+        degraded_link_count: degraded_link_count.max(0) as usize,
+        last_receipt_id: row.get(7)?,
+        last_error: row.get(8)?,
+        artifact_generation_id: row.get(9)?,
+        vector_artifact_manifest_digest: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudioOutput {
     pub id: String,
     pub output_type: String,
@@ -113,6 +189,7 @@ pub struct StudioOutput {
     pub created_at: String,
 }
 
+#[allow(dead_code)]
 impl NotebookDb {
     /// Connect to an existing per-notebook database with runtime pragmas.
     pub fn connect(path: &Path) -> Result<Self, GlossError> {
@@ -484,19 +561,19 @@ impl NotebookDb {
 
     /// Returns true when every chunk in the selected scope has an embedding and
     /// there is at least one embedded chunk available for hybrid search.
-    pub fn can_run_hybrid_search(&self, source_ids: &[String]) -> Result<bool, GlossError> {
+    pub fn can_run_hybrid_search(&self, scoped_ids: &[String]) -> Result<bool, GlossError> {
         let (embedded_sql, missing_sql, params): (
             String,
             String,
             Vec<&dyn rusqlite::types::ToSql>,
-        ) = if source_ids.is_empty() {
+        ) = if scoped_ids.is_empty() {
             (
                 "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NOT NULL".to_string(),
                 "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NULL".to_string(),
                 Vec::new(),
             )
         } else {
-            let placeholders: Vec<String> = (0..source_ids.len())
+            let placeholders: Vec<String> = (0..scoped_ids.len())
                 .map(|i| format!("?{}", i + 1))
                 .collect();
             let clause = placeholders.join(", ");
@@ -507,7 +584,7 @@ impl NotebookDb {
                     format!(
                         "SELECT COUNT(*) FROM chunks WHERE embedding_id IS NULL AND source_id IN ({clause})"
                     ),
-                    source_ids
+                    scoped_ids
                         .iter()
                         .map(|id| id as &dyn rusqlite::types::ToSql)
                         .collect(),
@@ -529,24 +606,48 @@ impl NotebookDb {
 
     pub fn retrieval_coverage(
         &self,
-        source_ids: &[String],
+        scope: &ResolvedSourceScope,
     ) -> Result<RetrievalCoverage, GlossError> {
-        let (chunk_clause, params): (String, Vec<&dyn rusqlite::types::ToSql>) =
-            if source_ids.is_empty() {
-                ("".to_string(), Vec::new())
-            } else {
-                let placeholders = (0..source_ids.len())
-                    .map(|idx| format!("?{}", idx + 1))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                (
-                    format!(" WHERE source_id IN ({placeholders})"),
-                    source_ids
-                        .iter()
-                        .map(|id| id as &dyn rusqlite::types::ToSql)
-                        .collect(),
-                )
-            };
+        if scope.is_none() {
+            return Ok(RetrievalCoverage {
+                selected_sources: 0,
+                total_chunks: 0,
+                fts_indexed_chunks: 0,
+                embedded_chunks: 0,
+                missing_embeddings: 0,
+                semantic_links_total: 0,
+                semantic_links_healthy: 0,
+                semantic_links_degraded: 0,
+                dense_coverage_ratio: 0.0,
+            });
+        }
+        let scoped_ids = scope.source_ids();
+        if scoped_ids.is_empty() {
+            return Ok(RetrievalCoverage {
+                selected_sources: 0,
+                total_chunks: 0,
+                fts_indexed_chunks: 0,
+                embedded_chunks: 0,
+                missing_embeddings: 0,
+                semantic_links_total: 0,
+                semantic_links_healthy: 0,
+                semantic_links_degraded: 0,
+                dense_coverage_ratio: 0.0,
+            });
+        }
+        let (chunk_clause, params): (String, Vec<&dyn rusqlite::types::ToSql>) = {
+            let placeholders = (0..scoped_ids.len())
+                .map(|idx| format!("?{}", idx + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                format!(" WHERE source_id IN ({placeholders})"),
+                scoped_ids
+                    .iter()
+                    .map(|id| id as &dyn rusqlite::types::ToSql)
+                    .collect(),
+            )
+        };
 
         let total_chunks: i64 = self.conn.query_row(
             &format!("SELECT COUNT(*) FROM chunks{chunk_clause}"),
@@ -570,10 +671,8 @@ impl NotebookDb {
                 "SELECT COUNT(*)
                  FROM chunks c
                  JOIN chunks_fts fts ON fts.rowid = c.rowid{}",
-                if source_ids.is_empty() {
-                    String::new()
-                } else {
-                    let placeholders = (0..source_ids.len())
+                {
+                    let placeholders = (0..scoped_ids.len())
                         .map(|idx| format!("?{}", idx + 1))
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -587,16 +686,14 @@ impl NotebookDb {
         let (semantic_links_total, semantic_links_healthy, semantic_links_degraded) = if self
             .table_exists("semantic_memory_links")?
         {
-            let link_scope = if source_ids.is_empty() {
-                ("".to_string(), Vec::new())
-            } else {
-                let placeholders = (0..source_ids.len())
+            let link_scope = {
+                let placeholders = (0..scoped_ids.len())
                     .map(|idx| format!("?{}", idx + 1))
                     .collect::<Vec<_>>()
                     .join(", ");
                 (
                     format!(" WHERE source_id IN ({placeholders})"),
-                    source_ids
+                    scoped_ids
                         .iter()
                         .map(|id| id as &dyn rusqlite::types::ToSql)
                         .collect::<Vec<_>>(),
@@ -611,11 +708,7 @@ impl NotebookDb {
                     &format!(
                         "SELECT COUNT(*) FROM semantic_memory_links{}{}",
                         link_scope.0,
-                        if link_scope.0.is_empty() {
-                            " WHERE sync_status = 'synced' AND sm_document_id IS NOT NULL AND sm_chunk_id IS NOT NULL AND content_digest != ''"
-                        } else {
-                            " AND sync_status = 'synced' AND sm_document_id IS NOT NULL AND sm_chunk_id IS NOT NULL AND content_digest != ''"
-                        }
+                        " AND sync_status = 'synced' AND sm_document_id IS NOT NULL AND sm_chunk_id IS NOT NULL AND content_digest != ''"
                     ),
                     link_scope.1.as_slice(),
                     |row| row.get(0),
@@ -633,7 +726,7 @@ impl NotebookDb {
         let embedded_chunks = embedded_chunks.max(0) as usize;
         let missing_embeddings = total_chunks.saturating_sub(embedded_chunks);
         Ok(RetrievalCoverage {
-            selected_sources: source_ids.len(),
+            selected_sources: scoped_ids.len(),
             total_chunks,
             fts_indexed_chunks: fts_indexed_chunks.max(0) as usize,
             embedded_chunks,
@@ -646,6 +739,284 @@ impl NotebookDb {
             } else {
                 embedded_chunks as f64 / total_chunks as f64
             },
+        })
+    }
+
+    pub fn upsert_semantic_memory_projection_status(
+        &self,
+        update: &SemanticMemoryProjectionStatusUpdate,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT INTO semantic_memory_projection_status
+             (notebook_id, source_id, status, chunk_count, projected_chunk_count,
+              healthy_link_count, degraded_link_count, last_receipt_id, last_error,
+              artifact_generation_id, vector_artifact_manifest_digest, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))
+             ON CONFLICT(notebook_id, source_id) DO UPDATE SET
+                status = excluded.status,
+                chunk_count = excluded.chunk_count,
+                projected_chunk_count = excluded.projected_chunk_count,
+                healthy_link_count = excluded.healthy_link_count,
+                degraded_link_count = excluded.degraded_link_count,
+                last_receipt_id = excluded.last_receipt_id,
+                last_error = excluded.last_error,
+                artifact_generation_id = excluded.artifact_generation_id,
+                vector_artifact_manifest_digest = excluded.vector_artifact_manifest_digest,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                update.notebook_id,
+                update.source_id,
+                update.status,
+                update.chunk_count as i64,
+                update.projected_chunk_count as i64,
+                update.healthy_link_count as i64,
+                update.degraded_link_count as i64,
+                update.last_receipt_id,
+                update.last_error,
+                update.artifact_generation_id,
+                update.vector_artifact_manifest_digest,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_semantic_memory_projection_status(
+        &self,
+        notebook_id: &str,
+        source_id: &str,
+    ) -> Result<Option<SemanticMemoryProjectionStatus>, GlossError> {
+        self.conn
+            .query_row(
+                "SELECT notebook_id, source_id, status, chunk_count, projected_chunk_count,
+                        healthy_link_count, degraded_link_count, last_receipt_id, last_error,
+                        artifact_generation_id, vector_artifact_manifest_digest, updated_at
+                 FROM semantic_memory_projection_status
+                 WHERE notebook_id = ?1 AND source_id = ?2",
+                rusqlite::params![notebook_id, source_id],
+                projection_status_from_row,
+            )
+            .optional()
+            .map_err(GlossError::Database)
+    }
+
+    pub fn list_semantic_memory_projection_statuses(
+        &self,
+        notebook_id: &str,
+    ) -> Result<Vec<SemanticMemoryProjectionStatus>, GlossError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT notebook_id, source_id, status, chunk_count, projected_chunk_count,
+                    healthy_link_count, degraded_link_count, last_receipt_id, last_error,
+                    artifact_generation_id, vector_artifact_manifest_digest, updated_at
+             FROM semantic_memory_projection_status
+             WHERE notebook_id = ?1
+             ORDER BY updated_at DESC, source_id ASC",
+        )?;
+        let rows = stmt.query_map([notebook_id], projection_status_from_row)?;
+        let mut statuses = Vec::new();
+        for row in rows {
+            statuses.push(row?);
+        }
+        Ok(statuses)
+    }
+
+    pub fn update_semantic_memory_projection_artifact(
+        &self,
+        notebook_id: &str,
+        receipt_id: Option<&str>,
+        artifact_generation_id: Option<&str>,
+        vector_artifact_manifest_digest: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "UPDATE semantic_memory_projection_status
+             SET last_receipt_id = COALESCE(?2, last_receipt_id),
+                 artifact_generation_id = ?3,
+                 vector_artifact_manifest_digest = ?4,
+                 last_error = ?5,
+                 status = CASE
+                    WHEN status = 'synced' AND (?3 IS NULL OR ?4 IS NULL) THEN 'artifact_stale'
+                    ELSE status
+                 END,
+                 updated_at = datetime('now')
+             WHERE notebook_id = ?1",
+            rusqlite::params![
+                notebook_id,
+                receipt_id,
+                artifact_generation_id,
+                vector_artifact_manifest_digest,
+                error
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn semantic_memory_projection_summary(
+        &self,
+        notebook_id: &str,
+        scope: &ResolvedSourceScope,
+    ) -> Result<SemanticMemoryProjectionSummary, GlossError> {
+        if scope.is_none() {
+            return Ok(SemanticMemoryProjectionSummary {
+                notebook_id: notebook_id.to_string(),
+                total_sources: 0,
+                chunk_bearing_sources: 0,
+                zero_chunk_sources: 0,
+                projected_sources: 0,
+                failed_sources: 0,
+                skipped_no_chunks: 0,
+                stale_sources: 0,
+                partial_sources: 0,
+                projecting_sources: 0,
+                healthy_links: 0,
+                degraded_links: 0,
+                missing_links: 0,
+                total_chunks: 0,
+                projected_chunks: 0,
+                projection_required: false,
+            });
+        }
+        let scoped_ids = scope.source_ids();
+        if scoped_ids.is_empty() {
+            return Ok(SemanticMemoryProjectionSummary {
+                notebook_id: notebook_id.to_string(),
+                total_sources: 0,
+                chunk_bearing_sources: 0,
+                zero_chunk_sources: 0,
+                projected_sources: 0,
+                failed_sources: 0,
+                skipped_no_chunks: 0,
+                stale_sources: 0,
+                partial_sources: 0,
+                projecting_sources: 0,
+                healthy_links: 0,
+                degraded_links: 0,
+                missing_links: 0,
+                total_chunks: 0,
+                projected_chunks: 0,
+                projection_required: false,
+            });
+        }
+        let placeholders = (0..scoped_ids.len())
+            .map(|idx| format!("?{}", idx + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source_filter = format!(" WHERE s.id IN ({placeholders})");
+
+        let sql = format!(
+            "SELECT
+                COUNT(*) AS total_sources,
+                COALESCE(SUM(CASE WHEN COALESCE(chunk_counts.chunk_count, 0) > 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN COALESCE(chunk_counts.chunk_count, 0) = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN ps.status = 'synced' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN ps.status = 'failed' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN COALESCE(chunk_counts.chunk_count, 0) = 0 OR ps.status = 'skipped_no_chunks' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN ps.status IN ('stale', 'artifact_stale') THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN ps.status = 'partial' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN ps.status = 'projecting' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(COALESCE(ps.healthy_link_count, 0)), 0),
+                COALESCE(SUM(COALESCE(ps.degraded_link_count, 0)), 0),
+                COALESCE(SUM(COALESCE(chunk_counts.chunk_count, 0)), 0),
+                COALESCE(SUM(COALESCE(ps.projected_chunk_count, 0)), 0)
+             FROM sources s
+             LEFT JOIN (
+                SELECT source_id, COUNT(*) AS chunk_count
+                FROM chunks
+                GROUP BY source_id
+             ) chunk_counts ON chunk_counts.source_id = s.id
+             LEFT JOIN semantic_memory_projection_status ps
+                ON ps.source_id = s.id AND ps.notebook_id = ?1{source_filter}"
+        );
+
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&notebook_id];
+        for source_id in scoped_ids {
+            params.push(source_id);
+        }
+
+        let (
+            total_sources,
+            chunk_bearing_sources,
+            zero_chunk_sources,
+            projected_sources,
+            failed_sources,
+            skipped_no_chunks,
+            stale_sources,
+            partial_sources,
+            projecting_sources,
+            healthy_links,
+            degraded_links,
+            total_chunks,
+            projected_chunks,
+        ): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self.conn.query_row(&sql, params.as_slice(), |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+            ))
+        })?;
+
+        let total_sources = total_sources.max(0) as usize;
+        let chunk_bearing_sources = chunk_bearing_sources.max(0) as usize;
+        let zero_chunk_sources = zero_chunk_sources.max(0) as usize;
+        let projected_sources = projected_sources.max(0) as usize;
+        let failed_sources = failed_sources.max(0) as usize;
+        let skipped_no_chunks = skipped_no_chunks.max(0) as usize;
+        let stale_sources = stale_sources.max(0) as usize;
+        let partial_sources = partial_sources.max(0) as usize;
+        let projecting_sources = projecting_sources.max(0) as usize;
+        let healthy_links = healthy_links.max(0) as usize;
+        let degraded_links = degraded_links.max(0) as usize;
+        let total_chunks = total_chunks.max(0) as usize;
+        let projected_chunks = projected_chunks.max(0) as usize;
+        let missing_links = total_chunks.saturating_sub(healthy_links);
+        let projection_required = chunk_bearing_sources > 0
+            && (healthy_links < total_chunks
+                || failed_sources > 0
+                || stale_sources > 0
+                || partial_sources > 0
+                || projecting_sources > 0);
+
+        Ok(SemanticMemoryProjectionSummary {
+            notebook_id: notebook_id.to_string(),
+            total_sources,
+            chunk_bearing_sources,
+            zero_chunk_sources,
+            projected_sources,
+            failed_sources,
+            skipped_no_chunks,
+            stale_sources,
+            partial_sources,
+            projecting_sources,
+            healthy_links,
+            degraded_links,
+            missing_links,
+            total_chunks,
+            projected_chunks,
+            projection_required,
         })
     }
 
@@ -709,12 +1080,13 @@ impl NotebookDb {
     pub fn fts_search_chunks_in_sources(
         &self,
         query: &str,
-        source_ids: &[String],
+        scope: &ResolvedSourceScope,
         limit: usize,
     ) -> Result<Vec<(Chunk, f64)>, GlossError> {
-        if limit == 0 {
+        if limit == 0 || scope.is_none() || scope.source_ids().is_empty() {
             return Ok(Vec::new());
         }
+        let scoped_ids = scope.source_ids();
 
         let mut sql = String::from(
             "SELECT c.id, c.source_id, c.chunk_index, c.content, c.token_count,
@@ -724,22 +1096,20 @@ impl NotebookDb {
              JOIN chunks c ON c.rowid = chunks_fts.rowid
              WHERE chunks_fts MATCH ?1",
         );
-        if !source_ids.is_empty() {
-            let placeholders = (0..source_ids.len())
-                .map(|idx| format!("?{}", idx + 3))
-                .collect::<Vec<_>>()
-                .join(", ");
-            sql.push_str(" AND c.source_id IN (");
-            sql.push_str(&placeholders);
-            sql.push(')');
-        }
+        let placeholders = (0..scoped_ids.len())
+            .map(|idx| format!("?{}", idx + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(" AND c.source_id IN (");
+        sql.push_str(&placeholders);
+        sql.push(')');
         sql.push_str(
             " ORDER BY chunks_fts.rank ASC, c.source_id ASC, c.chunk_index ASC, c.id ASC LIMIT ?2",
         );
 
         let limit_i64 = limit as i64;
         let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&query, &limit_i64];
-        for source_id in source_ids {
+        for source_id in scoped_ids {
             params.push(source_id);
         }
 
@@ -1361,9 +1731,9 @@ mod tests {
         }
 
         let source_ids = vec!["a".to_string()];
-        let limited = db
-            .fts_search_chunks_in_sources("tie", &source_ids, 2)
-            .unwrap();
+        let scope = crate::retrieval::source_scope::SourceScope::Explicit(source_ids)
+            .resolve(&db.list_sources().unwrap());
+        let limited = db.fts_search_chunks_in_sources("tie", &scope, 2).unwrap();
         let limited_ids = limited
             .iter()
             .map(|(chunk, _rank)| chunk.id.as_str())
@@ -1372,15 +1742,63 @@ mod tests {
         assert_eq!(limited_ids, vec!["a-01", "a-02"]);
         assert!(limited.iter().all(|(chunk, _rank)| chunk.source_id == "a"));
 
-        let all_scoped = db
-            .fts_search_chunks_in_sources("tie", &source_ids, 10)
-            .unwrap();
+        let all_scoped = db.fts_search_chunks_in_sources("tie", &scope, 10).unwrap();
         let all_ids = all_scoped
             .iter()
             .map(|(chunk, _rank)| chunk.id.as_str())
             .collect::<Vec<_>>();
 
         assert_eq!(all_ids, vec!["a-01", "a-02", "a-03"]);
+    }
+
+    #[test]
+    fn retrieval_coverage_distinguishes_none_all_and_explicit() {
+        let db = test_db();
+        for id in ["a", "b"] {
+            db.insert_source(&Source {
+                id: id.to_string(),
+                source_type: "text".to_string(),
+                title: id.to_string(),
+                original_filename: None,
+                file_hash: None,
+                url: None,
+                file_path: None,
+                content_text: None,
+                word_count: None,
+                metadata: None,
+                summary: None,
+                summary_model: None,
+                status: "ready".to_string(),
+                error_message: None,
+                selected: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+            db.insert_chunk(&Chunk {
+                id: format!("c-{id}"),
+                source_id: id.to_string(),
+                chunk_index: 0,
+                content: format!("coverage {id}"),
+                token_count: None,
+                start_offset: None,
+                end_offset: None,
+                metadata: None,
+                embedding_id: None,
+                embedding_model: None,
+            })
+            .unwrap();
+        }
+
+        let sources = db.list_sources().unwrap();
+        let none = crate::retrieval::source_scope::SourceScope::None.resolve(&sources);
+        let all = crate::retrieval::source_scope::SourceScope::All.resolve(&sources);
+        let explicit = crate::retrieval::source_scope::SourceScope::Explicit(vec!["a".to_string()])
+            .resolve(&sources);
+
+        assert_eq!(db.retrieval_coverage(&none).unwrap().total_chunks, 0);
+        assert_eq!(db.retrieval_coverage(&all).unwrap().total_chunks, 2);
+        assert_eq!(db.retrieval_coverage(&explicit).unwrap().total_chunks, 1);
     }
 
     #[test]
@@ -1474,5 +1892,207 @@ mod tests {
         db.delete_source("s1").unwrap();
         let chunks = db.get_chunks_for_source("s1").unwrap();
         assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn semantic_memory_projection_summary_marks_projection_required_until_links_healthy() {
+        let db = test_db();
+        let source = Source {
+            id: "s-proj".to_string(),
+            source_type: "text".to_string(),
+            title: "Projection".to_string(),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: Some("content".to_string()),
+            word_count: Some(1),
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: "ready".to_string(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        db.insert_source(&source).unwrap();
+        db.insert_chunk(&Chunk {
+            id: "c-proj".to_string(),
+            source_id: "s-proj".to_string(),
+            chunk_index: 0,
+            content: "semantic content".to_string(),
+            token_count: Some(2),
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: None,
+            embedding_model: None,
+        })
+        .unwrap();
+
+        let summary = db
+            .semantic_memory_projection_summary(
+                "notebook-proj",
+                &crate::retrieval::source_scope::SourceScope::All
+                    .resolve(&db.list_sources().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(summary.chunk_bearing_sources, 1);
+        assert_eq!(summary.total_chunks, 1);
+        assert_eq!(summary.healthy_links, 0);
+        assert!(summary.projection_required);
+
+        db.upsert_semantic_memory_projection_status(&SemanticMemoryProjectionStatusUpdate {
+            notebook_id: "notebook-proj".to_string(),
+            source_id: "s-proj".to_string(),
+            status: "synced".to_string(),
+            chunk_count: 1,
+            projected_chunk_count: 1,
+            healthy_link_count: 1,
+            degraded_link_count: 0,
+            last_receipt_id: Some("receipt-proj".to_string()),
+            last_error: None,
+            artifact_generation_id: None,
+            vector_artifact_manifest_digest: None,
+        })
+        .unwrap();
+
+        let summary = db
+            .semantic_memory_projection_summary(
+                "notebook-proj",
+                &crate::retrieval::source_scope::SourceScope::All
+                    .resolve(&db.list_sources().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(summary.projected_sources, 1);
+        assert_eq!(summary.healthy_links, 1);
+        assert!(!summary.projection_required);
+    }
+
+    #[test]
+    fn projection_summary_counts_zero_chunk_sources_as_skipped() {
+        let db = test_db();
+        db.insert_source(&Source {
+            id: "empty-source".to_string(),
+            source_type: "text".to_string(),
+            title: "Empty".to_string(),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: None,
+            word_count: Some(0),
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: "ready".to_string(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+
+        let scope =
+            crate::retrieval::source_scope::SourceScope::All.resolve(&db.list_sources().unwrap());
+        let summary = db
+            .semantic_memory_projection_summary("notebook-empty", &scope)
+            .unwrap();
+
+        assert_eq!(summary.total_sources, 1);
+        assert_eq!(summary.zero_chunk_sources, 1);
+        assert_eq!(summary.skipped_no_chunks, 1);
+        assert!(!summary.projection_required);
+    }
+
+    #[test]
+    fn projection_summary_is_scope_aware_for_failed_source() {
+        let db = test_db();
+        for id in ["healthy", "failed"] {
+            db.insert_source(&Source {
+                id: id.to_string(),
+                source_type: "text".to_string(),
+                title: id.to_string(),
+                original_filename: None,
+                file_hash: None,
+                url: None,
+                file_path: None,
+                content_text: Some(format!("{id} content")),
+                word_count: Some(2),
+                metadata: None,
+                summary: None,
+                summary_model: None,
+                status: "ready".to_string(),
+                error_message: None,
+                selected: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+            db.insert_chunk(&Chunk {
+                id: format!("chunk-{id}"),
+                source_id: id.to_string(),
+                chunk_index: 0,
+                content: format!("semantic {id}"),
+                token_count: Some(2),
+                start_offset: None,
+                end_offset: None,
+                metadata: None,
+                embedding_id: None,
+                embedding_model: None,
+            })
+            .unwrap();
+        }
+
+        db.upsert_semantic_memory_projection_status(&SemanticMemoryProjectionStatusUpdate {
+            notebook_id: "notebook-scope".to_string(),
+            source_id: "healthy".to_string(),
+            status: "synced".to_string(),
+            chunk_count: 1,
+            projected_chunk_count: 1,
+            healthy_link_count: 1,
+            degraded_link_count: 0,
+            last_receipt_id: Some("receipt-healthy".to_string()),
+            last_error: None,
+            artifact_generation_id: None,
+            vector_artifact_manifest_digest: None,
+        })
+        .unwrap();
+        db.upsert_semantic_memory_projection_status(&SemanticMemoryProjectionStatusUpdate {
+            notebook_id: "notebook-scope".to_string(),
+            source_id: "failed".to_string(),
+            status: "failed".to_string(),
+            chunk_count: 1,
+            projected_chunk_count: 0,
+            healthy_link_count: 0,
+            degraded_link_count: 1,
+            last_receipt_id: Some("receipt-failed".to_string()),
+            last_error: Some("projection failed".to_string()),
+            artifact_generation_id: None,
+            vector_artifact_manifest_digest: None,
+        })
+        .unwrap();
+
+        let sources = db.list_sources().unwrap();
+        let healthy_scope =
+            crate::retrieval::source_scope::SourceScope::Explicit(vec!["healthy".to_string()])
+                .resolve(&sources);
+        let failed_scope =
+            crate::retrieval::source_scope::SourceScope::Explicit(vec!["failed".to_string()])
+                .resolve(&sources);
+
+        let healthy_summary = db
+            .semantic_memory_projection_summary("notebook-scope", &healthy_scope)
+            .unwrap();
+        let failed_summary = db
+            .semantic_memory_projection_summary("notebook-scope", &failed_scope)
+            .unwrap();
+
+        assert_eq!(healthy_summary.failed_sources, 0);
+        assert!(!healthy_summary.projection_required);
+        assert_eq!(failed_summary.failed_sources, 1);
+        assert!(failed_summary.projection_required);
+        assert_eq!(db.get_source("failed").unwrap().status, "ready");
     }
 }

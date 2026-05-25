@@ -27,6 +27,20 @@ pub struct MemoryBackendStatus {
     pub diagnostic: Option<String>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalCapabilityDecisionV1 {
+    pub requested_backend: String,
+    pub effective_backend: String,
+    pub decision_reason: Option<String>,
+    pub build_feature_available: bool,
+    pub runtime_enabled: bool,
+    pub projection_ready: bool,
+    pub dense_ready: bool,
+    pub fallback_allowed: bool,
+    pub degraded: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryScopeEcho {
     pub mode: String,
@@ -34,6 +48,7 @@ pub struct MemoryScopeEcho {
     pub effective_source_ids: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSourceRequest {
     pub notebook_id: String,

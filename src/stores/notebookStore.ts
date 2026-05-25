@@ -4,16 +4,18 @@ import * as api from '../lib/tauri';
 import { useChatStore } from './chatStore';
 import { useNoteStore } from './noteStore';
 import { useSourceStore } from './sourceStore';
+import { registerNotebookListRefresher } from './notebookRefresh';
 
 interface NotebookStore {
   notebooks: Notebook[];
   activeNotebookId: string | null;
+  activationStatus: 'idle' | 'pending' | 'confirmed' | 'error';
   loading: boolean;
   loadNotebooks: () => Promise<void>;
   createNotebook: (name: string) => Promise<string>;
   renameNotebook: (id: string, name: string) => Promise<void>;
   deleteNotebook: (id: string) => Promise<void>;
-  setActive: (id: string | null) => void;
+  setActive: (id: string | null) => Promise<void>;
 }
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
@@ -21,6 +23,7 @@ const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
 export const useNotebookStore = create<NotebookStore>((set, get) => ({
   notebooks: [],
   activeNotebookId: localStorage.getItem(ACTIVE_NB_KEY),
+  activationStatus: localStorage.getItem(ACTIVE_NB_KEY) ? 'pending' : 'idle',
   loading: false,
 
   loadNotebooks: async () => {
@@ -38,7 +41,7 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
     try {
       const id = await api.createNotebook(name);
       await get().loadNotebooks();
-      get().setActive(id);
+      await get().setActive(id);
       return id;
     } catch (e) {
       console.error('Failed to create notebook:', e);
@@ -56,41 +59,48 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
     // Clear active notebook BEFORE deletion so the backend stops summary jobs
     // and the UI resets immediately (prevents race with summary loop)
     if (activeNotebookId === id) {
-      get().setActive(null);
+      await get().setActive(null);
     }
     await api.deleteNotebook(id);
     await get().loadNotebooks();
   },
 
-  setActive: (id) => {
-    if (get().activeNotebookId === id) {
+  setActive: async (id) => {
+    if (get().activeNotebookId === id && get().activationStatus === 'confirmed') {
       return;
     }
 
-    // Reset notebook-scoped frontend state before switching
-    useChatStore.getState().resetForNotebookSwitch();
-    useNoteStore.getState().resetForNotebookSwitch();
-    useSourceStore.getState().resetForNotebookSwitch();
-    set({ activeNotebookId: id });
-    // Persist across restarts
-    if (id) {
-      localStorage.setItem(ACTIVE_NB_KEY, id);
-    } else {
-      localStorage.removeItem(ACTIVE_NB_KEY);
-    }
-    // Await backend initialization before reloading notebook metadata
+    set({ activationStatus: 'pending' });
     if (id) {
       const targetId = id;
-      api.setActiveNotebook(targetId)
-        .then(() => {
-          if (get().activeNotebookId !== targetId) return;
-          void get().loadNotebooks();
-        })
-        .catch((e) => console.error('Notebook activation failed:', e));
+      try {
+        await api.setActiveNotebook(targetId);
+        useChatStore.getState().resetForNotebookSwitch();
+        useNoteStore.getState().resetForNotebookSwitch();
+        useSourceStore.getState().resetForNotebookSwitch();
+        localStorage.setItem(ACTIVE_NB_KEY, targetId);
+        set({ activeNotebookId: targetId, activationStatus: 'confirmed' });
+        await get().loadNotebooks();
+      } catch (e) {
+        console.error('Notebook activation failed:', e);
+        set({ activationStatus: 'error' });
+        throw e;
+      }
     } else {
-      api.setActiveNotebook(null).catch((e) => {
+      try {
+        await api.setActiveNotebook(null);
+        useChatStore.getState().resetForNotebookSwitch();
+        useNoteStore.getState().resetForNotebookSwitch();
+        useSourceStore.getState().resetForNotebookSwitch();
+        localStorage.removeItem(ACTIVE_NB_KEY);
+        set({ activeNotebookId: null, activationStatus: 'idle' });
+      } catch (e) {
         console.error('Failed to clear active notebook:', e);
-      });
+        set({ activationStatus: 'error' });
+        throw e;
+      }
     }
   },
 }));
+
+registerNotebookListRefresher(() => useNotebookStore.getState().loadNotebooks());

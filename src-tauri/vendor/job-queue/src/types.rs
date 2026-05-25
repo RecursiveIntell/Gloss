@@ -212,7 +212,7 @@ where
         self.trace_ctx.clone().or_else(|| {
             self.trace_id
                 .as_ref()
-                .map(|id| stack_ids::TraceCtx::from_legacy_trace_id(id))
+                .map(stack_ids::TraceCtx::from_legacy_trace_id)
         })
     }
 

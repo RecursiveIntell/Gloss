@@ -13,9 +13,9 @@ def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--run-id', default='P32R3'); args=ap.parse_args()
     root=Path.cwd(); failures=[]; warnings=[]
     files={rel: read(root,rel) for rel in [
-      'src-tauri/src/commands/chat.rs','src-tauri/src/commands/sources.rs','src-tauri/src/commands/settings.rs',
+      'src-tauri/src/commands/chat/mod.rs','src-tauri/src/commands/sources/mod.rs','src-tauri/src/commands/settings.rs',
       'src-tauri/src/providers/mod.rs','src-tauri/src/providers/ollama.rs','src-tauri/src/jobs/mod.rs','src-tauri/src/lib.rs',
-      'src-tauri/src/db/notebook_db.rs','src/lib/types.ts','src/lib/events.ts','src/lib/tauri.ts',
+      'src-tauri/src/db/notebook_db/mod.rs','src/lib/types.ts','src/lib/events.ts','src/lib/tauri.ts',
       'src/stores/sourceStore.ts','src/components/chat/ChatPanel.tsx','src/components/sources/SourcesPanel.tsx','src/components/layout/StatusBar.tsx'
     ]}
     def require(cond, msg):
@@ -23,7 +23,7 @@ def main():
     def warn(cond, msg):
         if not cond: warnings.append(msg)
 
-    chat=files['src-tauri/src/commands/chat.rs']; types=files['src/lib/types.ts']; events=files['src/lib/events.ts']
+    chat=files['src-tauri/src/commands/chat/mod.rs']; types=files['src/lib/types.ts']; events=files['src/lib/events.ts']
     require('chat:status' in chat or 'ChatStatus' in chat, 'chat.rs must emit typed chat status or equivalent')
     require('ChatStatusPayload' in types, 'types.ts must define ChatStatusPayload')
     require('onChatStatus' in events, 'events.ts must expose onChatStatus')
@@ -37,14 +37,14 @@ def main():
     require('provider_id' in settings and re.search(r'if\s+let\s+Some\s*\(|match\s+provider_id', settings), 'refresh_models must branch on provider_id')
     warn('stale' in settings.lower() or 'available' in settings.lower(), 'model stale/unavailable state not obvious in settings.rs')
 
-    source_store=files['src/stores/sourceStore.ts']; tauri=files['src/lib/tauri.ts']; sources=files['src-tauri/src/commands/sources.rs']
+    source_store=files['src/stores/sourceStore.ts']; tauri=files['src/lib/tauri.ts']; sources=files['src-tauri/src/commands/sources/mod.rs']
     require('addSourceFiles' in source_store or 'add_source_files' in sources or 'addSourceFiles' in tauri, 'batch addSourceFiles/add_source_files missing')
     require('deleteSources' in source_store or 'delete_sources' in sources or 'deleteSources' in tauri, 'bulk deleteSources/delete_sources missing')
     require('debounce' in source_store.lower() or 'setTimeout' in source_store or 'persistTimer' in source_store, 'selection persistence debounce missing')
     require('sort_by' in sources or '.sort()' in sources or 'sort_unstable' in sources, 'folder traversal deterministic sort missing')
     require('folder_scan' in sources or 'scan_empty' in sources or 'scan_truncated' in sources, 'folder scan events missing')
 
-    db=files['src-tauri/src/db/notebook_db.rs']
+    db=files['src-tauri/src/db/notebook_db/mod.rs']
     require('list_source_headers_needing_summary' in db or ('list_sources_needing_summary' in db and 'content_text' not in re.search(r'list_sources_needing_summary[\s\S]{0,1200}', db).group(0)), 'summary candidate discovery still appears to load content_text')
     warn('transaction' in db.lower() or '.transaction' in db, 'NotebookDb transaction usage not obvious')
 

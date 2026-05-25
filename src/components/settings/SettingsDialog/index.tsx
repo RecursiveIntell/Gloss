@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import type React from "react";
-import { useSettingsStore } from "../../stores/settingsStore";
-import { useToastStore } from "../../stores/toastStore";
-import { useNotebookStore } from "../../stores/notebookStore";
-import * as api from "../../lib/tauri";
+import { useSettingsStore } from "../../../stores/settingsStore";
+import { useToastStore } from "../../../stores/toastStore";
+import { useNotebookStore } from "../../../stores/notebookStore";
+import * as api from "../../../lib/tauri";
 import {
   canUseSemanticMemoryPreview,
   EXPERIMENTAL_FEATURES_ENABLED,
@@ -11,12 +11,13 @@ import {
   featureSections,
   FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED,
   FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
-} from "../../lib/features";
+} from "../../../lib/features";
 import type {
   FeatureFlagStatus,
   MemoryBackendStatus,
+  SemanticMemoryProfileStatus,
   SemanticMemoryLinkStatus,
-} from "../../lib/types";
+} from "../../../lib/types";
 import {
   AlertCircle,
   BookOpen,
@@ -288,7 +289,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
   const [memoryStatus, setMemoryStatus] = useState<MemoryBackendStatus | null>(null);
   const [linkStatus, setLinkStatus] = useState<SemanticMemoryLinkStatus | null>(null);
+  const [profileStatus, setProfileStatus] = useState<SemanticMemoryProfileStatus | null>(null);
   const [reindexingSemanticMemory, setReindexingSemanticMemory] = useState(false);
+  const [rebuildingTurboQuant, setRebuildingTurboQuant] = useState(false);
+  const [runningRetrievalProbe, setRunningRetrievalProbe] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -300,8 +304,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => setMemoryStatus(null));
       if (activeNotebookId) {
         api.semanticMemoryLinkStatus(activeNotebookId).then(setLinkStatus).catch(() => setLinkStatus(null));
+        api.getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" }).then(setProfileStatus).catch(() => setProfileStatus(null));
       } else {
         setLinkStatus(null);
+        setProfileStatus(null);
       }
     }
   }, [
@@ -377,16 +383,34 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   };
 
   const handleSelectMemoryBackend = async (backendId: string) => {
+    await handleMemoryProfile(
+      backendId === "semantic-memory-preview" ? "semantic-memory-safe" : "gloss-local"
+    );
+  };
+
+  const handleMemoryProfile = async (profile: string) => {
     try {
-      await updateSetting("memory_backend", backendId);
-      await api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => setMemoryStatus(null));
+      const receipt = await api.setMemoryBackendProfile(profile, activeNotebookId);
+      await loadSettings();
+      await loadFeatureFlags();
+      await refreshMemoryEvidence();
+      useToastStore.getState().addToast({
+        type: receipt.blocked ? "error" : "success",
+        title: receipt.blocked ? "Memory profile blocked" : "Memory profile applied",
+        message: receipt.blocked
+          ? `${receipt.blocking_reasons.join(", ")}`
+          : `${receipt.profile}: ${receipt.backend_used}`,
+        duration: 4000,
+      });
     } catch (error) {
       await loadSettings();
+      await loadFeatureFlags();
+      await refreshMemoryEvidence();
       useToastStore.getState().addToast({
         type: "error",
-        title: "Memory backend not changed",
+        title: "Memory profile not applied",
         message: error instanceof Error ? error.message : String(error),
-        duration: 6000,
+        duration: 7000,
       });
     }
   };
@@ -395,8 +419,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     await api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => setMemoryStatus(null));
     if (activeNotebookId) {
       await api.semanticMemoryLinkStatus(activeNotebookId).then(setLinkStatus).catch(() => setLinkStatus(null));
+      await api.getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" }).then(setProfileStatus).catch(() => setProfileStatus(null));
     } else {
       setLinkStatus(null);
+      setProfileStatus(null);
     }
   };
 
@@ -404,12 +430,12 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     if (!activeNotebookId) return;
     setReindexingSemanticMemory(true);
     try {
-      const receipts = await api.semanticMemoryReindexNotebook(activeNotebookId);
+      const receipt = await api.semanticMemoryBackfillNotebook(activeNotebookId);
       await refreshMemoryEvidence();
       useToastStore.getState().addToast({
         type: "success",
-        title: "semantic-memory reindex complete",
-        message: `${receipts.length} source receipts emitted.`,
+        title: "Projection backfill complete",
+        message: `${receipt.projected_sources} projected, ${receipt.skipped_no_chunks} skipped, ${receipt.failed_sources} failed.`,
         duration: 5000,
       });
     } catch (error) {
@@ -422,6 +448,56 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       });
     } finally {
       setReindexingSemanticMemory(false);
+    }
+  };
+
+  const handleRebuildTurboQuantArtifacts = async () => {
+    if (!activeNotebookId) return;
+    setRebuildingTurboQuant(true);
+    try {
+      await api.semanticMemoryRebuildVectorArtifacts(activeNotebookId);
+      await refreshMemoryEvidence();
+      useToastStore.getState().addToast({
+        type: "success",
+        title: "TurboQuant artifacts rebuilt",
+        message: "Fresh artifact receipt recorded.",
+        duration: 5000,
+      });
+    } catch (error) {
+      await refreshMemoryEvidence();
+      useToastStore.getState().addToast({
+        type: "error",
+        title: "TurboQuant rebuild failed",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 7000,
+      });
+    } finally {
+      setRebuildingTurboQuant(false);
+    }
+  };
+
+  const handleRunRetrievalProbe = async () => {
+    if (!activeNotebookId) return;
+    setRunningRetrievalProbe(true);
+    try {
+      const probe = await api.runRetrievalProbe(activeNotebookId, "GLOSS_SM_TQ_SENTINEL_20260523", { kind: "all" }, 8);
+      await refreshMemoryEvidence();
+      useToastStore.getState().addToast({
+        type: probe.fallback_used ? "error" : "success",
+        title: "Retrieval probe complete",
+        message: `${probe.backend_used}: ${probe.bm25_candidates} BM25, ${probe.vector_candidates} semantic, exact rerank ${probe.exact_rerank_count}.`,
+        duration: 7000,
+      });
+    } catch (error) {
+      await refreshMemoryEvidence();
+      useToastStore.getState().addToast({
+        type: "error",
+        title: "Retrieval probe failed",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 7000,
+      });
+    } finally {
+      setRunningRetrievalProbe(false);
     }
   };
 
@@ -621,6 +697,73 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 {memoryStatus.fallback_reason}
               </p>
             )}
+            {profileStatus?.projection_summary && (
+              <div className="rounded border border-border bg-bg-tertiary/40 px-3 py-2 text-xs text-text-secondary">
+                <div className="grid gap-1 sm:grid-cols-4">
+                  <span>Sources {profileStatus.projection_summary.total_sources}</span>
+                  <span>Chunks {profileStatus.projection_summary.total_chunks}</span>
+                  <span>Healthy {profileStatus.projection_summary.healthy_links}</span>
+                  <span>Missing {profileStatus.projection_summary.missing_links}</span>
+                </div>
+                <div className="mt-1 grid gap-1 sm:grid-cols-3">
+                  <span>Skipped {profileStatus.projection_summary.skipped_no_chunks}</span>
+                  <span>Failed {profileStatus.projection_summary.failed_sources}</span>
+                  <span>Fallback {profileStatus.fallback_allowed ? "on" : "off"}</span>
+                </div>
+                {profileStatus.blocking_reasons.length > 0 && (
+                  <p className="mt-1 text-[11px] text-warning">
+                    {profileStatus.blocking_reasons.join(", ")}
+                  </p>
+                )}
+              </div>
+            )}
+            {profileStatus?.turbo_quant_status && (
+              <div className="rounded border border-border bg-bg-tertiary/40 px-3 py-2 text-xs text-text-secondary">
+                <div className="grid gap-1 sm:grid-cols-3">
+                  <span>Compiled TQ {profileStatus.turbo_quant_status.compiled_turbo_quant ? "yes" : "no"}</span>
+                  <span>Runtime TQ {profileStatus.turbo_quant_status.runtime_turbo_quant_enabled ? "on" : "off"}</span>
+                  <span>Exact rerank {profileStatus.turbo_quant_status.exact_rerank ? "yes" : "no"}</span>
+                </div>
+                <p className="mt-1 truncate text-[11px] text-text-muted">
+                  {profileStatus.turbo_quant_status.vector_artifact_manifest_digest || "No vector artifact digest"}
+                </p>
+              </div>
+            )}
+            <div className="grid gap-2 sm:grid-cols-3">
+              {[
+                ["gloss-local", "Gloss local", true],
+                ["semantic-memory-safe", "Enable semantic-memory", semanticPreviewSelectable],
+                ["semantic-memory-turbo-quant-safe", "TurboQuant", Boolean(turboQuant?.available)],
+              ].map(([profile, label, enabled]) => (
+                <button
+                  key={String(profile)}
+                  onClick={() => handleMemoryProfile(String(profile))}
+                  disabled={!enabled}
+                  className="inline-flex items-center justify-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Database className="h-3.5 w-3.5" />
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <button
+                onClick={() => handleMemoryProfile("semantic-memory-strict")}
+                disabled={!activeNotebookId || !semanticPreviewSelectable}
+                className="inline-flex items-center justify-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <ShieldCheck className="h-3.5 w-3.5" />
+                Strict semantic-memory
+              </button>
+              <button
+                onClick={() => handleMemoryProfile("semantic-memory-turbo-quant-strict")}
+                disabled={!activeNotebookId || !turboQuant?.available}
+                className="inline-flex items-center justify-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <ShieldCheck className="h-3.5 w-3.5" />
+                Strict TurboQuant
+              </button>
+            </div>
             <select
               value={settings["memory_backend"] || "gloss-local"}
               onChange={(e) => handleSelectMemoryBackend(e.target.value)}
@@ -636,12 +779,34 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               <input
                 type="checkbox"
                 checked={(settings["memory_backend_fallback"] || "true") !== "false"}
-                onChange={(e) =>
-                  updateSetting("memory_backend_fallback", e.target.checked ? "true" : "false")
-                }
+                readOnly
+                disabled
                 className="accent-accent"
               />
               Fallback to Gloss local when preview retrieval fails
+            </label>
+            <label className="flex items-center gap-2 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={(settings["semantic_memory_auto_project"] || "false") === "true"}
+                readOnly
+                disabled
+                className="accent-accent"
+              />
+              Auto-project imports into semantic-memory
+            </label>
+            <label className="flex items-center gap-2 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={
+                  (settings["semantic_memory_turbo_quant_require_fresh_artifacts"] || "true") !==
+                  "false"
+                }
+                readOnly
+                disabled
+                className="accent-accent"
+              />
+              Require fresh TurboQuant artifact evidence
             </label>
             <div className="flex flex-wrap items-center gap-2">
               <button
@@ -658,7 +823,35 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 ) : (
                   <RefreshCw className="h-3.5 w-3.5" />
                 )}
-                Reindex semantic-memory
+                Run projection backfill
+              </button>
+              <button
+                onClick={handleRebuildTurboQuantArtifacts}
+                disabled={
+                  !activeNotebookId ||
+                  !turboQuant?.active ||
+                  rebuildingTurboQuant
+                }
+                className="inline-flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {rebuildingTurboQuant ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Database className="h-3.5 w-3.5" />
+                )}
+                Rebuild TurboQuant artifacts
+              </button>
+              <button
+                onClick={handleRunRetrievalProbe}
+                disabled={!activeNotebookId || runningRetrievalProbe}
+                className="inline-flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {runningRetrievalProbe ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <TestTube2 className="h-3.5 w-3.5" />
+                )}
+                Run retrieval probe
               </button>
               <button
                 onClick={refreshMemoryEvidence}

@@ -41,7 +41,7 @@ adapter = read('src-tauri/src/memory/semantic_memory_adapter.rs')
 if adapter:
     if 'VALUES (?1, ?2, ?3, ?4, NULL, NULL' in adapter: errors.append('semantic_memory_adapter still inserts NULL sm_chunk_id/sm_episode_id for links')
     if 'content_digest' not in adapter: errors.append('semantic_memory_adapter lacks content digest mapping support')
-chat = read('src-tauri/src/commands/chat.rs')
+chat = read('src-tauri/src/commands/chat/mod.rs')
 if chat:
     if 'local-retrieval-fallback' in chat and 'fts' not in chat.lower() and 'bm25' not in chat.lower(): warnings.append('chat fallback markers exist but no clear FTS/BM25 evidence path in chat.rs')
     for field in ['backend_requested','backend_used','fallback_used','fallback_reason','degradation_markers','receipt_id']:

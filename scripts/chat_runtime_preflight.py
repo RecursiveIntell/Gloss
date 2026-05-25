@@ -7,7 +7,7 @@ from pathlib import Path
 REQUIRED = [
     "src/App.tsx",
     "src/stores/chatStore.ts",
-    "src-tauri/src/commands/chat.rs",
+    "src-tauri/src/commands/chat/mod.rs",
     "src-tauri/src/commands/settings.rs",
     "src-tauri/src/providers/mod.rs",
     "src-tauri/src/providers/ollama.rs",

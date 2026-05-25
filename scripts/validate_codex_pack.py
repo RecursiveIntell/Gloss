@@ -11,20 +11,8 @@ RUN_ID = "GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519"
 
 REQUIRED_ROOT_FILES = [
     "AGENTS.md",
-    f"codex/prompts/{RUN_ID}/MASTER_PROMPT.md",
-    f"codex/prompts/{RUN_ID}/PHASE_00_PREFLIGHT_AND_SOURCE_TRUTH.md",
-    f"codex/prompts/{RUN_ID}/PHASE_01_ACTIVE_VALIDATION_REPAIR.md",
-    f"codex/prompts/{RUN_ID}/PHASE_02_SM_TQ_RUNTIME_SETTING_CONTROL.md",
-    f"codex/prompts/{RUN_ID}/PHASE_03_RETRIEVAL_AND_BACKPOINTER_PROOF.md",
-    f"codex/prompts/{RUN_ID}/PHASE_04_SETTINGS_UI_AND_DISCLOSURE.md",
-    f"codex/prompts/{RUN_ID}/PHASE_05_DESKTOP_SMOKE_HARNESS.md",
-    f"codex/prompts/{RUN_ID}/PHASE_06_GUI_REDESIGN_PORT.md",
-    f"codex/prompts/{RUN_ID}/PHASE_07_SECURITY_AND_PACKAGE_WARNING_CLEANUP.md",
-    f"codex/prompts/{RUN_ID}/PHASE_08_TEST_EXPANSION_AND_PARITY.md",
-    f"codex/prompts/{RUN_ID}/PHASE_09_DOCS_PUBLIC_RELEASE_TRUTH.md",
-    f"codex/prompts/{RUN_ID}/PHASE_10_PACKAGE_AND_FRESH_UNZIP_REPLAY.md",
-    f"codex/prompts/{RUN_ID}/PHASE_11_PARALLEL_HOSTILE_SUBAGENTS.md",
-    f"codex/prompts/{RUN_ID}/PHASE_12_FINAL_AUDIT_RELEASE_DECISION.md",
+    "CODEX_MASTER_PROMPT.md",
+    "PHASE_PROMPTS",
     f"codex/schemas/{RUN_ID}/final_receipt.schema.json",
     f"docs/codex-runs/{RUN_ID}/PHASE_ORDER.md",
     f"docs/codex-runs/{RUN_ID}/ACCEPTANCE_GATES.md",
@@ -46,7 +34,7 @@ EXPECTED_PHASE_IDS = [
     "PHASE_12",
 ]
 
-PHASE_PROMPT_RE = re.compile(r"^PHASE_(\d{2})_.*\.md$")
+PHASE_PROMPT_RE = re.compile(r"^PHASE_(\d{2})(?:_|$).*\.md$")
 
 
 def validate() -> list[str]:
@@ -56,11 +44,12 @@ def validate() -> list[str]:
     if missing:
         errors.extend(f"missing required file: {path}" for path in missing)
 
-    prompt_dir = ROOT / "codex" / "prompts" / RUN_ID
+    prompt_dir = ROOT / "PHASE_PROMPTS"
     phase_prompt_ids = sorted(
-        f"PHASE_{match.group(1)}"
+        {f"PHASE_{match.group(1)}"
         for path in prompt_dir.glob("PHASE_*.md")
         if (match := PHASE_PROMPT_RE.match(path.name))
+        }
     )
     if phase_prompt_ids != EXPECTED_PHASE_IDS:
         errors.append(

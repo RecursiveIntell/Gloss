@@ -45,7 +45,7 @@ def main() -> int:
         repo / "src/lib/tauri.ts",
         repo / "src/lib/features.ts",
         repo / "src/stores/settingsStore.ts",
-        repo / "src/components/settings/SettingsDialog.tsx",
+        repo / "src/components/settings/SettingsDialog/index.tsx",
     ])
 
     for key in REQUIRED_KEYS:
@@ -61,7 +61,7 @@ def main() -> int:
     if "cfg!(feature = \"semantic-memory-turbo-quant\")" not in rust_blob:
         findings.append({"severity":"error","code":"missing-build-feature-gate","detail":"semantic-memory-turbo-quant cfg gate not found"})
 
-    settings_dialog = read(repo / "src/components/settings/SettingsDialog.tsx")
+    settings_dialog = read(repo / "src/components/settings/SettingsDialog/index.tsx")
     # Fail only the old exact unconditional option pattern; Codex may replace it with a mapped/gated option.
     old_option = '<option value="semantic-memory-preview">semantic-memory preview</option>'
     if old_option in settings_dialog:

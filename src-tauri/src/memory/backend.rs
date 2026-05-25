@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
+#[allow(dead_code)]
 pub trait MemorySearchBackend {
     fn backend_id(&self) -> &'static str;
     fn backend_status(&self) -> MemoryBackendStatus;
@@ -234,6 +235,7 @@ pub fn chunk_id_intersection(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn compare_memory_backends_for_notebook(
     data_dir: &Path,
     notebook_id: &str,
@@ -348,6 +350,7 @@ fn semantic_memory_unavailable_response(
     let invalid_source_ids = invalid_requested_source_ids(&requested_ids, &resolved_scope);
     let excluded_source_count = excluded_source_count(all_sources, &resolved_scope);
     let scope = scope_echo(requested_ids, &resolved_scope);
+    let source_scope_preserved = invalid_source_ids.is_empty();
     let receipt_id = request
         .trace_id
         .clone()
@@ -371,11 +374,11 @@ fn semantic_memory_unavailable_response(
             "unmapped_semantic_candidates": [reason.clone()],
             "fallback_used": false,
             "degraded": true,
-            "source_scope_preserved": true
+            "source_scope_preserved": source_scope_preserved
         }),
         fallback_reason: Some(reason),
         degradation_markers: vec!["semantic-memory-unavailable".to_string()],
-        source_scope_preserved: true,
+        source_scope_preserved,
         fallback_used: false,
         degraded: true,
     }
@@ -467,6 +470,7 @@ fn comparison_decision(
     "pass".to_string()
 }
 
+#[allow(dead_code)]
 pub fn unavailable_status(active_backend: String, diagnostic: String) -> MemoryBackendStatus {
     MemoryBackendStatus {
         backend_id: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),

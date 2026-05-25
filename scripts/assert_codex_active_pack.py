@@ -10,14 +10,14 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_ID = "GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519"
 REQUIRED = [
     "AGENTS.md",
-    f"codex/prompts/{RUN_ID}/MASTER_PROMPT.md",
-    f"codex/prompts/{RUN_ID}/PHASE_12_FINAL_AUDIT_RELEASE_DECISION.md",
+    "CODEX_MASTER_PROMPT.md",
+    "PHASE_PROMPTS",
     f"codex/schemas/{RUN_ID}/final_receipt.schema.json",
     f"docs/codex-runs/{RUN_ID}/PHASE_ORDER.md",
     f"docs/codex-runs/{RUN_ID}/ACCEPTANCE_GATES.md",
 ]
 EXPECTED_PHASE_IDS = [f"PHASE_{idx:02d}" for idx in range(13)]
-PHASE_PROMPT_RE = re.compile(r"^PHASE_(\d{2})_.*\.md$")
+PHASE_PROMPT_RE = re.compile(r"^PHASE_(\d{2})(?:_|$).*\.md$")
 
 
 def main() -> int:
@@ -28,11 +28,12 @@ def main() -> int:
     errors: list[str] = []
     errors.extend(f"missing required file: {p}" for p in missing)
 
-    prompt_dir = ROOT / "codex" / "prompts" / RUN_ID
+    prompt_dir = ROOT / "PHASE_PROMPTS"
     phase_prompt_ids = sorted(
-        f"PHASE_{match.group(1)}"
+        {f"PHASE_{match.group(1)}"
         for path in prompt_dir.glob("PHASE_*.md")
         if (match := PHASE_PROMPT_RE.match(path.name))
+        }
     )
     if phase_prompt_ids != EXPECTED_PHASE_IDS:
         errors.append(

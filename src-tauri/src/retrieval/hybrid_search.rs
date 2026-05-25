@@ -31,6 +31,7 @@ fn scope_allows_chunk(scope: &ResolvedSourceScope, chunk: &Chunk) -> bool {
     scope.allows(&chunk.source_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn local_retrieval_outcome(
     query: &str,
     nb_db: &NotebookDb,
@@ -41,7 +42,7 @@ pub fn local_retrieval_outcome(
     top_k: usize,
     trace_ref: String,
 ) -> Result<RetrievalOutcome, GlossError> {
-    let coverage = nb_db.retrieval_coverage(scope.source_ids())?;
+    let coverage = nb_db.retrieval_coverage(scope)?;
     if scope.is_none() {
         return Ok(unavailable_outcome(
             coverage,
@@ -68,7 +69,7 @@ pub fn local_retrieval_outcome(
         bm25_reason = Some(RetrievalReasonCode::Bm25QuerySanitizedEmpty);
         fallback_chain.push(RetrievalReasonCode::Bm25QuerySanitizedEmpty);
     } else {
-        match nb_db.fts_search_chunks_in_sources(&fts_query, scope.source_ids(), k_per_source) {
+        match nb_db.fts_search_chunks_in_sources(&fts_query, scope, k_per_source) {
             Ok(results) => {
                 bm25_chunks = results
                     .into_iter()
@@ -294,6 +295,7 @@ fn user_visible_summary(
 }
 
 /// Perform hybrid search: HNSW semantic + FTS5 keyword, fused with RRF.
+#[allow(dead_code)]
 pub fn hybrid_search(
     query: &str,
     nb_db: &NotebookDb,
@@ -415,8 +417,7 @@ pub fn hybrid_search(
 
 /// Sanitize a query string for FTS5 MATCH syntax.
 pub fn sanitize_fts_query(query: &str) -> String {
-    // Split into words and join with spaces (implicit AND in FTS5)
-    query
+    let terms = query
         .split_whitespace()
         .filter(|w| !w.is_empty())
         .map(|w| {
@@ -426,8 +427,54 @@ pub fn sanitize_fts_query(query: &str) -> String {
                 .collect::<String>()
         })
         .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>();
+    let content_terms = terms
+        .iter()
+        .filter(|term| !is_query_stopword(term))
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected_terms = if content_terms.is_empty() {
+        terms
+    } else {
+        content_terms
+    };
+    selected_terms
+        .into_iter()
+        .map(|term| format!("\"{}\"", term))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" OR ")
+}
+
+fn is_query_stopword(term: &str) -> bool {
+    matches!(
+        term.to_ascii_lowercase().as_str(),
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "cite"
+            | "does"
+            | "for"
+            | "from"
+            | "in"
+            | "is"
+            | "it"
+            | "of"
+            | "on"
+            | "or"
+            | "source"
+            | "sources"
+            | "the"
+            | "this"
+            | "to"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+            | "why"
+            | "with"
+    )
 }
 
 #[cfg(test)]
@@ -574,16 +621,42 @@ mod tests {
 
         let serialized = serde_json::to_value(&outcome).unwrap();
         assert_eq!(serialized["mode"], "bm25_only");
-        assert_eq!(
-            serialized["fallback_chain"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|value| value.as_str())
-                .collect::<Vec<_>>()
-                .contains(&"partial_embedding_coverage"),
-            true
-        );
+        assert!(serialized["fallback_chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>()
+            .contains(&"partial_embedding_coverage"));
+    }
+
+    #[test]
+    fn natural_question_query_matches_answer_terms_without_fallback() {
+        let dir = tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let selected = source("selected");
+        db.insert_source(&selected).unwrap();
+        let mut record = chunk("c1", "selected");
+        record.content =
+            "The P33 desktop smoke answer is ORCHID-913. Cite this source as [1].".to_string();
+        db.insert_chunk(&record).unwrap();
+        let scope = SourceScope::Explicit(vec!["selected".to_string()]).resolve(&[selected]);
+
+        let outcome = local_retrieval_outcome(
+            "What is the P33 desktop smoke answer? Cite the source.",
+            &db,
+            None,
+            None,
+            false,
+            &scope,
+            4,
+            "trace-natural-question".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.mode, RetrievalMode::Bm25Only);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(outcome.results[0].content.contains("ORCHID-913"));
     }
 
     #[test]

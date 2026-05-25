@@ -134,10 +134,7 @@ pub fn build_provider(config: &ProviderConfig) -> Box<dyn LlmProvider> {
     }
 }
 
-fn provider_row<'a>(
-    providers: &'a [Provider],
-    provider_type: ProviderType,
-) -> Option<&'a Provider> {
+fn provider_row(providers: &[Provider], provider_type: ProviderType) -> Option<&Provider> {
     providers
         .iter()
         .find(|provider| provider.id == provider_type.as_str())
@@ -183,6 +180,7 @@ pub fn provider_config_from_db(
 }
 
 /// Registry of all configured LLM providers and cached models.
+#[allow(dead_code)]
 pub struct ModelRegistry {
     pub ollama: Option<ollama::OllamaProvider>,
     pub openai: Option<openai::OpenAIProvider>,
@@ -191,6 +189,7 @@ pub struct ModelRegistry {
     pub cached_models: Vec<ModelInfo>,
 }
 
+#[allow(dead_code)]
 impl ModelRegistry {
     /// Create registry from app database config.
     pub fn new(app_db: &AppDb, secret_store: &SecretStore) -> Result<Self, GlossError> {

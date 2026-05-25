@@ -44,7 +44,7 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
     cancelEditing();
   };
 
-  const parseCitations = (citations?: Citation[] | string): Citation[] => {
+  const parseCitations = (citations?: unknown): Citation[] => {
     if (!citations) return [];
     try {
       const raw = typeof citations === "string" ? JSON.parse(citations) : citations;

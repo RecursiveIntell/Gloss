@@ -6,7 +6,7 @@ import sys
 
 def main() -> int:
     root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
-    chat = (root / "src-tauri/src/commands/chat.rs").read_text()
+    chat = (root / "src-tauri/src/commands/chat/mod.rs").read_text()
     store = (root / "src/stores/chatStore.ts").read_text()
     types = (root / "src/lib/types.ts").read_text()
     errors = []

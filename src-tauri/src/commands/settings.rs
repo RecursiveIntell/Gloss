@@ -1,10 +1,147 @@
 use crate::db::app_db::{ModelRecord, Provider};
 use crate::error::GlossError;
 use crate::features::{self, FeatureFlagStatus};
+use crate::memory::MemoryBackendStatus;
 use crate::providers::{self, ModelInfo, ModelRegistry, ProviderType};
+use crate::retrieval::source_scope::SourceScope;
 use crate::state::AppState;
+use serde::Serialize;
 use std::collections::HashMap;
 use tauri::State;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryProfile {
+    GlossLocal,
+    SemanticMemorySafe,
+    SemanticMemoryStrict,
+    SemanticMemoryTurboQuantSafe,
+    SemanticMemoryTurboQuantStrict,
+}
+
+impl MemoryProfile {
+    fn parse(input: &str) -> Result<Self, GlossError> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "gloss-local" => Ok(Self::GlossLocal),
+            "semantic-memory" | "semantic-memory-hybrid" | "semantic-memory-safe" => {
+                Ok(Self::SemanticMemorySafe)
+            }
+            "semantic-memory-strict" => Ok(Self::SemanticMemoryStrict),
+            "semantic-memory-turbo-quant"
+            | "semantic-memory+tq"
+            | "semantic-memory-sm-tq"
+            | "semantic-memory-turbo-quant-safe" => Ok(Self::SemanticMemoryTurboQuantSafe),
+            "semantic-memory-turbo-quant-strict" => Ok(Self::SemanticMemoryTurboQuantStrict),
+            other => Err(GlossError::Config(format!(
+                "Unknown memory backend profile '{other}'"
+            ))),
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::GlossLocal => "gloss-local",
+            Self::SemanticMemorySafe => "semantic-memory-safe",
+            Self::SemanticMemoryStrict => "semantic-memory-strict",
+            Self::SemanticMemoryTurboQuantSafe => "semantic-memory-turbo-quant-safe",
+            Self::SemanticMemoryTurboQuantStrict => "semantic-memory-turbo-quant-strict",
+        }
+    }
+
+    fn is_strict(self) -> bool {
+        matches!(
+            self,
+            Self::SemanticMemoryStrict | Self::SemanticMemoryTurboQuantStrict
+        )
+    }
+
+    fn requires_semantic_memory(self) -> bool {
+        !matches!(self, Self::GlossLocal)
+    }
+
+    fn requires_turbo_quant(self) -> bool {
+        matches!(
+            self,
+            Self::SemanticMemoryTurboQuantSafe | Self::SemanticMemoryTurboQuantStrict
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryBackendProfileReceipt {
+    pub profile: String,
+    pub requested_backend: String,
+    pub backend_used: String,
+    pub strict_mode: bool,
+    pub semantic_memory_auto_project: bool,
+    pub turbo_quant_requested: bool,
+    pub turbo_quant_active: bool,
+    pub blocked: bool,
+    pub next_action: Option<String>,
+    pub blocking_reasons: Vec<String>,
+    pub receipt_id: String,
+    pub status: MemoryBackendStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticMemoryProfileStatus {
+    pub compiled_semantic_memory: bool,
+    pub compiled_turbo_quant: bool,
+    pub experimental_enabled: bool,
+    pub semantic_memory_flag_enabled: bool,
+    pub turbo_quant_flag_enabled: bool,
+    pub selected_backend: String,
+    pub effective_backend: String,
+    pub fallback_allowed: bool,
+    pub strict_testing: bool,
+    pub projection_summary: Option<crate::db::notebook_db::SemanticMemoryProjectionSummary>,
+    pub turbo_quant_status: Option<crate::commands::sources::VectorArtifactStatus>,
+    pub next_actions: Vec<String>,
+    pub blocking_reasons: Vec<String>,
+}
+
+fn scoped_projection_summary(
+    state: &AppState,
+    notebook_id: Option<&str>,
+    source_scope: Option<SourceScope>,
+) -> Result<Option<crate::db::notebook_db::SemanticMemoryProjectionSummary>, GlossError> {
+    let Some(notebook_id) = notebook_id else {
+        return Ok(None);
+    };
+    state.with_notebook_db(notebook_id, |db| {
+        let resolved_scope = if let Some(scope) = source_scope {
+            let sources = db.list_sources()?;
+            scope.resolve(&sources)
+        } else {
+            let sources = db.list_sources()?;
+            SourceScope::All.resolve(&sources)
+        };
+        db.semantic_memory_projection_summary(notebook_id, &resolved_scope)
+            .map(Some)
+    })
+}
+
+fn projection_ready_for_strict(
+    state: &AppState,
+    notebook_id: Option<&str>,
+) -> Result<(bool, Vec<String>), GlossError> {
+    let Some(summary) = scoped_projection_summary(state, notebook_id, None)? else {
+        return Ok((
+            false,
+            vec!["select a notebook before enabling strict semantic-memory".to_string()],
+        ));
+    };
+    let mut reasons = Vec::new();
+    if summary.chunk_bearing_sources == 0 || summary.total_chunks == 0 {
+        reasons.push("selected scope has no chunk-bearing sources".to_string());
+    }
+    if summary.projection_required {
+        reasons.push("projection required for selected source scope".to_string());
+    }
+    if summary.failed_sources > 0 {
+        reasons.push("one or more source projections failed".to_string());
+    }
+    Ok((reasons.is_empty(), reasons))
+}
 
 fn secret_setting_key(provider_type: ProviderType) -> Option<&'static str> {
     provider_type.api_key_setting_key()
@@ -370,6 +507,346 @@ pub async fn update_feature_flag(
     features::feature_flag_statuses(&app_db)
 }
 
+#[tauri::command]
+pub async fn set_memory_backend_profile(
+    profile: String,
+    notebook_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<MemoryBackendProfileReceipt, GlossError> {
+    let profile = MemoryProfile::parse(&profile)?;
+    let normalized = profile.id().to_string();
+    let mut blocked = false;
+    let mut next_action = None;
+    let mut blocking_reasons = Vec::new();
+
+    if profile.requires_semantic_memory() && !cfg!(feature = "semantic-memory-backend") {
+        blocked = true;
+        next_action = Some("rebuild_with_semantic_memory_backend".to_string());
+        blocking_reasons.push(
+            "semantic-memory profile requires the semantic-memory-backend build feature"
+                .to_string(),
+        );
+    }
+
+    if profile.requires_turbo_quant() && !cfg!(feature = "semantic-memory-turbo-quant") {
+        blocked = true;
+        next_action = Some("rebuild_with_semantic_memory_turbo_quant".to_string());
+        blocking_reasons.push(
+            "TurboQuant profile requires the semantic-memory-turbo-quant build feature".to_string(),
+        );
+    }
+
+    if profile.is_strict() && !blocked {
+        let (ready, reasons) = projection_ready_for_strict(&state, notebook_id.as_deref())?;
+        if !ready {
+            blocked = true;
+            next_action = Some("run_projection_backfill".to_string());
+            blocking_reasons = reasons;
+        }
+    }
+    if profile == MemoryProfile::SemanticMemoryTurboQuantStrict && !blocked {
+        if let Some(notebook_id) = notebook_id.clone() {
+            let tq_status = crate::commands::sources::semantic_memory_vector_artifact_status(
+                notebook_id,
+                state.clone(),
+            )
+            .await?;
+            if tq_status
+                .candidate_backend
+                .as_deref()
+                .is_none_or(|backend| !backend.contains("turbo_quant"))
+                || tq_status.artifact_generation_id.is_none()
+                || tq_status.vector_artifact_manifest_digest.is_none()
+                || !tq_status.exact_rerank
+                || tq_status.exact_rerank_count == 0
+                || tq_status.vector_artifact_missing_count > 0
+                || tq_status.vector_artifact_stale_count > 0
+            {
+                blocked = true;
+                next_action =
+                    Some("run_retrieval_probe_and_rebuild_turbo_quant_artifacts".to_string());
+                blocking_reasons.push(
+                    "TurboQuant strict mode requires fresh artifact digest/generation and exact rerank proof"
+                        .to_string(),
+                );
+            }
+        } else {
+            blocked = true;
+            next_action = Some("select_notebook".to_string());
+            blocking_reasons.push(
+                "TurboQuant strict mode requires a notebook-scoped probe receipt".to_string(),
+            );
+        }
+    }
+
+    if blocked {
+        let status = crate::commands::sources::memory_backend_status(notebook_id, state).await?;
+        return Ok(MemoryBackendProfileReceipt {
+            profile: normalized,
+            requested_backend: status.backend_id.clone(),
+            backend_used: status.backend_used.clone(),
+            strict_mode: false,
+            semantic_memory_auto_project: true,
+            turbo_quant_requested: false,
+            turbo_quant_active: false,
+            blocked,
+            next_action,
+            blocking_reasons,
+            receipt_id: uuid::Uuid::new_v4().to_string(),
+            status,
+        });
+    }
+
+    let (
+        requested_backend,
+        strict_mode,
+        semantic_memory_auto_project,
+        turbo_quant_requested,
+        turbo_quant_active,
+    ) = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+
+        match profile {
+            MemoryProfile::GlossLocal => {
+                app_db.set_settings_atomically(&[
+                    (features::EXPERIMENTAL_FEATURES_ENABLED, "false"),
+                    (features::FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED, "false"),
+                    (
+                        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+                        "false",
+                    ),
+                    ("memory_backend", features::MEMORY_BACKEND_GLOSS_LOCAL),
+                    ("memory_backend_fallback", "true"),
+                    (features::SEMANTIC_MEMORY_AUTO_PROJECT, "false"),
+                    (features::SEMANTIC_MEMORY_STRICT_TESTING, "false"),
+                    (
+                        features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
+                        "true",
+                    ),
+                ])?;
+            }
+            MemoryProfile::SemanticMemorySafe => {
+                app_db.set_settings_atomically(&[
+                    (features::EXPERIMENTAL_FEATURES_ENABLED, "true"),
+                    (features::FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED, "true"),
+                    (
+                        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+                        "false",
+                    ),
+                    (
+                        "memory_backend",
+                        features::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
+                    ),
+                    ("memory_backend_fallback", "true"),
+                    (features::SEMANTIC_MEMORY_AUTO_PROJECT, "true"),
+                    (features::SEMANTIC_MEMORY_STRICT_TESTING, "false"),
+                    (
+                        features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
+                        "true",
+                    ),
+                ])?;
+            }
+            MemoryProfile::SemanticMemoryStrict => {
+                app_db.set_settings_atomically(&[
+                    (features::EXPERIMENTAL_FEATURES_ENABLED, "true"),
+                    (features::FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED, "true"),
+                    (
+                        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+                        "false",
+                    ),
+                    (
+                        "memory_backend",
+                        features::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
+                    ),
+                    ("memory_backend_fallback", "false"),
+                    (features::SEMANTIC_MEMORY_AUTO_PROJECT, "true"),
+                    (features::SEMANTIC_MEMORY_STRICT_TESTING, "true"),
+                    (
+                        features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
+                        "true",
+                    ),
+                ])?;
+            }
+            MemoryProfile::SemanticMemoryTurboQuantSafe => {
+                app_db.set_settings_atomically(&[
+                    (features::EXPERIMENTAL_FEATURES_ENABLED, "true"),
+                    (features::FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED, "true"),
+                    (
+                        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+                        "true",
+                    ),
+                    (
+                        "memory_backend",
+                        features::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
+                    ),
+                    ("memory_backend_fallback", "true"),
+                    (features::SEMANTIC_MEMORY_AUTO_PROJECT, "true"),
+                    (features::SEMANTIC_MEMORY_STRICT_TESTING, "false"),
+                    (
+                        features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
+                        "true",
+                    ),
+                ])?;
+            }
+            MemoryProfile::SemanticMemoryTurboQuantStrict => {
+                app_db.set_settings_atomically(&[
+                    (features::EXPERIMENTAL_FEATURES_ENABLED, "true"),
+                    (features::FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED, "true"),
+                    (
+                        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+                        "true",
+                    ),
+                    (
+                        "memory_backend",
+                        features::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
+                    ),
+                    ("memory_backend_fallback", "false"),
+                    (features::SEMANTIC_MEMORY_AUTO_PROJECT, "true"),
+                    (features::SEMANTIC_MEMORY_STRICT_TESTING, "true"),
+                    (
+                        features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
+                        "true",
+                    ),
+                ])?;
+            }
+        }
+
+        let requested_backend = app_db
+            .get_setting("memory_backend")?
+            .unwrap_or_else(|| features::MEMORY_BACKEND_GLOSS_LOCAL.to_string());
+        let strict_mode =
+            !super::chat::setting_is_enabled(app_db.get_setting("memory_backend_fallback")?);
+        let semantic_memory_auto_project = super::chat::setting_is_enabled(
+            app_db.get_setting(features::SEMANTIC_MEMORY_AUTO_PROJECT)?,
+        );
+        let turbo_quant_requested = app_db
+            .get_setting(features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED)?
+            .as_deref()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "enabled"
+                )
+            })
+            .unwrap_or(false);
+        let turbo_quant_active = features::turbo_quant_active(&app_db)?;
+        (
+            requested_backend,
+            strict_mode,
+            semantic_memory_auto_project,
+            turbo_quant_requested,
+            turbo_quant_active,
+        )
+    };
+
+    let status = crate::commands::sources::memory_backend_status(notebook_id, state).await?;
+    Ok(MemoryBackendProfileReceipt {
+        profile: normalized,
+        requested_backend,
+        backend_used: status.backend_used.clone(),
+        strict_mode,
+        semantic_memory_auto_project,
+        turbo_quant_requested,
+        turbo_quant_active,
+        receipt_id: uuid::Uuid::new_v4().to_string(),
+        blocked,
+        next_action,
+        blocking_reasons,
+        status,
+    })
+}
+
+#[tauri::command]
+pub async fn get_semantic_memory_profile_status(
+    notebook_id: Option<String>,
+    source_scope: Option<SourceScope>,
+    state: State<'_, AppState>,
+) -> Result<SemanticMemoryProfileStatus, GlossError> {
+    let (
+        experimental_enabled,
+        semantic_memory_flag_enabled,
+        turbo_quant_flag_enabled,
+        selected_backend,
+        fallback_allowed,
+        strict_testing,
+    ) = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        (
+            super::chat::setting_is_enabled(
+                app_db.get_setting(features::EXPERIMENTAL_FEATURES_ENABLED)?,
+            ),
+            super::chat::setting_is_enabled(
+                app_db.get_setting(features::FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED)?,
+            ),
+            super::chat::setting_is_enabled(
+                app_db.get_setting(features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED)?,
+            ),
+            app_db
+                .get_setting("memory_backend")?
+                .unwrap_or_else(|| features::MEMORY_BACKEND_GLOSS_LOCAL.to_string()),
+            super::chat::setting_is_enabled(app_db.get_setting("memory_backend_fallback")?),
+            super::chat::setting_is_enabled(
+                app_db.get_setting(features::SEMANTIC_MEMORY_STRICT_TESTING)?,
+            ),
+        )
+    };
+    let projection_summary =
+        scoped_projection_summary(&state, notebook_id.as_deref(), source_scope)?;
+    let turbo_quant_status = if let Some(id) = notebook_id.clone() {
+        Some(
+            crate::commands::sources::semantic_memory_vector_artifact_status(id, state.clone())
+                .await?,
+        )
+    } else {
+        None
+    };
+    let backend_status =
+        crate::commands::sources::memory_backend_status(notebook_id.clone(), state).await?;
+
+    let mut next_actions = Vec::new();
+    let mut blocking_reasons = Vec::new();
+    if projection_summary
+        .as_ref()
+        .is_some_and(|summary| summary.projection_required)
+    {
+        next_actions.push("run_projection_backfill".to_string());
+        blocking_reasons.push("projection required for selected source scope".to_string());
+    }
+    if turbo_quant_flag_enabled
+        && turbo_quant_status.as_ref().is_some_and(|status| {
+            status.artifact_generation_id.is_none()
+                || status.vector_artifact_manifest_digest.is_none()
+                || !status.exact_rerank
+                || status.exact_rerank_count == 0
+        })
+    {
+        next_actions.push("rebuild_turbo_quant_artifacts_and_run_retrieval_probe".to_string());
+        blocking_reasons.push("TurboQuant strict proof is not fresh".to_string());
+    }
+
+    Ok(SemanticMemoryProfileStatus {
+        compiled_semantic_memory: cfg!(feature = "semantic-memory-backend"),
+        compiled_turbo_quant: cfg!(feature = "semantic-memory-turbo-quant"),
+        experimental_enabled,
+        semantic_memory_flag_enabled,
+        turbo_quant_flag_enabled,
+        selected_backend,
+        effective_backend: backend_status.backend_used,
+        fallback_allowed,
+        strict_testing,
+        projection_summary,
+        turbo_quant_status,
+        next_actions,
+        blocking_reasons,
+    })
+}
+
 /// Check availability of external tools (ffmpeg, etc.)
 #[tauri::command]
 pub async fn check_external_tools() -> Result<HashMap<String, bool>, GlossError> {
@@ -393,4 +870,24 @@ pub async fn check_external_tools() -> Result<HashMap<String, bool>, GlossError>
     }
 
     Ok(tools)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemoryProfile;
+
+    #[test]
+    fn memory_profile_parser_normalizes_safe_and_strict_profiles() {
+        assert_eq!(
+            MemoryProfile::parse("semantic-memory").unwrap(),
+            MemoryProfile::SemanticMemorySafe
+        );
+        assert_eq!(
+            MemoryProfile::parse("semantic-memory-turbo-quant-safe").unwrap(),
+            MemoryProfile::SemanticMemoryTurboQuantSafe
+        );
+        assert!(MemoryProfile::SemanticMemoryStrict.is_strict());
+        assert!(MemoryProfile::SemanticMemoryTurboQuantStrict.requires_turbo_quant());
+        assert_eq!(MemoryProfile::GlossLocal.id(), "gloss-local");
+    }
 }

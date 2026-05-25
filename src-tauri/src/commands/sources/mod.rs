@@ -1,5 +1,5 @@
 use crate::db::app_db::ModelRecord;
-use crate::db::notebook_db::{Chunk, NotebookStats, Source};
+use crate::db::notebook_db::{Chunk, NotebookStats, SemanticMemoryProjectionSummary, Source};
 use crate::error::GlossError;
 use crate::features;
 use crate::ingestion::chunk::chunk_text_with_title;
@@ -15,6 +15,7 @@ use crate::memory::{
 };
 use crate::retrieval::source_scope::SourceScope;
 use crate::state::{ActiveCounterGuard, AppState, SUMMARY_MODE_AUTO, SUMMARY_MODE_MANUAL};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -26,10 +27,95 @@ use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 use tauri_queue::{QueueJob, QueueManager, QueuePriority};
 
+// Profile status is owned by settings.rs through get_semantic_memory_profile_status.
+
 #[derive(Debug, Serialize)]
 pub struct SourceContent {
     pub content_text: Option<String>,
     pub word_count: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SemanticMemorySourceProjectionError {
+    pub source_id: String,
+    pub title: String,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SemanticMemoryBackfillReceipt {
+    pub notebook_id: String,
+    pub receipt_id: String,
+    pub total_sources: usize,
+    pub chunk_bearing_sources: usize,
+    pub projected_sources: usize,
+    pub skipped_no_chunks: usize,
+    pub failed_sources: usize,
+    pub stale_sources: usize,
+    pub total_chunks: usize,
+    pub projected_chunks: usize,
+    pub errors: Vec<SemanticMemorySourceProjectionError>,
+    pub vector_artifact_receipt: Option<serde_json::Value>,
+    pub projection_summary: SemanticMemoryProjectionSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VectorArtifactStatus {
+    pub compiled_turbo_quant: bool,
+    pub runtime_turbo_quant_enabled: bool,
+    pub candidate_backend: Option<String>,
+    pub artifact_generation_id: Option<String>,
+    pub vector_artifact_manifest_digest: Option<String>,
+    pub vector_artifact_missing_count: usize,
+    pub vector_artifact_stale_count: usize,
+    pub exact_rerank: bool,
+    pub exact_rerank_count: usize,
+    pub last_receipt_id: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RetrievalDiagnostics {
+    pub query: String,
+    pub scope_kind: String,
+    pub scoped_sources: usize,
+    pub scoped_chunks: usize,
+    pub fts_indexed_chunks: usize,
+    pub bm25_hit_count: usize,
+    pub semantic_links_total: usize,
+    pub semantic_links_healthy: usize,
+    pub semantic_links_missing: usize,
+    pub semantic_links_degraded: usize,
+    pub semantic_search_attempted: bool,
+    pub semantic_candidate_count: usize,
+    pub candidate_backend: Option<String>,
+    pub fallback_allowed: bool,
+    pub fallback_used: bool,
+    pub fallback_reason: Option<String>,
+    pub retrieval_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetrievalProbeReceipt {
+    pub receipt_id: String,
+    pub notebook_id: String,
+    pub query_digest: String,
+    pub source_scope_kind: String,
+    pub scoped_sources: usize,
+    pub scoped_chunks: usize,
+    pub backend_requested: String,
+    pub backend_used: String,
+    pub bm25_candidates: usize,
+    pub vector_candidates: usize,
+    pub tq_candidates: usize,
+    pub candidate_backend: Option<String>,
+    pub artifact_generation_id: Option<String>,
+    pub vector_artifact_manifest_digest: Option<String>,
+    pub exact_rerank: bool,
+    pub exact_rerank_count: usize,
+    pub fallback_used: bool,
+    pub fallback_reason: Option<String>,
+    pub degradation_markers: Vec<String>,
 }
 
 /// Classify a file extension into (source_type, optional language).
@@ -516,6 +602,25 @@ fn run_ingestion_inner(
             db.update_source_status(source_id, "ready", None)
         })?;
 
+        if let Err(error) =
+            maybe_auto_project_semantic_memory(notebook_id, source_id, state, app_handle)
+        {
+            tracing::warn!(
+                notebook_id,
+                source_id,
+                error = %error,
+                "semantic-memory projection failed after source import"
+            );
+            let message = error.to_string();
+            emit_status(
+                app_handle,
+                notebook_id,
+                source_id,
+                "semantic_memory_error",
+                Some(&message),
+            );
+        }
+
         // Queue background summary job if a model is configured
         if opts.queue_summary {
             let source_title = source.title.clone();
@@ -567,6 +672,108 @@ fn run_ingestion_inner(
             error_msg.as_deref(),
         );
     }
+}
+
+#[cfg(feature = "semantic-memory-backend")]
+fn semantic_memory_runtime_config_from_state(
+    state: &AppState,
+) -> Result<semantic_memory_adapter::SemanticMemoryRuntimeConfig, GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    features::require_semantic_memory_preview_enabled(&app_db)?;
+    semantic_memory_runtime_config_from_app_db(&app_db)
+}
+
+#[cfg(feature = "semantic-memory-backend")]
+fn semantic_memory_runtime_config_from_app_db(
+    app_db: &crate::db::app_db::AppDb,
+) -> Result<semantic_memory_adapter::SemanticMemoryRuntimeConfig, GlossError> {
+    let config = semantic_memory_adapter::runtime_config_from_settings(
+        app_db.get_setting("semantic_memory_embedding_url")?,
+        app_db.get_setting("semantic_memory_embedding_model")?,
+        app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+        features::turbo_quant_active(app_db)?,
+        crate::commands::chat::setting_is_enabled(
+            app_db.get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
+        ),
+    );
+    semantic_memory_adapter::validate_embedding_model_role(&config)?;
+    Ok(config)
+}
+
+#[cfg(feature = "semantic-memory-backend")]
+fn maybe_auto_project_semantic_memory(
+    notebook_id: &str,
+    source_id: &str,
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+) -> Result<(), GlossError> {
+    let runtime_config = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        if !crate::commands::chat::setting_is_enabled(
+            app_db.get_setting(features::SEMANTIC_MEMORY_AUTO_PROJECT)?,
+        ) || !features::semantic_memory_preview_active(&app_db)?
+        {
+            return Ok(());
+        }
+        semantic_memory_runtime_config_from_app_db(&app_db)?
+    };
+
+    emit_status(
+        app_handle,
+        notebook_id,
+        source_id,
+        "semantic_memory_projecting",
+        None,
+    );
+    let receipt_id = uuid::Uuid::new_v4().to_string();
+    let db_path = state.notebook_db_path(notebook_id)?;
+    match tauri::async_runtime::block_on(semantic_memory_adapter::reindex_source(
+        &state.data_dir,
+        notebook_id,
+        &db_path,
+        source_id,
+        Some(receipt_id),
+        Some(runtime_config),
+    )) {
+        Ok(receipt) => {
+            let message = serde_json::to_string(&receipt).ok();
+            emit_status(
+                app_handle,
+                notebook_id,
+                source_id,
+                "semantic_memory_synced",
+                message.as_deref(),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let message = error.to_string();
+            emit_status(
+                app_handle,
+                notebook_id,
+                source_id,
+                "semantic_memory_error",
+                Some(&message),
+            );
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(feature = "semantic-memory-backend"))]
+fn maybe_auto_project_semantic_memory(
+    _notebook_id: &str,
+    _source_id: &str,
+    _state: &AppState,
+    _app_handle: &tauri::AppHandle,
+) -> Result<(), GlossError> {
+    Ok(())
 }
 
 fn queue_epoch_for_notebook(state: &AppState, notebook_id: &str) -> u64 {
@@ -659,6 +866,166 @@ fn has_vision_capability(model: &ModelRecord) -> bool {
     ]
     .iter()
     .any(|needle| fingerprint.contains(needle))
+}
+
+fn vector_artifact_receipt_fields(
+    receipt: &serde_json::Value,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let receipt_id = receipt
+        .get("build_receipt_id")
+        .or_else(|| receipt.get("receipt_id"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let generation_id = receipt
+        .get("generation_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let manifest_digest = receipt
+        .get("artifact_manifest_digest")
+        .or_else(|| receipt.get("vector_artifact_manifest_digest"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    (receipt_id, generation_id, manifest_digest)
+}
+
+fn record_vector_artifact_receipt(
+    state: &AppState,
+    notebook_id: &str,
+    receipt: &serde_json::Value,
+) -> Result<(), GlossError> {
+    let (receipt_id, generation_id, manifest_digest) = vector_artifact_receipt_fields(receipt);
+    let receipt_id = receipt_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let status = receipt
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("ok");
+    let raw_receipt_json =
+        serde_json::to_string(receipt).map_err(|error| GlossError::Other(error.to_string()))?;
+    state.with_notebook_db(notebook_id, |db| {
+        db.conn.execute(
+            "INSERT OR REPLACE INTO semantic_memory_vector_artifact_receipts
+             (receipt_id, notebook_id, generation_id, artifact_manifest_digest, raw_receipt_json, status, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+            rusqlite::params![
+                receipt_id,
+                notebook_id,
+                generation_id.as_deref(),
+                manifest_digest.as_deref(),
+                raw_receipt_json,
+                status
+            ],
+        )?;
+        db.update_semantic_memory_projection_artifact(
+            notebook_id,
+            Some(&receipt_id),
+            generation_id.as_deref(),
+            manifest_digest.as_deref(),
+            None,
+        )
+    })
+}
+
+fn query_digest(query: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(query.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn receipt_usize(receipt: &serde_json::Value, key: &str) -> usize {
+    receipt
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize
+}
+
+fn receipt_string(receipt: &serde_json::Value, key: &str) -> Option<String> {
+    receipt
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn record_retrieval_probe_receipt(
+    state: &AppState,
+    receipt: &RetrievalProbeReceipt,
+    raw_receipt: &serde_json::Value,
+) -> Result<(), GlossError> {
+    let degradation_markers = serde_json::to_string(&receipt.degradation_markers)
+        .map_err(|error| GlossError::Other(error.to_string()))?;
+    let raw_receipt_json =
+        serde_json::to_string(raw_receipt).map_err(|error| GlossError::Other(error.to_string()))?;
+    state.with_notebook_db(&receipt.notebook_id, |db| {
+        db.conn.execute(
+            "INSERT OR REPLACE INTO semantic_memory_retrieval_probe_receipts
+             (receipt_id, notebook_id, query_digest, source_scope_kind, scoped_sources, scoped_chunks,
+              backend_requested, backend_used, bm25_candidates, vector_candidates, tq_candidates,
+              candidate_backend, artifact_generation_id, vector_artifact_manifest_digest,
+              exact_rerank, exact_rerank_count, fallback_used, fallback_reason,
+              degradation_markers, raw_receipt_json, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, datetime('now'))",
+            rusqlite::params![
+                receipt.receipt_id,
+                receipt.notebook_id,
+                receipt.query_digest,
+                receipt.source_scope_kind,
+                receipt.scoped_sources as i64,
+                receipt.scoped_chunks as i64,
+                receipt.backend_requested,
+                receipt.backend_used,
+                receipt.bm25_candidates as i64,
+                receipt.vector_candidates as i64,
+                receipt.tq_candidates as i64,
+                receipt.candidate_backend.as_deref(),
+                receipt.artifact_generation_id.as_deref(),
+                receipt.vector_artifact_manifest_digest.as_deref(),
+                if receipt.exact_rerank { 1_i64 } else { 0_i64 },
+                receipt.exact_rerank_count as i64,
+                if receipt.fallback_used { 1_i64 } else { 0_i64 },
+                receipt.fallback_reason.as_deref(),
+                degradation_markers,
+                raw_receipt_json,
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+type LatestRetrievalProbeTurboProof = (
+    String,
+    bool,
+    usize,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn latest_retrieval_probe_turbo_proof(
+    state: &AppState,
+    notebook_id: &str,
+) -> Result<Option<LatestRetrievalProbeTurboProof>, GlossError> {
+    state.with_notebook_db(notebook_id, |db| {
+        db.conn
+            .query_row(
+                "SELECT receipt_id, exact_rerank, exact_rerank_count, candidate_backend,
+                        artifact_generation_id, vector_artifact_manifest_digest
+                 FROM semantic_memory_retrieval_probe_receipts
+                 WHERE notebook_id = ?1
+                 ORDER BY recorded_at DESC LIMIT 1",
+                [notebook_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? == 1,
+                        row.get::<_, i64>(2)?.max(0) as usize,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(GlossError::Database)
+    })
 }
 
 fn resolve_background_job_config(
@@ -988,6 +1355,60 @@ fn emit_folder_scan_event(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_import_batch_receipt(
+    app_handle: &tauri::AppHandle,
+    notebook_id: &str,
+    import_batch_id: &str,
+    notebook_epoch: u64,
+    status: &str,
+    found: usize,
+    created: usize,
+    ingested_ready: usize,
+    failed: usize,
+    skipped_duplicate: usize,
+    skipped_unsupported: usize,
+    cancelled_superseded: usize,
+    message: Option<&str>,
+) {
+    let _ = app_handle.emit(
+        "sources:batch_ingestion_complete",
+        serde_json::json!({
+            "notebook_id": notebook_id,
+            "import_batch_id": import_batch_id,
+            "notebook_epoch": notebook_epoch,
+            "status": status,
+            "found": found,
+            "created": created,
+            "ingested_ready": ingested_ready,
+            "failed": failed,
+            "skipped_duplicate": skipped_duplicate,
+            "skipped_unsupported": skipped_unsupported,
+            "cancelled_superseded": cancelled_superseded,
+            "count": ingested_ready,
+            "message": message,
+        }),
+    );
+}
+
+fn validate_import_batch_notebook(
+    app_handle: &tauri::AppHandle,
+    notebook_id: &str,
+    notebook_epoch: u64,
+) -> Result<(), String> {
+    let state = app_handle.state::<AppState>();
+    {
+        let app_db = state.app_db.lock().map_err(|e| e.to_string())?;
+        app_db
+            .get_notebook(notebook_id)
+            .map_err(|e| e.to_string())?;
+    }
+    if !state.is_active_notebook_epoch(notebook_id, notebook_epoch) {
+        return Err("cancelled_superseded".to_string());
+    }
+    Ok(())
+}
+
 fn invalidate_suggested_questions(state: &AppState, notebook_id: &str) {
     if let Err(e) =
         state.with_notebook_db(notebook_id, |db| db.set_config("suggested_questions", ""))
@@ -1255,6 +1676,20 @@ pub async fn add_source_folder(
     queue: State<'_, Arc<QueueManager>>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), GlossError> {
+    {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let _notebook = app_db.get_notebook(&notebook_id)?;
+    }
+    let notebook_epoch = state.get_active_epoch();
+    if !state.is_active_notebook_epoch(&notebook_id, notebook_epoch) {
+        return Err(GlossError::Ingestion {
+            source_id: String::new(),
+            message: "cancelled_superseded".to_string(),
+        });
+    }
     invalidate_suggested_questions(&state, &notebook_id);
     let folder = PathBuf::from(&path);
     if !folder.is_dir() {
@@ -1278,12 +1713,39 @@ pub async fn add_source_folder(
     let folder_walk = folder.clone();
     let folder_create = folder.clone();
     let import_path = path.clone();
+    let import_batch_id = uuid::Uuid::new_v4().to_string();
     tauri::async_runtime::spawn(async move {
         emit_folder_scan_event(&handle, &nb_id, "scan_started", &import_path, 0, None);
         let batch_ingestion_guard = {
             let state = handle.state::<AppState>();
             ActiveCounterGuard::new(&state.ingestion_active, "batch_ingestion_active")
         };
+        if let Err(reason) = validate_import_batch_notebook(&handle, &nb_id, notebook_epoch) {
+            emit_import_batch_receipt(
+                &handle,
+                &nb_id,
+                &import_batch_id,
+                notebook_epoch,
+                "cancelled_superseded",
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                Some(&reason),
+            );
+            emit_folder_scan_event(
+                &handle,
+                &nb_id,
+                "cancelled_superseded",
+                &import_path,
+                0,
+                Some(&reason),
+            );
+            return;
+        }
 
         // Keep the IPC command fast: scan the folder entirely in the background.
         let files = match tokio::task::spawn_blocking(move || {
@@ -1308,6 +1770,21 @@ pub async fn add_source_folder(
                     0,
                     Some(&e.to_string()),
                 );
+                emit_import_batch_receipt(
+                    &handle,
+                    &nb_id,
+                    &import_batch_id,
+                    notebook_epoch,
+                    "failed",
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    Some(&e.to_string()),
+                );
                 return;
             }
         };
@@ -1329,11 +1806,38 @@ pub async fn add_source_folder(
         }
 
         let file_count = files.len();
+        let found = file_count;
         tracing::info!(
             folder = %import_path,
             files_found = file_count,
             "Directory walk complete"
         );
+        if let Err(reason) = validate_import_batch_notebook(&handle, &nb_id, notebook_epoch) {
+            emit_import_batch_receipt(
+                &handle,
+                &nb_id,
+                &import_batch_id,
+                notebook_epoch,
+                "cancelled_superseded",
+                found,
+                0,
+                0,
+                0,
+                0,
+                0,
+                found,
+                Some(&reason),
+            );
+            emit_folder_scan_event(
+                &handle,
+                &nb_id,
+                "cancelled_superseded",
+                &import_path,
+                found,
+                Some(&reason),
+            );
+            return;
+        }
 
         if file_count == 0 {
             emit_folder_scan_event(
@@ -1344,20 +1848,74 @@ pub async fn add_source_folder(
                 0,
                 Some("No supported files found"),
             );
+            emit_import_batch_receipt(
+                &handle,
+                &nb_id,
+                &import_batch_id,
+                notebook_epoch,
+                "empty",
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("No supported files found"),
+            );
             return;
         }
 
         // Phase 1: Create source records (blocking I/O — file reads + copies)
         let mut sources: Vec<(String, String)> = Vec::new();
+        let mut failed = 0usize;
+        let mut skipped_duplicate = 0usize;
         for batch in files.chunks(SOURCE_CREATION_BATCH_SIZE) {
+            if let Err(reason) = validate_import_batch_notebook(&handle, &nb_id, notebook_epoch) {
+                emit_import_batch_receipt(
+                    &handle,
+                    &nb_id,
+                    &import_batch_id,
+                    notebook_epoch,
+                    "cancelled_superseded",
+                    found,
+                    sources.len(),
+                    0,
+                    failed,
+                    skipped_duplicate,
+                    0,
+                    found.saturating_sub(sources.len() + skipped_duplicate + failed),
+                    Some(&reason),
+                );
+                emit_folder_scan_event(
+                    &handle,
+                    &nb_id,
+                    "cancelled_superseded",
+                    &import_path,
+                    sources.len(),
+                    Some(&reason),
+                );
+                return;
+            }
             let batch_files = batch.to_vec();
             let handle_p1 = handle.clone();
             let nb_id_p1 = nb_id.clone();
             let folder_p1 = folder_create.clone();
+            let import_batch_id_p1 = import_batch_id.clone();
             let created = tokio::task::spawn_blocking(move || {
                 let state = handle_p1.state::<AppState>();
                 let mut created: Vec<(String, String)> = Vec::new();
+                let mut failed = 0usize;
+                let mut skipped_duplicate = 0usize;
                 for file_path in batch_files {
+                    if !state.is_active_notebook_epoch(&nb_id_p1, notebook_epoch) {
+                        tracing::info!(
+                            notebook_id = %nb_id_p1,
+                            import_batch_id = %import_batch_id_p1,
+                            "Folder import cancelled_superseded before source creation"
+                        );
+                        break;
+                    }
                     if let Ok(meta) = file_path.metadata() {
                         let ext = file_path
                             .extension()
@@ -1377,6 +1935,7 @@ pub async fn add_source_folder(
                                 "Skipping oversized file (>{} MB)",
                                 limit / (1024 * 1024)
                             );
+                            failed += 1;
                             continue;
                         }
                     }
@@ -1384,9 +1943,10 @@ pub async fn add_source_folder(
                     match create_file_source(&nb_id_p1, &file_path, Some(&folder_p1), &state) {
                         Ok((source_id, source_type)) => created.push((source_id, source_type)),
                         Err(GlossError::Ingestion { message, .. }) if message == "duplicate" => {
-                            // Silently skip duplicates on re-import
+                            skipped_duplicate += 1;
                         }
                         Err(e) => {
+                            failed += 1;
                             tracing::warn!(
                                 file = %file_path.display(),
                                 error = %e,
@@ -1395,21 +1955,28 @@ pub async fn add_source_folder(
                         }
                     }
                 }
-                created
+                (created, skipped_duplicate, failed)
             })
             .await
             .unwrap_or_default();
 
-            if created.is_empty() {
+            let (created_batch, skipped_duplicate_batch, failed_batch) = created;
+            skipped_duplicate += skipped_duplicate_batch;
+            failed += failed_batch;
+            if created_batch.is_empty() {
                 continue;
             }
 
-            sources.extend(created);
+            sources.extend(created_batch);
             let _ = handle.emit(
                 "sources:batch_created",
                 serde_json::json!({
                     "notebook_id": &nb_id,
+                    "import_batch_id": &import_batch_id,
+                    "notebook_epoch": notebook_epoch,
                     "count": sources.len(),
+                    "created": sources.len(),
+                    "found": found,
                 }),
             );
 
@@ -1426,6 +1993,21 @@ pub async fn add_source_folder(
                 0,
                 Some("No new sources created"),
             );
+            emit_import_batch_receipt(
+                &handle,
+                &nb_id,
+                &import_batch_id,
+                notebook_epoch,
+                "completed_empty",
+                found,
+                0,
+                0,
+                failed,
+                skipped_duplicate,
+                0,
+                0,
+                Some("No new sources created"),
+            );
             return;
         }
 
@@ -1433,6 +2015,32 @@ pub async fn add_source_folder(
         // spawn_blocking isolates panics from ONNX/usearch C++ code.
         // Images are routed to the vision pipeline (queued jobs) instead.
         for (i, (source_id, source_type)) in sources.into_iter().enumerate() {
+            if let Err(reason) = validate_import_batch_notebook(&handle, &nb_id, notebook_epoch) {
+                emit_import_batch_receipt(
+                    &handle,
+                    &nb_id,
+                    &import_batch_id,
+                    notebook_epoch,
+                    "cancelled_superseded",
+                    found,
+                    total,
+                    i,
+                    failed,
+                    skipped_duplicate,
+                    0,
+                    total.saturating_sub(i),
+                    Some(&reason),
+                );
+                emit_folder_scan_event(
+                    &handle,
+                    &nb_id,
+                    "cancelled_superseded",
+                    &import_path,
+                    i,
+                    Some(&reason),
+                );
+                return;
+            }
             let nb_id = nb_id.clone();
             let q = q.clone();
             let handle = handle.clone();
@@ -1467,6 +2075,7 @@ pub async fn add_source_folder(
             .await;
 
             if let Err(e) = result {
+                failed += 1;
                 tracing::error!(
                     index = i,
                     total,
@@ -1500,7 +2109,18 @@ pub async fn add_source_folder(
             "sources:batch_ingestion_complete",
             serde_json::json!({
                 "notebook_id": &nb_id,
-                "count": total,
+                "import_batch_id": &import_batch_id,
+                "notebook_epoch": notebook_epoch,
+                "status": "completed",
+                "found": found,
+                "created": total,
+                "ingested_ready": total.saturating_sub(failed),
+                "failed": failed,
+                "skipped_duplicate": skipped_duplicate,
+                "skipped_unsupported": 0,
+                "cancelled_superseded": 0,
+                "count": total.saturating_sub(failed),
+                "message": null,
             }),
         );
         emit_folder_scan_event(
@@ -1902,12 +2522,166 @@ pub async fn get_notebook_stats(
 #[tauri::command]
 pub async fn diagnose_retrieval_coverage(
     notebook_id: String,
-    source_ids: Option<Vec<String>>,
+    source_scope: Option<SourceScope>,
     state: State<'_, AppState>,
 ) -> Result<RetrievalCoverage, GlossError> {
     state.with_notebook_db(&notebook_id, |db| {
-        db.retrieval_coverage(source_ids.as_deref().unwrap_or(&[]))
+        let sources = db.list_sources()?;
+        let resolved = source_scope.unwrap_or(SourceScope::All).resolve(&sources);
+        db.retrieval_coverage(&resolved)
     })
+}
+
+#[tauri::command]
+pub async fn diagnose_retrieval_query(
+    notebook_id: String,
+    query: String,
+    source_scope: SourceScope,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<RetrievalDiagnostics, GlossError> {
+    let probe = run_retrieval_probe(
+        notebook_id.clone(),
+        query.clone(),
+        source_scope.clone(),
+        limit,
+        state.clone(),
+    )
+    .await?;
+    let coverage = state.with_notebook_db(&notebook_id, |db| {
+        let sources = db.list_sources()?;
+        let resolved = source_scope.resolve(&sources);
+        db.retrieval_coverage(&resolved)
+    })?;
+    let fallback_allowed = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        crate::commands::chat::setting_is_enabled(app_db.get_setting("memory_backend_fallback")?)
+    };
+    let vector_status =
+        semantic_memory_vector_artifact_status(notebook_id.clone(), state.clone()).await?;
+    let semantic_links_missing = coverage
+        .total_chunks
+        .saturating_sub(coverage.semantic_links_healthy);
+    let semantic_ready = coverage.total_chunks > 0 && semantic_links_missing == 0;
+    let fallback_used = !semantic_ready && fallback_allowed;
+    let fallback_reason = if !semantic_ready {
+        Some("semantic-memory projection required for selected scope".to_string())
+    } else {
+        None
+    };
+
+    Ok(RetrievalDiagnostics {
+        query,
+        scope_kind: probe.source_scope_kind,
+        scoped_sources: probe.scoped_sources,
+        scoped_chunks: coverage.total_chunks,
+        fts_indexed_chunks: coverage.fts_indexed_chunks,
+        bm25_hit_count: probe.bm25_candidates,
+        semantic_links_total: coverage.semantic_links_total,
+        semantic_links_healthy: coverage.semantic_links_healthy,
+        semantic_links_missing,
+        semantic_links_degraded: coverage.semantic_links_degraded,
+        semantic_search_attempted: semantic_ready,
+        semantic_candidate_count: probe.vector_candidates,
+        candidate_backend: vector_status.candidate_backend,
+        fallback_allowed,
+        fallback_used,
+        fallback_reason,
+        retrieval_mode: if semantic_ready {
+            "semantic_memory".to_string()
+        } else if probe.bm25_candidates > 0 {
+            "bm25_only".to_string()
+        } else {
+            "unavailable".to_string()
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn run_retrieval_probe(
+    notebook_id: String,
+    query: String,
+    source_scope: SourceScope,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<RetrievalProbeReceipt, GlossError> {
+    let comparison = compare_memory_backends(
+        notebook_id.clone(),
+        query.clone(),
+        source_scope.clone(),
+        limit,
+        state.clone(),
+    )
+    .await?;
+    let (scope_kind, scoped_sources, scoped_chunks) =
+        state.with_notebook_db(&notebook_id, |db| {
+            let sources = db.list_sources()?;
+            let resolved = source_scope.resolve(&sources);
+            let coverage = db.retrieval_coverage(&resolved)?;
+            Ok((
+                format!("{:?}", resolved.kind()).to_ascii_lowercase(),
+                resolved.source_count(),
+                coverage.total_chunks,
+            ))
+        })?;
+    let semantic = comparison.semantic_memory_result.as_ref();
+    let raw_receipt = semantic
+        .and_then(|result| result.provenance.get("semantic_memory_receipt"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let candidate_backend = receipt_string(&raw_receipt, "candidate_backend");
+    let vector_candidates = semantic.map(|result| result.candidates.len()).unwrap_or(0);
+    let tq_candidates = if candidate_backend
+        .as_deref()
+        .is_some_and(|backend| backend.contains("turbo_quant"))
+    {
+        vector_candidates
+    } else {
+        0
+    };
+    let mut degradation_markers = semantic
+        .map(|result| result.degradation_markers.clone())
+        .unwrap_or_default();
+    degradation_markers.extend(comparison.unmapped_semantic_candidates.clone());
+    degradation_markers.sort();
+    degradation_markers.dedup();
+
+    let receipt = RetrievalProbeReceipt {
+        receipt_id: uuid::Uuid::new_v4().to_string(),
+        notebook_id: notebook_id.clone(),
+        query_digest: query_digest(&query),
+        source_scope_kind: scope_kind,
+        scoped_sources,
+        scoped_chunks,
+        backend_requested: semantic
+            .map(|result| result.backend_requested.clone())
+            .unwrap_or_else(|| MEMORY_BACKEND_GLOSS_LOCAL.to_string()),
+        backend_used: semantic
+            .map(|result| result.backend_used.clone())
+            .unwrap_or_else(|| MEMORY_BACKEND_GLOSS_LOCAL.to_string()),
+        bm25_candidates: comparison.local_backend_result.candidates.len(),
+        vector_candidates,
+        tq_candidates,
+        candidate_backend,
+        artifact_generation_id: receipt_string(&raw_receipt, "artifact_generation_id"),
+        vector_artifact_manifest_digest: receipt_string(
+            &raw_receipt,
+            "vector_artifact_manifest_digest",
+        ),
+        exact_rerank: raw_receipt
+            .get("exact_rerank")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        exact_rerank_count: receipt_usize(&raw_receipt, "exact_rerank_count"),
+        fallback_used: semantic.map(|result| result.fallback_used).unwrap_or(true),
+        fallback_reason: semantic.and_then(|result| result.fallback_reason.clone()),
+        degradation_markers,
+    };
+    record_retrieval_probe_receipt(&state, &receipt, &raw_receipt)?;
+    Ok(receipt)
 }
 
 /// Queue summary jobs for all sources that are ready but have no summary.
@@ -2172,11 +2946,8 @@ pub async fn memory_backend_status(
     if requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
         && !semantic_memory_available
     {
-        fallback_reason = Some(
-            "semantic-memory preview selected but experimental feature gate is not open"
-                .to_string(),
-        );
-        degradation_markers.push("semantic-memory-feature-gated".to_string());
+        fallback_reason = Some("semantic-memory-flag-off".to_string());
+        degradation_markers.push("semantic_memory_feature_disabled".to_string());
     }
     if index_sync_status == "failed" || index_sync_status == "degraded" {
         degradation_markers.push(format!("semantic-memory-sync-{index_sync_status}"));
@@ -2229,19 +3000,7 @@ pub async fn semantic_memory_reindex_source(
     #[cfg(feature = "semantic-memory-backend")]
     {
         let db_path = state.notebook_db_path(&notebook_id)?;
-        let runtime_config = {
-            let app_db = state
-                .app_db
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            features::require_semantic_memory_preview_enabled(&app_db)?;
-            semantic_memory_adapter::runtime_config_from_settings(
-                app_db.get_setting("semantic_memory_embedding_url")?,
-                app_db.get_setting("semantic_memory_embedding_model")?,
-                app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
-                features::turbo_quant_active(&app_db)?,
-            )
-        };
+        let runtime_config = semantic_memory_runtime_config_from_state(&state)?;
         semantic_memory_adapter::reindex_source(
             &state.data_dir,
             &notebook_id,
@@ -2266,7 +3025,15 @@ pub async fn semantic_memory_reindex_source(
 pub async fn semantic_memory_reindex_notebook(
     notebook_id: String,
     state: State<'_, AppState>,
-) -> Result<Vec<crate::memory::IndexSourceReceipt>, GlossError> {
+) -> Result<SemanticMemoryBackfillReceipt, GlossError> {
+    semantic_memory_backfill_notebook(notebook_id, state).await
+}
+
+#[tauri::command]
+pub async fn semantic_memory_backfill_notebook(
+    notebook_id: String,
+    state: State<'_, AppState>,
+) -> Result<SemanticMemoryBackfillReceipt, GlossError> {
     #[cfg(not(feature = "semantic-memory-backend"))]
     {
         let _ = (notebook_id, state);
@@ -2278,36 +3045,191 @@ pub async fn semantic_memory_reindex_notebook(
     #[cfg(feature = "semantic-memory-backend")]
     {
         let sources = state.with_notebook_db(&notebook_id, |db| db.list_sources())?;
-        let runtime_config = {
-            let app_db = state
-                .app_db
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            features::require_semantic_memory_preview_enabled(&app_db)?;
-            semantic_memory_adapter::runtime_config_from_settings(
-                app_db.get_setting("semantic_memory_embedding_url")?,
-                app_db.get_setting("semantic_memory_embedding_model")?,
-                app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
-                features::turbo_quant_active(&app_db)?,
+        let runtime_config = semantic_memory_runtime_config_from_state(&state)?;
+        let db_path = state.notebook_db_path(&notebook_id)?;
+        let receipt_id = uuid::Uuid::new_v4().to_string();
+        let mut projected_sources = 0usize;
+        let mut skipped_no_chunks = 0usize;
+        let mut failed_sources = 0usize;
+        let mut chunk_bearing_sources = 0usize;
+        let mut total_chunks = 0usize;
+        let mut projected_chunks = 0usize;
+        let mut errors = Vec::new();
+
+        for source in &sources {
+            let chunk_count = state.with_notebook_db(&notebook_id, |db| {
+                db.get_chunks_for_source(&source.id)
+                    .map(|chunks| chunks.len())
+            })?;
+            total_chunks += chunk_count;
+            if chunk_count > 0 {
+                chunk_bearing_sources += 1;
+            }
+
+            match semantic_memory_adapter::reindex_source_with_options(
+                &state.data_dir,
+                &notebook_id,
+                &db_path,
+                &source.id,
+                Some(uuid::Uuid::new_v4().to_string()),
+                Some(runtime_config.clone()),
+                semantic_memory_adapter::ReindexSourceOptions {
+                    rebuild_vector_artifacts: false,
+                    classify_zero_chunks_as_skip: true,
+                },
             )
-        };
-        let mut receipts = Vec::new();
-        for source in sources {
-            let db_path = state.notebook_db_path(&notebook_id)?;
-            receipts.push(
-                semantic_memory_adapter::reindex_source(
-                    &state.data_dir,
-                    &notebook_id,
-                    &db_path,
-                    &source.id,
-                    Some(uuid::Uuid::new_v4().to_string()),
-                    Some(runtime_config.clone()),
-                )
-                .await?,
-            );
+            .await
+            {
+                Ok(receipt) => {
+                    if receipt.sync_status == "skipped_no_chunks" {
+                        skipped_no_chunks += 1;
+                    } else if receipt.sync_status == "synced" {
+                        projected_sources += 1;
+                        projected_chunks += receipt.indexed_chunks;
+                    }
+                }
+                Err(error) => {
+                    failed_sources += 1;
+                    errors.push(SemanticMemorySourceProjectionError {
+                        source_id: source.id.clone(),
+                        title: source.title.clone(),
+                        error: error.to_string(),
+                    });
+                }
+            }
         }
-        Ok(receipts)
+
+        let vector_artifact_receipt = if runtime_config.turbo_quant_enabled {
+            semantic_memory_adapter::rebuild_vector_artifacts(
+                &state.data_dir,
+                &notebook_id,
+                Some(runtime_config),
+            )
+            .await?
+        } else {
+            None
+        };
+        if let Some(receipt) = vector_artifact_receipt.as_ref() {
+            record_vector_artifact_receipt(&state, &notebook_id, receipt)?;
+        }
+        let projection_summary = state.with_notebook_db(&notebook_id, |db| {
+            let resolved = SourceScope::All.resolve(&sources);
+            db.semantic_memory_projection_summary(&notebook_id, &resolved)
+        })?;
+
+        Ok(SemanticMemoryBackfillReceipt {
+            notebook_id,
+            receipt_id,
+            total_sources: sources.len(),
+            chunk_bearing_sources,
+            projected_sources,
+            skipped_no_chunks,
+            failed_sources,
+            stale_sources: projection_summary.stale_sources,
+            total_chunks,
+            projected_chunks,
+            errors,
+            vector_artifact_receipt,
+            projection_summary,
+        })
     }
+}
+
+#[tauri::command]
+pub async fn semantic_memory_rebuild_vector_artifacts(
+    notebook_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<serde_json::Value>, GlossError> {
+    #[cfg(feature = "semantic-memory-turbo-quant")]
+    {
+        let mut runtime_config = semantic_memory_runtime_config_from_state(&state)?;
+        runtime_config.turbo_quant_enabled = true;
+        let receipt = semantic_memory_adapter::rebuild_vector_artifacts(
+            &state.data_dir,
+            &notebook_id,
+            Some(runtime_config),
+        )
+        .await?;
+        if let Some(receipt_value) = receipt.as_ref() {
+            record_vector_artifact_receipt(&state, &notebook_id, receipt_value)?;
+        }
+        Ok(receipt)
+    }
+
+    #[cfg(not(feature = "semantic-memory-turbo-quant"))]
+    {
+        let _ = (notebook_id, state);
+        Err(GlossError::Config(
+            "semantic-memory-turbo-quant feature is not enabled".to_string(),
+        ))
+    }
+}
+
+#[tauri::command]
+pub async fn semantic_memory_vector_artifact_status(
+    notebook_id: String,
+    state: State<'_, AppState>,
+) -> Result<VectorArtifactStatus, GlossError> {
+    let (runtime_turbo_quant_enabled, last_status) = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let runtime = features::turbo_quant_active(&app_db)?;
+        drop(app_db);
+        let statuses = state.with_notebook_db(&notebook_id, |db| {
+            db.list_semantic_memory_projection_statuses(&notebook_id)
+        })?;
+        (runtime, statuses.into_iter().next())
+    };
+    let latest_probe = latest_retrieval_probe_turbo_proof(&state, &notebook_id)?;
+    let exact_rerank = latest_probe
+        .as_ref()
+        .map(|(_, exact, _, _, _, _)| *exact)
+        .unwrap_or_default();
+    let exact_rerank_count = latest_probe
+        .as_ref()
+        .map(|(_, _, count, _, _, _)| *count)
+        .unwrap_or_default();
+    let probe_candidate_backend = latest_probe
+        .as_ref()
+        .and_then(|(_, _, _, backend, _, _)| backend.clone());
+    let probe_generation_id = latest_probe
+        .as_ref()
+        .and_then(|(_, _, _, _, generation_id, _)| generation_id.clone());
+    let probe_manifest_digest = latest_probe
+        .as_ref()
+        .and_then(|(_, _, _, _, _, digest)| digest.clone());
+    Ok(VectorArtifactStatus {
+        compiled_turbo_quant: cfg!(feature = "semantic-memory-turbo-quant"),
+        runtime_turbo_quant_enabled,
+        candidate_backend: probe_candidate_backend.or_else(|| {
+            runtime_turbo_quant_enabled.then(|| "turbo_quant_candidate_then_exact_f32".to_string())
+        }),
+        artifact_generation_id: last_status
+            .as_ref()
+            .and_then(|status| status.artifact_generation_id.clone())
+            .or(probe_generation_id),
+        vector_artifact_manifest_digest: last_status
+            .as_ref()
+            .and_then(|status| status.vector_artifact_manifest_digest.clone())
+            .or(probe_manifest_digest),
+        vector_artifact_missing_count: if runtime_turbo_quant_enabled && last_status.is_none() {
+            1
+        } else {
+            0
+        },
+        vector_artifact_stale_count: last_status
+            .as_ref()
+            .is_some_and(|status| status.status == "artifact_stale")
+            as usize,
+        exact_rerank,
+        exact_rerank_count,
+        last_receipt_id: last_status
+            .as_ref()
+            .and_then(|status| status.last_receipt_id.clone()),
+        last_error: last_status.and_then(|status| status.last_error),
+    })
 }
 
 #[tauri::command]
@@ -2340,6 +3262,10 @@ pub async fn compare_memory_backends(
             app_db.get_setting("semantic_memory_embedding_model")?,
             app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
             features::turbo_quant_active(&app_db)?,
+            crate::commands::chat::setting_is_enabled(
+                app_db
+                    .get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
+            ),
         )
     };
     let (all_sources, local_backend_result, local_latency_ms, semantic_links) = {

@@ -67,6 +67,9 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   const {
     sources,
     selectedSourceIds,
+    sourceListStatus,
+    sourceListError,
+    stats,
     toggleSource,
     toggleGroup,
     selectAll,
@@ -79,6 +82,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     reindexSource,
     reindexNotebook,
     bulkDeleteSelected,
+    loadSources,
   } = useSourceStore();
   const [showPaste, setShowPaste] = useState(false);
   const [pasteTitle, setPasteTitle] = useState("");
@@ -113,6 +117,13 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     () => Array.from(new Set(sources.map((source) => source.status))).sort(),
     [sources]
   );
+  const expectedSourceCount = stats?.source_count ?? sources.length;
+  const hasStatsSources = expectedSourceCount > 0;
+  const noLoadedSources = sources.length === 0;
+  const hasLoadedSources = sources.length > 0;
+  const sourceListUnavailable = sourceListStatus === "error";
+  const sourceListLoading = sourceListStatus === "loading";
+  const sourceListPartial = sourceListStatus === "partial" || sources.length < expectedSourceCount;
 
   const handleFileUpload = async () => {
     const selected = await open({
@@ -289,7 +300,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
           </button>
         </div>
 
-        {sources.length > 0 && (
+        {hasLoadedSources && (
           <div className="mt-2 flex flex-wrap gap-2 text-xs text-text-muted">
             <button onClick={selectAll} className="hover:text-text">
               Select all
@@ -308,7 +319,28 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             <button onClick={handleSummarize} className="hover:text-accent" disabled={summarizing}>
               {summarizing ? "Queuing..." : "Summarize missing"}
             </button>
-            <span className="gloss-mono ml-auto text-[10px]">{sources.length} sources</span>
+            <span className="gloss-mono ml-auto text-[10px]">
+              Loaded {sources.length} of {expectedSourceCount}
+            </span>
+          </div>
+        )}
+        {(sourceListLoading || sourceListPartial || sourceListUnavailable || hasStatsSources) && (
+          <div className="mt-2 flex items-center gap-2 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary">
+            <span className="min-w-0 flex-1 truncate">
+              {sourceListUnavailable
+                ? sourceListError || "Source list failed to load."
+                : sourceListLoading
+                  ? "Loading sources..."
+                  : sourceListPartial
+                    ? `Loaded ${sources.length} of ${expectedSourceCount}`
+                    : `${sources.length} sources loaded`}
+            </span>
+            <button
+              onClick={() => loadSources(notebookId)}
+              className="shrink-0 rounded border border-border px-2 py-0.5 text-[10px] text-text hover:bg-border"
+            >
+              Reload Sources
+            </button>
           </div>
         )}
         <div className="mt-2 space-y-1.5">
@@ -472,12 +504,39 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
           );
         })()}
 
-        {sources.length === 0 && (
+        {sourceListLoading && noLoadedSources && (
+          <p className="text-xs text-text-muted text-center mt-4 px-2">
+            Loading sources...
+          </p>
+        )}
+        {sourceListUnavailable && noLoadedSources && (
+          <div className="mt-4 px-2 text-center text-xs text-text-muted">
+            <p className="text-error">{sourceListError || "Source list failed to load."}</p>
+            <button
+              onClick={() => loadSources(notebookId)}
+              className="mt-2 rounded border border-border px-2 py-1 text-text-secondary hover:bg-border hover:text-text"
+            >
+              Reload Sources
+            </button>
+          </div>
+        )}
+        {!sourceListLoading && !sourceListUnavailable && hasStatsSources && noLoadedSources && (
+          <div className="mt-4 px-2 text-center text-xs text-text-muted">
+            <p>Notebook stats report {expectedSourceCount} sources, but the source list is not loaded.</p>
+            <button
+              onClick={() => loadSources(notebookId)}
+              className="mt-2 rounded border border-border px-2 py-1 text-text-secondary hover:bg-border hover:text-text"
+            >
+              Reload Sources
+            </button>
+          </div>
+        )}
+        {!sourceListLoading && !sourceListUnavailable && !hasStatsSources && noLoadedSources && (
           <p className="text-xs text-text-muted text-center mt-4 px-2">
             No sources yet. Upload files, add a folder, or paste text.
           </p>
         )}
-        {sources.length > 0 && filteredSources.length === 0 && (
+        {hasLoadedSources && filteredSources.length === 0 && (
           <p className="text-xs text-text-muted text-center mt-4 px-2">
             No sources match the current filters.
           </p>

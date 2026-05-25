@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 const APP_SCHEMA_VERSION: i32 = 2;
-const NOTEBOOK_SCHEMA_VERSION: i32 = 3;
+const NOTEBOOK_SCHEMA_VERSION: i32 = 5;
 
 /// Apply pragmas for performance and correctness.
 pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
@@ -43,7 +43,7 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
                 id             TEXT PRIMARY KEY,
                 enabled        INTEGER DEFAULT 0,
                 base_url       TEXT,
-                api_key        TEXT,
+                secret_ref     TEXT,
                 last_refreshed TEXT,
                 created_at     TEXT DEFAULT (datetime('now'))
             );
@@ -75,6 +75,9 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
              INSERT OR IGNORE INTO settings (key, value) VALUES ('summary_mode', 'manual');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend', 'gloss-local');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend_fallback', 'true');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_auto_project', 'false');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_strict_testing', 'false');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_url', 'http://localhost:11434');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_model', 'nomic-embed-text');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_timeout_secs', '10');
@@ -107,6 +110,11 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
         }
         set_schema_version(conn, APP_SCHEMA_VERSION)?;
     }
+
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_strict_testing', 'false');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');",
+    )?;
 
     ensure_provider_rows(conn)?;
 
@@ -297,8 +305,22 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
         set_schema_version(conn, NOTEBOOK_SCHEMA_VERSION)?;
     }
 
+    if version < 4 {
+        ensure_semantic_memory_projection_status(conn)?;
+        set_schema_version(conn, NOTEBOOK_SCHEMA_VERSION)?;
+    }
+
+    if version < 5 {
+        ensure_provenance_receipts(conn)?;
+        set_schema_version(conn, NOTEBOOK_SCHEMA_VERSION)?;
+    }
+
     ensure_notebook_fts(conn)?;
     ensure_semantic_memory_links(conn)?;
+    ensure_semantic_memory_projection_status(conn)?;
+    ensure_semantic_memory_vector_artifact_receipts(conn)?;
+    ensure_semantic_memory_retrieval_probe_receipts(conn)?;
+    ensure_provenance_receipts(conn)?;
 
     Ok(())
 }
@@ -355,6 +377,127 @@ fn ensure_semantic_memory_links(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     Ok(())
+}
+
+fn ensure_semantic_memory_projection_status(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS semantic_memory_projection_status (
+            notebook_id TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            chunk_count INTEGER NOT NULL DEFAULT 0,
+            projected_chunk_count INTEGER NOT NULL DEFAULT 0,
+            healthy_link_count INTEGER NOT NULL DEFAULT 0,
+            degraded_link_count INTEGER NOT NULL DEFAULT 0,
+            last_receipt_id TEXT,
+            last_error TEXT,
+            artifact_generation_id TEXT,
+            vector_artifact_manifest_digest TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (notebook_id, source_id),
+            FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_semantic_memory_projection_status_status
+        ON semantic_memory_projection_status (notebook_id, status);",
+    )?;
+
+    for (column, definition) in [
+        ("notebook_id", "TEXT"),
+        ("source_id", "TEXT"),
+        ("status", "TEXT"),
+        ("chunk_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("projected_chunk_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("healthy_link_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("degraded_link_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_receipt_id", "TEXT"),
+        ("last_error", "TEXT"),
+        ("artifact_generation_id", "TEXT"),
+        ("vector_artifact_manifest_digest", "TEXT"),
+        ("updated_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+    ] {
+        if !table_has_column(conn, "semantic_memory_projection_status", column)? {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE semantic_memory_projection_status ADD COLUMN {column} {definition}"
+                ),
+                [],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_semantic_memory_vector_artifact_receipts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS semantic_memory_vector_artifact_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL,
+            generation_id TEXT,
+            artifact_manifest_digest TEXT,
+            raw_receipt_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_semantic_memory_vector_artifact_receipts_notebook
+        ON semantic_memory_vector_artifact_receipts (notebook_id, recorded_at DESC);",
+    )
+}
+
+fn ensure_semantic_memory_retrieval_probe_receipts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS semantic_memory_retrieval_probe_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL,
+            query_digest TEXT NOT NULL,
+            source_scope_kind TEXT NOT NULL,
+            scoped_sources INTEGER NOT NULL DEFAULT 0,
+            scoped_chunks INTEGER NOT NULL DEFAULT 0,
+            backend_requested TEXT NOT NULL,
+            backend_used TEXT NOT NULL,
+            bm25_candidates INTEGER NOT NULL DEFAULT 0,
+            vector_candidates INTEGER NOT NULL DEFAULT 0,
+            tq_candidates INTEGER NOT NULL DEFAULT 0,
+            candidate_backend TEXT,
+            artifact_generation_id TEXT,
+            vector_artifact_manifest_digest TEXT,
+            exact_rerank INTEGER NOT NULL DEFAULT 0 CHECK (exact_rerank IN (0, 1)),
+            exact_rerank_count INTEGER NOT NULL DEFAULT 0,
+            fallback_used INTEGER NOT NULL DEFAULT 0 CHECK (fallback_used IN (0, 1)),
+            fallback_reason TEXT,
+            degradation_markers TEXT NOT NULL DEFAULT '[]',
+            raw_receipt_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_semantic_memory_retrieval_probe_receipts_notebook
+        ON semantic_memory_retrieval_probe_receipts (notebook_id, recorded_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_semantic_memory_retrieval_probe_receipts_candidate
+        ON semantic_memory_retrieval_probe_receipts (notebook_id, candidate_backend, exact_rerank);",
+    )
+}
+
+fn ensure_provenance_receipts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS provenance_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            operator_kind TEXT NOT NULL,
+            subject_kind TEXT NOT NULL,
+            subject_id TEXT NOT NULL,
+            valid_time_start TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            valid_time_end TEXT,
+            recorded_time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            supersedes_receipt_id TEXT,
+            invalidated_by_receipt_id TEXT,
+            raw_receipt_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_provenance_receipts_subject
+        ON provenance_receipts (subject_kind, subject_id, recorded_time DESC);",
+    )
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -416,8 +559,13 @@ fn ensure_notebook_fts(conn: &Connection) -> rusqlite::Result<()> {
             INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
         END;
 
-        INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild');",
-    )
+        ",
+    )?;
+    conn.execute(
+        "INSERT INTO chunks_fts(chunks_fts) VALUES (?1)",
+        ["rebuild"],
+    )?;
+    Ok(())
 }
 
 fn get_schema_version(conn: &Connection) -> i32 {
@@ -667,5 +815,88 @@ mod tests {
             .unwrap();
         assert_eq!(table_count, 1);
         assert!(table_has_column(&conn, "semantic_memory_links", "sm_chunk_id").unwrap());
+    }
+
+    #[test]
+    fn notebook_migration_creates_semantic_memory_projection_status_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO _meta (key, value) VALUES ('schema_version', '3');
+
+            CREATE TABLE sources (
+                id                TEXT PRIMARY KEY,
+                source_type       TEXT NOT NULL,
+                title             TEXT NOT NULL,
+                original_filename TEXT,
+                file_hash         TEXT,
+                url               TEXT,
+                file_path         TEXT,
+                content_text      TEXT,
+                word_count        INTEGER,
+                metadata          TEXT,
+                summary           TEXT,
+                summary_model     TEXT,
+                status            TEXT DEFAULT 'pending',
+                error_message     TEXT,
+                selected          INTEGER DEFAULT 1,
+                created_at        TEXT DEFAULT (datetime('now')),
+                updated_at        TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE chunks (
+                id              TEXT PRIMARY KEY,
+                source_id       TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                chunk_index     INTEGER NOT NULL,
+                content         TEXT NOT NULL,
+                token_count     INTEGER,
+                start_offset    INTEGER,
+                end_offset      INTEGER,
+                metadata        TEXT,
+                embedding_id    INTEGER,
+                embedding_model TEXT,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        migrate_notebook_db(&conn).unwrap();
+
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'semantic_memory_projection_status'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+        assert!(table_has_column(&conn, "semantic_memory_projection_status", "status").unwrap());
+        assert!(table_has_column(
+            &conn,
+            "semantic_memory_projection_status",
+            "vector_artifact_manifest_digest"
+        )
+        .unwrap());
+
+        for table in [
+            "semantic_memory_vector_artifact_receipts",
+            "semantic_memory_retrieval_probe_receipts",
+        ] {
+            let table_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM sqlite_master
+                     WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_count, 1);
+        }
     }
 }

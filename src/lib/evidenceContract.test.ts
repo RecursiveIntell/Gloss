@@ -1,0 +1,69 @@
+import type { ChatEvidencePayload, Citation, Message, Note } from "./types";
+
+const citation: Citation = {
+  chunk_id: "chunk-1",
+  source_id: "source-1",
+  source_title: "Source One",
+};
+
+const evidencePayload: ChatEvidencePayload = {
+  citations: [citation],
+  evidence: {
+    backend_requested: "gloss-local",
+    backend_used: "gloss-local",
+    retrieval_mode: "bm25_only",
+    fallback_used: false,
+    fallback_reason: null,
+    degradation_markers: [],
+    source_scope_mode: "explicit",
+    requested_source_ids: ["source-1"],
+    selected_source_ids: ["source-1"],
+    effective_source_ids: ["source-1"],
+    invalid_source_ids: [],
+    excluded_source_ids: [],
+    invalid_source_count: 0,
+    effective_source_count: 1,
+    excluded_source_count: 0,
+    context_passage_count: 1,
+    citation_valid_count: 1,
+    citation_invalid_count: 0,
+    citation_anchors: [],
+    citation_filter_reasons: [],
+    omitted_candidate_count: 0,
+    source_scope_preserved: true,
+    index_status: "indexed",
+    link_status: "gloss-local",
+    receipt_id: "receipt-1",
+    context_digest: "context-digest",
+    source_context_digest: "source-context-digest",
+    prompt_digest: null,
+    semantic_memory_receipt_id: null,
+    candidate_backend: null,
+    turbo_quant_generation_id: null,
+    vector_artifact_manifest_digest: null,
+    exact_rerank: null,
+    exact_rerank_count: null,
+    approximate_candidate_count: null,
+    semantic_memory_fallback_reason: null,
+    retrieval_outcome: null,
+  },
+};
+
+export const assistantMessageContract: Message = {
+  id: "message-1",
+  conversation_id: "conversation-1",
+  role: "assistant",
+  content: "Answer [1]",
+  citations: evidencePayload,
+  created_at: "2026-05-24T00:00:00Z",
+};
+
+export const noteCitationContract: Note = {
+  id: "note-1",
+  content: "Saved note",
+  note_type: "saved_response",
+  citations: [citation],
+  pinned: false,
+  created_at: "2026-05-24T00:00:00Z",
+  updated_at: "2026-05-24T00:00:00Z",
+};

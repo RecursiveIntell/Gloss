@@ -4,11 +4,11 @@ use crate::db::notebook_db::{Conversation, Message, Source};
 use crate::error::GlossError;
 use crate::features;
 use crate::jobs;
-use crate::memory::backend::MemorySearchBackend;
-use crate::memory::gloss_local::GlossLocalMemoryBackend;
 #[cfg(feature = "semantic-memory-backend")]
 use crate::memory::semantic_memory_adapter;
 use crate::memory::MemorySearchRequest;
+#[cfg(feature = "semantic-memory-backend")]
+use crate::memory::{RetrievalCoverage, RetrievalEngineStatus, RetrievalResult};
 use crate::memory::{RetrievalMode, RetrievalOutcome, RetrievalReasonCode};
 use crate::memory::{MEMORY_BACKEND_GLOSS_LOCAL, MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW};
 use crate::providers::{self, ChatMessage, ChatRequest, ChatToken, LlmProvider};
@@ -19,6 +19,7 @@ use crate::retrieval::source_scope::{ResolvedSourceScope, SourceScope};
 use crate::state::AppState;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -28,10 +29,6 @@ use tauri::{Emitter, State};
 use tauri_queue::QueueManager;
 use tokio::sync::TryAcquireError;
 
-/// Maximum characters of source content to inject per source (fallback path).
-const MAX_SOURCE_CHARS: usize = 8_000;
-/// Maximum total characters of all source context combined (fallback path).
-const MAX_TOTAL_CONTEXT_CHARS: usize = 32_000;
 const CHAT_CANCELLED_NOTEBOOK_SWITCH: &str = "__chat_cancelled_notebook_switch__";
 const CHAT_PROVIDER_START_TIMEOUT: Duration = Duration::from_secs(180);
 const CHAT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(120);
@@ -61,11 +58,16 @@ struct ChatEvidenceDisclosure {
     context_passage_count: usize,
     citation_valid_count: usize,
     citation_invalid_count: usize,
+    citation_anchors: Vec<citations::CitationAnchorV1>,
+    citation_filter_reasons: Vec<citations::CitationFilterReasonV1>,
     omitted_candidate_count: usize,
     source_scope_preserved: bool,
     index_status: String,
     link_status: String,
     receipt_id: String,
+    context_digest: String,
+    source_context_digest: String,
+    prompt_digest: Option<String>,
     semantic_memory_receipt_id: Option<String>,
     candidate_backend: Option<String>,
     turbo_quant_generation_id: Option<String>,
@@ -78,9 +80,71 @@ struct ChatEvidenceDisclosure {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct SourceScopeIntegrityV1 {
+    requested_ids_valid: bool,
+    effective_ids_match_allowed_set: bool,
+    no_out_of_scope_context: bool,
+    no_unanchored_context: bool,
+    fallback_class_allowed: bool,
+    projection_links_preserved: bool,
+    preserved: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct AssistantMessageEvidence {
     citations: Vec<citations::Citation>,
     evidence: ChatEvidenceDisclosure,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptBudgetReceiptV1 {
+    model_context_window: u32,
+    system_prompt_chars: usize,
+    message_count: usize,
+    source_passage_count: usize,
+    prompt_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LlmInvocationReceiptV1 {
+    provider: String,
+    model: String,
+    request_digest: String,
+    response_digest: Option<String>,
+    error: Option<String>,
+}
+
+fn digest_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn source_context_digest(source_context: &[ContextPassage]) -> String {
+    let mut material = String::new();
+    for passage in source_context {
+        material.push_str(&passage.source_id);
+        material.push('\n');
+        material.push_str(passage.chunk_id.as_deref().unwrap_or(""));
+        material.push('\n');
+        material.push_str(&passage.evidence_class);
+        material.push('\n');
+        material.push_str(&digest_text(&passage.content));
+        material.push('\n');
+    }
+    digest_text(&material)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProjectionReadiness {
+    ready: bool,
+    reason_code: Option<RetrievalReasonCode>,
+    user_action: Option<String>,
+    scoped_sources: usize,
+    scoped_chunks: usize,
+    healthy_links: usize,
+    missing_links: usize,
+    skipped_no_chunks: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,7 +235,6 @@ fn persist_chat_attempt_trace(
     std::fs::create_dir_all(&trace_dir)?;
     let bytes = serde_json::to_vec_pretty(trace)?;
     std::fs::write(trace_dir.join(format!("{}.json", trace.attempt_id)), &bytes)?;
-    std::fs::write(trace_dir.join("latest.json"), bytes)?;
     Ok(())
 }
 
@@ -302,13 +365,35 @@ fn semantic_memory_search_timeout_from_setting(value: Option<String>) -> Duratio
         .unwrap_or(SEMANTIC_MEMORY_SEARCH_TIMEOUT)
 }
 
-fn setting_is_enabled(value: Option<String>) -> bool {
+pub(crate) fn setting_is_enabled(value: Option<String>) -> bool {
     value
         .map(|value| {
             let normalized = value.trim().to_ascii_lowercase();
             normalized == "1" || normalized == "true" || normalized == "yes"
         })
         .unwrap_or(false)
+}
+
+fn bounded_semantic_fallback_reason(reason: &str) -> &'static str {
+    let normalized = reason.trim().to_ascii_lowercase();
+    if normalized.contains("timeout") {
+        "search-timeout"
+    } else if normalized.contains("not compiled") || normalized.contains("feature is not enabled") {
+        "semantic-memory-not-compiled"
+    } else if normalized.contains("flag") || normalized.contains("gate") {
+        "semantic-memory-flag-off"
+    } else if normalized.contains("link") || normalized.contains("backpointer") {
+        "links-missing"
+    } else if normalized.contains("artifact")
+        || normalized.contains("turbo")
+        || normalized.contains("derived_vector")
+    {
+        "turbo-artifacts-stale"
+    } else if normalized.contains("candidate") || normalized.contains("empty") {
+        "no-candidates"
+    } else {
+        "projection-failed"
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -856,27 +941,31 @@ pub async fn send_message(
         semantic_fallback_allowed,
         semantic_memory_runtime_config,
         semantic_memory_search_timeout,
-    ) = {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        (
-            app_db
-                .get_setting("memory_backend")?
-                .unwrap_or_else(|| "gloss-local".to_string()),
-            setting_is_enabled(app_db.get_setting("memory_backend_fallback")?),
-            semantic_memory_adapter::runtime_config_from_settings(
-                app_db.get_setting("semantic_memory_embedding_url")?,
-                app_db.get_setting("semantic_memory_embedding_model")?,
-                app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
-                features::turbo_quant_active(&app_db)?,
-            ),
-            semantic_memory_search_timeout_from_setting(
-                app_db.get_setting("semantic_memory_search_timeout_ms")?,
-            ),
-        )
-    };
+    ) =
+        {
+            let app_db = state
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            (
+                app_db
+                    .get_setting("memory_backend")?
+                    .unwrap_or_else(|| "gloss-local".to_string()),
+                setting_is_enabled(app_db.get_setting("memory_backend_fallback")?),
+                semantic_memory_adapter::runtime_config_from_settings(
+                    app_db.get_setting("semantic_memory_embedding_url")?,
+                    app_db.get_setting("semantic_memory_embedding_model")?,
+                    app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+                    features::turbo_quant_active(&app_db)?,
+                    setting_is_enabled(app_db.get_setting(
+                        features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
+                    )?),
+                ),
+                semantic_memory_search_timeout_from_setting(
+                    app_db.get_setting("semantic_memory_search_timeout_ms")?,
+                ),
+            )
+        };
     #[cfg(not(feature = "semantic-memory-backend"))]
     let (memory_backend, semantic_fallback_allowed) = {
         let app_db = state
@@ -897,6 +986,7 @@ pub async fn send_message(
     let mut retrieval_degradation_markers: Vec<String> = Vec::new();
     let mut retrieval_mode = MEMORY_BACKEND_GLOSS_LOCAL.to_string();
     let mut force_gloss_local_retrieval = false;
+    let mut retrieval_outcome_for_evidence: Option<RetrievalOutcome> = None;
     let retrieval_receipt_id = uuid::Uuid::new_v4().to_string();
     #[cfg(feature = "semantic-memory-backend")]
     let mut semantic_memory_receipt: Option<serde_json::Value> = None;
@@ -915,12 +1005,50 @@ pub async fn send_message(
     let memory_backend = if memory_backend == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
         && !semantic_preview_gate_open
     {
-        retrieval_fallback_reason = Some(
-            "semantic-memory-preview is disabled by the experimental feature gate".to_string(),
-        );
-        retrieval_degradation_markers.push("memory-backend-feature-gate-fallback".to_string());
-        force_gloss_local_retrieval = true;
-        MEMORY_BACKEND_GLOSS_LOCAL.to_string()
+        if semantic_fallback_allowed {
+            retrieval_fallback_reason = Some("semantic-memory-flag-off".to_string());
+            retrieval_degradation_markers.push("semantic_memory_feature_disabled".to_string());
+            force_gloss_local_retrieval = true;
+            MEMORY_BACKEND_GLOSS_LOCAL.to_string()
+        } else {
+            let error =
+                "semantic-memory-flag-off: semantic-memory preview is disabled by the runtime feature gate"
+                    .to_string();
+            emit_chat_status(
+                &app_handle,
+                &notebook_id,
+                &conversation_id,
+                &message_id,
+                "semantic_memory_search_error",
+                "semantic-memory preview is disabled",
+                None,
+                Some(&model),
+                None,
+                Some("semantic-memory"),
+                None,
+                Duration::ZERO,
+                None,
+                false,
+                Some(&error),
+            );
+            emit_chat_error(
+                &app_handle,
+                &notebook_id,
+                &conversation_id,
+                &message_id,
+                &error,
+            );
+            record_chat_attempt_trace(
+                &attempt_trace,
+                &trace_data_dir,
+                "semantic_memory_search_error",
+                Some(Duration::ZERO),
+                Some("strict semantic-memory mode failed before local fallback"),
+                Some(&error),
+                |_| {},
+            );
+            return Err(GlossError::Config(error));
+        }
     } else {
         memory_backend
     };
@@ -935,6 +1063,10 @@ pub async fn send_message(
             let links = {
                 let nb_db = NotebookDb::connect(&db_path)?;
                 semantic_memory_adapter::load_links(&nb_db)?
+            };
+            let projection_summary = {
+                let nb_db = NotebookDb::connect(&db_path)?;
+                nb_db.semantic_memory_projection_summary(&notebook_id, &resolved_scope)?
             };
             let scoped_links = links
                 .iter()
@@ -955,90 +1087,55 @@ pub async fn send_message(
                         && !link.content_digest.trim().is_empty()
                 })
                 .count();
-            if scoped_links.is_empty() {
+            let scoped_link_count = scoped_links.len();
+            let scoped_degraded_link_count = scoped_link_count.saturating_sub(healthy_scoped_links);
+            let projection_readiness = ProjectionReadiness {
+                ready: projection_summary.total_chunks > 0
+                    && !projection_summary.projection_required
+                    && projection_summary.missing_links == 0,
+                reason_code: if projection_summary.missing_links > 0 || scoped_link_count == 0 {
+                    Some(RetrievalReasonCode::SemanticMemoryLinksMissing)
+                } else if scoped_degraded_link_count > 0 || projection_summary.degraded_links > 0 {
+                    Some(RetrievalReasonCode::SemanticMemoryLinksDegraded)
+                } else {
+                    None
+                },
+                user_action: if projection_summary.projection_required {
+                    Some("Run semantic-memory backfill or enable fallback.".to_string())
+                } else {
+                    None
+                },
+                scoped_sources: projection_summary.total_sources,
+                scoped_chunks: projection_summary.total_chunks,
+                healthy_links: projection_summary.healthy_links.max(healthy_scoped_links),
+                missing_links: projection_summary.missing_links,
+                skipped_no_chunks: projection_summary.skipped_no_chunks,
+            };
+            if !projection_readiness.ready && projection_readiness.missing_links > 0 {
                 retrieval_degradation_markers.push(
                     RetrievalReasonCode::SemanticMemoryLinksMissing
                         .as_str()
                         .to_string(),
                 );
-                retrieval_fallback_reason.get_or_insert_with(|| {
-                    "semantic-memory links are missing for selected scope".to_string()
-                });
-            } else if healthy_scoped_links < scoped_links.len() {
+                retrieval_fallback_reason.get_or_insert_with(|| "projection-required".to_string());
+            } else if !projection_readiness.ready
+                && (healthy_scoped_links < scoped_link_count
+                    || projection_summary.degraded_links > 0
+                    || projection_summary.failed_sources > 0)
+            {
                 retrieval_degradation_markers.push(
                     RetrievalReasonCode::SemanticMemoryLinksDegraded
                         .as_str()
                         .to_string(),
                 );
-                retrieval_fallback_reason.get_or_insert_with(|| {
-                    "semantic-memory links are stale, failed, or missing exact backpointers"
-                        .to_string()
-                });
+                retrieval_fallback_reason.get_or_insert_with(|| "projection-failed".to_string());
             }
-            let preview_request = MemorySearchRequest {
-                notebook_id: notebook_id.clone(),
-                source_scope: source_scope.clone(),
-                query: query.clone(),
-                limit: top_k,
-                trace_id: Some(retrieval_receipt_id.clone()),
-                allow_fallback: semantic_fallback_allowed,
-            };
-
-            let search_started = Instant::now();
-            emit_chat_status(
-                &app_handle,
-                &notebook_id,
-                &conversation_id,
-                &message_id,
-                "semantic_memory_search_start",
-                "Searching semantic-memory preview",
-                None,
-                Some(&model),
-                None,
-                Some("semantic-memory"),
-                Some(&semantic_memory_runtime_config.embedding_model),
-                search_started.elapsed(),
-                Some(semantic_memory_search_timeout),
-                false,
-                None,
-            );
-
-            let preview_result = tokio::time::timeout(
-                semantic_memory_search_timeout,
-                semantic_memory_adapter::search_preview(
-                    &state.data_dir,
-                    &notebook_id,
-                    links,
-                    &all_sources,
-                    preview_request,
-                    Some(semantic_memory_runtime_config.clone()),
-                ),
-            )
-            .await;
-
-            match preview_result {
-                Err(_) if semantic_fallback_allowed => {
-                    let reason = format!(
-                        "semantic-memory preview timed out after {} ms",
-                        semantic_memory_search_timeout.as_millis()
-                    );
-                    emit_chat_status(
-                        &app_handle,
-                        &notebook_id,
-                        &conversation_id,
-                        &message_id,
-                        "semantic_memory_search_timeout",
-                        "semantic-memory preview timed out",
-                        None,
-                        Some(&model),
-                        None,
-                        Some("semantic-memory"),
-                        Some(&semantic_memory_runtime_config.embedding_model),
-                        search_started.elapsed(),
-                        Some(semantic_memory_search_timeout),
-                        false,
-                        Some(&reason),
-                    );
+            if retrieval_fallback_reason
+                .as_deref()
+                .is_some_and(|reason| matches!(reason, "projection-required" | "projection-failed"))
+            {
+                if semantic_fallback_allowed {
+                    force_gloss_local_retrieval = true;
                     emit_chat_status(
                         &app_handle,
                         &notebook_id,
@@ -1050,50 +1147,52 @@ pub async fn send_message(
                         Some(&model),
                         None,
                         Some("gloss-local"),
-                        Some(&reason),
-                        search_started.elapsed(),
-                        Some(semantic_memory_search_timeout),
+                        retrieval_fallback_reason.as_deref(),
+                        Duration::ZERO,
+                        None,
                         true,
                         None,
                     );
-                    retrieval_fallback_reason = Some(reason);
-                    force_gloss_local_retrieval = true;
-                    retrieval_degradation_markers
-                        .push("semantic-memory-preview-timeout-fallback".to_string());
                     record_chat_attempt_trace(
                         &attempt_trace,
                         &trace_data_dir,
                         "semantic_memory_search_fallback",
-                        Some(search_started.elapsed()),
+                        Some(Duration::ZERO),
                         retrieval_fallback_reason.as_deref(),
                         None,
                         |_| {},
                     );
-                    tracing::warn!(
-                        timeout_ms = semantic_memory_search_timeout.as_millis(),
-                        "semantic-memory preview retrieval timed out; explicit fallback enabled"
-                    );
                     None
-                }
-                Err(_) => {
+                } else {
                     let error = format!(
-                        "semantic-memory preview timed out after {} ms",
-                        semantic_memory_search_timeout.as_millis()
+                        "semantic-memory strict mode blocked: projection required for selected scope ({}; scoped_sources={}, scoped_chunks={}, healthy_links={}, missing_links={}, skipped_no_chunks={}). {}",
+                        retrieval_fallback_reason
+                            .as_deref()
+                            .unwrap_or("projection-failed"),
+                        projection_readiness.scoped_sources,
+                        projection_readiness.scoped_chunks,
+                        projection_readiness.healthy_links,
+                        projection_readiness.missing_links,
+                        projection_readiness.skipped_no_chunks,
+                        projection_readiness
+                            .user_action
+                            .as_deref()
+                            .unwrap_or("Run semantic-memory backfill or enable fallback.")
                     );
                     emit_chat_status(
                         &app_handle,
                         &notebook_id,
                         &conversation_id,
                         &message_id,
-                        "semantic_memory_search_timeout",
-                        "semantic-memory preview timed out",
+                        "semantic_memory_search_error",
+                        "semantic-memory projection is not ready",
                         None,
                         Some(&model),
                         None,
                         Some("semantic-memory"),
-                        Some(&semantic_memory_runtime_config.embedding_model),
-                        search_started.elapsed(),
-                        Some(semantic_memory_search_timeout),
+                        None,
+                        Duration::ZERO,
+                        None,
                         false,
                         Some(&error),
                     );
@@ -1107,195 +1206,449 @@ pub async fn send_message(
                     record_chat_attempt_trace(
                         &attempt_trace,
                         &trace_data_dir,
-                        "semantic_memory_search_timeout",
-                        Some(search_started.elapsed()),
-                        Some("semantic-memory preview timed out and fallback is disabled"),
+                        "semantic_memory_search_error",
+                        Some(Duration::ZERO),
+                        Some("strict semantic-memory mode failed because projection links are not ready"),
                         Some(&error),
                         |_| {},
                     );
                     return Err(GlossError::Search(error));
                 }
-                Ok(Ok(response)) => {
-                    if let Some(reason) = response.fallback_reason.clone() {
+            } else {
+                let preview_request = MemorySearchRequest {
+                    notebook_id: notebook_id.clone(),
+                    source_scope: source_scope.clone(),
+                    query: query.clone(),
+                    limit: top_k,
+                    trace_id: Some(retrieval_receipt_id.clone()),
+                    allow_fallback: semantic_fallback_allowed,
+                };
+
+                let search_started = Instant::now();
+                emit_chat_status(
+                    &app_handle,
+                    &notebook_id,
+                    &conversation_id,
+                    &message_id,
+                    "semantic_memory_search_start",
+                    "Searching semantic-memory preview",
+                    None,
+                    Some(&model),
+                    None,
+                    Some("semantic-memory"),
+                    Some(&semantic_memory_runtime_config.embedding_model),
+                    search_started.elapsed(),
+                    Some(semantic_memory_search_timeout),
+                    false,
+                    None,
+                );
+
+                let preview_result = tokio::time::timeout(
+                    semantic_memory_search_timeout,
+                    semantic_memory_adapter::search_preview(
+                        &state.data_dir,
+                        &notebook_id,
+                        links,
+                        &all_sources,
+                        preview_request,
+                        Some(semantic_memory_runtime_config.clone()),
+                    ),
+                )
+                .await;
+
+                match preview_result {
+                    Err(_) if semantic_fallback_allowed => {
+                        let reason = "search-timeout".to_string();
+                        emit_chat_status(
+                            &app_handle,
+                            &notebook_id,
+                            &conversation_id,
+                            &message_id,
+                            "semantic_memory_search_timeout",
+                            "semantic-memory preview timed out",
+                            None,
+                            Some(&model),
+                            None,
+                            Some("semantic-memory"),
+                            Some(&semantic_memory_runtime_config.embedding_model),
+                            search_started.elapsed(),
+                            Some(semantic_memory_search_timeout),
+                            false,
+                            Some(&reason),
+                        );
+                        emit_chat_status(
+                            &app_handle,
+                            &notebook_id,
+                            &conversation_id,
+                            &message_id,
+                            "semantic_memory_search_fallback",
+                            "Falling back to Gloss local retrieval",
+                            None,
+                            Some(&model),
+                            None,
+                            Some("gloss-local"),
+                            Some(&reason),
+                            search_started.elapsed(),
+                            Some(semantic_memory_search_timeout),
+                            true,
+                            None,
+                        );
                         retrieval_fallback_reason = Some(reason);
-                    }
-                    for marker in response.degradation_markers.clone() {
-                        if !retrieval_degradation_markers.contains(&marker) {
-                            retrieval_degradation_markers.push(marker);
-                        }
-                    }
-                    semantic_memory_receipt =
-                        response.provenance.get("semantic_memory_receipt").cloned();
-                    retrieval_mode = MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string();
-                    retrieval_backend_used = MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string();
-                    tracing::info!(
-                        receipt_id = %response.receipt_id,
-                        candidates = response.candidates.len(),
-                        degraded = response.degraded,
-                        "semantic-memory preview retrieval completed"
+                        force_gloss_local_retrieval = true;
+                        retrieval_degradation_markers
+                            .push("semantic-memory-preview-timeout-fallback".to_string());
+                        record_chat_attempt_trace(
+                            &attempt_trace,
+                            &trace_data_dir,
+                            "semantic_memory_search_fallback",
+                            Some(search_started.elapsed()),
+                            retrieval_fallback_reason.as_deref(),
+                            None,
+                            |_| {},
+                        );
+                        tracing::warn!(
+                        timeout_ms = semantic_memory_search_timeout.as_millis(),
+                        "semantic-memory preview retrieval timed out; explicit fallback enabled"
                     );
-                    let context = response
-                        .candidates
-                        .into_iter()
-                        .map(|candidate| ContextPassage {
-                            source_id: candidate.source_id,
-                            chunk_id: Some(candidate.chunk_id),
-                            title: candidate
-                                .source_title
-                                .unwrap_or_else(|| "Untitled source".to_string()),
-                            content: candidate.content,
-                        })
-                        .collect::<Vec<_>>();
-                    if context.is_empty() {
-                        retrieval_fallback_reason.get_or_insert_with(|| {
-                            "semantic-memory preview returned no mapped candidates".to_string()
-                        });
-                        if !retrieval_degradation_markers
-                            .iter()
-                            .any(|marker| marker == "semantic-memory-empty-context")
-                        {
-                            retrieval_degradation_markers
-                                .push("semantic-memory-empty-context".to_string());
+                        None
+                    }
+                    Err(_) => {
+                        let error = format!(
+                            "search-timeout: semantic-memory preview timed out after {} ms",
+                            semantic_memory_search_timeout.as_millis()
+                        );
+                        emit_chat_status(
+                            &app_handle,
+                            &notebook_id,
+                            &conversation_id,
+                            &message_id,
+                            "semantic_memory_search_timeout",
+                            "semantic-memory preview timed out",
+                            None,
+                            Some(&model),
+                            None,
+                            Some("semantic-memory"),
+                            Some(&semantic_memory_runtime_config.embedding_model),
+                            search_started.elapsed(),
+                            Some(semantic_memory_search_timeout),
+                            false,
+                            Some(&error),
+                        );
+                        emit_chat_error(
+                            &app_handle,
+                            &notebook_id,
+                            &conversation_id,
+                            &message_id,
+                            &error,
+                        );
+                        record_chat_attempt_trace(
+                            &attempt_trace,
+                            &trace_data_dir,
+                            "semantic_memory_search_timeout",
+                            Some(search_started.elapsed()),
+                            Some("semantic-memory preview timed out and fallback is disabled"),
+                            Some(&error),
+                            |_| {},
+                        );
+                        return Err(GlossError::Search(error));
+                    }
+                    Ok(Ok(response)) => {
+                        if let Some(reason) = response.fallback_reason.clone() {
+                            retrieval_fallback_reason =
+                                Some(bounded_semantic_fallback_reason(&reason).to_string());
                         }
-                        if semantic_fallback_allowed {
-                            retrieval_degradation_markers
-                                .push("semantic-memory-empty-context-fallback".to_string());
-                            retrieval_backend_used = MEMORY_BACKEND_GLOSS_LOCAL.to_string();
-                            force_gloss_local_retrieval = true;
-                            emit_chat_status(
-                                &app_handle,
-                                &notebook_id,
-                                &conversation_id,
-                                &message_id,
-                                "semantic_memory_search_fallback",
-                                "Falling back to Gloss local retrieval",
-                                None,
-                                Some(&model),
-                                None,
-                                Some("gloss-local"),
-                                retrieval_fallback_reason.as_deref(),
-                                search_started.elapsed(),
-                                Some(semantic_memory_search_timeout),
-                                true,
-                                None,
-                            );
-                            record_chat_attempt_trace(
+                        for marker in response.degradation_markers.clone() {
+                            if !retrieval_degradation_markers.contains(&marker) {
+                                retrieval_degradation_markers.push(marker);
+                            }
+                        }
+                        semantic_memory_receipt =
+                            response.provenance.get("semantic_memory_receipt").cloned();
+                        retrieval_mode = MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string();
+                        retrieval_backend_used = MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string();
+                        tracing::info!(
+                            receipt_id = %response.receipt_id,
+                            candidates = response.candidates.len(),
+                            degraded = response.degraded,
+                            "semantic-memory preview retrieval completed"
+                        );
+                        let semantic_results = response
+                            .candidates
+                            .iter()
+                            .map(|candidate| RetrievalResult {
+                                chunk_id: Some(candidate.chunk_id.clone()),
+                                source_id: candidate.source_id.clone(),
+                                title: candidate.source_title.clone(),
+                                content: candidate.content.clone(),
+                                score: candidate.score,
+                                engine: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
+                            })
+                            .collect::<Vec<_>>();
+                        let semantic_candidate_count = semantic_results.len();
+                        let mut semantic_fallback_chain = Vec::new();
+                        if response
+                            .degradation_markers
+                            .iter()
+                            .any(|marker| marker == "semantic-memory-backpointer-filtered")
+                        {
+                            semantic_fallback_chain
+                                .push(RetrievalReasonCode::SemanticMemoryLinksDegraded);
+                        }
+                        if response
+                            .degradation_markers
+                            .iter()
+                            .any(|marker| marker == "source-scope-partial-invalid")
+                        {
+                            semantic_fallback_chain.push(RetrievalReasonCode::NoRetrievalContext);
+                        }
+                        if semantic_candidate_count == 0 {
+                            semantic_fallback_chain.push(RetrievalReasonCode::NoRetrievalContext);
+                        }
+                        let semantic_summary = if semantic_candidate_count == 0 {
+                            "semantic-memory returned no mapped candidates".to_string()
+                        } else {
+                            format!(
+                                "semantic-memory retrieval used {} mapped candidate(s).",
+                                semantic_candidate_count
+                            )
+                        };
+                        let semantic_outcome = RetrievalOutcome {
+                            mode: RetrievalMode::SemanticMemory,
+                            results: semantic_results,
+                            engines: vec![RetrievalEngineStatus {
+                                engine: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
+                                attempted: true,
+                                available: true,
+                                contributed: semantic_candidate_count > 0,
+                                candidate_count: semantic_candidate_count,
+                                elapsed_ms: search_started.elapsed().as_millis(),
+                                reason_code: if semantic_candidate_count == 0 {
+                                    Some(RetrievalReasonCode::NoRetrievalContext)
+                                } else {
+                                    None
+                                },
+                                detail: Some("semantic-memory backend search result".to_string()),
+                            }],
+                            coverage: RetrievalCoverage {
+                                selected_sources: resolved_scope.source_count(),
+                                semantic_links_total: scoped_link_count,
+                                semantic_links_healthy: healthy_scoped_links,
+                                semantic_links_degraded: scoped_degraded_link_count,
+                                ..Default::default()
+                            },
+                            degraded: response.degraded || semantic_candidate_count == 0,
+                            fallback_chain: semantic_fallback_chain,
+                            user_visible_summary: semantic_summary.clone(),
+                            trace_ref: response.receipt_id.clone(),
+                        };
+                        record_chat_attempt_trace(
+                            &attempt_trace,
+                            &trace_data_dir,
+                            "retrieval_outcome",
+                            Some(search_started.elapsed()),
+                            Some(&semantic_summary),
+                            None,
+                            |trace| {
+                                trace.retrieval_trace_ref = Some(response.receipt_id.clone());
+                                trace.retrieval_outcome = Some(semantic_outcome.clone());
+                            },
+                        );
+                        retrieval_outcome_for_evidence = Some(semantic_outcome);
+                        let context = response
+                            .candidates
+                            .into_iter()
+                            .map(|candidate| ContextPassage {
+                                source_id: candidate.source_id,
+                                chunk_id: Some(candidate.chunk_id),
+                                title: candidate
+                                    .source_title
+                                    .unwrap_or_else(|| "Untitled source".to_string()),
+                                content: candidate.content,
+                                evidence_class: "semantic_memory".to_string(),
+                            })
+                            .collect::<Vec<_>>();
+                        if context.is_empty() {
+                            retrieval_fallback_reason
+                                .get_or_insert_with(|| "no-candidates".to_string());
+                            if !retrieval_degradation_markers
+                                .iter()
+                                .any(|marker| marker == "semantic-memory-empty-context")
+                            {
+                                retrieval_degradation_markers
+                                    .push("semantic-memory-empty-context".to_string());
+                            }
+                            if semantic_fallback_allowed {
+                                retrieval_degradation_markers
+                                    .push("semantic-memory-empty-context-fallback".to_string());
+                                retrieval_backend_used = MEMORY_BACKEND_GLOSS_LOCAL.to_string();
+                                force_gloss_local_retrieval = true;
+                                emit_chat_status(
+                                    &app_handle,
+                                    &notebook_id,
+                                    &conversation_id,
+                                    &message_id,
+                                    "semantic_memory_search_fallback",
+                                    "Falling back to Gloss local retrieval",
+                                    None,
+                                    Some(&model),
+                                    None,
+                                    Some("gloss-local"),
+                                    retrieval_fallback_reason.as_deref(),
+                                    search_started.elapsed(),
+                                    Some(semantic_memory_search_timeout),
+                                    true,
+                                    None,
+                                );
+                                record_chat_attempt_trace(
+                                    &attempt_trace,
+                                    &trace_data_dir,
+                                    "semantic_memory_search_fallback",
+                                    Some(search_started.elapsed()),
+                                    retrieval_fallback_reason.as_deref(),
+                                    None,
+                                    |_| {},
+                                );
+                                None
+                            } else {
+                                let error = "no-candidates: semantic-memory returned no mapped candidates for the selected source scope".to_string();
+                                emit_chat_status(
+                                    &app_handle,
+                                    &notebook_id,
+                                    &conversation_id,
+                                    &message_id,
+                                    "semantic_memory_search_error",
+                                    "semantic-memory returned no mapped candidates",
+                                    None,
+                                    Some(&model),
+                                    None,
+                                    Some("semantic-memory"),
+                                    None,
+                                    search_started.elapsed(),
+                                    Some(semantic_memory_search_timeout),
+                                    false,
+                                    Some(&error),
+                                );
+                                emit_chat_error(
+                                    &app_handle,
+                                    &notebook_id,
+                                    &conversation_id,
+                                    &message_id,
+                                    &error,
+                                );
+                                record_chat_attempt_trace(
                                 &attempt_trace,
                                 &trace_data_dir,
-                                "semantic_memory_search_fallback",
+                                "semantic_memory_search_error",
                                 Some(search_started.elapsed()),
-                                retrieval_fallback_reason.as_deref(),
-                                None,
+                                Some("strict semantic-memory mode failed because no candidates were mapped"),
+                                Some(&error),
                                 |_| {},
                             );
-                            None
+                                return Err(GlossError::Search(error));
+                            }
                         } else {
                             Some(context)
                         }
-                    } else {
-                        Some(context)
                     }
-                }
-                Ok(Err(err)) if semantic_fallback_allowed => {
-                    let reason = format!("semantic-memory preview failed: {err}");
-                    emit_chat_status(
-                        &app_handle,
-                        &notebook_id,
-                        &conversation_id,
-                        &message_id,
-                        "semantic_memory_search_error",
-                        "semantic-memory preview failed",
-                        None,
-                        Some(&model),
-                        None,
-                        Some("semantic-memory"),
-                        Some(&semantic_memory_runtime_config.embedding_model),
-                        search_started.elapsed(),
-                        Some(semantic_memory_search_timeout),
-                        false,
-                        Some(&reason),
-                    );
-                    emit_chat_status(
-                        &app_handle,
-                        &notebook_id,
-                        &conversation_id,
-                        &message_id,
-                        "semantic_memory_search_fallback",
-                        "Falling back to Gloss local retrieval",
-                        None,
-                        Some(&model),
-                        None,
-                        Some("gloss-local"),
-                        Some(&reason),
-                        search_started.elapsed(),
-                        Some(semantic_memory_search_timeout),
-                        true,
-                        None,
-                    );
-                    retrieval_fallback_reason = Some(reason);
-                    force_gloss_local_retrieval = true;
-                    retrieval_degradation_markers
-                        .push("semantic-memory-preview-fallback".to_string());
-                    record_chat_attempt_trace(
-                        &attempt_trace,
-                        &trace_data_dir,
-                        "semantic_memory_search_fallback",
-                        Some(search_started.elapsed()),
-                        retrieval_fallback_reason.as_deref(),
-                        None,
-                        |_| {},
-                    );
-                    tracing::warn!(
-                        error = %err,
-                        "semantic-memory preview retrieval failed; explicit fallback enabled"
-                    );
-                    None
-                }
-                Ok(Err(err)) => {
-                    let error = err.to_string();
-                    emit_chat_status(
-                        &app_handle,
-                        &notebook_id,
-                        &conversation_id,
-                        &message_id,
-                        "semantic_memory_search_error",
-                        "semantic-memory preview failed",
-                        None,
-                        Some(&model),
-                        None,
-                        Some("semantic-memory"),
-                        Some(&semantic_memory_runtime_config.embedding_model),
-                        search_started.elapsed(),
-                        Some(semantic_memory_search_timeout),
-                        false,
-                        Some(&error),
-                    );
-                    emit_chat_error(
-                        &app_handle,
-                        &notebook_id,
-                        &conversation_id,
-                        &message_id,
-                        &error,
-                    );
-                    record_chat_attempt_trace(
-                        &attempt_trace,
-                        &trace_data_dir,
-                        "semantic_memory_search_error",
-                        Some(search_started.elapsed()),
-                        Some("semantic-memory preview failed and fallback is disabled"),
-                        Some(&error),
-                        |_| {},
-                    );
-                    return Err(err);
+                    Ok(Err(err)) if semantic_fallback_allowed => {
+                        let reason = "projection-failed".to_string();
+                        emit_chat_status(
+                            &app_handle,
+                            &notebook_id,
+                            &conversation_id,
+                            &message_id,
+                            "semantic_memory_search_error",
+                            "semantic-memory preview failed",
+                            None,
+                            Some(&model),
+                            None,
+                            Some("semantic-memory"),
+                            Some(&semantic_memory_runtime_config.embedding_model),
+                            search_started.elapsed(),
+                            Some(semantic_memory_search_timeout),
+                            false,
+                            Some(&reason),
+                        );
+                        emit_chat_status(
+                            &app_handle,
+                            &notebook_id,
+                            &conversation_id,
+                            &message_id,
+                            "semantic_memory_search_fallback",
+                            "Falling back to Gloss local retrieval",
+                            None,
+                            Some(&model),
+                            None,
+                            Some("gloss-local"),
+                            Some(&reason),
+                            search_started.elapsed(),
+                            Some(semantic_memory_search_timeout),
+                            true,
+                            None,
+                        );
+                        retrieval_fallback_reason = Some(reason);
+                        force_gloss_local_retrieval = true;
+                        retrieval_degradation_markers
+                            .push("semantic-memory-preview-fallback".to_string());
+                        record_chat_attempt_trace(
+                            &attempt_trace,
+                            &trace_data_dir,
+                            "semantic_memory_search_fallback",
+                            Some(search_started.elapsed()),
+                            retrieval_fallback_reason.as_deref(),
+                            None,
+                            |_| {},
+                        );
+                        tracing::warn!(
+                            error = %err,
+                            "semantic-memory preview retrieval failed; explicit fallback enabled"
+                        );
+                        None
+                    }
+                    Ok(Err(err)) => {
+                        let error = format!("projection-failed: {err}");
+                        emit_chat_status(
+                            &app_handle,
+                            &notebook_id,
+                            &conversation_id,
+                            &message_id,
+                            "semantic_memory_search_error",
+                            "semantic-memory preview failed",
+                            None,
+                            Some(&model),
+                            None,
+                            Some("semantic-memory"),
+                            Some(&semantic_memory_runtime_config.embedding_model),
+                            search_started.elapsed(),
+                            Some(semantic_memory_search_timeout),
+                            false,
+                            Some(&error),
+                        );
+                        emit_chat_error(
+                            &app_handle,
+                            &notebook_id,
+                            &conversation_id,
+                            &message_id,
+                            &error,
+                        );
+                        record_chat_attempt_trace(
+                            &attempt_trace,
+                            &trace_data_dir,
+                            "semantic_memory_search_error",
+                            Some(search_started.elapsed()),
+                            Some("semantic-memory preview failed and fallback is disabled"),
+                            Some(&error),
+                            |_| {},
+                        );
+                        return Err(err);
+                    }
                 }
             }
         }
         #[cfg(not(feature = "semantic-memory-backend"))]
         {
             if semantic_fallback_allowed {
-                let reason =
-                    "semantic-memory preview selected but semantic-memory-backend feature is not enabled"
-                        .to_string();
+                let reason = "semantic-memory-not-compiled".to_string();
                 emit_chat_status(
                     &app_handle,
                     &notebook_id,
@@ -1332,8 +1685,8 @@ pub async fn send_message(
                 None
             } else {
                 let error =
-                        "semantic-memory preview selected but semantic-memory-backend feature is not enabled"
-                            .to_string();
+                    "semantic-memory-not-compiled: semantic-memory-backend feature is not enabled"
+                        .to_string();
                 emit_chat_status(
                     &app_handle,
                     &notebook_id,
@@ -1375,7 +1728,6 @@ pub async fn send_message(
     };
 
     // 4. Hybrid search with multi-tier fallback
-    let mut retrieval_outcome_for_evidence: Option<RetrievalOutcome> = None;
     let source_context: Vec<ContextPassage> = if let Some(context) = semantic_preview_context {
         context
     } else if resolved_scope.is_none() {
@@ -1471,186 +1823,33 @@ pub async fn send_message(
                         .clone()
                         .unwrap_or_else(|| result.source_id.clone()),
                     content: result.content.clone(),
+                    evidence_class: local_outcome.mode.as_str().to_string(),
                 })
                 .collect()
         } else {
-            if !retrieval_degradation_markers
-                .iter()
-                .any(|marker| marker == "source_order_fallback")
-            {
-                retrieval_degradation_markers.push("source_order_fallback".to_string());
-            }
+            local_outcome.degraded = true;
+            retrieval_fallback_reason.get_or_insert_with(|| {
+                "indexed retrieval produced no proof-grade context; answer must disclose missing support"
+                    .to_string()
+            });
             tracing::info!(
                 reason = %local_outcome.user_visible_summary,
-                "Indexed retrieval unavailable, using fallback context"
+                "Indexed retrieval unavailable; continuing without proof-grade context"
             );
-
-            let local_response = state.with_notebook_db(&notebook_id, |db| {
-                let backend = GlossLocalMemoryBackend::new(notebook_id.clone(), db, &all_sources);
-                backend.search(MemorySearchRequest {
-                    notebook_id: notebook_id.clone(),
-                    source_scope: source_scope.clone(),
-                    query: query.clone(),
-                    limit: top_k,
-                    trace_id: Some(retrieval_receipt_id.clone()),
-                    allow_fallback: true,
-                })
-            })?;
-
-            if let Some(reason) = local_response.fallback_reason.clone() {
-                retrieval_fallback_reason.get_or_insert(reason);
-            }
-            for marker in &local_response.degradation_markers {
-                if !retrieval_degradation_markers.contains(marker) {
-                    retrieval_degradation_markers.push(marker.clone());
-                }
-            }
-
-            let ranked_ctx = local_response
-                .candidates
-                .into_iter()
-                .map(|candidate| ContextPassage {
-                    source_id: candidate.source_id,
-                    chunk_id: Some(candidate.chunk_id),
-                    title: candidate
-                        .source_title
-                        .unwrap_or_else(|| "Untitled source".to_string()),
-                    content: candidate.content,
-                })
-                .collect::<Vec<_>>();
-
-            if !ranked_ctx.is_empty() {
-                retrieval_mode = RetrievalMode::SourceOrderFallback.as_str().to_string();
-                local_outcome.mode = RetrievalMode::SourceOrderFallback;
-                local_outcome.results = ranked_ctx
-                    .iter()
-                    .map(|passage| crate::memory::RetrievalResult {
-                        chunk_id: passage.chunk_id.clone(),
-                        source_id: passage.source_id.clone(),
-                        title: Some(passage.title.clone()),
-                        content: passage.content.clone(),
-                        score: 0.0,
-                        engine: "source_order_fallback".to_string(),
-                    })
-                    .collect();
-                local_outcome
-                    .fallback_chain
-                    .push(RetrievalReasonCode::SourceOrderFallback);
-                local_outcome.degraded = true;
-                local_outcome.user_visible_summary =
-                    "Source-order fallback used after indexed retrieval produced no context"
-                        .to_string();
-                record_chat_attempt_trace(
-                    &attempt_trace,
-                    &trace_data_dir,
-                    "retrieval_outcome",
-                    Some(Duration::ZERO),
-                    Some(&local_outcome.user_visible_summary),
-                    None,
-                    |trace| {
-                        trace.retrieval_trace_ref = Some(local_outcome.trace_ref.clone());
-                        trace.retrieval_outcome = Some(local_outcome.clone());
-                    },
-                );
-                retrieval_outcome_for_evidence = Some(local_outcome.clone());
-                ranked_ctx
-            } else {
-                retrieval_mode = RetrievalMode::RawContentFallback.as_str().to_string();
-                retrieval_backend_used = "raw-content-text-fallback".to_string();
-                retrieval_fallback_reason.get_or_insert_with(|| {
-                    "gloss-local ranked retrieval returned no context; raw content_text fallback"
-                        .to_string()
-                });
-                if !retrieval_degradation_markers
-                    .iter()
-                    .any(|marker| marker == "raw_content_fallback")
-                {
-                    retrieval_degradation_markers.push("raw_content_fallback".to_string());
-                }
-
-                // Last resort: raw content_text for paste sources or sources without chunks.
-                tracing::info!("Fallback: using raw content_text");
-                let raw_ctx = state.with_notebook_db(&notebook_id, |db| {
-                    let mut ctx = Vec::new();
-                    let mut total_chars = 0usize;
-                    let mut seen_hashes = HashSet::new();
-                    for sid in resolved_scope.source_ids() {
-                        if total_chars >= MAX_TOTAL_CONTEXT_CHARS {
-                            break;
-                        }
-                        if let Ok(source) = db.get_source(sid) {
-                            if let Some(ref hash) = source.file_hash {
-                                if !seen_hashes.insert(hash.clone()) {
-                                    continue;
-                                }
-                            }
-                            if let Some(ref text) = source.content_text {
-                                if !text.is_empty() {
-                                    let remaining =
-                                        MAX_TOTAL_CONTEXT_CHARS.saturating_sub(total_chars);
-                                    let limit = remaining.min(MAX_SOURCE_CHARS).min(text.len());
-                                    let truncated = if limit < text.len() {
-                                        let mut safe = limit.min(text.len());
-                                        while safe > 0 && !text.is_char_boundary(safe) {
-                                            safe -= 1;
-                                        }
-                                        let slice = &text[..safe];
-                                        let end = slice.rfind(' ').unwrap_or(safe);
-                                        format!(
-                                            "{}...\n[truncated, {} chars total]",
-                                            &text[..end],
-                                            text.len()
-                                        )
-                                    } else {
-                                        text.clone()
-                                    };
-                                    total_chars += truncated.len();
-                                    ctx.push(ContextPassage {
-                                        source_id: source.id.clone(),
-                                        chunk_id: None,
-                                        title: source.title.clone(),
-                                        content: truncated,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    Ok(ctx)
-                })?;
-                local_outcome.mode = RetrievalMode::RawContentFallback;
-                local_outcome.results = raw_ctx
-                    .iter()
-                    .map(|passage| crate::memory::RetrievalResult {
-                        chunk_id: None,
-                        source_id: passage.source_id.clone(),
-                        title: Some(passage.title.clone()),
-                        content: passage.content.clone(),
-                        score: 0.0,
-                        engine: "raw_content_fallback".to_string(),
-                    })
-                    .collect();
-                local_outcome
-                    .fallback_chain
-                    .push(RetrievalReasonCode::RawContentFallback);
-                local_outcome.degraded = true;
-                local_outcome.user_visible_summary =
-                    "Raw content fallback used after indexed retrieval produced no context"
-                        .to_string();
-                record_chat_attempt_trace(
-                    &attempt_trace,
-                    &trace_data_dir,
-                    "retrieval_outcome",
-                    Some(Duration::ZERO),
-                    Some(&local_outcome.user_visible_summary),
-                    None,
-                    |trace| {
-                        trace.retrieval_trace_ref = Some(local_outcome.trace_ref.clone());
-                        trace.retrieval_outcome = Some(local_outcome.clone());
-                    },
-                );
-                retrieval_outcome_for_evidence = Some(local_outcome.clone());
-                raw_ctx
-            }
+            record_chat_attempt_trace(
+                &attempt_trace,
+                &trace_data_dir,
+                "retrieval_outcome",
+                Some(Duration::ZERO),
+                Some(&local_outcome.user_visible_summary),
+                None,
+                |trace| {
+                    trace.retrieval_trace_ref = Some(local_outcome.trace_ref.clone());
+                    trace.retrieval_outcome = Some(local_outcome.clone());
+                },
+            );
+            retrieval_outcome_for_evidence = Some(local_outcome);
+            Vec::new()
         }
     };
 
@@ -1712,7 +1911,41 @@ pub async fn send_message(
                 .or_else(|| receipt.get("fallback"))
         })
         .and_then(|value| value.as_str())
+        .map(bounded_semantic_fallback_reason)
         .map(str::to_string);
+    let source_scope_integrity = {
+        let requested_ids_valid = invalid_source_ids.is_empty();
+        let effective_ids_match_allowed_set = effective_source_ids
+            .iter()
+            .all(|source_id| resolved_scope.allows(source_id));
+        let no_out_of_scope_context = source_context
+            .iter()
+            .all(|passage| resolved_scope.allows(&passage.source_id));
+        let no_unanchored_context = source_context
+            .iter()
+            .all(|passage| passage.chunk_id.is_some());
+        let fallback_class_allowed = retrieval_fallback_reason.is_none();
+        let projection_links_preserved = !retrieval_degradation_markers.iter().any(|marker| {
+            marker.contains("semantic_memory")
+                || marker.contains("semantic-memory")
+                || marker.contains("unanchored")
+        });
+        let preserved = requested_ids_valid
+            && effective_ids_match_allowed_set
+            && no_out_of_scope_context
+            && no_unanchored_context
+            && fallback_class_allowed
+            && projection_links_preserved;
+        SourceScopeIntegrityV1 {
+            requested_ids_valid,
+            effective_ids_match_allowed_set,
+            no_out_of_scope_context,
+            no_unanchored_context,
+            fallback_class_allowed,
+            projection_links_preserved,
+            preserved,
+        }
+    };
 
     let evidence_base = ChatEvidenceDisclosure {
         backend_requested: retrieval_backend_requested,
@@ -1733,8 +1966,10 @@ pub async fn send_message(
         context_passage_count: source_context.len(),
         citation_valid_count: 0,
         citation_invalid_count: 0,
+        citation_anchors: citations::citation_anchors_for_context(&source_context),
+        citation_filter_reasons: Vec::new(),
         omitted_candidate_count: 0,
-        source_scope_preserved: true,
+        source_scope_preserved: source_scope_integrity.preserved,
         index_status: if resolved_scope.is_none() {
             "scope-none".to_string()
         } else if native_dense_possible {
@@ -1748,6 +1983,9 @@ pub async fn send_message(
             "gloss-local".to_string()
         },
         receipt_id: retrieval_receipt_id,
+        context_digest: source_context_digest(&source_context),
+        source_context_digest: source_context_digest(&source_context),
+        prompt_digest: None,
         semantic_memory_receipt_id,
         candidate_backend,
         turbo_quant_generation_id,
@@ -1968,13 +2206,17 @@ pub async fn send_message(
                 }
 
                 // Extract citations from the response
-                let extracted =
-                    citations::extract_citations_from_context(full_response, &source_context);
+                let (extracted, citation_filter_reasons) =
+                    citations::extract_citations_from_context_with_reasons(
+                        full_response,
+                        &source_context,
+                    );
                 let citation_ref_count = citations::count_unique_citation_refs(full_response);
                 let mut evidence = evidence_for_message.clone();
                 evidence.citation_valid_count = extracted.len();
                 evidence.citation_invalid_count =
                     citation_ref_count.saturating_sub(extracted.len());
+                evidence.citation_filter_reasons = citation_filter_reasons;
                 evidence.omitted_candidate_count =
                     source_context.len().saturating_sub(extracted.len());
                 let citations_payload = AssistantMessageEvidence {
@@ -2098,13 +2340,12 @@ async fn stream_chat_response(
 ) -> Result<String, GlossError> {
     use tauri::Manager;
 
-    // Build system prompt with source manifest + selected source content.
+    // Build system prompt with source manifest and authority rules only.
     let system_prompt = ContextAssembler::build_system_prompt(
         custom_goal,
         style,
         resolved_scope.kind(),
         resolved_scope.manifest_sources(),
-        source_context,
     );
 
     tracing::info!(
@@ -2142,10 +2383,10 @@ async fn stream_chat_response(
         });
     }
 
-    // User message is just the query — source context is in the system prompt
+    let user_turn = ContextAssembler::build_user_turn(query, source_context);
     chat_messages.push(ChatMessage {
         role: "user".to_string(),
-        content: query.to_string(),
+        content: user_turn,
         images: None,
     });
 
@@ -2155,6 +2396,32 @@ async fn stream_chat_response(
         &chat_messages,
         model_context_window,
         max_tokens,
+    );
+    let request_material = serde_json::json!({
+        "system": &system_prompt,
+        "messages": &chat_messages,
+        "model": model,
+        "num_ctx": num_ctx,
+        "max_tokens": max_tokens,
+    })
+    .to_string();
+    let request_digest = digest_text(&request_material);
+    let prompt_budget_receipt = PromptBudgetReceiptV1 {
+        model_context_window: num_ctx,
+        system_prompt_chars: request_material.len(),
+        message_count: history_msgs.len() + 1,
+        source_passage_count: source_context.len(),
+        prompt_digest: request_digest.clone(),
+    };
+    let prompt_budget_detail = serde_json::to_string(&prompt_budget_receipt).ok();
+    record_chat_attempt_trace(
+        attempt_trace,
+        trace_data_dir,
+        "prompt_budget_receipt",
+        Some(Duration::ZERO),
+        prompt_budget_detail.as_deref(),
+        None,
+        |_| {},
     );
 
     // Build the provider-agnostic chat request
@@ -2266,12 +2533,20 @@ async fn stream_chat_response(
                 Ok(stream) => break stream,
                 Err(err) => {
                     let error = err.to_string();
+                    let invocation = LlmInvocationReceiptV1 {
+                        provider: provider.provider_type().as_str().to_string(),
+                        model: model.to_string(),
+                        request_digest: request_digest.clone(),
+                        response_digest: None,
+                        error: Some(error.clone()),
+                    };
+                    let invocation_detail = serde_json::to_string(&invocation).ok();
                     record_chat_attempt_trace(
                         attempt_trace,
                         trace_data_dir,
-                        "provider_start_error",
+                        "llm_invocation_receipt",
                         Some(started.elapsed()),
-                        Some("Provider failed before returning a stream"),
+                        invocation_detail.as_deref(),
                         Some(&error),
                         |_| {},
                     );
@@ -2395,12 +2670,20 @@ async fn stream_chat_response(
             Ok(token) => token,
             Err(err) => {
                 let error = err.to_string();
+                let invocation = LlmInvocationReceiptV1 {
+                    provider: provider.provider_type().as_str().to_string(),
+                    model: model.to_string(),
+                    request_digest: request_digest.clone(),
+                    response_digest: None,
+                    error: Some(error.clone()),
+                };
+                let invocation_detail = serde_json::to_string(&invocation).ok();
                 record_chat_attempt_trace(
                     attempt_trace,
                     trace_data_dir,
-                    "provider_stream_error",
+                    "llm_invocation_receipt",
                     Some(started.elapsed()),
-                    Some("Provider stream yielded an error"),
+                    invocation_detail.as_deref(),
                     Some(&error),
                     |_| {},
                 );
@@ -2555,6 +2838,23 @@ async fn stream_chat_response(
         |trace| {
             trace.done_seen = true;
         },
+    );
+    let invocation = LlmInvocationReceiptV1 {
+        provider: provider.provider_type().as_str().to_string(),
+        model: model.to_string(),
+        request_digest,
+        response_digest: Some(digest_text(&full_response)),
+        error: None,
+    };
+    let invocation_detail = serde_json::to_string(&invocation).ok();
+    record_chat_attempt_trace(
+        attempt_trace,
+        trace_data_dir,
+        "llm_invocation_receipt",
+        Some(started.elapsed()),
+        invocation_detail.as_deref(),
+        None,
+        |_| {},
     );
     emit_chat_done(app_handle, notebook_id, conversation_id, message_id);
 
@@ -2833,13 +3133,29 @@ pub async fn debug_chat_provider_smoke(
 pub async fn get_last_chat_attempt_trace(
     state: State<'_, AppState>,
 ) -> Result<Option<ChatAttemptTraceV1>, GlossError> {
-    let path = state
-        .data_dir
-        .join("chat-attempt-traces")
-        .join("latest.json");
-    if !path.exists() {
+    let trace_dir = state.data_dir.join("chat-attempt-traces");
+    if !trace_dir.exists() {
         return Ok(None);
     }
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(trace_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        if newest
+            .as_ref()
+            .map(|(current, _)| modified > *current)
+            .unwrap_or(true)
+        {
+            newest = Some((modified, path));
+        }
+    }
+    let Some((_, path)) = newest else {
+        return Ok(None);
+    };
     let text = std::fs::read_to_string(path)?;
     Ok(Some(serde_json::from_str(&text)?))
 }

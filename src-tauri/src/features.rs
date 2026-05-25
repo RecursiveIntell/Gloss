@@ -21,6 +21,11 @@ pub const FEATURE_SOURCE_SCOPE_ENABLED: &str = "feature_source_scope_enabled";
 
 pub const MEMORY_BACKEND_GLOSS_LOCAL: &str = "gloss-local";
 pub const MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW: &str = "semantic-memory-preview";
+pub const SEMANTIC_MEMORY_AUTO_PROJECT: &str = "semantic_memory_auto_project";
+pub const SEMANTIC_MEMORY_STRICT_TESTING: &str = "semantic_memory_strict_testing";
+pub const SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS: &str =
+    "semantic_memory_turbo_quant_require_fresh_artifacts";
+// Settings profiles expose use_gloss_local_profile and enable_semantic_memory_profile flows.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildFeature {
@@ -367,12 +372,12 @@ fn unavailable_reason(
     if !build_feature_available(definition.build_feature) {
         return Ok(Some("Not available in this build".to_string()));
     }
-    if definition.id == FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED {
-        if !semantic_memory_preview_active(app_db)? {
-            return Ok(Some(
-                "Enable semantic-memory Preview before enabling TurboQuant Candidates".to_string(),
-            ));
-        }
+    if definition.id == FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED
+        && !semantic_memory_preview_active(app_db)?
+    {
+        return Ok(Some(
+            "Enable semantic-memory Preview before enabling TurboQuant Candidates".to_string(),
+        ));
     }
     if definition.requires_experimental && !experimental_master {
         return Ok(Some("Experimental Features is off".to_string()));

@@ -4,14 +4,14 @@ import argparse, json, shutil, subprocess, time
 from pathlib import Path
 
 PRIMARY = [
-    'src-tauri/src/commands/chat.rs',
-    'src-tauri/src/commands/sources.rs',
+    'src-tauri/src/commands/chat/mod.rs',
+    'src-tauri/src/commands/sources/mod.rs',
     'src-tauri/src/commands/settings.rs',
     'src-tauri/src/providers/mod.rs',
     'src-tauri/src/providers/ollama.rs',
     'src-tauri/src/jobs/mod.rs',
     'src-tauri/src/lib.rs',
-    'src-tauri/src/db/notebook_db.rs',
+    'src-tauri/src/db/notebook_db/mod.rs',
     'src/lib/events.ts',
     'src/lib/types.ts',
     'src/lib/tauri.ts',

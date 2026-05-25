@@ -7,9 +7,18 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "node scripts/run_frontend_contract_tests.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
-    "desktop-smoke": "python3 scripts/p33_desktop_smoke_harness.py --repo ."
+    "tauri:dev:sm": "tauri dev --features semantic-memory-backend",
+    "tauri:dev:sm-tq": "tauri dev --features semantic-memory-turbo-quant",
+    "tauri:build:sm": "tauri build --features semantic-memory-backend",
+    "tauri:build:sm-tq": "tauri build --features semantic-memory-turbo-quant",
+    "check:sm-tq-profile": "python3 scripts/check_gloss_sm_tq_fix.py .",
+    "test:tauri:sm": "cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-backend",
+    "test:tauri:sm-tq": "cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant",
+    "test:all:sm-tq": "npm run build && npm run check:sm-tq-profile && npm run test:tauri:sm && npm run test:tauri:sm-tq",
+    "desktop-smoke": "python3 scripts/gloss_desktop_smoke_harness.py --repo ."
   },
   "dependencies": {
     "react": "^19.1.0",

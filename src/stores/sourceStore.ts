@@ -3,29 +3,49 @@ import type { Source, NotebookStats, SourceScope } from '../lib/types';
 import * as api from '../lib/tauri';
 import { useChatStore } from './chatStore';
 import { useToastStore } from './toastStore';
+import { refreshNotebookList } from './notebookRefresh';
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
 const SELECTION_PERSIST_DEBOUNCE_MS = 350;
 let persistSelectedSourcesTimer: ReturnType<typeof setTimeout> | null = null;
 let persistSelectedSourcesInFlight = false;
 let persistSelectedSourcesPending: { notebookId: string; ids: string[] } | null = null;
+export type SourceListStatus = 'idle' | 'loading' | 'partial' | 'ready' | 'empty' | 'error';
+export type SourceScopeMode = 'none' | 'all' | 'explicit';
 
-async function refreshNotebookList() {
-  const { useNotebookStore } = await import('./notebookStore');
-  await useNotebookStore.getState().loadNotebooks();
-}
-
-function buildSourceScope(sources: Source[], selectedSourceIds: Set<string>): SourceScope {
-  if (sources.length === 0) {
-    return { kind: 'all' };
-  }
-  if (selectedSourceIds.size === 0) {
+function buildSourceScope(
+  sources: Source[],
+  selectedSourceIds: Set<string>,
+  sourceScopeMode: SourceScopeMode,
+  sourceListStatus: SourceListStatus,
+  stats: NotebookStats | null
+): SourceScope {
+  if (
+    sourceListStatus === 'loading' ||
+    sourceListStatus === 'partial' ||
+    sourceListStatus === 'error' ||
+    sourceListStatus === 'idle'
+  ) {
     return { kind: 'none' };
   }
-  if (selectedSourceIds.size === sources.length) {
+  if (sources.length === 0) {
+    if (sourceListStatus === 'ready' && stats?.source_count && stats.source_count > 0) {
+      return { kind: 'none' };
+    }
+    return { kind: 'none' };
+  }
+  if (sourceScopeMode === 'none') {
+    return { kind: 'none' };
+  }
+  if (sourceScopeMode === 'all') {
+    if (stats?.source_count && stats.source_count !== sources.length) {
+      return { kind: 'none' };
+    }
     return { kind: 'all' };
   }
-  return { kind: 'explicit', ids: Array.from(selectedSourceIds) };
+  const validIds = new Set(sources.map((source) => source.id));
+  const ids = Array.from(selectedSourceIds).filter((id) => validIds.has(id));
+  return ids.length > 0 ? { kind: 'explicit', ids } : { kind: 'none' };
 }
 
 function clearSuggestedQuestions() {
@@ -64,7 +84,10 @@ async function flushSelectedSources(): Promise<void> {
 interface SourceStore {
   sources: Source[];
   selectedSourceIds: Set<string>;
+  sourceScopeMode: SourceScopeMode;
   loading: boolean;
+  sourceListStatus: SourceListStatus;
+  sourceListError?: string | null;
   stats: NotebookStats | null;
   loadSources: (notebookId: string) => Promise<void>;
   addSourceFile: (notebookId: string, path: string) => Promise<void>;
@@ -81,6 +104,7 @@ interface SourceStore {
   selectAll: () => void;
   selectNone: () => void;
   getSourceScope: () => SourceScope;
+  markSourceListPartial: (expectedTotal?: number) => void;
   updateSourceStatus: (sourceId: string, status: string) => void;
   updateSourceStatusBulk: (updates: Array<{ sourceId: string; status: string; errorMessage?: string }>) => void;
   loadStats: (notebookId: string) => Promise<void>;
@@ -90,24 +114,46 @@ interface SourceStore {
 export const useSourceStore = create<SourceStore>((set, get) => ({
   sources: [],
   selectedSourceIds: new Set<string>(),
+  sourceScopeMode: 'none',
   loading: false,
+  sourceListStatus: 'idle',
+  sourceListError: null,
   stats: null,
 
   loadSources: async (notebookId) => {
-    set({ loading: true });
+    set({ loading: true, sourceListStatus: 'loading', sourceListError: null });
     try {
       const sources = await api.listSources(notebookId);
       if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
         return;
       }
       const selectedIds = new Set(sources.filter(s => s.selected).map(s => s.id));
-      set({ sources, selectedSourceIds: selectedIds, loading: false });
+      const sourceScopeMode: SourceScopeMode =
+        sources.length === 0
+          ? 'none'
+          : selectedIds.size === sources.length
+            ? 'all'
+            : selectedIds.size > 0
+              ? 'explicit'
+              : 'none';
+      set({
+        sources,
+        selectedSourceIds: selectedIds,
+        sourceScopeMode,
+        loading: false,
+        sourceListStatus: sources.length === 0 ? 'empty' : 'ready',
+        sourceListError: null,
+      });
     } catch (e) {
       if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
         return;
       }
       console.error('Failed to load sources:', e);
-      set({ loading: false });
+      set({
+        loading: false,
+        sourceListStatus: 'error',
+        sourceListError: String(e),
+      });
     }
   },
 
@@ -245,13 +291,13 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
 
   reindexNotebook: async (notebookId) => {
     try {
-      const receipts = await api.semanticMemoryReindexNotebook(notebookId);
+      const receipt = await api.semanticMemoryBackfillNotebook(notebookId);
       await get().loadSources(notebookId);
       await get().loadStats(notebookId);
       useToastStore.getState().addToast({
         type: 'success',
-        title: 'Notebook Reindexed',
-        message: `${receipts.length} sources processed for semantic-memory preview.`,
+        title: 'Projection backfill complete',
+        message: `${receipt.projected_sources} projected, ${receipt.skipped_no_chunks} skipped, ${receipt.failed_sources} failed.`,
         duration: 4000,
       });
     } catch (e) {
@@ -288,9 +334,11 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       const next = new Set(state.selectedSourceIds);
       if (next.has(sourceId)) next.delete(sourceId);
       else next.add(sourceId);
+      const sourceScopeMode: SourceScopeMode =
+        next.size === 0 ? 'none' : next.size === state.sources.length ? 'all' : 'explicit';
       persistSelectedSources(next);
       clearSuggestedQuestions();
-      return { selectedSourceIds: next };
+      return { selectedSourceIds: next, sourceScopeMode };
     });
   },
 
@@ -306,9 +354,11 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         if (allSelected) next.delete(s.id);
         else next.add(s.id);
       }
+      const sourceScopeMode: SourceScopeMode =
+        next.size === 0 ? 'none' : next.size === state.sources.length ? 'all' : 'explicit';
       persistSelectedSources(next);
       clearSuggestedQuestions();
-      return { selectedSourceIds: next };
+      return { selectedSourceIds: next, sourceScopeMode };
     });
   },
 
@@ -317,7 +367,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       const next = new Set(state.sources.map(s => s.id));
       persistSelectedSources(next);
       clearSuggestedQuestions();
-      return { selectedSourceIds: next };
+      return { selectedSourceIds: next, sourceScopeMode: next.size > 0 ? 'all' : 'none' };
     });
   },
 
@@ -325,12 +375,22 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
     const next = new Set<string>();
     persistSelectedSources(next);
     clearSuggestedQuestions();
-    set({ selectedSourceIds: next });
+    set({ selectedSourceIds: next, sourceScopeMode: 'none' });
   },
 
   getSourceScope: () => {
-    const { sources, selectedSourceIds } = get();
-    return buildSourceScope(sources, selectedSourceIds);
+    const { sources, selectedSourceIds, sourceScopeMode, sourceListStatus, stats } = get();
+    return buildSourceScope(sources, selectedSourceIds, sourceScopeMode, sourceListStatus, stats);
+  },
+
+  markSourceListPartial: (expectedTotal) => {
+    set((state) => ({
+      sourceListStatus: 'partial',
+      sourceListError: null,
+      stats: state.stats
+        ? { ...state.stats, source_count: Math.max(state.stats.source_count, expectedTotal ?? 0) }
+        : state.stats,
+    }));
   },
 
   updateSourceStatus: (sourceId, status) => {
@@ -359,7 +419,20 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
         return;
       }
-      set({ stats });
+      set((state) => ({
+        stats,
+        sourceListStatus:
+          state.sources.length > 0 && stats.source_count > state.sources.length
+            ? 'partial'
+            :
+          state.sourceListStatus === 'empty' && stats.source_count > 0
+            ? 'error'
+            : state.sourceListStatus,
+        sourceListError:
+          state.sourceListStatus === 'empty' && stats.source_count > 0
+            ? 'Source list returned empty while notebook stats report sources.'
+            : state.sourceListError,
+      }));
     } catch {
       // Stats are optional — don't crash on failure
     }
@@ -369,8 +442,11 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
     set({
       sources: [],
       selectedSourceIds: new Set<string>(),
+      sourceScopeMode: 'none',
       stats: null,
       loading: false,
+      sourceListStatus: 'idle',
+      sourceListError: null,
     });
   },
 }));

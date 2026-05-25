@@ -118,7 +118,7 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
             } else {
                 match self.nb_db.fts_search_chunks_in_sources(
                     &fts_query,
-                    resolved_scope.source_ids(),
+                    &resolved_scope,
                     request.limit,
                 ) {
                     Ok(results) => {
@@ -184,6 +184,11 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let degraded = !degradation_markers.is_empty();
+        let source_scope_preserved = invalid_source_ids.is_empty()
+            && !fallback_used
+            && candidates
+                .iter()
+                .all(|candidate| resolved_scope.allows(&candidate.source_id));
 
         Ok(MemorySearchResponse {
             backend_id: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
@@ -204,11 +209,11 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
                 "fallback_used": fallback_used,
                 "fallback_reason": fallback_reason.clone(),
                 "degradation_markers": degradation_markers.clone(),
-                "source_scope_preserved": true
+                "source_scope_preserved": source_scope_preserved
             }),
             fallback_reason,
             degradation_markers,
-            source_scope_preserved: true,
+            source_scope_preserved,
             fallback_used,
             degraded,
         })

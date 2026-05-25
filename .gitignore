@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 dist-ssr/
+target/
 src-tauri/target/
 
 # Logs
@@ -69,6 +70,8 @@ install_into_repo.sh
 docs/design/
 
 # Generated source packages and bundle sidecars
+docs/source-packages/
+docs/noncanonical-source-archive/20260524-p01-quarantine/
 /*.zip
 /*.codex-archive.json
 /*.excluded.json

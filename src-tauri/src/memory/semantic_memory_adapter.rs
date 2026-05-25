@@ -1,4 +1,4 @@
-use crate::db::notebook_db::{Chunk, NotebookDb, Source};
+use crate::db::notebook_db::{Chunk, NotebookDb, SemanticMemoryProjectionStatusUpdate, Source};
 use crate::error::GlossError;
 use crate::memory::backend::{
     excluded_source_count, filter_semantic_candidates_by_scope, invalid_requested_source_ids,
@@ -22,6 +22,32 @@ const BACKEND_VERSION: &str = "semantic-memory 0.5.0";
 const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL: &str = "http://localhost:11434";
 const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL: &str = "nomic-embed-text";
 const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS: u64 = 10;
+const SEMANTIC_MEMORY_PROJECTION_MAX_CHUNKS_PER_BATCH: usize = 12;
+const SEMANTIC_MEMORY_PROJECTION_MAX_CHARS_PER_BATCH: usize = 24_000;
+const SEMANTIC_MEMORY_PROJECTION_MAX_TOKENS_PER_BATCH: usize = 6_000;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProjectionFailureRecordV1 {
+    pub source_id: String,
+    pub chunk_id: String,
+    pub reason_code: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReindexSourceOptions {
+    pub rebuild_vector_artifacts: bool,
+    pub classify_zero_chunks_as_skip: bool,
+}
+
+impl Default for ReindexSourceOptions {
+    fn default() -> Self {
+        Self {
+            rebuild_vector_artifacts: true,
+            classify_zero_chunks_as_skip: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SemanticMemoryRuntimeConfig {
@@ -29,6 +55,7 @@ pub struct SemanticMemoryRuntimeConfig {
     pub embedding_model: String,
     pub embedding_timeout_secs: u64,
     pub turbo_quant_enabled: bool,
+    pub turbo_quant_require_fresh_artifacts: bool,
 }
 
 impl Default for SemanticMemoryRuntimeConfig {
@@ -38,6 +65,7 @@ impl Default for SemanticMemoryRuntimeConfig {
             embedding_model: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL.to_string(),
             embedding_timeout_secs: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS,
             turbo_quant_enabled: false,
+            turbo_quant_require_fresh_artifacts: true,
         }
     }
 }
@@ -47,6 +75,7 @@ pub fn runtime_config_from_settings(
     embedding_model: Option<String>,
     embedding_timeout_secs: Option<String>,
     turbo_quant_enabled: bool,
+    turbo_quant_require_fresh_artifacts: bool,
 ) -> SemanticMemoryRuntimeConfig {
     let defaults = SemanticMemoryRuntimeConfig::default();
     SemanticMemoryRuntimeConfig {
@@ -61,7 +90,26 @@ pub fn runtime_config_from_settings(
             .filter(|value| *value > 0)
             .unwrap_or(defaults.embedding_timeout_secs),
         turbo_quant_enabled,
+        turbo_quant_require_fresh_artifacts,
     }
+}
+
+pub fn validate_embedding_model_role(
+    config: &SemanticMemoryRuntimeConfig,
+) -> Result<(), GlossError> {
+    let model = config.embedding_model.trim().to_ascii_lowercase();
+    let looks_embedding_capable = model.contains("embed")
+        || model.contains("nomic")
+        || model.contains("bge")
+        || model.contains("e5")
+        || model.contains("gte");
+    if looks_embedding_capable {
+        return Ok(());
+    }
+    Err(GlossError::Search(format!(
+        "semantic-memory projection rejects chat-only model as embedder: {}",
+        config.embedding_model
+    )))
 }
 
 pub fn semantic_memory_base_dir(data_dir: &Path, notebook_id: &str) -> PathBuf {
@@ -132,6 +180,18 @@ async fn rebuild_vector_artifacts_receipt(
     Ok(None)
 }
 
+pub async fn rebuild_vector_artifacts(
+    data_dir: &Path,
+    notebook_id: &str,
+    runtime_config: Option<SemanticMemoryRuntimeConfig>,
+) -> Result<Option<serde_json::Value>, GlossError> {
+    let store = open_store(
+        semantic_memory_base_dir(data_dir, notebook_id),
+        runtime_config.as_ref(),
+    )?;
+    rebuild_vector_artifacts_receipt(&store, runtime_config.as_ref()).await
+}
+
 fn upsert_failed_link_rows(
     nb_db: &NotebookDb,
     notebook_id: &str,
@@ -193,6 +253,34 @@ fn mark_source_links_status(
         rusqlite::params![status, error, now, notebook_id, source_id],
     )?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_projection_status(
+    nb_db: &NotebookDb,
+    notebook_id: &str,
+    source_id: &str,
+    status: &str,
+    chunk_count: usize,
+    projected_chunk_count: usize,
+    healthy_link_count: usize,
+    degraded_link_count: usize,
+    receipt_id: Option<String>,
+    error: Option<String>,
+) -> Result<(), GlossError> {
+    nb_db.upsert_semantic_memory_projection_status(&SemanticMemoryProjectionStatusUpdate {
+        notebook_id: notebook_id.to_string(),
+        source_id: source_id.to_string(),
+        status: status.to_string(),
+        chunk_count,
+        projected_chunk_count,
+        healthy_link_count,
+        degraded_link_count,
+        last_receipt_id: receipt_id,
+        last_error: error,
+        artifact_generation_id: None,
+        vector_artifact_manifest_digest: None,
+    })
 }
 
 fn upsert_synced_link_rows(
@@ -282,6 +370,64 @@ fn chunk_manifest_entries(chunks: &[Chunk]) -> Vec<ChunkManifestEntry> {
         .collect()
 }
 
+fn chunk_token_budget(chunk: &Chunk) -> usize {
+    chunk
+        .token_count
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or_else(|| chunk.content.len().saturating_div(4).max(1))
+}
+
+fn projection_batches(chunks: &[Chunk]) -> Vec<Vec<Chunk>> {
+    let mut batches: Vec<Vec<Chunk>> = Vec::new();
+    let mut current: Vec<Chunk> = Vec::new();
+    let mut current_chars = 0usize;
+    let mut current_tokens = 0usize;
+    for chunk in chunks {
+        let chunk_chars = chunk.content.len();
+        let chunk_tokens = chunk_token_budget(chunk);
+        let would_exceed = !current.is_empty()
+            && (current.len() >= SEMANTIC_MEMORY_PROJECTION_MAX_CHUNKS_PER_BATCH
+                || current_chars.saturating_add(chunk_chars)
+                    > SEMANTIC_MEMORY_PROJECTION_MAX_CHARS_PER_BATCH
+                || current_tokens.saturating_add(chunk_tokens)
+                    > SEMANTIC_MEMORY_PROJECTION_MAX_TOKENS_PER_BATCH);
+        if would_exceed {
+            batches.push(std::mem::take(&mut current));
+            current_chars = 0;
+            current_tokens = 0;
+        }
+        current_chars = current_chars.saturating_add(chunk_chars);
+        current_tokens = current_tokens.saturating_add(chunk_tokens);
+        current.push(chunk.clone());
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn is_context_length_error(error: &GlossError) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("context length")
+        || text.contains("context_length")
+        || text.contains("input length")
+        || text.contains("too many tokens")
+}
+
+fn projection_failure_record(
+    source_id: &str,
+    chunk: &Chunk,
+    reason_code: &str,
+    error: &GlossError,
+) -> ProjectionFailureRecordV1 {
+    ProjectionFailureRecordV1 {
+        source_id: source_id.to_string(),
+        chunk_id: chunk.id.clone(),
+        reason_code: reason_code.to_string(),
+        error: error.to_string(),
+    }
+}
+
 pub async fn reindex_source(
     data_dir: &Path,
     notebook_id: &str,
@@ -290,6 +436,28 @@ pub async fn reindex_source(
     trace_id: Option<String>,
     runtime_config: Option<SemanticMemoryRuntimeConfig>,
 ) -> Result<IndexSourceReceipt, GlossError> {
+    reindex_source_with_options(
+        data_dir,
+        notebook_id,
+        notebook_db_path,
+        source_id,
+        trace_id,
+        runtime_config,
+        ReindexSourceOptions::default(),
+    )
+    .await
+}
+
+pub async fn reindex_source_with_options(
+    data_dir: &Path,
+    notebook_id: &str,
+    notebook_db_path: &Path,
+    source_id: &str,
+    trace_id: Option<String>,
+    runtime_config: Option<SemanticMemoryRuntimeConfig>,
+    options: ReindexSourceOptions,
+) -> Result<IndexSourceReceipt, GlossError> {
+    let receipt_id = trace_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let (source, chunks) = {
         let nb_db = NotebookDb::connect(notebook_db_path)?;
         (
@@ -299,30 +467,54 @@ pub async fn reindex_source(
     };
     if chunks.is_empty() {
         let nb_db = NotebookDb::connect(notebook_db_path)?;
-        mark_source_links_status(
+        let status = if options.classify_zero_chunks_as_skip {
+            "skipped_no_chunks"
+        } else {
+            "failed"
+        };
+        let error = if options.classify_zero_chunks_as_skip {
+            None
+        } else {
+            Some("source has no Gloss chunks to project into semantic-memory")
+        };
+        upsert_projection_status(
             &nb_db,
             notebook_id,
             source_id,
-            "failed",
-            Some("source has no Gloss chunks to project into semantic-memory"),
-        )?;
-        upsert_failed_link_rows(
-            &nb_db,
-            notebook_id,
-            source_id,
-            &chunks,
-            "source has no Gloss chunks to project into semantic-memory",
+            status,
+            0,
+            0,
+            0,
+            0,
+            Some(receipt_id.clone()),
+            error.map(str::to_string),
         )?;
         return Ok(IndexSourceReceipt {
             backend_id: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
             notebook_id: notebook_id.to_string(),
             source_id: source_id.to_string(),
-            receipt_id: trace_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            receipt_id,
             indexed_chunks: 0,
-            sync_status: "failed".to_string(),
-            error: Some("source has no Gloss chunks to project into semantic-memory".to_string()),
+            sync_status: status.to_string(),
+            error: error.map(str::to_string),
             vector_artifact_receipt: None,
         });
+    }
+
+    {
+        let nb_db = NotebookDb::connect(notebook_db_path)?;
+        upsert_projection_status(
+            &nb_db,
+            notebook_id,
+            source_id,
+            "projecting",
+            chunks.len(),
+            0,
+            0,
+            0,
+            Some(receipt_id.clone()),
+            None,
+        )?;
     }
 
     let store = open_store(
@@ -338,32 +530,8 @@ pub async fn reindex_source(
         "scope_repo_id": source_id
     });
 
-    let manifest_receipt = ingest_document_chunk_manifest(
-        &store,
-        ChunkManifestIngestOptions {
-            title: source.title.clone(),
-            namespace: notebook_id.to_string(),
-            source_path: source.file_path.clone(),
-            metadata: Some(metadata),
-        },
-        chunk_manifest_entries(&chunks),
-    )
-    .await?;
-
-    let mappings = manifest_receipt
-        .chunks
-        .iter()
-        .map(|mapping| {
-            (
-                mapping.external_chunk_id.clone(),
-                (
-                    mapping.sm_chunk_id.clone(),
-                    mapping.content_digest.clone().unwrap_or_default(),
-                ),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-
+    let mut projected_chunks = 0usize;
+    let mut failure_records: Vec<ProjectionFailureRecordV1> = Vec::new();
     {
         let nb_db = NotebookDb::connect(notebook_db_path)?;
         mark_source_links_status(
@@ -373,26 +541,195 @@ pub async fn reindex_source(
             "stale",
             Some("source reindexed; superseded by newer semantic-memory manifest"),
         )?;
-        upsert_synced_link_rows(
+    }
+
+    for batch in projection_batches(&chunks) {
+        let batch_options = ChunkManifestIngestOptions {
+            title: source.title.clone(),
+            namespace: notebook_id.to_string(),
+            source_path: source.file_path.clone(),
+            metadata: Some(metadata.clone()),
+        };
+        let batch_receipt =
+            ingest_document_chunk_manifest(&store, batch_options, chunk_manifest_entries(&batch))
+                .await;
+        let manifest_receipt = match batch_receipt {
+            Ok(receipt) => receipt,
+            Err(error) if is_context_length_error(&error) && batch.len() > 1 => {
+                for chunk in batch {
+                    let single_options = ChunkManifestIngestOptions {
+                        title: source.title.clone(),
+                        namespace: notebook_id.to_string(),
+                        source_path: source.file_path.clone(),
+                        metadata: Some(metadata.clone()),
+                    };
+                    match ingest_document_chunk_manifest(
+                        &store,
+                        single_options,
+                        chunk_manifest_entries(std::slice::from_ref(&chunk)),
+                    )
+                    .await
+                    {
+                        Ok(receipt) => {
+                            let mappings = receipt
+                                .chunks
+                                .iter()
+                                .map(|mapping| {
+                                    (
+                                        mapping.external_chunk_id.clone(),
+                                        (
+                                            mapping.sm_chunk_id.clone(),
+                                            mapping.content_digest.clone().unwrap_or_default(),
+                                        ),
+                                    )
+                                })
+                                .collect::<HashMap<_, _>>();
+                            let nb_db = NotebookDb::connect(notebook_db_path)?;
+                            upsert_synced_link_rows(
+                                &nb_db,
+                                notebook_id,
+                                source_id,
+                                &receipt.sm_document_id,
+                                std::slice::from_ref(&chunk),
+                                &mappings,
+                            )?;
+                            projected_chunks += 1;
+                        }
+                        Err(single_error) => {
+                            let reason_code = if is_context_length_error(&single_error) {
+                                "context_length"
+                            } else {
+                                "single_chunk_projection_failed"
+                            };
+                            failure_records.push(projection_failure_record(
+                                source_id,
+                                &chunk,
+                                reason_code,
+                                &single_error,
+                            ));
+                            let nb_db = NotebookDb::connect(notebook_db_path)?;
+                            upsert_failed_link_rows(
+                                &nb_db,
+                                notebook_id,
+                                source_id,
+                                std::slice::from_ref(&chunk),
+                                &single_error.to_string(),
+                            )?;
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(error) => {
+                let reason_code = if is_context_length_error(&error) {
+                    "context_length"
+                } else {
+                    "batch_projection_failed"
+                };
+                for chunk in &batch {
+                    failure_records.push(projection_failure_record(
+                        source_id,
+                        chunk,
+                        reason_code,
+                        &error,
+                    ));
+                }
+                let nb_db = NotebookDb::connect(notebook_db_path)?;
+                upsert_failed_link_rows(
+                    &nb_db,
+                    notebook_id,
+                    source_id,
+                    &batch,
+                    &error.to_string(),
+                )?;
+                continue;
+            }
+        };
+
+        let mappings = manifest_receipt
+            .chunks
+            .iter()
+            .map(|mapping| {
+                (
+                    mapping.external_chunk_id.clone(),
+                    (
+                        mapping.sm_chunk_id.clone(),
+                        mapping.content_digest.clone().unwrap_or_default(),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        {
+            let nb_db = NotebookDb::connect(notebook_db_path)?;
+            upsert_synced_link_rows(
+                &nb_db,
+                notebook_id,
+                source_id,
+                &manifest_receipt.sm_document_id,
+                &batch,
+                &mappings,
+            )?;
+        }
+        projected_chunks += batch.len();
+    }
+
+    {
+        let nb_db = NotebookDb::connect(notebook_db_path)?;
+        let status = if failure_records.is_empty() {
+            "synced"
+        } else if projected_chunks > 0 {
+            "partial"
+        } else {
+            "failed"
+        };
+        let error = if failure_records.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&failure_records)
+                    .unwrap_or_else(|_| "projection failures".to_string()),
+            )
+        };
+        upsert_projection_status(
             &nb_db,
             notebook_id,
             source_id,
-            &manifest_receipt.sm_document_id,
-            &chunks,
-            &mappings,
+            status,
+            chunks.len(),
+            projected_chunks,
+            projected_chunks,
+            chunks.len().saturating_sub(projected_chunks),
+            Some(receipt_id.clone()),
+            error.clone(),
         )?;
     }
-    let vector_artifact_receipt =
-        rebuild_vector_artifacts_receipt(&store, runtime_config.as_ref()).await?;
+    let vector_artifact_receipt = if options.rebuild_vector_artifacts {
+        rebuild_vector_artifacts_receipt(&store, runtime_config.as_ref()).await?
+    } else {
+        None
+    };
 
     Ok(IndexSourceReceipt {
         backend_id: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
         notebook_id: notebook_id.to_string(),
         source_id: source_id.to_string(),
-        receipt_id: trace_id.unwrap_or(manifest_receipt.receipt_id),
-        indexed_chunks: chunks.len(),
-        sync_status: "synced".to_string(),
-        error: None,
+        receipt_id,
+        indexed_chunks: projected_chunks,
+        sync_status: if failure_records.is_empty() {
+            "synced".to_string()
+        } else if projected_chunks > 0 {
+            "partial".to_string()
+        } else {
+            "failed".to_string()
+        },
+        error: if failure_records.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&failure_records)
+                    .unwrap_or_else(|_| "projection failures".to_string()),
+            )
+        },
         vector_artifact_receipt,
     })
 }
@@ -450,6 +787,7 @@ pub async fn search_preview(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     if resolved_scope.is_none() {
+        let source_scope_preserved = invalid_source_ids.is_empty();
         return Ok(MemorySearchResponse {
             backend_id: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
             backend_requested: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
@@ -469,7 +807,7 @@ pub async fn search_preview(
             }),
             fallback_reason: None,
             degradation_markers: Vec::new(),
-            source_scope_preserved: true,
+            source_scope_preserved,
             fallback_used: false,
             degraded: false,
         });
@@ -496,6 +834,28 @@ pub async fn search_preview(
         )
         .await
         .map_err(|e| GlossError::Search(format!("semantic-memory search failed: {e}")))?;
+
+    if runtime_config.as_ref().is_some_and(|config| {
+        config.turbo_quant_enabled && config.turbo_quant_require_fresh_artifacts
+    }) {
+        let receipt = response.receipt.as_ref().ok_or_else(|| {
+            GlossError::Search(
+                "turbo-artifacts-stale: semantic-memory returned no TurboQuant receipt".to_string(),
+            )
+        })?;
+        let turbo_candidate_used = receipt.candidate_backend.contains("turbo_quant");
+        let exact_rerank_safe = receipt.exact_rerank && receipt.exact_rerank_count.unwrap_or(0) > 0;
+        let artifacts_fresh = receipt.artifact_generation_id.is_some()
+            && receipt.vector_artifact_manifest_digest.is_some()
+            && receipt.vector_artifact_missing_count.unwrap_or(0) == 0
+            && receipt.vector_artifact_stale_count.unwrap_or(0) == 0;
+        if !(turbo_candidate_used && exact_rerank_safe && artifacts_fresh) {
+            return Err(GlossError::Search(
+                "turbo-artifacts-stale: TurboQuant was requested but fresh candidate artifacts and exact rerank evidence were not present"
+                    .to_string(),
+            ));
+        }
+    }
 
     let semantic_candidates = response
         .results
@@ -541,6 +901,13 @@ pub async fn search_preview(
         candidate.degradation = degradation_markers.clone();
     }
 
+    let source_scope_preserved = invalid_source_ids.is_empty()
+        && source_scope_violations.is_empty()
+        && unmapped_semantic_candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|candidate| resolved_scope.allows(&candidate.source_id));
+
     Ok(MemorySearchResponse {
         backend_id: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
         backend_requested: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
@@ -564,11 +931,11 @@ pub async fn search_preview(
             "fallback_used": false,
             "degraded": degraded,
             "backend_version_or_digest": BACKEND_VERSION,
-            "source_scope_preserved": true
+            "source_scope_preserved": source_scope_preserved
         }),
         fallback_reason: None,
         degradation_markers,
-        source_scope_preserved: true,
+        source_scope_preserved,
         fallback_used: false,
         degraded,
     })
@@ -577,10 +944,33 @@ pub async fn search_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn test_source(id: &str) -> Source {
+        Source {
+            id: id.to_string(),
+            source_type: "text".to_string(),
+            title: "Empty Source".to_string(),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: Some(String::new()),
+            word_count: Some(0),
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: "ready".to_string(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
 
     #[test]
     fn runtime_config_defaults_turbo_quant_off() {
-        let config = runtime_config_from_settings(None, None, None, false);
+        let config = runtime_config_from_settings(None, None, None, false, true);
         assert_eq!(
             config.embedding_ollama_url,
             DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL
@@ -603,10 +993,48 @@ mod tests {
             Some("embed-model".to_string()),
             Some("12".to_string()),
             true,
+            true,
         );
         assert_eq!(config.embedding_ollama_url, "http://localhost:11435");
         assert_eq!(config.embedding_model, "embed-model");
         assert_eq!(config.embedding_timeout_secs, 12);
         assert!(config.turbo_quant_enabled);
+        assert!(config.turbo_quant_require_fresh_artifacts);
+    }
+
+    #[tokio::test]
+    async fn zero_chunk_source_projection_is_skipped_not_failed() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("notebook.db");
+        let db = NotebookDb::open(&db_path).unwrap();
+        db.insert_source(&test_source("source-empty")).unwrap();
+        drop(db);
+
+        let receipt = reindex_source_with_options(
+            dir.path(),
+            "notebook-1",
+            &db_path,
+            "source-empty",
+            Some("receipt-zero-chunk".to_string()),
+            None,
+            ReindexSourceOptions {
+                rebuild_vector_artifacts: false,
+                classify_zero_chunks_as_skip: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(receipt.sync_status, "skipped_no_chunks");
+        assert_eq!(receipt.indexed_chunks, 0);
+        assert!(receipt.error.is_none());
+
+        let db = NotebookDb::connect(&db_path).unwrap();
+        let status = db
+            .get_semantic_memory_projection_status("notebook-1", "source-empty")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.status, "skipped_no_chunks");
+        assert_eq!(db.get_source("source-empty").unwrap().status, "ready");
     }
 }

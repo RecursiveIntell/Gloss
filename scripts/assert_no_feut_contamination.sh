@@ -5,7 +5,7 @@ ROOT="${1:-.}"
 cd "$ROOT"
 
 scan_paths=()
-for path in crates policies schemas/generated; do
+for path in src-tauri/src src policies schemas/generated; do
   if [[ -e "$path" ]]; then
     scan_paths+=("$path")
   fi

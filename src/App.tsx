@@ -9,10 +9,7 @@ import { useChatStore } from "./stores/chatStore";
 import { useToastStore } from "./stores/toastStore";
 import { onChatToken, onChatStatus, onChatError, onChatEvidence, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
 import { useSourceStore } from "./stores/sourceStore";
-import { setActiveNotebook } from "./lib/tauri";
 import { BookOpen, Database, Search, Sparkles } from "lucide-react";
-
-const EAGER_BATCH_SOURCE_LOAD_LIMIT = 200;
 
 export function App() {
   const { notebooks, activeNotebookId, loadNotebooks } = useNotebookStore();
@@ -40,8 +37,7 @@ export function App() {
       if (nbId) {
         const exists = useNotebookStore.getState().notebooks.some(n => n.id === nbId);
         if (exists) {
-          // Re-notify backend (frontend already has it from localStorage)
-          setActiveNotebook(nbId);
+          void useNotebookStore.getState().setActive(nbId);
         } else {
           // Stale ID — notebook was deleted
           useNotebookStore.getState().setActive(null);
@@ -205,13 +201,12 @@ export function App() {
       const nbId = useNotebookStore.getState().activeNotebookId;
       if (payload.notebook_id === nbId) {
         if (batchCreatedDebounceRef.current) clearTimeout(batchCreatedDebounceRef.current);
+        useSourceStore.getState().markSourceListPartial(payload.count);
         batchCreatedDebounceRef.current = setTimeout(() => {
           batchCreatedDebounceRef.current = null;
           void useNotebookStore.getState().loadNotebooks();
           useSourceStore.getState().loadStats(nbId);
-          if (payload.count <= EAGER_BATCH_SOURCE_LOAD_LIMIT) {
-            useSourceStore.getState().loadSources(nbId);
-          }
+          useSourceStore.getState().loadSources(nbId);
         }, 500);
       }
     });
@@ -258,10 +253,21 @@ export function App() {
         useSourceStore.getState().loadSources(nbId);
         useSourceStore.getState().loadStats(nbId);
         useChatStore.getState().clearSuggestedQuestions();
+        const ready = payload.ingested_ready ?? payload.count;
+        const failed = payload.failed ?? 0;
+        const cancelled = payload.cancelled_superseded ?? 0;
+        const skipped = (payload.skipped_duplicate ?? 0) + (payload.skipped_unsupported ?? 0);
+        const status = payload.status ?? 'completed';
+        const toastType = status === 'completed' && failed === 0 && cancelled === 0 ? 'success' : 'warning';
+        const suffix = [
+          failed ? `${failed} failed` : null,
+          skipped ? `${skipped} skipped` : null,
+          cancelled ? `${cancelled} cancelled` : null,
+        ].filter(Boolean).join(', ');
         useToastStore.getState().addToast({
-          type: 'success',
-          title: 'Folder Import Complete',
-          message: `${payload.count} sources ingested`,
+          type: toastType,
+          title: status === 'cancelled_superseded' ? 'Folder Import Cancelled' : 'Folder Import Complete',
+          message: suffix ? `${ready} sources ready; ${suffix}` : `${ready} sources ready`,
           duration: 5000,
         });
       }

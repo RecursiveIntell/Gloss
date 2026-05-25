@@ -11,7 +11,10 @@ name = "gloss_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = []
+# Compile semantic-memory into the normal desktop binary so users can enable
+# the preview from Settings without needing a special build. Runtime settings
+# still keep Gloss local as the default and preview features off.
+default = ["semantic-memory-backend"]
 semantic-memory-backend = ["dep:semantic-memory"]
 semantic-memory-turbo-quant = [
     "semantic-memory-backend",

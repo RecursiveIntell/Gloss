@@ -4,7 +4,7 @@ import { useNotebookStore } from "../../stores/notebookStore";
 import { useToastStore } from "../../stores/toastStore";
 import { onEmbeddingModelStatus } from "../../lib/events";
 import * as api from "../../lib/tauri";
-import type { MemoryBackendStatus, QueueStatus } from "../../lib/types";
+import type { MemoryBackendStatus, QueueStatus, SemanticMemoryProfileStatus } from "../../lib/types";
 import {
   Wifi,
   WifiOff,
@@ -28,6 +28,7 @@ export function StatusBar() {
   const [embeddingStatus, setEmbeddingStatus] = useState<string | null>(null);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<MemoryBackendStatus | null>(null);
+  const [profileStatus, setProfileStatus] = useState<SemanticMemoryProfileStatus | null>(null);
   const [generating, setGenerating] = useState(false);
   const [healthOpen, setHealthOpen] = useState(false);
   const testProvider = useSettingsStore((s) => s.testProvider);
@@ -96,6 +97,12 @@ export function StatusBar() {
       api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => {});
       if (activeNotebookId) {
         useSourceStore.getState().loadStats(activeNotebookId);
+        api
+          .getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" })
+          .then(setProfileStatus)
+          .catch(() => setProfileStatus(null));
+      } else {
+        setProfileStatus(null);
       }
     };
     poll();
@@ -230,8 +237,27 @@ export function StatusBar() {
               <HealthLine label="Default backend" value={memoryStatus?.default_backend ?? "gloss-local"} />
               <HealthLine label="Fallback" value={memoryStatus?.fallback_reason ?? "none"} />
               <HealthLine label="Index state" value={memoryStatus?.index_sync_status ?? "unknown"} />
+              <HealthLine label="Sources" value={`${stats?.source_count ?? 0}`} />
               <HealthLine label="Preview feature" value={memoryStatus?.semantic_memory_feature_enabled ? "enabled" : "disabled"} />
               <HealthLine label="Preview availability" value={memoryStatus?.semantic_memory_available ? "available" : "not active"} />
+              <HealthLine label="Compiled semantic" value={profileStatus?.compiled_semantic_memory ? "yes" : "no"} />
+              <HealthLine label="Compiled TQ" value={profileStatus?.compiled_turbo_quant ? "yes" : "no"} />
+              <HealthLine
+                label="Projection"
+                value={
+                  profileStatus?.projection_summary
+                    ? `${profileStatus.projection_summary.projected_chunks}/${profileStatus.projection_summary.total_chunks} chunks`
+                    : "unknown"
+                }
+              />
+              <HealthLine
+                label="TQ proof"
+                value={
+                  profileStatus?.turbo_quant_status?.exact_rerank
+                    ? `exact ${profileStatus.turbo_quant_status.exact_rerank_count}`
+                    : "not proven"
+                }
+              />
               {memoryStatus?.degradation_markers.length ? (
                 <HealthLine label="Degraded" value={memoryStatus.degradation_markers.join(", ")} />
               ) : (

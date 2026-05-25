@@ -52,6 +52,7 @@ pub async fn summarize_source(
 }
 
 /// Generate suggested questions from source summaries.
+#[allow(dead_code)]
 pub async fn generate_suggested_questions(
     summaries: &[(String, String, Option<String>)], // (source_id, title, summary)
     provider: &dyn LlmProvider,

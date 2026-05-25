@@ -45,13 +45,13 @@ def _(repo: Path):
 
 @check("chat_attempt_trace_exists")
 def _(repo: Path):
-    hay = "\n".join(read(repo, rel) for rel in ["src-tauri/src/commands/chat.rs", "src-tauri/src/lib.rs", "src/lib/tauri.ts"])
+    hay = "\n".join(read(repo, rel) for rel in ["src-tauri/src/commands/chat/mod.rs", "src-tauri/src/lib.rs", "src/lib/tauri.ts"])
     ok = "ChatAttemptTrace" in hay and "get_last_chat_attempt_trace" in hay
     return ok, "ChatAttemptTraceV1 command present" if ok else "missing ChatAttemptTraceV1/get_last_chat_attempt_trace"
 
 @check("provider_only_smoke_exists")
 def _(repo: Path):
-    hay = "\n".join(read(repo, rel) for rel in ["src-tauri/src/commands/chat.rs", "src-tauri/src/commands/settings.rs", "src-tauri/src/lib.rs", "src/lib/tauri.ts"])
+    hay = "\n".join(read(repo, rel) for rel in ["src-tauri/src/commands/chat/mod.rs", "src-tauri/src/commands/settings.rs", "src-tauri/src/lib.rs", "src/lib/tauri.ts"])
     ok = "debug_chat_provider_smoke" in hay
     return ok, "debug_chat_provider_smoke present" if ok else "missing debug_chat_provider_smoke"
 
@@ -63,7 +63,7 @@ def _(repo: Path):
 
 @check("semantic_memory_timeout_fallback")
 def _(repo: Path):
-    text = read(repo, "src-tauri/src/commands/chat.rs")
+    text = read(repo, "src-tauri/src/commands/chat/mod.rs")
     ok = "semantic_memory_search_timeout" in text and "semantic_memory_search_fallback" in text and "memory_backend_fallback" in text
     return ok, "semantic-memory timeout/fallback status present" if ok else "missing semantic-memory bounded fallback indicators"
 

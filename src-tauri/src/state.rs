@@ -188,6 +188,21 @@ impl AppState {
             app_db.set_setting("memory_backend_fallback", "true")?;
         }
         if app_db
+            .get_setting("semantic_memory_auto_project")?
+            .is_none()
+        {
+            app_db.set_setting("semantic_memory_auto_project", "false")?;
+        }
+        if app_db
+            .get_setting("semantic_memory_turbo_quant_require_fresh_artifacts")?
+            .is_none()
+        {
+            app_db.set_setting(
+                "semantic_memory_turbo_quant_require_fresh_artifacts",
+                "true",
+            )?;
+        }
+        if app_db
             .get_setting("semantic_memory_embedding_url")?
             .is_none()
         {
@@ -733,6 +748,10 @@ mod tests {
         let secret_store = SecretStore::new(dir.path()).unwrap();
 
         app_db.set_setting("openai_api_key", "sk-settings").unwrap();
+        app_db
+            .conn
+            .execute("ALTER TABLE providers ADD COLUMN api_key TEXT", [])
+            .unwrap();
         app_db
             .conn
             .execute(

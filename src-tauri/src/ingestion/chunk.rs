@@ -34,6 +34,7 @@ pub struct ChunkData {
 /// Split text into chunks using recursive character splitting.
 /// When `source_title` has a recognized code extension, uses code-aware
 /// boundary detection to prefer splitting at structural boundaries.
+#[allow(dead_code)]
 pub fn chunk_text(text: &str, source_id: &str) -> Vec<ChunkData> {
     chunk_text_with_title(text, source_id, "")
 }

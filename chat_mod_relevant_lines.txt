@@ -1,0 +1,1004 @@
+     1	#[cfg(feature = "semantic-memory-backend")]
+     2	use crate::db::notebook_db::NotebookDb;
+     3	use crate::db::notebook_db::{Conversation, Message, Source};
+     4	use crate::error::GlossError;
+     5	use crate::features;
+     6	use crate::jobs;
+     7	#[cfg(feature = "semantic-memory-backend")]
+     8	use crate::memory::semantic_memory_adapter;
+     9	use crate::memory::MemorySearchRequest;
+    10	use crate::memory::{
+    11	    RetrievalCapabilityDecisionV1, RetrievalMode, RetrievalOutcome, RetrievalReasonCode,
+    12	};
+    13	#[cfg(feature = "semantic-memory-backend")]
+    14	use crate::memory::{RetrievalCoverage, RetrievalEngineStatus, RetrievalResult};
+    15	use crate::memory::{MEMORY_BACKEND_GLOSS_LOCAL, MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW};
+    16	use crate::providers::{self, ChatMessage, ChatRequest, ChatToken, LlmProvider};
+    17	use crate::retrieval::citations;
+    18	use crate::retrieval::context::{ContextAssembler, ContextPassage};
+    19	use crate::retrieval::hybrid_search;
+    20	use crate::retrieval::source_scope::{ResolvedSourceScope, SourceScope};
+    21	use crate::state::AppState;
+    22	use futures::StreamExt;
+    23	use serde::{Deserialize, Serialize};
+    24	use sha2::{Digest, Sha256};
+    25	use std::collections::{HashMap, HashSet};
+    26	use std::path::Path;
+    27	use std::sync::atomic::Ordering;
+    28	use std::sync::{Arc, Mutex};
+    29	use std::time::{Duration, Instant};
+    30	use tauri::{Emitter, State};
+    31	use tauri_queue::QueueManager;
+    32	use tokio::sync::TryAcquireError;
+    33	
+    34	const CHAT_CANCELLED_NOTEBOOK_SWITCH: &str = "__chat_cancelled_notebook_switch__";
+    35	const CHAT_PROVIDER_START_TIMEOUT: Duration = Duration::from_secs(180);
+    36	const CHAT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(168);
+    37	const CHAT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(84);
+    38	const DEFAULT_CHAT_TEMPERATURE: f32 = 0.7;
+    39	#[cfg(feature = "semantic-memory-backend")]
+    40	const SEMANTIC_MEMORY_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
+    41	const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8_192;
+    42	const MAX_CONTEXT_WINDOW_TOKENS: u32 = 32_768;
+    43	
+    44	#[derive(Debug, Clone, Serialize)]
+    45	struct ChatEvidenceDisclosure {
+    46	    backend_requested: String,
+    47	    backend_used: String,
+    48	    retrieval_mode: String,
+    49	    fallback_used: bool,
+    50	    fallback_reason: Option<String>,
+    51	    degradation_markers: Vec<String>,
+    52	    source_scope_mode: String,
+    53	    requested_source_ids: Vec<String>,
+    54	    selected_source_ids: Vec<String>,
+    55	    effective_source_ids: Vec<String>,
+    56	    invalid_source_ids: Vec<String>,
+    57	    excluded_source_ids: Vec<String>,
+    58	    invalid_source_count: usize,
+    59	    effective_source_count: usize,
+    60	    excluded_source_count: usize,
+    61	    context_passage_count: usize,
+    62	    citation_valid_count: usize,
+    63	    citation_invalid_count: usize,
+    64	    citation_anchors: Vec<citations::CitationAnchorV1>,
+    65	    citation_filter_reasons: Vec<citations::CitationFilterReasonV1>,
+    66	    omitted_candidate_count: usize,
+    67	    source_scope_preserved: bool,
+    68	    index_status: String,
+    69	    link_status: String,
+    70	    receipt_id: String,
+    71	    context_digest: String,
+    72	    source_context_digest: String,
+    73	    prompt_digest: Option<String>,
+    74	    semantic_memory_receipt_id: Option<String>,
+    75	    candidate_backend: Option<String>,
+    76	    turbo_quant_generation_id: Option<String>,
+    77	    vector_artifact_manifest_digest: Option<String>,
+    78	    exact_rerank: Option<bool>,
+    79	    exact_rerank_count: Option<usize>,
+    80	    approximate_candidate_count: Option<usize>,
+    81	    semantic_memory_fallback_reason: Option<String>,
+    82	    retrieval_outcome: Option<RetrievalOutcome>,
+    83	    retrieval_capability_decision: RetrievalCapabilityDecisionV1,
+    84	    semantic_memory_runtime_truth: SemanticMemoryRuntimeTruthV1,
+    85	    decoding_settings_receipt: Option<DecodingSettingsReceiptV1>,
+    86	    prompt_receipt: Option<PromptReceiptV1>,
+    87	    generation_receipt: Option<GenerationReceiptV1>,
+    88	}
+    89	
+    90	#[derive(Debug, Clone, Serialize)]
+    91	struct SemanticMemoryRuntimeTruthV1 {
+    92	    schema: String,
+    93	    receipt_id: String,
+    94	    build: serde_json::Value,
+    95	    settings: serde_json::Value,
+    96	    projection: serde_json::Value,
+    97	    turbo_quant: serde_json::Value,
+    98	    decision: RetrievalCapabilityDecisionV1,
+    99	}
+   100	
+   101	#[derive(Debug, Clone, Serialize)]
+   102	struct SourceScopeIntegrityV1 {
+   103	    requested_ids_valid: bool,
+   104	    effective_ids_match_allowed_set: bool,
+   105	    no_out_of_scope_context: bool,
+   106	    no_unanchored_context: bool,
+   107	    fallback_class_allowed: bool,
+   108	    projection_links_preserved: bool,
+   109	    preserved: bool,
+   110	}
+   111	
+   112	#[derive(Debug, Clone, Serialize)]
+   113	struct AssistantMessageEvidence {
+   114	    citations: Vec<citations::Citation>,
+   115	    evidence: ChatEvidenceDisclosure,
+   116	}
+   117	
+   118	#[derive(Debug, Clone, Serialize)]
+   119	struct PromptBudgetReceiptV1 {
+   120	    model_context_window: u32,
+   180	    user_turn_digest: String,
+   181	    source_passage_count: usize,
+   182	    recorded_at: String,
+   183	}
+   184	
+   185	#[derive(Debug, Clone, Serialize)]
+   186	struct GenerationReceiptV1 {
+   187	    schema: String,
+   188	    receipt_id: String,
+   189	    notebook_id: String,
+   190	    conversation_id: String,
+   191	    message_id: String,
+   192	    provider: String,
+   193	    model: String,
+   194	    provider_request_digest: String,
+   195	    response_digest: Option<String>,
+   196	    status: String,
+   197	    error: Option<String>,
+   198	    prompt_receipt_id: String,
+   199	    decoding_settings_receipt_id: String,
+   200	    recorded_at: String,
+   201	}
+   202	
+   203	#[derive(Debug, Clone)]
+   204	struct ChatStreamResult {
+   205	    full_response: String,
+   206	    decoding_settings_receipt: DecodingSettingsReceiptV1,
+   207	    prompt_receipt: PromptReceiptV1,
+   208	    generation_receipt: GenerationReceiptV1,
+   209	}
+   210	
+   211	fn digest_text(text: &str) -> String {
+   212	    let mut hasher = Sha256::new();
+   213	    hasher.update(text.as_bytes());
+   214	    format!("{:x}", hasher.finalize())
+   215	}
+   216	
+   217	fn provider_decoding_capability(
+   218	    provider_type: providers::ProviderType,
+   219	) -> ProviderDecodingCapabilityV1 {
+   220	    match provider_type {
+   221	        providers::ProviderType::Ollama => ProviderDecodingCapabilityV1 {
+   222	            supports_temperature: true,
+   223	            supports_top_p: true,
+   224	            supports_top_k: true,
+   225	            supports_min_p: true,
+   226	            supports_repeat_penalty: true,
+   227	        },
+   228	        providers::ProviderType::LlamaCpp | providers::ProviderType::OpenAI => {
+   229	            ProviderDecodingCapabilityV1 {
+   230	                supports_temperature: true,
+   231	                supports_top_p: true,
+   232	                supports_top_k: false,
+   233	                supports_min_p: false,
+   234	                supports_repeat_penalty: false,
+   235	            }
+   236	        }
+   237	        providers::ProviderType::Anthropic => ProviderDecodingCapabilityV1 {
+   238	            supports_temperature: true,
+   239	            supports_top_p: true,
+   240	            supports_top_k: true,
+   241	            supports_min_p: false,
+   242	            supports_repeat_penalty: false,
+   243	        },
+   244	    }
+   245	}
+   246	
+   247	fn parse_optional_f32(value: Option<String>) -> Option<f32> {
+   248	    value
+   249	        .and_then(|value| value.trim().parse::<f32>().ok())
+   250	        .filter(|value| value.is_finite())
+   251	}
+   252	
+   253	fn parse_optional_i64(value: Option<String>) -> Option<i64> {
+   254	    value.and_then(|value| value.trim().parse::<i64>().ok())
+   255	}
+   256	
+   257	fn effective_decoding_settings(
+   258	    state: &AppState,
+   259	    provider_type: providers::ProviderType,
+   260	    model: &str,
+   520	    message: &str,
+   521	    provider: Option<&str>,
+   522	    model: Option<&str>,
+   523	    gate: Option<&str>,
+   524	    owner: Option<&str>,
+   525	    owner_detail: Option<&str>,
+   526	    elapsed: Duration,
+   527	    timeout: Option<Duration>,
+   528	    truncated: bool,
+   529	    error: Option<&str>,
+   530	) {
+   531	    let _ = handle.emit(
+   532	        "chat:status",
+   533	        ChatStatusPayload {
+   534	            notebook_id,
+   535	            conversation_id,
+   536	            message_id,
+   537	            phase,
+   538	            message,
+   539	            provider,
+   540	            model,
+   541	            gate,
+   542	            owner,
+   543	            owner_detail,
+   544	            elapsed_ms: elapsed.as_millis(),
+   545	            timeout_ms: timeout.map(|timeout| timeout.as_millis()),
+   546	            truncated,
+   547	            error,
+   548	        },
+   549	    );
+   550	}
+   551	
+   552	fn gate_owner_for(state: &AppState, gate_name: &str) -> Option<crate::state::RuntimeGateOwner> {
+   553	    state
+   554	        .gate_owners_snapshot()
+   555	        .into_iter()
+   556	        .find(|owner| owner.gate == gate_name)
+   557	}
+   558	
+   559	fn emit_chat_done(
+   560	    handle: &tauri::AppHandle,
+  2320	            &trace_data_dir,
+  2321	            "cancelled",
+  2322	            Some(Duration::ZERO),
+  2323	            Some("Active notebook epoch changed before provider start"),
+  2324	            Some(error),
+  2325	            |_| {},
+  2326	        );
+  2327	        return Err(GlossError::Other(error.to_string()));
+  2328	    }
+  2329	
+  2330	    // For streaming, we spawn an async task
+  2331	    let msg_id = message_id.clone();
+  2332	    let conv_id = conversation_id.clone();
+  2333	    let nb_id = notebook_id.clone();
+  2334	    let epoch = request_epoch;
+  2335	    let handle = app_handle.clone();
+  2336	    let prompt_scope: ResolvedSourceScope = resolved_scope.clone();
+  2337	    let evidence_for_message = evidence_base.clone();
+  2338	    emit_chat_status(
+  2339	        &app_handle,
+  2340	        &notebook_id,
+  2341	        &conversation_id,
+  2342	        &message_id,
+  2343	        "context_built",
+  2344	        "Context built",
+  2345	        Some(provider_config.provider_type.as_str()),
+  2346	        Some(&model),
+  2347	        None,
+  2348	        None,
+  2349	        None,
+  2350	        Duration::ZERO,
+  2351	        None,
+  2352	        false,
+  2353	        None,
+  2354	    );
+  2355	    record_chat_attempt_trace(
+  2356	        &attempt_trace,
+  2357	        &trace_data_dir,
+  2358	        "context_built",
+  2359	        Some(Duration::ZERO),
+  2360	        Some("RAG context assembled for provider request"),
+  2361	        None,
+  2362	        |_| {},
+  2363	    );
+  2364	
+  2365	    // Construct the provider outside any lock (provider_config was extracted above)
+  2366	    let provider = providers::build_provider(&provider_config);
+  2367	    let spawned_attempt_trace = Arc::clone(&attempt_trace);
+  2368	    let spawned_trace_data_dir = trace_data_dir.clone();
+  2369	
+  2370	    tokio::spawn(async move {
+  2371	        use tauri::Manager;
+  2372	        let app_state: tauri::State<'_, AppState> = handle.state();
+  2373	
+  2374	        // Acquire gates in the same order as the background summary loop:
+  2375	        // GPU first, then LLM. Keeping one global order prevents lock-order
+  2376	        // inversion when chat races a summary job.
+  2377	        let gpu_permit = match acquire_gate_with_epoch(
+  2378	            &handle,
+  2379	            &app_state,
+  2380	            &nb_id,
+  2381	            &conv_id,
+  2382	            &msg_id,
+  2383	            epoch,
+  2384	            &app_state.gpu_gate,
+  2385	            Duration::from_secs(120),
+  2386	            "GPU gate",
+  2387	        )
+  2388	        .await
+  2389	        {
+  2390	            Ok(Some(permit)) => permit,
+  2391	            Ok(None) => {
+  2392	                record_chat_attempt_trace(
+  2393	                    &spawned_attempt_trace,
+  2394	                    &spawned_trace_data_dir,
+  2395	                    "cancelled",
+  2396	                    Some(Duration::ZERO),
+  2397	                    Some("GPU gate wait cancelled by notebook switch"),
+  2398	                    Some("chat cancelled before acquiring GPU gate"),
+  2399	                    |_| {},
+  2400	                );
+  2401	                return;
+  2402	            }
+  2403	            Err(e) => {
+  2404	                tracing::error!(message_id = %msg_id, error = %e, "GPU gate acquisition failed");
+  2405	                emit_chat_error(&handle, &nb_id, &conv_id, &msg_id, &e.to_string());
+  2406	                record_chat_attempt_trace(
+  2407	                    &spawned_attempt_trace,
+  2408	                    &spawned_trace_data_dir,
+  2409	                    "gate_error",
+  2410	                    Some(Duration::ZERO),
+  2411	                    Some("GPU gate acquisition failed"),
+  2412	                    Some(&e.to_string()),
+  2413	                    |_| {},
+  2414	                );
+  2415	                return;
+  2416	            }
+  2417	        };
+  2418	
+  2419	        let permit = match acquire_gate_with_epoch(
+  2420	            &handle,
+  2421	            &app_state,
+  2422	            &nb_id,
+  2423	            &conv_id,
+  2424	            &msg_id,
+  2425	            epoch,
+  2426	            &app_state.llm_gate,
+  2427	            Duration::from_secs(120),
+  2428	            "LLM gate",
+  2429	        )
+  2430	        .await
+  2431	        {
+  2432	            Ok(Some(permit)) => permit,
+  2433	            Ok(None) => {
+  2434	                app_state.clear_gate_owner("GPU gate", "chat");
+  2435	                drop(gpu_permit);
+  2436	                record_chat_attempt_trace(
+  2437	                    &spawned_attempt_trace,
+  2438	                    &spawned_trace_data_dir,
+  2439	                    "cancelled",
+  2440	                    Some(Duration::ZERO),
+  2441	                    Some("LLM gate wait cancelled by notebook switch"),
+  2442	                    Some("chat cancelled before acquiring LLM gate"),
+  2443	                    |_| {},
+  2444	                );
+  2445	                return;
+  2446	            }
+  2447	            Err(e) => {
+  2448	                app_state.clear_gate_owner("GPU gate", "chat");
+  2449	                drop(gpu_permit);
+  2450	                emit_chat_error(&handle, &nb_id, &conv_id, &msg_id, &e.to_string());
+  2451	                record_chat_attempt_trace(
+  2452	                    &spawned_attempt_trace,
+  2453	                    &spawned_trace_data_dir,
+  2454	                    "gate_error",
+  2455	                    Some(Duration::ZERO),
+  2456	                    Some("LLM gate acquisition failed"),
+  2457	                    Some(&e.to_string()),
+  2458	                    |_| {},
+  2459	                );
+  2460	                return;
+  2461	            }
+  2462	        };
+  2463	
+  2464	        let result = stream_chat_response(
+  2465	            &handle,
+  2466	            provider.as_ref(),
+  2467	            &nb_id,
+  2468	            epoch,
+  2469	            &conv_id,
+  2470	            &msg_id,
+  2471	            &query,
+  2472	            &model,
+  2473	            &history,
+  2474	            custom_goal.as_deref(),
+  2475	            &style,
+  2476	            &prompt_scope,
+  2477	            &source_context,
+  2478	            model_context_window,
+  2479	            &spawned_attempt_trace,
+  2480	            &spawned_trace_data_dir,
+  2481	        )
+  2482	        .await;
+  2483	
+  2484	        match &result {
+  2485	            Ok(stream_result) => {
+  2486	                let full_response = &stream_result.full_response;
+  2487	                if !app_state.is_active_notebook_epoch(&nb_id, epoch) {
+  2488	                    emit_chat_done(&handle, &nb_id, &conv_id, &msg_id);
+  2489	                    app_state.clear_gate_owner("GPU gate", "chat");
+  2490	                    app_state.clear_gate_owner("LLM gate", "chat");
+  2491	                    drop(gpu_permit);
+  2492	                    drop(permit);
+  2493	                    return;
+  2494	                }
+  2495	
+  2496	                // Extract citations from the response
+  2497	                let (extracted, citation_filter_reasons) =
+  2498	                    citations::extract_citations_from_context_with_reasons(
+  2499	                        full_response,
+  2500	                        &source_context,
+  2501	                    );
+  2502	                let citation_ref_count = citations::count_unique_citation_refs(full_response);
+  2503	                let mut evidence = evidence_for_message.clone();
+  2504	                evidence.citation_valid_count = extracted.len();
+  2505	                evidence.citation_invalid_count =
+  2506	                    citation_ref_count.saturating_sub(extracted.len());
+  2507	                evidence.citation_filter_reasons = citation_filter_reasons;
+  2508	                evidence.omitted_candidate_count =
+  2509	                    source_context.len().saturating_sub(extracted.len());
+  2510	                evidence.decoding_settings_receipt =
+  2511	                    Some(stream_result.decoding_settings_receipt.clone());
+  2512	                evidence.prompt_receipt = Some(stream_result.prompt_receipt.clone());
+  2513	                evidence.generation_receipt = Some(stream_result.generation_receipt.clone());
+  2514	                let citations_payload = AssistantMessageEvidence {
+  2515	                    citations: extracted,
+  2516	                    evidence,
+  2517	                };
+  2518	                let citations_json = serde_json::to_string(&citations_payload).ok();
+  2519	
+  2520	                // Persist assistant message to DB
+  2521	                let assistant_msg = Message {
+  2522	                    id: msg_id.clone(),
+  2523	                    conversation_id: conv_id.clone(),
+  2524	                    role: "assistant".to_string(),
+  2525	                    content: full_response.clone(),
+  2526	                    citations: citations_json,
+  2527	                    model_used: Some(model.clone()),
+  2528	                    tokens_prompt: None,
+  2529	                    tokens_response: None,
+  2530	                    created_at: String::new(),
+  2531	                };
+  2532	                if let Err(e) =
+  2533	                    app_state.with_notebook_db(&nb_id, |db| db.insert_message(&assistant_msg))
+  2534	                {
+  2535	                    tracing::error!(message_id = %msg_id, "Failed to persist assistant message: {}", e);
+  2536	                    record_chat_attempt_trace(
+  2537	                        &spawned_attempt_trace,
+  2538	                        &spawned_trace_data_dir,
+  2539	                        "assistant_persist_error",
+  2540	                        Some(Duration::ZERO),
+  2541	                        Some("Assistant message streaming completed but persistence failed"),
+  2542	                        Some(&e.to_string()),
+  2543	                        |_| {},
+  2544	                    );
+  2545	                } else {
+  2700	        None,
+  2701	    );
+  2702	
+  2703	    // Build chat messages: history + user query
+  2704	    let mut chat_messages: Vec<ChatMessage> = Vec::new();
+  2705	
+  2706	    let history_msgs = ContextAssembler::format_history(history, 10);
+  2707	    for (role, content) in &history_msgs {
+  2708	        chat_messages.push(ChatMessage {
+  2709	            role: role.clone(),
+  2710	            content: content.clone(),
+  2711	            images: None,
+  2712	        });
+  2713	    }
+  2714	
+  2715	    let user_turn = ContextAssembler::build_user_turn(query, source_context);
+  2716	    chat_messages.push(ChatMessage {
+  2717	        role: "user".to_string(),
+  2718	        content: user_turn,
+  2719	        images: None,
+  2720	    });
+  2721	
+  2722	    let max_tokens = 2048;
+  2723	    let decoding_settings_receipt =
+  2724	        effective_decoding_settings(&state, provider.provider_type(), model, max_tokens)?;
+  2725	    let num_ctx = compute_dynamic_num_ctx(
+  2726	        &system_prompt,
+  2727	        &chat_messages,
+  2728	        model_context_window,
+  2729	        max_tokens,
+  2730	    );
+  2731	    let request_material = serde_json::json!({
+  2732	        "system": &system_prompt,
+  2733	        "messages": &chat_messages,
+  2734	        "model": model,
+  2735	        "num_ctx": num_ctx,
+  2736	        "max_tokens": max_tokens,
+  2737	        "decoding_settings": &decoding_settings_receipt.effective,
+  2738	    })
+  2739	    .to_string();
+  2740	    let request_digest = digest_text(&request_material);
+  2741	    let user_turn_digest = chat_messages
+  2742	        .last()
+  2743	        .map(|message| digest_text(&message.content))
+  2744	        .unwrap_or_else(|| digest_text(""));
+  2745	    let context_payload_digest = source_context_digest(source_context);
+  2746	    let prompt_receipt = PromptReceiptV1 {
+  2747	        schema: "PromptReceiptV1".to_string(),
+  2748	        receipt_id: uuid::Uuid::new_v4().to_string(),
+  2749	        notebook_id: notebook_id.to_string(),
+  2750	        conversation_id: conversation_id.to_string(),
+  2751	        message_id: message_id.to_string(),
+  2752	        prompt_digest: request_digest.clone(),
+  2753	        context_payload_digest,
+  2754	        capture_state: "captured_digest_only".to_string(),
+  2755	        redaction_state: "content_not_stored_in_receipt".to_string(),
+  2756	        system_prompt_digest: digest_text(&system_prompt),
+  2757	        user_turn_digest,
+  2758	        source_passage_count: source_context.len(),
+  2759	        recorded_at: chrono::Utc::now().to_rfc3339(),
+  2760	    };
+  2761	    let prompt_budget_receipt = PromptBudgetReceiptV1 {
+  2762	        model_context_window: num_ctx,
+  2763	        system_prompt_chars: request_material.len(),
+  2764	        message_count: history_msgs.len() + 1,
+  2765	        source_passage_count: source_context.len(),
+  2766	        prompt_digest: request_digest.clone(),
+  2767	    };
+  2768	    let prompt_budget_detail = serde_json::to_string(&prompt_budget_receipt).ok();
+  2769	    record_chat_attempt_trace(
+  2770	        attempt_trace,
+  2771	        trace_data_dir,
+  2772	        "prompt_budget_receipt",
+  2773	        Some(Duration::ZERO),
+  2774	        prompt_budget_detail.as_deref(),
+  2775	        None,
+  2776	        |_| {},
+  2777	    );
+  2778	
+  2779	    // Build the provider-agnostic chat request
+  2780	    let request = ChatRequest {
+  2781	        model: model.to_string(),
+  2782	        system_prompt: Some(system_prompt),
+  2783	        messages: chat_messages,
+  2784	        max_tokens,
+  2785	        temperature: decoding_settings_receipt.effective.temperature,
+  2786	        top_p: decoding_settings_receipt.effective.top_p,
+  2787	        top_k: decoding_settings_receipt.effective.top_k,
+  2788	        min_p: decoding_settings_receipt.effective.min_p,
+  2789	        repeat_penalty: decoding_settings_receipt.effective.repeat_penalty,
+  2790	        stream: true,
+  2791	        num_ctx: Some(num_ctx),
+  2792	    };
+  2793	
+  2794	    if !state.is_active_notebook_epoch(notebook_id, epoch) {
+  2795	        record_chat_attempt_trace(
+  2796	            attempt_trace,
+  2797	            trace_data_dir,
+  2798	            "cancelled",
+  2799	            Some(Duration::ZERO),
+  2800	            Some("Active notebook epoch changed before provider request"),
+  2801	            Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
+  2802	            |_| {},
+  2803	        );
+  2804	        return Err(GlossError::Other(CHAT_CANCELLED_NOTEBOOK_SWITCH.into()));
+  2805	    }
+  2806	
+  2807	    // Call the provider, but keep checking notebook epoch while waiting for the
+  2808	    // first response so a switch can cancel the HTTP request promptly.
+  2809	    let started = Instant::now();
+  2810	    emit_chat_status(
+  2811	        app_handle,
+  2812	        notebook_id,
+  2813	        conversation_id,
+  2814	        message_id,
+  2815	        "provider_request_start",
+  2816	        "Starting provider request",
+  2817	        Some(provider.provider_type().as_str()),
+  2818	        Some(model),
+  2819	        None,
+  2820	        None,
+  2821	        None,
+  2822	        started.elapsed(),
+  2823	        Some(CHAT_PROVIDER_START_TIMEOUT),
+  2824	        false,
+  2825	        None,
+  2826	    );
+  2827	    record_chat_attempt_trace(
+  2828	        attempt_trace,
+  2829	        trace_data_dir,
+  2830	        "provider_request_start",
+  2831	        Some(started.elapsed()),
+  2832	        Some("Starting provider request"),
+  2833	        None,
+  2834	        |_| {},
+  2835	    );
+  2836	    let chat_future = provider.chat(request);
+  2837	    tokio::pin!(chat_future);
+  2838	    let mut token_stream = loop {
+  2839	        if !state.is_active_notebook_epoch(notebook_id, epoch) {
+  2840	            record_chat_attempt_trace(
+  2841	                attempt_trace,
+  2842	                trace_data_dir,
+  2843	                "cancelled",
+  2844	                Some(started.elapsed()),
+  2845	                Some("Active notebook epoch changed during provider start"),
+  2846	                Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
+  2847	                |_| {},
+  2848	            );
+  2849	            return Err(GlossError::Other(CHAT_CANCELLED_NOTEBOOK_SWITCH.into()));
+  2850	        }
+  2851	        if started.elapsed() >= CHAT_PROVIDER_START_TIMEOUT {
+  2852	            let error = "Provider did not start streaming before the provider-start timeout";
+  2853	            emit_chat_status(
+  2854	                app_handle,
+  2855	                notebook_id,
+  2856	                conversation_id,
+  2857	                message_id,
+  2858	                "provider_start_timeout",
+  2859	                error,
+  2860	                Some(provider.provider_type().as_str()),
+  2861	                Some(model),
+  2862	                None,
+  2863	                None,
+  2864	                None,
+  2865	                started.elapsed(),
+  2866	                Some(CHAT_PROVIDER_START_TIMEOUT),
+  2867	                false,
+  2868	                Some(error),
+  2869	            );
+  2870	            record_chat_attempt_trace(
+  2871	                attempt_trace,
+  2872	                trace_data_dir,
+  2873	                "provider_start_timeout",
+  2874	                Some(started.elapsed()),
+  2875	                Some("Provider did not return a stream before timeout"),
+  2876	                Some(error),
+  2877	                |_| {},
+  2878	            );
+  2879	            return Err(GlossError::Provider {
+  2880	                provider: provider.provider_type().as_str().to_string(),
+  2881	                source: anyhow::anyhow!(error),
+  2882	            });
+  2883	        }
+  2884	
+  2885	        tokio::select! {
+  2886	            result = &mut chat_future => match result {
+  2887	                Ok(stream) => break stream,
+  2888	                Err(err) => {
+  2889	                    let error = err.to_string();
+  2890	                    let invocation = LlmInvocationReceiptV1 {
+  2891	                        provider: provider.provider_type().as_str().to_string(),
+  2892	                        model: model.to_string(),
+  2893	                        request_digest: request_digest.clone(),
+  2894	                        response_digest: None,
+  2895	                        error: Some(error.clone()),
+  2896	                    };
+  2897	                    let invocation_detail = serde_json::to_string(&invocation).ok();
+  2898	                    record_chat_attempt_trace(
+  2899	                        attempt_trace,
+  2900	                        trace_data_dir,
+  2901	                        "llm_invocation_receipt",
+  2902	                        Some(started.elapsed()),
+  2903	                        invocation_detail.as_deref(),
+  2904	                        Some(&error),
+  2905	                        |_| {},
+  2906	                    );
+  2907	                    return Err(err);
+  2908	                }
+  2909	            },
+  2910	            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+  2911	        }
+  2912	    };
+  2913	    let first_token_wait_started = Instant::now();
+  2914	    emit_chat_status(
+  2915	        app_handle,
+  2916	        notebook_id,
+  2917	        conversation_id,
+  2918	        message_id,
+  2919	        "first_token_wait",
+  2920	        "Waiting for first token",
+  2921	        Some(provider.provider_type().as_str()),
+  2922	        Some(model),
+  2923	        None,
+  2924	        None,
+  2925	        None,
+  2926	        first_token_wait_started.elapsed(),
+  2927	        Some(CHAT_FIRST_TOKEN_TIMEOUT),
+  2928	        false,
+  2929	        None,
+  2930	    );
+  2931	    record_chat_attempt_trace(
+  2932	        attempt_trace,
+  2933	        trace_data_dir,
+  2934	        "first_token_wait",
+  2935	        Some(first_token_wait_started.elapsed()),
+  2936	        Some("Waiting for first provider token"),
+  2937	        None,
+  2938	        |_| {},
+  2939	    );
+  2940	
+  2941	    let mut full_response = String::new();
+  2942	    let mut sent_done = false;
+  2943	    let mut first_token_seen = false;
+  2944	    let mut last_token_at = Instant::now();
+  2945	
+  2946	    loop {
+  2947	        if !state.is_active_notebook_epoch(notebook_id, epoch) {
+  2948	            record_chat_attempt_trace(
+  2949	                attempt_trace,
+  2950	                trace_data_dir,
+  2951	                "cancelled",
+  2952	                Some(started.elapsed()),
+  2953	                Some("Active notebook epoch changed during provider stream"),
+  2954	                Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
+  2955	                |_| {},
+  2956	            );
+  2957	            return Err(GlossError::Other(CHAT_CANCELLED_NOTEBOOK_SWITCH.into()));
+  2958	        }
+  2959	
+  2960	        let next = match tokio::time::timeout(Duration::from_millis(250), token_stream.next()).await
+  2961	        {
+  2962	            Ok(next) => next,
+  2963	            Err(_) => {
+  2964	                let timeout = if first_token_seen {
+  2965	                    CHAT_STREAM_IDLE_TIMEOUT
+  2966	                } else {
+  2967	                    CHAT_FIRST_TOKEN_TIMEOUT
+  2968	                };
+  2969	                let elapsed = if first_token_seen {
+  2970	                    last_token_at.elapsed()
+  2971	                } else {
+  2972	                    first_token_wait_started.elapsed()
+  2973	                };
+  2974	                if elapsed >= timeout {
+  2975	                    let phase = if first_token_seen {
+  2976	                        "stream_idle_timeout"
+  2977	                    } else {
+  2978	                        "first_token_timeout"
+  2979	                    };
+  2980	                    let error = if first_token_seen {
+  2981	                        "Provider stream was idle past the stream-idle timeout"
+  2982	                    } else {
+  2983	                        "Provider did not produce a first token before timeout"
+  2984	                    };
+  2985	                    emit_chat_status(
+  2986	                        app_handle,
+  2987	                        notebook_id,
+  2988	                        conversation_id,
+  2989	                        message_id,
+  2990	                        phase,
+  2991	                        error,
+  2992	                        Some(provider.provider_type().as_str()),
+  2993	                        Some(model),
+  2994	                        None,
+  2995	                        None,
+  2996	                        None,
+  2997	                        elapsed,
+  2998	                        Some(timeout),
+  2999	                        first_token_seen,
+  3000	                        Some(error),
+  3001	                    );
+  3002	                    record_chat_attempt_trace(
+  3003	                        attempt_trace,
+  3004	                        trace_data_dir,
+  3005	                        phase,
+  3006	                        Some(elapsed),
+  3007	                        Some(error),
+  3008	                        Some(error),
+  3009	                        |_| {},
+  3010	                    );
+  3011	                    return Err(GlossError::Provider {
+  3012	                        provider: provider.provider_type().as_str().to_string(),
+  3013	                        source: anyhow::anyhow!(error),
+  3014	                    });
+  3015	                }
+  3016	                continue;
+  3017	            }
+  3018	        };
+  3019	        let Some(result) = next else {
+  3020	            break;
+  3021	        };
+  3022	
+  3023	        let ChatToken { token, done } = match result {
+  3024	            Ok(token) => token,
+  3025	            Err(err) => {
+  3026	                let error = err.to_string();
+  3027	                let invocation = LlmInvocationReceiptV1 {
+  3028	                    provider: provider.provider_type().as_str().to_string(),
+  3029	                    model: model.to_string(),
+  3030	                    request_digest: request_digest.clone(),
+  3031	                    response_digest: None,
+  3032	                    error: Some(error.clone()),
+  3033	                };
+  3034	                let invocation_detail = serde_json::to_string(&invocation).ok();
+  3035	                record_chat_attempt_trace(
+  3036	                    attempt_trace,
+  3037	                    trace_data_dir,
+  3038	                    "llm_invocation_receipt",
+  3039	                    Some(started.elapsed()),
+  3040	                    invocation_detail.as_deref(),
+  3041	                    Some(&error),
+  3042	                    |_| {},
+  3043	                );
+  3044	                return Err(err);
+  3045	            }
+  3046	        };
+  3047	        if !first_token_seen {
+  3048	            first_token_seen = true;
+  3049	            emit_chat_status(
+  3050	                app_handle,
+  3051	                notebook_id,
+  3052	                conversation_id,
+  3053	                message_id,
+  3054	                "streaming",
+  3055	                "Streaming response",
+  3056	                Some(provider.provider_type().as_str()),
+  3057	                Some(model),
+  3058	                None,
+  3059	                None,
+  3060	                None,
+  3061	                started.elapsed(),
+  3062	                None,
+  3063	                false,
+  3064	                None,
+  3065	            );
+  3066	            record_chat_attempt_trace(
+  3067	                attempt_trace,
+  3068	                trace_data_dir,
+  3069	                "streaming",
+  3070	                Some(started.elapsed()),
+  3071	                Some("First provider token received"),
+  3072	                None,
+  3073	                |trace| {
+  3074	                    trace.first_token_seen = true;
+  3075	                },
+  3076	            );
+  3077	        }
+  3078	        if !token.is_empty() {
+  3079	            last_token_at = Instant::now();
+  3080	        }
+  3081	
+  3082	        full_response.push_str(&token);
+  3083	
+  3084	        if done {
+  3085	            sent_done = true;
+  3086	        }
+  3087	
+  3088	        let _ = app_handle.emit(
+  3089	            "chat:token",
+  3090	            serde_json::json!({
+  3091	                "notebook_id": notebook_id,
+  3092	                "conversation_id": conversation_id,
+  3093	                "message_id": message_id,
+  3094	                "token": token,
+  3095	                "done": false,
+  3096	            }),
+  3097	        );
+  3098	    }
+  3099	
+  3100	    if !sent_done {
+  3101	        let error = "Provider stream ended before a clean completion; response is incomplete";
+  3102	        emit_chat_status(
+  3103	            app_handle,
+  3104	            notebook_id,
+  3105	            conversation_id,
+  3106	            message_id,
+  3107	            "incomplete_stream",
+  3108	            error,
+  3109	            Some(provider.provider_type().as_str()),
+  3110	            Some(model),
+  3111	            None,
+  3112	            None,
+  3113	            None,
+  3114	            started.elapsed(),
+  3115	            None,
+  3116	            true,
+  3117	            Some(error),
+  3118	        );
+  3119	        record_chat_attempt_trace(
+  3120	            attempt_trace,
+  3121	            trace_data_dir,
+  3122	            "incomplete_stream",
+  3123	            Some(started.elapsed()),
+  3124	            Some(error),
+  3125	            Some(error),
+  3126	            |_| {},
+  3127	        );
+  3128	        return Err(GlossError::Provider {
+  3129	            provider: provider.provider_type().as_str().to_string(),
+  3130	            source: anyhow::anyhow!(error),
+  3131	        });
+  3132	    }
+  3133	
+  3134	    if full_response.trim().is_empty() {
+  3135	        let error = "Provider stream completed without response content";
+  3136	        emit_chat_status(
+  3137	            app_handle,
+  3138	            notebook_id,
+  3139	            conversation_id,
+  3140	            message_id,
+  3141	            "empty_response",
+  3142	            error,
+  3143	            Some(provider.provider_type().as_str()),
+  3144	            Some(model),
+  3145	            None,
+  3146	            None,
+  3147	            None,
+  3148	            started.elapsed(),
+  3149	            None,
+  3150	            false,
+  3151	            Some(error),
+  3152	        );
+  3153	        record_chat_attempt_trace(
+  3154	            attempt_trace,
+  3155	            trace_data_dir,
+  3156	            "empty_response",
+  3157	            Some(started.elapsed()),
+  3158	            Some(error),
+  3159	            Some(error),
+  3160	            |_| {},
+  3161	        );
+  3162	        return Err(GlossError::Provider {
+  3163	            provider: provider.provider_type().as_str().to_string(),
+  3164	            source: anyhow::anyhow!(error),
+  3165	        });
+  3166	    }
+  3167	
+  3168	    emit_chat_status(
+  3169	        app_handle,
+  3170	        notebook_id,
+  3171	        conversation_id,
+  3172	        message_id,
+  3173	        "complete",
+  3174	        "Response complete",
+  3175	        Some(provider.provider_type().as_str()),
+  3176	        Some(model),
+  3177	        None,
+  3178	        None,
+  3179	        None,
+  3180	        started.elapsed(),
+  3181	        None,
+  3182	        false,
+  3183	        None,
+  3184	    );
+  3185	    record_chat_attempt_trace(
+  3186	        attempt_trace,
+  3187	        trace_data_dir,
+  3188	        "complete",
+  3189	        Some(started.elapsed()),
+  3190	        Some("Provider stream completed cleanly"),
+  3191	        None,
+  3192	        |trace| {
+  3193	            trace.done_seen = true;
+  3194	        },
+  3195	    );
+  3196	    let invocation = LlmInvocationReceiptV1 {
+  3197	        provider: provider.provider_type().as_str().to_string(),
+  3198	        model: model.to_string(),
+  3199	        request_digest: request_digest.clone(),
+  3200	        response_digest: Some(digest_text(&full_response)),
+  3201	        error: None,
+  3202	    };
+  3203	    let invocation_detail = serde_json::to_string(&invocation).ok();
+  3204	    record_chat_attempt_trace(
+  3205	        attempt_trace,
+  3206	        trace_data_dir,
+  3207	        "llm_invocation_receipt",
+  3208	        Some(started.elapsed()),
+  3209	        invocation_detail.as_deref(),
+  3210	        None,
+  3211	        |_| {},
+  3212	    );
+  3213	    emit_chat_done(app_handle, notebook_id, conversation_id, message_id);
+  3214	
+  3215	    tracing::debug!(
+  3216	        message_id,
+  3217	        len = full_response.len(),
+  3218	        "Chat response complete"
+  3219	    );
+  3220	
+  3221	    let generation_receipt = GenerationReceiptV1 {
+  3222	        schema: "GenerationReceiptV1".to_string(),
+  3223	        receipt_id: uuid::Uuid::new_v4().to_string(),
+  3224	        notebook_id: notebook_id.to_string(),
+  3225	        conversation_id: conversation_id.to_string(),
+  3226	        message_id: message_id.to_string(),
+  3227	        provider: provider.provider_type().as_str().to_string(),
+  3228	        model: model.to_string(),
+  3229	        provider_request_digest: request_digest,
+  3230	        response_digest: Some(digest_text(&full_response)),
+  3231	        status: "completed".to_string(),
+  3232	        error: None,
+  3233	        prompt_receipt_id: prompt_receipt.receipt_id.clone(),
+  3234	        decoding_settings_receipt_id: decoding_settings_receipt.receipt_id.clone(),
+  3235	        recorded_at: chrono::Utc::now().to_rfc3339(),

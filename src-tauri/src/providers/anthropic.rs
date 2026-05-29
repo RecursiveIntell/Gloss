@@ -1,9 +1,10 @@
-use super::{ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
+use super::{provider_http_error, ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
 use futures::StreamExt;
 use std::pin::Pin;
+use zeroize::Zeroize;
 
 /// Anthropic LLM provider.
 pub struct AnthropicProvider {
@@ -23,6 +24,12 @@ impl AnthropicProvider {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
+    }
+}
+
+impl Drop for AnthropicProvider {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
     }
 }
 
@@ -140,10 +147,7 @@ impl LlmProvider for AnthropicProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(GlossError::Provider {
-                provider: "anthropic".into(),
-                source: anyhow::anyhow!("HTTP {}: {}", status, text),
-            });
+            return Err(provider_http_error("anthropic", status, &text));
         }
 
         if request.stream {
@@ -253,7 +257,8 @@ impl LlmProvider for AnthropicProvider {
             .send()
             .await
         {
-            Ok(resp) => Ok(resp.status().is_success() || resp.status().as_u16() == 401),
+            // 401 means the key is wrong or missing — not healthy
+            Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
         }
     }

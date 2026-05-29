@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimeoutChangeReceiptV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "receipt_id",
+    "changes"
+  ],
+  "properties": {
+    "schema": {
+      "const": "TimeoutChangeReceiptV1"
+    },
+    "receipt_id": {
+      "type": "string"
+    },
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "file",
+          "surface",
+          "old_value",
+          "new_value",
+          "reason"
+        ],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "surface": {
+            "type": "string"
+          },
+          "old_value": {},
+          "new_value": {},
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

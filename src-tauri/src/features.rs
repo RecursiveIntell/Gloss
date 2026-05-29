@@ -25,6 +25,7 @@ pub const SEMANTIC_MEMORY_AUTO_PROJECT: &str = "semantic_memory_auto_project";
 pub const SEMANTIC_MEMORY_STRICT_TESTING: &str = "semantic_memory_strict_testing";
 pub const SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS: &str =
     "semantic_memory_turbo_quant_require_fresh_artifacts";
+pub const FASTEMBED_DOWNLOAD_CONSENT: &str = "fastembed_download_consent";
 // Settings profiles expose use_gloss_local_profile and enable_semantic_memory_profile flows.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +270,11 @@ pub fn update_feature_flag(app_db: &AppDb, id: &str, enabled: bool) -> Result<()
 pub fn validate_setting_update(app_db: &AppDb, key: &str, value: &str) -> Result<(), GlossError> {
     if key == "memory_backend" && value == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW {
         require_semantic_memory_preview_enabled(app_db)?;
+    }
+    if key == FASTEMBED_DOWNLOAD_CONSENT && !matches!(value, "true" | "false") {
+        return Err(GlossError::Config(
+            "fastembed_download_consent must be true or false".into(),
+        ));
     }
     Ok(())
 }

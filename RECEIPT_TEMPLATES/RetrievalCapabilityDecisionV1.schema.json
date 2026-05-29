@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RetrievalCapabilityDecisionV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "requested_backend",
+    "effective_backend",
+    "fallback_used",
+    "reason_codes"
+  ],
+  "properties": {
+    "schema": {
+      "const": "RetrievalCapabilityDecisionV1"
+    },
+    "requested_backend": {
+      "type": "string"
+    },
+    "effective_backend": {
+      "type": "string"
+    },
+    "decision_reason": {
+      "type": "string"
+    },
+    "build_feature_available": {
+      "type": "boolean"
+    },
+    "runtime_enabled": {
+      "type": "boolean"
+    },
+    "settings_enabled": {
+      "type": "boolean"
+    },
+    "projection_ready": {
+      "type": "boolean"
+    },
+    "links_ready": {
+      "type": "boolean"
+    },
+    "dense_ready": {
+      "type": "boolean"
+    },
+    "fallback_allowed": {
+      "type": "boolean"
+    },
+    "fallback_used": {
+      "type": "boolean"
+    },
+    "degraded": {
+      "type": "boolean"
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

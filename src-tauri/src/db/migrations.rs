@@ -5,11 +5,26 @@ const APP_SCHEMA_VERSION: i32 = 2;
 const NOTEBOOK_SCHEMA_VERSION: i32 = 6;
 
 /// Apply pragmas for performance and correctness.
+///
+/// Four issues fixed from hostile audit:
+/// 1. `synchronous=NORMAL` was missing — required for WAL mode to avoid
+///    unnecessary fsync on every commit while still protecting against
+///    database corruption (WAL + NORMAL is safe; FULL is only needed
+///    for rollback-journal mode).
+/// 2. `cache_size` was missing — set a reasonable negative value (KiB)
+///    to allow the page cache to grow beyond the tiny default.
+/// 3. `mmap_size` was missing — enable memory-mapped I/O for read-heavy
+///    workloads (FTS5, HNSW lookups).
+/// 4. `temp_store=MEMORY` was missing — keep temp tables/indexes in RAM.
 pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA foreign_keys=ON;
-         PRAGMA busy_timeout=5000;",
+         PRAGMA busy_timeout=5000;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA cache_size=-65536;
+         PRAGMA mmap_size=67108864;
+         PRAGMA temp_store=MEMORY;",
     )
 }
 
@@ -83,6 +98,11 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_model', 'nomic-embed-text');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_timeout_secs', '10');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_search_timeout_ms', '8000');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_temperature', '0.7');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_p', '');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_k', '');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_min_p', '');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_repeat_penalty', '');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('ollama_url', 'http://localhost:11434');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('theme', 'system');",
         )?;
@@ -114,7 +134,12 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
 
     conn.execute_batch(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_strict_testing', 'false');
-         INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');",
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_temperature', '0.7');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_p', '');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_k', '');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_min_p', '');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_repeat_penalty', '');",
     )?;
 
     ensure_provider_rows(conn)?;
@@ -327,6 +352,7 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
     ensure_semantic_memory_projection_status(conn)?;
     ensure_semantic_memory_vector_artifact_receipts(conn)?;
     ensure_semantic_memory_retrieval_probe_receipts(conn)?;
+    ensure_prompt_generation_receipts(conn)?;
     ensure_provenance_receipts(conn)?;
 
     Ok(())
@@ -504,6 +530,41 @@ fn ensure_provenance_receipts(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_provenance_receipts_subject
         ON provenance_receipts (subject_kind, subject_id, recorded_time DESC);",
+    )
+}
+
+fn ensure_prompt_generation_receipts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS prompt_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            prompt_digest TEXT NOT NULL,
+            context_payload_digest TEXT NOT NULL,
+            raw_receipt_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_prompt_receipts_message
+        ON prompt_receipts (message_id, recorded_at DESC);
+
+        CREATE TABLE IF NOT EXISTS generation_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            provider_request_digest TEXT NOT NULL,
+            response_digest TEXT,
+            status TEXT NOT NULL,
+            raw_receipt_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_generation_receipts_message
+        ON generation_receipts (message_id, recorded_at DESC);",
     )
 }
 

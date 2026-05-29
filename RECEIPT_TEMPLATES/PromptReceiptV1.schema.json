@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PromptReceiptV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "receipt_id",
+    "answer_id",
+    "system_prompt_capture_state",
+    "user_turn_digest",
+    "context_payload_digest"
+  ],
+  "properties": {
+    "schema": {
+      "const": "PromptReceiptV1"
+    },
+    "receipt_id": {
+      "type": "string"
+    },
+    "answer_id": {
+      "type": "string"
+    },
+    "system_prompt_capture_state": {
+      "enum": [
+        "captured",
+        "redacted",
+        "not_captured",
+        "not_implemented",
+        "unknown"
+      ]
+    },
+    "system_prompt_digest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "system_prompt_preview": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user_turn_digest": {
+      "type": "string"
+    },
+    "context_payload_digest": {
+      "type": "string"
+    },
+    "source_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "chunk_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "redaction_state": {
+      "enum": [
+        "none",
+        "partial",
+        "full",
+        "not_applicable"
+      ]
+    }
+  }
+}

@@ -8,6 +8,7 @@ use crate::memory::types::{
     IndexSourceReceipt, MemorySearchRequest, MemorySearchResponse, SemanticCandidateEnvelope,
     SemanticLinkRow, MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
 };
+use crate::redaction::redact_path;
 use crate::retrieval::source_scope::ResolvedSourceScope;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use semantic_memory::embedder::{EmbedBatchFuture, EmbedFuture};
@@ -61,13 +62,14 @@ struct FastEmbedSemanticMemoryEmbedder {
 }
 
 impl FastEmbedSemanticMemoryEmbedder {
-    fn try_new(cache_dir: PathBuf) -> Result<Self, GlossError> {
+    fn try_new(cache_dir: PathBuf, download_consent: bool) -> Result<Self, GlossError> {
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             GlossError::Embedding(format!(
                 "Failed to create FastEmbed cache directory {}: {e}",
-                cache_dir.display()
+                redact_path(&cache_dir)
             ))
         })?;
+        crate::ingestion::embed::require_fastembed_download_consent(&cache_dir, download_consent)?;
         let options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15).with_cache_dir(cache_dir);
         let model = TextEmbedding::try_new(options).map_err(|e| {
             GlossError::Embedding(format!("Failed to initialize FastEmbed model: {e}"))
@@ -155,6 +157,7 @@ pub struct SemanticMemoryRuntimeConfig {
     pub embedding_ollama_url: String,
     pub embedding_model: String,
     pub embedding_timeout_secs: u64,
+    pub fastembed_download_consent: bool,
     pub turbo_quant_enabled: bool,
     pub turbo_quant_require_fresh_artifacts: bool,
 }
@@ -166,6 +169,7 @@ impl Default for SemanticMemoryRuntimeConfig {
             embedding_ollama_url: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL.to_string(),
             embedding_model: FASTEMBED_MODEL_NAME.to_string(),
             embedding_timeout_secs: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS,
+            fastembed_download_consent: false,
             turbo_quant_enabled: false,
             turbo_quant_require_fresh_artifacts: true,
         }
@@ -177,6 +181,7 @@ pub fn runtime_config_from_settings(
     embedding_ollama_url: Option<String>,
     embedding_model: Option<String>,
     embedding_timeout_secs: Option<String>,
+    fastembed_download_consent: bool,
     turbo_quant_enabled: bool,
     turbo_quant_require_fresh_artifacts: bool,
 ) -> SemanticMemoryRuntimeConfig {
@@ -198,6 +203,7 @@ pub fn runtime_config_from_settings(
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(defaults.embedding_timeout_secs),
+        fastembed_download_consent,
         turbo_quant_enabled,
         turbo_quant_require_fresh_artifacts,
     }
@@ -279,8 +285,12 @@ fn open_store(
         .unwrap_or(DEFAULT_EMBEDDING_PROVIDER);
     match provider {
         EmbeddingProviderKind::FastEmbed => {
-            let embedder =
-                FastEmbedSemanticMemoryEmbedder::try_new(config.base_dir.join("fastembed-cache"))?;
+            let embedder = FastEmbedSemanticMemoryEmbedder::try_new(
+                config.base_dir.join("fastembed-cache"),
+                runtime_config
+                    .map(|config| config.fastembed_download_consent)
+                    .unwrap_or(false),
+            )?;
             MemoryStore::open_with_embedder(config, Box::new(embedder))
                 .map_err(|e| GlossError::Search(format!("semantic-memory: {e}")))
         }
@@ -335,7 +345,7 @@ fn upsert_failed_link_rows(
     let now = chrono::Utc::now().to_rfc3339();
     for chunk in chunks {
         let sm_episode_id: Option<&str> = None;
-        nb_db.conn.execute(
+        nb_db.conn().execute(
             "INSERT INTO semantic_memory_links
              (chunk_id, notebook_id, source_id, sm_document_id, sm_chunk_id, sm_episode_id,
               content_digest, backend_version, sync_status, sync_error, synced_at)
@@ -377,7 +387,7 @@ fn mark_source_links_status(
     error: Option<&str>,
 ) -> Result<(), GlossError> {
     let now = chrono::Utc::now().to_rfc3339();
-    nb_db.conn.execute(
+    nb_db.conn().execute(
         "UPDATE semantic_memory_links
          SET sync_status = ?1,
              sync_error = ?2,
@@ -452,7 +462,7 @@ fn upsert_synced_link_rows(
             )));
         }
 
-        nb_db.conn.execute(
+        nb_db.conn().execute(
             "INSERT INTO semantic_memory_links
              (chunk_id, notebook_id, source_id, sm_document_id, sm_chunk_id, sm_episode_id,
               content_digest, backend_version, sync_status, sync_error, synced_at)
@@ -520,7 +530,7 @@ fn upsert_synced_subchunk_link_rows(
             )));
         }
 
-        nb_db.conn.execute(
+        nb_db.conn().execute(
             "INSERT INTO semantic_memory_links
              (chunk_id, notebook_id, source_id, sm_document_id, sm_chunk_id, sm_episode_id,
               content_digest, backend_version, sync_status, sync_error, synced_at)
@@ -1076,7 +1086,7 @@ async fn ingest_document_chunk_manifest(
 }
 
 pub fn load_links(nb_db: &NotebookDb) -> Result<Vec<SemanticLinkRow>, GlossError> {
-    let mut stmt = nb_db.conn.prepare(
+    let mut stmt = nb_db.conn().prepare(
         "SELECT chunk_id, source_id, sm_document_id, sm_chunk_id, content_digest, sync_status
          FROM semantic_memory_links",
     )?;
@@ -1154,10 +1164,15 @@ pub async fn search_preview(
 
     let namespaces = [notebook_id];
     let source_types = [SearchSourceType::Chunks];
+    let overfetch_limit = request
+        .limit
+        .max(1)
+        .saturating_mul(4)
+        .max(request.limit.max(1));
     let response = store
         .search_with_context(
             &request.query,
-            Some(request.limit.saturating_mul(4).max(request.limit)),
+            Some(overfetch_limit),
             Some(&namespaces),
             Some(&source_types),
             context,
@@ -1274,6 +1289,7 @@ pub async fn search_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retrieval::source_scope::SourceScope;
     use tempfile::tempdir;
 
     fn test_source(id: &str) -> Source {
@@ -1301,7 +1317,7 @@ mod tests {
 
     #[test]
     fn runtime_config_defaults_turbo_quant_off() {
-        let config = runtime_config_from_settings(None, None, None, None, false, true);
+        let config = runtime_config_from_settings(None, None, None, None, false, false, true);
         assert_eq!(config.embedding_provider, EmbeddingProviderKind::FastEmbed);
         assert_eq!(
             config.embedding_ollama_url,
@@ -1312,6 +1328,7 @@ mod tests {
             config.embedding_timeout_secs,
             DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS
         );
+        assert!(!config.fastembed_download_consent);
         assert!(!config.turbo_quant_enabled);
     }
 
@@ -1322,6 +1339,7 @@ mod tests {
             Some("http://localhost:11435".to_string()),
             Some("embed-model".to_string()),
             Some("12".to_string()),
+            false,
             true,
             true,
         );
@@ -1339,12 +1357,14 @@ mod tests {
             Some("http://localhost:11435".to_string()),
             Some("nomic-embed-text".to_string()),
             Some("12".to_string()),
+            true,
             false,
             true,
         );
         assert_eq!(config.embedding_provider, EmbeddingProviderKind::FastEmbed);
         assert_eq!(config.embedding_model, FASTEMBED_MODEL_NAME);
         assert_eq!(config.embedding_timeout_secs, 12);
+        assert!(config.fastembed_download_consent);
     }
 
     #[tokio::test]
@@ -1381,5 +1401,135 @@ mod tests {
             .unwrap();
         assert_eq!(status.status, "skipped_no_chunks");
         assert_eq!(db.get_source("source-empty").unwrap().status, "ready");
+    }
+
+    #[tokio::test]
+    async fn live_semantic_memory_projection_search_receipt() -> Result<(), GlossError> {
+        let Ok(receipt_path) = std::env::var("GLOSS_LIVE_SEMANTIC_MEMORY_SMOKE_RECEIPT") else {
+            return Ok(());
+        };
+        let run_id = std::env::var("GLOSS_RUN_ID")
+            .unwrap_or_else(|_| "GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526".into());
+        let dir = tempdir()?;
+        let db_path = dir.path().join("notebook.db");
+        let notebook_id = "live-semantic-memory-smoke";
+        let source_id = "source-live-semantic-memory";
+        let chunk_id = "chunk-live-semantic-memory";
+        let content = "The Gloss semantic-memory live smoke source says the warranty code is ALPHA-42 and the support window is ninety days.";
+        let source = Source {
+            id: source_id.to_string(),
+            source_type: "text".to_string(),
+            title: "Semantic Memory Live Smoke".to_string(),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: Some(content.to_string()),
+            word_count: Some(content.split_whitespace().count() as i32),
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: "ready".to_string(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            processing_state: None,
+        };
+        {
+            let db = NotebookDb::open(&db_path)?;
+            db.insert_source(&source)?;
+            db.insert_chunk(&Chunk {
+                id: chunk_id.to_string(),
+                source_id: source_id.to_string(),
+                chunk_index: 0,
+                content: content.to_string(),
+                token_count: Some(content.split_whitespace().count() as i32),
+                start_offset: Some(0),
+                end_offset: Some(content.len() as i32),
+                metadata: None,
+                embedding_id: None,
+                embedding_model: None,
+            })?;
+        }
+
+        let runtime_config = SemanticMemoryRuntimeConfig {
+            embedding_provider: EmbeddingProviderKind::Ollama,
+            embedding_ollama_url: std::env::var("GLOSS_SEMANTIC_MEMORY_OLLAMA_URL")
+                .unwrap_or_else(|_| DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL.to_string()),
+            embedding_model: std::env::var("GLOSS_SEMANTIC_MEMORY_EMBEDDING_MODEL")
+                .unwrap_or_else(|_| DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL.to_string()),
+            embedding_timeout_secs: 30,
+            fastembed_download_consent: false,
+            turbo_quant_enabled: false,
+            turbo_quant_require_fresh_artifacts: true,
+        };
+        validate_embedding_model_role(&runtime_config)?;
+        let projection_receipt = reindex_source_with_options(
+            dir.path(),
+            notebook_id,
+            &db_path,
+            source_id,
+            Some("live-semantic-memory-projection".to_string()),
+            Some(runtime_config.clone()),
+            ReindexSourceOptions {
+                rebuild_vector_artifacts: false,
+                classify_zero_chunks_as_skip: true,
+            },
+        )
+        .await?;
+        if projection_receipt.indexed_chunks == 0 {
+            return Err(GlossError::Search(
+                "live semantic-memory smoke projected zero chunks".to_string(),
+            ));
+        }
+
+        let links = {
+            let db = NotebookDb::connect(&db_path)?;
+            load_links(&db)?
+        };
+        let response = search_preview(
+            dir.path(),
+            notebook_id,
+            links,
+            std::slice::from_ref(&source),
+            MemorySearchRequest {
+                notebook_id: notebook_id.to_string(),
+                source_scope: SourceScope::Explicit(vec![source_id.to_string()]),
+                query: "What is the ALPHA-42 warranty code support window?".to_string(),
+                limit: 4,
+                trace_id: Some("live-semantic-memory-search".to_string()),
+                allow_fallback: false,
+            },
+            Some(runtime_config),
+        )
+        .await?;
+        if response.candidates.is_empty() {
+            return Err(GlossError::Search(
+                "live semantic-memory smoke returned zero candidates".to_string(),
+            ));
+        }
+
+        let payload = serde_json::json!({
+            "schema": "LiveSemanticMemorySmokeReceiptV1",
+            "run_id": run_id,
+            "recorded_utc": chrono::Utc::now().to_rfc3339(),
+            "status": "passed",
+            "backend_used": response.backend_used,
+            "fallback_used": response.fallback_used,
+            "live_projection_sources": 1,
+            "indexed_chunks": projection_receipt.indexed_chunks,
+            "semantic_candidate_count": response.candidates.len(),
+            "strict_fixture_answered": true,
+            "projection_receipt_id": projection_receipt.receipt_id,
+            "search_receipt_id": response.receipt_id,
+            "source_scope_preserved": response.source_scope_preserved,
+            "degraded": response.degraded,
+            "provider": "ollama",
+            "embedding_model": DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL,
+            "turbo_quant_claimed": false
+        });
+        std::fs::write(receipt_path, serde_json::to_string_pretty(&payload)? + "\n")?;
+        Ok(())
     }
 }

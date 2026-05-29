@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { ChatEvidencePayload, ChatStatusPayload, Conversation, Message, SourceScope } from '../lib/types';
 import * as api from '../lib/tauri';
+import { useToastStore } from './toastStore';
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
 
@@ -37,6 +38,7 @@ interface ChatStore {
   appendToken: (notebookId: string, conversationId: string, messageId: string, token: string) => void;
   finalizeMessage: (notebookId: string, conversationId: string, messageId: string) => void;
   setStreamingError: (notebookId: string, conversationId: string, messageId: string, error: string) => void;
+  handleChatCancelled: (notebookId: string, conversationId: string, messageId: string, reason: string) => void;
   setStreamingStatus: (payload: ChatStatusPayload) => void;
   resetForNotebookSwitch: () => void;
   loadSuggestedQuestions: (notebookId: string) => Promise<void>;
@@ -65,6 +67,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       set({ conversations });
     } catch (e) {
       console.error('Failed to load conversations:', e);
+      useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load conversations', duration: 5000 });
     }
   },
 
@@ -112,6 +115,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       set({ messages });
     } catch (e) {
       console.error('Failed to load messages:', e);
+      useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load messages', duration: 5000 });
     }
   },
 
@@ -185,27 +189,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     try {
       await api.stopChat(notebookId);
     } finally {
-      const { isStreaming, streamingMessageId, activeConversationId, streamingContent } = get();
-      if (!isStreaming || !streamingMessageId || !activeConversationId) return;
-      const pendingEvidence = get().pendingEvidence[streamingMessageId];
-      const assistantMsg: Message = {
-        id: streamingMessageId,
-        conversation_id: activeConversationId,
-        role: 'assistant',
-        content: streamingContent || '[Stopped]',
-        citations: pendingEvidence,
-        created_at: new Date().toISOString(),
-      };
+      const { isStreaming, streamingMessageId, streamingContent } = get();
+      if (!isStreaming || !streamingMessageId) return;
       set((state) => ({
-        messages: streamingContent ? [...state.messages, assistantMsg] : state.messages,
         pendingEvidence: Object.fromEntries(
           Object.entries(state.pendingEvidence).filter(([id]) => id !== streamingMessageId)
         ),
         isStreaming: false,
-        streamingContent: '',
+        streamingContent,
         streamingNotebookId: null,
         streamingMessageId: null,
-        streamingError: null,
+        streamingError: streamingContent
+          ? 'Generation stopped. Partial output was not saved as an assistant message.'
+          : 'Generation stopped before any output was received.',
         streamingStatus: null,
       }));
     }
@@ -236,14 +232,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }));
   },
 
-  finalizeMessage: (notebookId, conversationId, messageId) => {
+  finalizeMessage: (_notebookId, conversationId, messageId) => {
     const {
       isStreaming,
-      streamingNotebookId,
       streamingMessageId,
     } = get();
+    // Terminal event: MUST be processed regardless of notebookId — the
+    // frontend must always exit streaming state when the backend says we're
+    // done. Match on messageId to ensure we close the correct stream.
     if (!isStreaming) return;
-    if (streamingNotebookId !== notebookId) return;
     if (!streamingMessageId || streamingMessageId !== messageId) return;
     const finalContent = get().streamingContent;
     if (!finalContent.trim()) {
@@ -283,17 +280,39 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }));
   },
 
-  setStreamingError: (notebookId, _conversationId, messageId, error) => {
+  setStreamingError: (_notebookId, _conversationId, messageId, error) => {
     const {
       isStreaming,
-      streamingNotebookId,
       streamingMessageId,
     } = get();
+    // Terminal event: MUST be processed regardless of notebookId — the
+    // frontend must always exit streaming state on error. Match on messageId
+    // to ensure we close the correct stream.
     if (!isStreaming) return;
-    if (streamingNotebookId !== notebookId) return;
     if (!streamingMessageId || streamingMessageId !== messageId) return;
     set({
       streamingError: error,
+      isStreaming: false,
+      streamingContent: get().streamingContent,
+      streamingNotebookId: null,
+      streamingMessageId: null,
+      pendingEvidence: {},
+      streamingStatus: null,
+    });
+  },
+
+  handleChatCancelled: (_notebookId, _conversationId, messageId, reason) => {
+    const {
+      isStreaming,
+      streamingMessageId,
+    } = get();
+    // Terminal event: MUST be processed regardless of notebookId — the
+    // frontend must always exit streaming state on cancellation. Match on
+    // messageId to ensure we close the correct stream.
+    if (!isStreaming) return;
+    if (!streamingMessageId || streamingMessageId !== messageId) return;
+    set({
+      streamingError: reason,
       isStreaming: false,
       streamingContent: '',
       streamingNotebookId: null,

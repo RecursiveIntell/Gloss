@@ -93,8 +93,8 @@ export function StatusBar() {
   // Poll queue status + refresh stats when notebook changes or periodically
   useEffect(() => {
     const poll = () => {
-      api.getQueueStatus().then(setQueueStatus).catch(() => {});
-      api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => {});
+      api.getQueueStatus().then(setQueueStatus).catch((e) => { console.warn('Queue status unavailable:', e); setQueueStatus(null); });
+      api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch((e) => { console.warn('Memory backend status unavailable:', e); setMemoryStatus({ backend_id: '', default_backend: 'gloss-local', active_backend: 'gloss-local', backend_used: 'gloss-local', available: false, semantic_memory_feature_enabled: false, semantic_memory_available: false, index_sync_status: 'unknown', sync_status: 'unknown', degradation_markers: [], degraded: false, fallback_reason: 'status check failed' }); });
       if (activeNotebookId) {
         useSourceStore.getState().loadStats(activeNotebookId);
         api

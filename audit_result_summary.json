@@ -1,0 +1,38 @@
+{
+  "verdict": "NO-GO",
+  "issue_count": 66,
+  "s0_count": 12,
+  "s1_count": 29,
+  "current_package_created_utc": "2026-05-26T23:27:36Z",
+  "commands_run": [
+    {
+      "command": "npm run build",
+      "result": "PASS"
+    },
+    {
+      "command": "npm test",
+      "result": "PASS"
+    },
+    {
+      "command": "python3 scripts/chat_runtime_static_audit.py --repo .",
+      "result": "PASS but weak"
+    },
+    {
+      "command": "python3 validation/gloss_timeout_partial_continuation_gate.py --repo .",
+      "result": "PASS static"
+    },
+    {
+      "command": "python3 validation/gloss_package_scope_gate.py --repo .",
+      "result": "FAIL"
+    },
+    {
+      "command": "timeout 20s python3 validation/gloss_release_candidate_gate.py --repo . --run-id CURRENT",
+      "result": "TIMEOUT"
+    },
+    {
+      "command": "python3 validation/gloss_legacy_office_extractors_gate.py --repo .",
+      "result": "FAIL"
+    }
+  ],
+  "top_root_cause": "Backend waits for stream EOF after Ollama done=true instead of terminalizing immediately on done frame."
+}

@@ -11,6 +11,57 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
+const LOCAL_EGRESS_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+const OPENAI_EGRESS_HOST: &str = "api.openai.com";
+const ANTHROPIC_EGRESS_HOST: &str = "api.anthropic.com";
+
+const ALLOW_LAN_LOCAL_PROVIDERS_KEY: &str = "allow_lan_local_providers";
+
+fn is_rfc1918_host(host: &str) -> bool {
+    // 10.0.0.0/8
+    if host.starts_with("10.") || host.starts_with("10:") {
+        return true;
+    }
+    // 172.16.0.0/12
+    if host.starts_with("172.") {
+        let parts: Vec<&str> = host.split('.').collect();
+        if parts.len() >= 2 {
+            if let Ok(second_octet) = parts[1].parse::<u8>() {
+                if (16..=31).contains(&second_octet) {
+                    return true;
+                }
+            }
+        }
+    }
+    // 192.168.0.0/16
+    if host.starts_with("192.168.") {
+        return true;
+    }
+    // IPv6 private: fc00::/7
+    if host.starts_with("fc")
+        || host.starts_with("fd")
+        || host.starts_with("fc00")
+        || host.starts_with("fd00")
+    {
+        return true;
+    }
+    false
+}
+
+pub fn lan_local_providers_allowed(app_db: &crate::db::app_db::AppDb) -> bool {
+    app_db
+        .get_setting(ALLOW_LAN_LOCAL_PROVIDERS_KEY)
+        .ok()
+        .flatten()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "enabled"
+            )
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProviderType {
     Ollama,
@@ -82,6 +133,10 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub max_tokens: u32,
     pub temperature: f32,
+    pub top_p: Option<f32>,
+    pub top_k: Option<i64>,
+    pub min_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
     pub stream: bool,
     /// Ollama num_ctx: total context window size. When None, Ollama uses model default.
     pub num_ctx: Option<u32>,
@@ -118,6 +173,167 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkScopeReceiptV1 {
+    pub schema: String,
+    pub provider: String,
+    pub base_url: String,
+    pub host: String,
+    pub egress_class: String,
+    pub policy: String,
+    pub cloud_opt_in_required: bool,
+    pub lan_opt_in_applied: bool,
+}
+
+pub fn validate_provider_base_url(
+    provider_type: ProviderType,
+    base_url: &str,
+    allow_lan: bool,
+) -> Result<NetworkScopeReceiptV1, GlossError> {
+    let parsed = reqwest::Url::parse(base_url.trim()).map_err(|e| {
+        GlossError::Config(format!(
+            "Provider '{}' base URL is invalid: {e}",
+            provider_type.as_str()
+        ))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(GlossError::Config(format!(
+            "Provider '{}' base URL must use http or https",
+            provider_type.as_str()
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(GlossError::Config(format!(
+            "Provider '{}' base URL must not include credentials",
+            provider_type.as_str()
+        )));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(GlossError::Config(format!(
+            "Provider '{}' base URL must not include query strings or fragments",
+            provider_type.as_str()
+        )));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| {
+            GlossError::Config(format!(
+                "Provider '{}' base URL must include a host",
+                provider_type.as_str()
+            ))
+        })?
+        .to_ascii_lowercase();
+    let is_loopback = LOCAL_EGRESS_HOSTS.contains(&host.as_str());
+    let is_lan = is_rfc1918_host(&host);
+    let (allowed, egress_class, policy, cloud_opt_in_required, lan_opt_in_applied) = match provider_type {
+        ProviderType::Ollama | ProviderType::LlamaCpp => {
+            if is_loopback {
+                (true, "local_loopback", "local providers default to loopback endpoints", false, false)
+            } else if is_lan && allow_lan {
+                (true, "local_lan", "LAN local providers permitted by operator opt-in (allow_lan_local_providers=true)", false, true)
+            } else if is_lan {
+                (false, "lan_rejected", "LAN local provider URL rejected; set allow_lan_local_providers=true to permit RFC1918 LAN endpoints", false, false)
+            } else {
+                (false, "public_rejected", "local providers are restricted to loopback (or LAN with opt-in); public IPs are always rejected", false, false)
+            }
+        }
+        ProviderType::OpenAI => (
+            parsed.scheme() == "https" && host == OPENAI_EGRESS_HOST,
+            "cloud_default",
+            "OpenAI provider is restricted to https://api.openai.com without custom endpoint opt-in",
+            true,
+            false,
+        ),
+        ProviderType::Anthropic => (
+            parsed.scheme() == "https" && host == ANTHROPIC_EGRESS_HOST,
+            "cloud_default",
+            "Anthropic provider is restricted to https://api.anthropic.com without custom endpoint opt-in",
+            true,
+            false,
+        ),
+    };
+    if !allowed {
+        return Err(GlossError::Config(format!(
+            "Provider '{}' base URL '{}' is outside the active NetworkScopePolicy: {}",
+            provider_type.as_str(),
+            redact_url_for_error(base_url),
+            policy
+        )));
+    }
+    Ok(NetworkScopeReceiptV1 {
+        schema: "NetworkScopeReceiptV1".to_string(),
+        provider: provider_type.as_str().to_string(),
+        base_url: parsed.as_str().trim_end_matches('/').to_string(),
+        host,
+        egress_class: egress_class.to_string(),
+        policy: policy.to_string(),
+        cloud_opt_in_required,
+        lan_opt_in_applied,
+    })
+}
+
+pub fn sanitize_provider_error_body(body: &str) -> String {
+    let body = body
+        .replace(['\n', '\r'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out = String::new();
+    for token in body.split(' ') {
+        let lower = token.to_ascii_lowercase();
+        let redacted = lower.contains("authorization")
+            || lower.contains("api_key")
+            || lower.contains("apikey")
+            || lower.contains("token")
+            || lower.contains("secret")
+            || token.starts_with("sk-")
+            || token.starts_with("Bearer");
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        if redacted {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(token);
+        }
+        if out.len() >= 240 {
+            out.truncate(240);
+            out.push_str("...");
+            break;
+        }
+    }
+    let out = crate::redaction::redact_json_embedded_secrets(&out);
+    if out.is_empty() {
+        "[empty error body]".to_string()
+    } else {
+        out
+    }
+}
+
+pub fn provider_http_error(provider: &str, status: reqwest::StatusCode, body: &str) -> GlossError {
+    GlossError::Provider {
+        provider: provider.to_string(),
+        source: anyhow::anyhow!(
+            "HTTP {}: sanitized_body={}",
+            status,
+            sanitize_provider_error_body(body)
+        ),
+    }
+}
+
+fn redact_url_for_error(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.as_str().to_string()
+        }
+        Err(_) => "[invalid-url]".to_string(),
+    }
+}
+
 /// Construct a boxed LlmProvider from a config.
 pub fn build_provider(config: &ProviderConfig) -> Box<dyn LlmProvider> {
     match config.provider_type {
@@ -149,11 +365,21 @@ fn provider_base_url(row: &Provider, provider_type: ProviderType) -> String {
         .to_string()
 }
 
+fn validated_provider_base_url(
+    row: &Provider,
+    provider_type: ProviderType,
+    allow_lan: bool,
+) -> Result<String, GlossError> {
+    let base_url = provider_base_url(row, provider_type);
+    Ok(validate_provider_base_url(provider_type, &base_url, allow_lan)?.base_url)
+}
+
 pub fn provider_config_from_db(
     app_db: &AppDb,
     secret_store: &SecretStore,
     provider_type: ProviderType,
 ) -> Result<ProviderConfig, GlossError> {
+    let allow_lan = lan_local_providers_allowed(app_db);
     let providers = app_db.list_providers()?;
     let row = provider_row(&providers, provider_type).ok_or_else(|| {
         GlossError::Config(format!(
@@ -170,7 +396,7 @@ pub fn provider_config_from_db(
 
     Ok(ProviderConfig {
         provider_type,
-        base_url: provider_base_url(row, provider_type),
+        base_url: validated_provider_base_url(row, provider_type, allow_lan)?,
         api_key: provider_type
             .api_key_setting_key()
             .map(|key| secret_store.get(key))
@@ -193,10 +419,12 @@ pub struct ModelRegistry {
 impl ModelRegistry {
     /// Create registry from app database config.
     pub fn new(app_db: &AppDb, secret_store: &SecretStore) -> Result<Self, GlossError> {
+        let allow_lan = lan_local_providers_allowed(app_db);
         let providers = app_db.list_providers()?;
         let ollama = provider_row(&providers, ProviderType::Ollama)
             .filter(|row| row.enabled)
-            .map(|row| ollama::OllamaProvider::new(&provider_base_url(row, ProviderType::Ollama)));
+            .and_then(|row| validated_provider_base_url(row, ProviderType::Ollama, allow_lan).ok())
+            .map(|base_url| ollama::OllamaProvider::new(&base_url));
 
         let openai = match provider_row(&providers, ProviderType::OpenAI) {
             Some(row) if row.enabled => {
@@ -205,7 +433,7 @@ impl ModelRegistry {
                     None
                 } else {
                     Some(openai::OpenAIProvider::new(
-                        &provider_base_url(row, ProviderType::OpenAI),
+                        &validated_provider_base_url(row, ProviderType::OpenAI, allow_lan)?,
                         &key,
                     ))
                 }
@@ -220,7 +448,7 @@ impl ModelRegistry {
                     None
                 } else {
                     Some(anthropic::AnthropicProvider::new(
-                        &provider_base_url(row, ProviderType::Anthropic),
+                        &validated_provider_base_url(row, ProviderType::Anthropic, allow_lan)?,
                         &key,
                     ))
                 }
@@ -230,9 +458,10 @@ impl ModelRegistry {
 
         let llamacpp = provider_row(&providers, ProviderType::LlamaCpp)
             .filter(|row| row.enabled)
-            .map(|row| {
-                llamacpp::LlamaCppProvider::new(&provider_base_url(row, ProviderType::LlamaCpp))
-            });
+            .and_then(|row| {
+                validated_provider_base_url(row, ProviderType::LlamaCpp, allow_lan).ok()
+            })
+            .map(|base_url| llamacpp::LlamaCppProvider::new(&base_url));
 
         let cached_models = app_db
             .get_all_models()?
@@ -362,5 +591,194 @@ impl ModelRegistry {
                 last_error: None,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_scope_policy_allows_loopback_local_providers() {
+        let receipt =
+            validate_provider_base_url(ProviderType::Ollama, "http://localhost:11434/", false)
+                .unwrap();
+        assert_eq!(receipt.egress_class, "local_loopback");
+        assert_eq!(receipt.base_url, "http://localhost:11434");
+        assert!(!receipt.lan_opt_in_applied);
+        assert!(validate_provider_base_url(
+            ProviderType::LlamaCpp,
+            "http://127.0.0.1:8080/v1",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn network_scope_policy_rejects_lan_default() {
+        // LAN IPs rejected by default (allow_lan = false)
+        assert!(validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://192.168.1.7:11434",
+            false
+        )
+        .is_err());
+        assert!(
+            validate_provider_base_url(ProviderType::Ollama, "http://10.0.0.5:11434", false)
+                .is_err()
+        );
+        assert!(
+            validate_provider_base_url(ProviderType::Ollama, "http://172.16.0.1:11434", false)
+                .is_err()
+        );
+        assert!(validate_provider_base_url(
+            ProviderType::LlamaCpp,
+            "http://192.168.1.100:8080/v1",
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn network_scope_policy_allows_lan_with_opt_in() {
+        // LAN IPs accepted when allow_lan = true
+        let receipt =
+            validate_provider_base_url(ProviderType::Ollama, "http://192.168.1.7:11434", true)
+                .unwrap();
+        assert_eq!(receipt.egress_class, "local_lan");
+        assert!(receipt.lan_opt_in_applied);
+
+        let receipt2 =
+            validate_provider_base_url(ProviderType::Ollama, "http://10.0.0.5:11434", true)
+                .unwrap();
+        assert_eq!(receipt2.egress_class, "local_lan");
+        assert!(receipt2.lan_opt_in_applied);
+
+        let receipt3 =
+            validate_provider_base_url(ProviderType::LlamaCpp, "http://172.16.5.20:8080/v1", true)
+                .unwrap();
+        assert_eq!(receipt3.egress_class, "local_lan");
+        assert!(receipt3.lan_opt_in_applied);
+    }
+
+    #[test]
+    fn network_scope_policy_rejects_public_ips_even_with_opt_in() {
+        // Public IPs always rejected, even with allow_lan = true
+        assert!(
+            validate_provider_base_url(ProviderType::Ollama, "http://203.0.113.5:11434", true)
+                .is_err()
+        );
+        assert!(
+            validate_provider_base_url(ProviderType::Ollama, "http://8.8.8.8:11434", true).is_err()
+        );
+    }
+
+    #[test]
+    fn network_scope_policy_rejects_credentials_query_fragment() {
+        // Credentials in URLs always rejected
+        assert!(validate_provider_base_url(
+            ProviderType::OpenAI,
+            "https://token@example.com/v1",
+            false
+        )
+        .is_err());
+        // Query strings always rejected
+        assert!(validate_provider_base_url(
+            ProviderType::Anthropic,
+            "https://api.anthropic.com/v1?key=***\n",
+            false
+        )
+        .is_err());
+        // Fragment always rejected
+        assert!(validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://localhost:11434/#fragment",
+            false
+        )
+        .is_err());
+        // Credentials in URL even with LAN opt-in
+        assert!(validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://user:pass@192.168.1.7:11434",
+            true
+        )
+        .is_err());
+        // Query string even with LAN opt-in
+        assert!(validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://192.168.1.7:11434?token=abc",
+            true
+        )
+        .is_err());
+        // Fragment even with LAN opt-in
+        assert!(validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://192.168.1.7:11434#section",
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn network_scope_policy_restricts_cloud_defaults() {
+        assert!(validate_provider_base_url(
+            ProviderType::OpenAI,
+            "https://api.openai.com/v1",
+            false
+        )
+        .is_ok());
+        assert!(validate_provider_base_url(
+            ProviderType::OpenAI,
+            "https://openai-compatible.example.test/v1",
+            false
+        )
+        .is_err());
+        assert!(validate_provider_base_url(
+            ProviderType::Anthropic,
+            "https://api.anthropic.com/v1",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn lan_opt_in_not_applied_for_loopback() {
+        let receipt =
+            validate_provider_base_url(ProviderType::Ollama, "http://localhost:11434/", true)
+                .unwrap();
+        // Even with allow_lan=true, loopback should be local_loopback, not local_lan
+        assert_eq!(receipt.egress_class, "local_loopback");
+        assert!(!receipt.lan_opt_in_applied);
+    }
+
+    #[test]
+    fn is_rfc1918_host_detection() {
+        // 10.0.0.0/8
+        assert!(is_rfc1918_host("10.0.0.1"));
+        assert!(is_rfc1918_host("10.255.255.255"));
+        // 172.16.0.0/12
+        assert!(is_rfc1918_host("172.16.0.1"));
+        assert!(is_rfc1918_host("172.31.255.255"));
+        assert!(!is_rfc1918_host("172.15.0.1"));
+        assert!(!is_rfc1918_host("172.32.0.1"));
+        // 192.168.0.0/16
+        assert!(is_rfc1918_host("192.168.0.1"));
+        assert!(is_rfc1918_host("192.168.255.255"));
+        // Not RFC1918
+        assert!(!is_rfc1918_host("8.8.8.8"));
+        assert!(!is_rfc1918_host("203.0.113.1"));
+        // Loopback is not RFC1918
+        assert!(!is_rfc1918_host("127.0.0.1"));
+    }
+
+    #[test]
+    fn provider_error_body_redacts_secrets_and_bounds_output() {
+        let sanitized = sanitize_provider_error_body(
+            "bad Authorization: Bearer sk-test token secret api_key=abc prompt text",
+        );
+        assert!(sanitized.contains("[redacted]"));
+        assert!(!sanitized.contains("sk-test"));
+        assert!(!sanitized.contains("api_key=abc"));
+        assert!(sanitized.len() <= 243);
     }
 }

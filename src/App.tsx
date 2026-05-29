@@ -7,7 +7,7 @@ import { useNotebookStore } from "./stores/notebookStore";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useToastStore } from "./stores/toastStore";
-import { onChatToken, onChatStatus, onChatError, onChatEvidence, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
+import { onChatToken, onChatStatus, onChatError, onChatCancelled, onChatEvidence, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
 import { useSourceStore } from "./stores/sourceStore";
 import { BookOpen, Database, Search, Sparkles } from "lucide-react";
 
@@ -49,9 +49,11 @@ export function App() {
     loadModels();
   }, []);
 
-  // Listen for chat token events
+  // Listen for all Tauri events — consolidated cleanup
   useEffect(() => {
-    const unlisten = onChatToken((payload) => {
+    const unlisteners: Promise<VoidFunction>[] = [];
+
+    unlisteners.push(onChatToken((payload) => {
       const chatStore = useChatStore.getState();
       if (payload.token) {
         chatStore.appendToken(
@@ -68,21 +70,13 @@ export function App() {
           payload.message_id
         );
       }
-    });
-    return () => { unlisten.then(fn => fn()); };
-  }, []);
+    }));
 
-  // Listen for chat lifecycle status events
-  useEffect(() => {
-    const unlisten = onChatStatus((payload) => {
+    unlisteners.push(onChatStatus((payload) => {
       useChatStore.getState().setStreamingStatus(payload);
-    });
-    return () => { unlisten.then(fn => fn()); };
-  }, []);
+    }));
 
-  // Listen for chat error events
-  useEffect(() => {
-    const unlisten = onChatError((payload) => {
+    unlisteners.push(onChatError((payload) => {
       const chatStore = useChatStore.getState();
       chatStore.setStreamingError(
         payload.notebook_id,
@@ -96,25 +90,28 @@ export function App() {
         message: payload.error,
         duration: 8000,
       });
-    });
-    return () => { unlisten.then(fn => fn()); };
-  }, []);
+    }));
 
-  useEffect(() => {
-    const unlisten = onChatEvidence((payload) => {
+    unlisteners.push(onChatCancelled((payload) => {
+      const chatStore = useChatStore.getState();
+      chatStore.handleChatCancelled(
+        payload.notebook_id,
+        payload.conversation_id,
+        payload.message_id,
+        payload.reason
+      );
+    }));
+
+    unlisteners.push(onChatEvidence((payload) => {
       useChatStore.getState().attachAssistantEvidence(
         payload.notebook_id,
         payload.conversation_id,
         payload.message_id,
         { citations: payload.citations, evidence: payload.evidence }
       );
-    });
-    return () => { unlisten.then(fn => fn()); };
-  }, []);
+    }));
 
-  // Listen for source status events — BATCHED + THROTTLED
-  useEffect(() => {
-    const unlisten = onSourceStatus((payload) => {
+    unlisteners.push(onSourceStatus((payload) => {
       const currentNotebookId = useNotebookStore.getState().activeNotebookId;
       if (payload.notebook_id !== currentNotebookId) return;
 
@@ -174,30 +171,9 @@ export function App() {
           duration: 8000,
         });
       }
-    });
+    }));
 
-    return () => {
-      unlisten.then(fn => fn());
-      // Flush any pending status updates before clearing timers
-      if (statusFlushTimerRef.current) {
-        clearTimeout(statusFlushTimerRef.current);
-        statusFlushTimerRef.current = null;
-        const updates = Array.from(pendingStatusRef.current.entries()).map(
-          ([sourceId, v]) => ({ sourceId, status: v.status, errorMessage: v.errorMessage })
-        );
-        pendingStatusRef.current.clear();
-        if (updates.length > 0) {
-          useSourceStore.getState().updateSourceStatusBulk(updates);
-        }
-      }
-      if (statsDebounceRef.current) clearTimeout(statsDebounceRef.current);
-      if (batchToastTimerRef.current) clearTimeout(batchToastTimerRef.current);
-    };
-  }, []);
-
-  // Listen for batch source creation (folder imports Phase 1) — DEBOUNCED
-  useEffect(() => {
-    const unlisten = onSourcesBatchCreated((payload) => {
+    unlisteners.push(onSourcesBatchCreated((payload) => {
       const nbId = useNotebookStore.getState().activeNotebookId;
       if (payload.notebook_id === nbId) {
         if (batchCreatedDebounceRef.current) clearTimeout(batchCreatedDebounceRef.current);
@@ -209,17 +185,9 @@ export function App() {
           useSourceStore.getState().loadSources(nbId);
         }, 500);
       }
-    });
+    }));
 
-    return () => {
-      unlisten.then(fn => fn());
-      if (batchCreatedDebounceRef.current) clearTimeout(batchCreatedDebounceRef.current);
-    };
-  }, []);
-
-  // Listen for job completion events — DEBOUNCED (3s)
-  useEffect(() => {
-    const unlisten = onJobCompleted((payload) => {
+    unlisteners.push(onJobCompleted((payload) => {
       if (!payload.output) return;
       try {
         const data = JSON.parse(payload.output) as { notebook_id?: string };
@@ -236,17 +204,9 @@ export function App() {
       } catch {
         // Ignore unparseable output
       }
-    });
+    }));
 
-    return () => {
-      unlisten.then(fn => fn());
-      if (jobCompletedDebounceRef.current) clearTimeout(jobCompletedDebounceRef.current);
-    };
-  }, []);
-
-  // Listen for batch ingestion complete — single reload after all sources finish
-  useEffect(() => {
-    const unlisten = onBatchIngestionComplete((payload) => {
+    unlisteners.push(onBatchIngestionComplete((payload) => {
       const nbId = useNotebookStore.getState().activeNotebookId;
       if (payload.notebook_id === nbId) {
         void useNotebookStore.getState().loadNotebooks();
@@ -259,10 +219,13 @@ export function App() {
         const skipped = (payload.skipped_duplicate ?? 0) + (payload.skipped_unsupported ?? 0);
         const status = payload.status ?? 'completed';
         const toastType = status === 'completed' && failed === 0 && cancelled === 0 ? 'success' : 'warning';
+        const perf = payload.performance;
+        const elapsed = perf ? `${Math.max(0.1, perf.elapsed_ms / 1000).toFixed(1)}s` : null;
         const suffix = [
           failed ? `${failed} failed` : null,
           skipped ? `${skipped} skipped` : null,
           cancelled ? `${cancelled} cancelled` : null,
+          elapsed ? `${elapsed}` : null,
         ].filter(Boolean).join(', ');
         useToastStore.getState().addToast({
           type: toastType,
@@ -271,8 +234,27 @@ export function App() {
           duration: 5000,
         });
       }
-    });
-    return () => { unlisten.then(fn => fn()); };
+    }));
+
+    return () => {
+      unlisteners.forEach(p => p.then(fn => fn()));
+      // Flush any pending status updates before clearing timers
+      if (statusFlushTimerRef.current) {
+        clearTimeout(statusFlushTimerRef.current);
+        statusFlushTimerRef.current = null;
+        const updates = Array.from(pendingStatusRef.current.entries()).map(
+          ([sourceId, v]) => ({ sourceId, status: v.status, errorMessage: v.errorMessage })
+        );
+        pendingStatusRef.current.clear();
+        if (updates.length > 0) {
+          useSourceStore.getState().updateSourceStatusBulk(updates);
+        }
+      }
+      if (statsDebounceRef.current) clearTimeout(statsDebounceRef.current);
+      if (batchToastTimerRef.current) clearTimeout(batchToastTimerRef.current);
+      if (batchCreatedDebounceRef.current) clearTimeout(batchCreatedDebounceRef.current);
+      if (jobCompletedDebounceRef.current) clearTimeout(jobCompletedDebounceRef.current);
+    };
   }, []);
 
   return (

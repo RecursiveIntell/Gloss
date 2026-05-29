@@ -3,18 +3,29 @@ import type { ReactNode } from "react";
 import { SourcesPanel } from "../sources/SourcesPanel";
 import { ChatPanel } from "../chat/ChatPanel";
 import { NotesPanel } from "../notes/NotesPanel";
+import { StudioPanel } from "../studio/StudioPanel";
+import { EvidencePanel } from "../inspector/EvidencePanel";
+import { PromptPanel } from "../inspector/PromptPanel";
+import { ReceiptPanel } from "../inspector/ReceiptPanel";
+import { DiagnosticsPanel } from "../inspector/DiagnosticsPanel";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useChatStore } from "../../stores/chatStore";
 import { useNoteStore } from "../../stores/noteStore";
 import {
+  Activity,
   FileText,
   MessageSquare,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
+  ScrollText,
+  ShieldCheck,
+  Sparkles,
   StickyNote,
 } from "lucide-react";
+
+type InspectorTab = "notes" | "studio" | "prompt" | "evidence" | "receipt" | "diagnostics" | "sources";
 
 interface PanelLayoutProps {
   notebookId: string;
@@ -33,6 +44,7 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
   const [rightWidth, setRightWidth] = useState(() => Number(localStorage.getItem("gloss:layout:rightWidth") || 320));
   const [leftCollapsed, setLeftCollapsed] = useState(() => localStorage.getItem("gloss:layout:leftCollapsed") !== "0");
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("gloss:layout:rightCollapsed") !== "0");
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("notes");
 
   useEffect(() => {
     loadSources(notebookId);
@@ -117,12 +129,16 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
       {!rightCollapsed ? (
         <div className="gloss-panel relative flex shrink-0 flex-col overflow-hidden border-l border-border" style={{ width: rightWidth }}>
           <DrawerHeader
-            title="Notes"
+            title="Inspector Dock"
             subtitle={`${notes.length} saved notes`}
             onClose={() => setRightCollapsed(true)}
             closeSide="right"
           />
-          <NotesPanel notebookId={notebookId} />
+          <InspectorDock
+            notebookId={notebookId}
+            activeTab={inspectorTab}
+            onTabChange={setInspectorTab}
+          />
           <div
             role="separator"
             className="absolute left-0 top-0 h-full w-1 cursor-col-resize hover:bg-accent/40"
@@ -139,6 +155,56 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
         >
           {rightCollapsed ? <PanelRightOpen className="h-4 w-4" /> : <StickyNote className="h-4 w-4" />}
         </RailAction>
+      </div>
+    </div>
+  );
+}
+
+function InspectorDock({
+  notebookId,
+  activeTab,
+  onTabChange,
+}: {
+  notebookId: string;
+  activeTab: InspectorTab;
+  onTabChange: (tab: InspectorTab) => void;
+}) {
+  const tabs = [
+    { id: "notes", label: "Notes", icon: <StickyNote className="h-3.5 w-3.5" /> },
+    { id: "studio", label: "Studio", icon: <Sparkles className="h-3.5 w-3.5" /> },
+    { id: "evidence", label: "Evidence", icon: <ShieldCheck className="h-3.5 w-3.5" /> },
+    { id: "prompt", label: "Prompt", icon: <ScrollText className="h-3.5 w-3.5" /> },
+    { id: "receipt", label: "Receipt", icon: <FileText className="h-3.5 w-3.5" /> },
+    { id: "diagnostics", label: "Health", icon: <Activity className="h-3.5 w-3.5" /> },
+    { id: "sources", label: "Sources", icon: <PanelLeftOpen className="h-3.5 w-3.5" /> },
+  ] as const;
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="flex border-b border-border bg-bg-secondary/70">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            title={tab.label}
+            onClick={() => onTabChange(tab.id)}
+            className={`flex h-9 flex-1 items-center justify-center gap-1 text-[11px] ${
+              activeTab === tab.id ? "bg-bg-tertiary text-text" : "text-text-muted hover:text-text"
+            }`}
+          >
+            {tab.icon}
+            <span>{tab.label}</span>
+          </button>
+        ))}
+      </div>
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {activeTab === "notes" ? <NotesPanel notebookId={notebookId} /> : null}
+        {activeTab === "studio" ? <StudioPanel notebookId={notebookId} /> : null}
+        {activeTab === "evidence" ? <EvidencePanel /> : null}
+        {activeTab === "prompt" ? <PromptPanel /> : null}
+        {activeTab === "receipt" ? <ReceiptPanel /> : null}
+        {activeTab === "diagnostics" ? <DiagnosticsPanel notebookId={notebookId} /> : null}
+        {activeTab === "sources" ? <SourcesPanel notebookId={notebookId} /> : null}
       </div>
     </div>
   );

@@ -73,6 +73,7 @@ async function flushSelectedSources(): Promise<void> {
     await api.setSelectedSources(snapshot.notebookId, snapshot.ids);
   } catch (e) {
     console.error('Failed to persist selected sources:', e);
+    useToastStore.getState().addToast({ type: 'error', title: 'Save Failed', message: 'Failed to persist selected sources', duration: 5000 });
   } finally {
     persistSelectedSourcesInFlight = false;
     if (persistSelectedSourcesPending) {
@@ -94,7 +95,11 @@ interface SourceStore {
   addSourceFiles: (notebookId: string, paths: string[]) => Promise<void>;
   addSourceFolder: (notebookId: string, path: string) => Promise<void>;
   addSourcePaste: (notebookId: string, title: string, text: string) => Promise<void>;
+  addSourceUrl: (notebookId: string, url: string, networkConsent: boolean) => Promise<void>;
+  addSourceYouTubeTranscript: (notebookId: string, url: string, language: string | null, networkConsent: boolean) => Promise<void>;
   deleteSource: (notebookId: string, sourceId: string) => Promise<void>;
+  quarantineFailedImports: (notebookId: string) => Promise<void>;
+  deleteFailedImports: (notebookId: string) => Promise<void>;
   retrySource: (notebookId: string, sourceId: string) => Promise<void>;
   reindexSource: (notebookId: string, sourceId: string) => Promise<void>;
   reindexNotebook: (notebookId: string) => Promise<void>;
@@ -236,6 +241,52 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
     }
   },
 
+  addSourceUrl: async (notebookId, url, networkConsent) => {
+    try {
+      clearSuggestedQuestions();
+      await api.addSourceUrl(notebookId, url, networkConsent);
+      await refreshNotebookList();
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'URL Import Started',
+        message: 'Fetched URL text is queued for indexing.',
+        duration: 3000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'URL Import Failed',
+        message: String(e),
+        duration: 6000,
+      });
+    }
+  },
+
+  addSourceYouTubeTranscript: async (notebookId, url, language, networkConsent) => {
+    try {
+      clearSuggestedQuestions();
+      await api.addSourceYouTubeTranscript(notebookId, url, language, networkConsent);
+      await refreshNotebookList();
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'YouTube Transcript Import Started',
+        message: 'Fetched transcript text with timestamps is queued for indexing.',
+        duration: 3000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'YouTube Transcript Import Failed',
+        message: String(e),
+        duration: 6000,
+      });
+    }
+  },
+
   deleteSource: async (notebookId, sourceId) => {
     try {
       clearSuggestedQuestions();
@@ -249,6 +300,51 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         title: 'Delete Failed',
         message: String(e),
         duration: 5000,
+      });
+    }
+  },
+
+  quarantineFailedImports: async (notebookId) => {
+    try {
+      clearSuggestedQuestions();
+      const receipt = await api.quarantineFailedImports(notebookId);
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'Failed Imports Quarantined',
+        message: `${receipt.quarantined_sources} failed sources quarantined; ${receipt.cancelled_queue_jobs} queued jobs cancelled.`,
+        duration: 5000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Quarantine Failed',
+        message: String(e),
+        duration: 6000,
+      });
+    }
+  },
+
+  deleteFailedImports: async (notebookId) => {
+    try {
+      clearSuggestedQuestions();
+      const receipt = await api.deleteFailedImports(notebookId);
+      await refreshNotebookList();
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'Failed Imports Deleted',
+        message: `${receipt.deleted_sources} failed sources deleted; ${receipt.cancelled_queue_jobs} queued jobs cancelled.`,
+        duration: 5000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Delete Failed Imports Failed',
+        message: String(e),
+        duration: 6000,
       });
     }
   },

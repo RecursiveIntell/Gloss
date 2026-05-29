@@ -1,4 +1,4 @@
-use super::{ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
+use super::{provider_http_error, ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
@@ -98,6 +98,7 @@ impl LlmProvider for LlamaCppProvider {
             "stream": request.stream,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
+            "top_p": request.top_p,
         });
 
         let resp = self
@@ -115,10 +116,7 @@ impl LlmProvider for LlamaCppProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(GlossError::Provider {
-                provider: "llamacpp".into(),
-                source: anyhow::anyhow!("HTTP {}: {}", status, text),
-            });
+            return Err(provider_http_error("llamacpp", status, &text));
         }
 
         if request.stream {

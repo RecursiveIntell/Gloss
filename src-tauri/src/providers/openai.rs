@@ -1,9 +1,10 @@
-use super::{ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
+use super::{provider_http_error, ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
 use futures::StreamExt;
 use std::pin::Pin;
+use zeroize::Zeroize;
 
 /// OpenAI-compatible LLM provider (also works with OpenAI-compatible APIs).
 pub struct OpenAIProvider {
@@ -23,6 +24,12 @@ impl OpenAIProvider {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
+    }
+}
+
+impl Drop for OpenAIProvider {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
     }
 }
 
@@ -101,6 +108,7 @@ impl LlmProvider for OpenAIProvider {
             "stream": request.stream,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
+            "top_p": request.top_p,
         });
 
         let resp = self
@@ -119,10 +127,7 @@ impl LlmProvider for OpenAIProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(GlossError::Provider {
-                provider: "openai".into(),
-                source: anyhow::anyhow!("HTTP {}: {}", status, text),
-            });
+            return Err(provider_http_error("openai", status, &text));
         }
 
         if request.stream {

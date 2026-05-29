@@ -9,6 +9,88 @@ export interface Notebook {
   updated_at: string;
 }
 
+export interface DbDoctorFinding {
+  notebook_id: string;
+  code: string;
+  severity: "info" | "warning" | "error";
+  count: number;
+  repaired: boolean;
+  detail: string;
+}
+
+export interface DbDoctorNotebookReport {
+  notebook_id: string;
+  notebook_db_present: boolean;
+  source_count_recorded: number;
+  source_count_actual?: number | null;
+  orphan_source_processing_state_rows: number;
+  orphan_projection_status_rows: number;
+  orphan_semantic_memory_link_rows: number;
+  failed_import_sources: number;
+  quarantined_failed_import_sources: number;
+  receipt_id?: string | null;
+  supersedes_receipt_id?: string | null;
+}
+
+export interface DbDoctorReceipt {
+  schema: "DbDoctorReceiptV1";
+  receipt_id: string;
+  repair: boolean;
+  recorded_utc: string;
+  notebooks_checked: number;
+  findings: DbDoctorFinding[];
+  notebook_reports: DbDoctorNotebookReport[];
+  repaired_source_count_mismatches: number;
+  repaired_orphan_rows: number;
+  failed_import_sources: number;
+  quarantined_failed_import_sources: number;
+  queue_jobs_checked: number;
+  stale_queue_jobs: number;
+  repaired_stale_queue_jobs: number;
+}
+
+export interface PortableFileManifestEntry {
+  path: string;
+  sha256: string;
+  byte_len: number;
+}
+
+export interface NotebookPortableManifest {
+  schema: "NotebookPortableManifestV1";
+  package_id: string;
+  exported_utc: string;
+  source_notebook_id: string;
+  notebook_name: string;
+  files: PortableFileManifestEntry[];
+  manifest_digest: string;
+}
+
+export interface NotebookExportReceipt {
+  schema: "NotebookExportReceiptV1";
+  receipt_id: string;
+  package_id: string;
+  notebook_id: string;
+  package_format: "directory" | "tar_gzip";
+  package_dir: string;
+  archive_path?: string | null;
+  manifest_path: string;
+  file_count: number;
+  manifest_digest: string;
+  recorded_utc: string;
+}
+
+export interface NotebookImportReceipt {
+  schema: "NotebookImportReceiptV1";
+  receipt_id: string;
+  package_id: string;
+  source_notebook_id: string;
+  imported_notebook_id: string;
+  imported_notebook_dir: string;
+  file_count: number;
+  manifest_digest: string;
+  recorded_utc: string;
+}
+
 export interface Source {
   id: string;
   source_type: string;
@@ -44,6 +126,59 @@ export interface SourceProcessingState {
   updated_at: string;
 }
 
+export interface FailedImportQuarantineReceipt {
+  schema: "FailedImportQuarantineReceiptV1";
+  receipt_id: string;
+  notebook_id: string;
+  action: "quarantine" | "delete";
+  failed_sources_before: number;
+  affected_sources: number;
+  quarantined_sources: number;
+  deleted_sources: number;
+  cancelled_queue_jobs: number;
+  recorded_utc: string;
+}
+
+export interface YouTubeTranscriptSpan {
+  start_ms: number;
+  end_ms: number;
+}
+
+export interface YouTubeTranscriptReceipt {
+  schema: "YouTubeTranscriptReceiptV1";
+  receipt_id: string;
+  original_url_digest: string;
+  watch_url_digest: string;
+  video_id_digest: string;
+  language: string;
+  transcript_source: string;
+  transcript_url_host: string;
+  segment_count: number;
+  timestamp_spans: YouTubeTranscriptSpan[];
+  bytes_read: number;
+  elapsed_ms: number;
+  network_consent: boolean;
+  max_bytes: number;
+  max_segments: number;
+}
+
+export type ImportSupport =
+  | "supported"
+  | "supported_degraded"
+  | "deferred"
+  | "unsupported";
+
+export interface ImportCapability {
+  key: string;
+  label: string;
+  extensions: string[];
+  source_type?: string | null;
+  language?: string | null;
+  support: ImportSupport;
+  receipt_schema: string;
+  reason: string;
+}
+
 export interface EmbeddingDiagnosticsReceipt {
   native_fastembed: {
     init_ok: boolean;
@@ -62,6 +197,29 @@ export interface EmbeddingDiagnosticsReceipt {
     url?: string | null;
     embed_ok?: boolean | null;
   };
+}
+
+export interface ToolInvocationReceiptV1 {
+  schema: "ToolInvocationReceiptV1";
+  receipt_id: string;
+  tool: string;
+  action: string;
+  args_redacted: string[];
+  timeout_ms: number;
+  elapsed_ms: number;
+  exit_code?: number | null;
+  success: boolean;
+  timed_out: boolean;
+  stderr_sha256?: string | null;
+  stderr_len: number;
+  stderr_preview?: string | null;
+  stdout_sha256?: string | null;
+  stdout_len: number;
+}
+
+export interface ExternalToolAvailabilityReceipt {
+  available: boolean;
+  receipt: ToolInvocationReceiptV1;
 }
 
 export interface Conversation {
@@ -146,6 +304,112 @@ export interface ChatEvidenceDisclosure {
   approximate_candidate_count?: number | null;
   semantic_memory_fallback_reason?: string | null;
   retrieval_outcome?: RetrievalOutcome | null;
+  retrieval_capability_decision: RetrievalCapabilityDecisionV1;
+  semantic_memory_runtime_truth: SemanticMemoryRuntimeTruthV1;
+  decoding_settings_receipt?: DecodingSettingsReceiptV1 | null;
+  prompt_receipt?: PromptReceiptV1 | null;
+  generation_receipt?: GenerationReceiptV1 | null;
+  prompt_budget_receipt?: PromptBudgetReceiptV1 | null;
+}
+
+export interface RetrievalCapabilityDecisionV1 {
+  requested_backend: string;
+  effective_backend: string;
+  decision_reason?: string | null;
+  build_feature_available: boolean;
+  runtime_enabled: boolean;
+  projection_ready: boolean;
+  dense_ready: boolean;
+  fallback_allowed: boolean;
+  degraded: boolean;
+}
+
+export interface SemanticMemoryRuntimeTruthV1 {
+  schema: "SemanticMemoryRuntimeTruthV1";
+  receipt_id: string;
+  build: Record<string, unknown>;
+  settings: Record<string, unknown>;
+  projection: Record<string, unknown>;
+  turbo_quant?: Record<string, unknown> | null;
+  decision: RetrievalCapabilityDecisionV1;
+}
+
+export interface PromptBudgetReceiptV1 {
+  schema: "PromptBudgetReceiptV1";
+  receipt_id: string;
+  model_context_window: number;
+  system_prompt_chars: number;
+  message_count: number;
+  source_passage_count: number;
+  prompt_digest: string;
+  context_budgeted: boolean;
+  estimated_prompt_tokens: number;
+  recorded_at: string;
+}
+
+export interface ProviderModelTestResult {
+  provider_healthy: boolean;
+  model_found: boolean;
+  model_available: boolean;
+  model_list_error?: string | null;
+  model_list_count: number;
+}
+
+export interface DecodingSettingsReceiptV1 {
+  schema: "DecodingSettingsReceiptV1";
+  receipt_id: string;
+  provider: string;
+  model: string;
+  requested: Record<string, unknown>;
+  effective: {
+    temperature: number;
+    top_p?: number | null;
+    top_k?: number | null;
+    min_p?: number | null;
+    repeat_penalty?: number | null;
+    max_tokens: number;
+  };
+  unsupported_fields: string[];
+  provider_capability: Record<string, boolean>;
+  recorded_at: string;
+}
+
+export interface PromptReceiptV1 {
+  schema: "PromptReceiptV1";
+  receipt_id: string;
+  notebook_id: string;
+  conversation_id: string;
+  message_id: string;
+  prompt_digest: string;
+  context_payload_digest: string;
+  capture_state: string;
+  redaction_state: string;
+  system_prompt_digest: string;
+  user_turn_digest: string;
+  source_passage_count: number;
+  recorded_at: string;
+}
+
+export interface GenerationReceiptV1 {
+  schema: "GenerationReceiptV1";
+  receipt_id: string;
+  notebook_id: string;
+  conversation_id: string;
+  message_id: string;
+  provider: string;
+  model: string;
+  provider_request_digest: string;
+  response_digest?: string | null;
+  status: string;
+  error?: string | null;
+  terminal_cause?: string | null;
+  done_frame_seen: boolean;
+  eof_seen: boolean;
+  partial_persisted: boolean;
+  chunks_seen: number;
+  prompt_receipt_id: string;
+  decoding_settings_receipt_id: string;
+  recorded_at: string;
 }
 
 export interface ChatEvidencePayload {
@@ -172,6 +436,13 @@ export interface Note {
 }
 
 export interface StudioOutputConfig {
+  schema?: "StudioOutputConfigV1";
+  deterministic?: boolean;
+  source_bound?: boolean;
+  schema_validated?: boolean;
+  all_items_source_cited?: boolean;
+  max_items?: number;
+  receipt_id?: string;
   mode?: string;
   model?: string;
   provider?: string;
@@ -192,6 +463,20 @@ export interface StudioOutput {
   status: string;
   error_message?: string;
   created_at: string;
+}
+
+export interface StudioExportReceipt {
+  schema: "StudioExportReceiptV1";
+  receipt_id: string;
+  output_id: string;
+  output_type: string;
+  notebook_id: string;
+  format: "json";
+  file_path: string;
+  file_path_redacted: string;
+  bytes_written: number;
+  sha256: string;
+  recorded_utc: string;
 }
 
 export interface ModelInfo {
@@ -278,6 +563,17 @@ export interface ChatAttemptTraceEvent {
   elapsed_ms?: number | null;
   detail?: string | null;
   error?: string | null;
+}
+
+export interface NetworkScopeReceiptV1 {
+  schema: "NetworkScopeReceiptV1";
+  provider: string;
+  base_url: string;
+  host: string;
+  egress_class: string;
+  policy: string;
+  cloud_opt_in_required: boolean;
+  lan_opt_in_applied: boolean;
 }
 
 export interface ChatAttemptTraceV1 {
@@ -406,6 +702,13 @@ export interface ChatErrorPayload {
   error: string;
 }
 
+export interface ChatCancelledPayload {
+  notebook_id: string;
+  conversation_id: string;
+  message_id: string;
+  reason: string;
+}
+
 export interface QueueStatus {
   paused: boolean;
   mode: string;
@@ -434,7 +737,20 @@ export interface SourcesBatchCreatedPayload {
   created?: number;
 }
 
+export interface ImportBatchPerformanceReceipt {
+  schema: "ImportBatchPerformanceReceiptV1";
+  elapsed_ms: number;
+  scan_ms: number;
+  source_create_ms: number;
+  ingestion_ms: number;
+  index_save_ms: number;
+  found_per_second: number;
+  created_per_second: number;
+  ingested_ready_per_second: number;
+}
+
 export interface BatchIngestionCompletePayload {
+  schema?: "ImportBatchReceiptV1";
   notebook_id: string;
   import_batch_id?: string;
   notebook_epoch?: number;
@@ -448,6 +764,7 @@ export interface BatchIngestionCompletePayload {
   skipped_unsupported?: number;
   cancelled_superseded?: number;
   message?: string | null;
+  performance?: ImportBatchPerformanceReceipt | null;
 }
 
 export interface BackgroundBackendStatus {

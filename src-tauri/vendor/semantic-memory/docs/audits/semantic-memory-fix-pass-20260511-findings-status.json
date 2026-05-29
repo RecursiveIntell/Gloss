@@ -285,9 +285,9 @@
     "status": "fixed"
   },
   "SM-AUD-0058": {
-    "evidence": "Not closed in this partial stabilization turn; left explicit instead of silently claiming completion.",
+    "evidence": "search_episodes and get_episode now return episode_id instead of document_id as the first tuple element. parse_episode_outcome and parse_string_list_json diagnostics use episode_id for context. Fixed by Gloss closing pass 20260528.",
     "notes": "P1 api: search_episodes drops episode_id and returns document_id",
-    "status": "deferred"
+    "status": "fixed"
   },
   "SM-AUD-0059": {
     "evidence": "episode parsing diagnostics use episode_id rather than document_id.",

@@ -1,11 +1,13 @@
 use crate::db::app_db::AppDb;
 use crate::db::notebook_db::NotebookDb;
+use crate::db::notebook_pool::NotebookDbPools;
 use crate::error::GlossError;
 use crate::features;
 use crate::ingestion::embed::{EmbeddingService, HnswIndex};
 use crate::memory::types::RetrievalOutcome;
 use crate::provider_config_store::SecretStore;
 use crate::providers::ModelRegistry;
+use crate::redaction::redact_path;
 use crate::retrieval::hybrid_search;
 use crate::retrieval::source_scope::ResolvedSourceScope;
 use std::collections::HashMap;
@@ -36,11 +38,10 @@ pub struct AppState {
     pub app_db: Mutex<AppDb>,
     /// Encrypted local secret storage for provider API keys.
     pub secret_store: SecretStore,
-    /// Cached notebook database paths keyed by notebook ID.
-    /// Each DB access opens its own SQLite connection so long-running ingestion
-    /// work in one notebook does not serialize every other read for that same
-    /// notebook at the application mutex layer.
-    pub notebook_dbs: Mutex<HashMap<String, PathBuf>>,
+    /// Cached notebook database connection pools keyed by notebook ID.
+    /// Each pool manages read/write connections so concurrent access to a
+    /// single notebook DB is efficient (WAL mode allows concurrent readers).
+    pub notebook_pools: NotebookDbPools,
     /// LLM provider registry
     pub model_registry: Mutex<ModelRegistry>,
     /// Application data directory
@@ -135,7 +136,7 @@ impl AppState {
             if !notebook_db_path.exists() {
                 tracing::warn!(
                     notebook_id = %notebook.id,
-                    path = %notebook_db_path.display(),
+                    path = %redact_path(&notebook_db_path),
                     "Skipping source-count reconcile for missing notebook DB"
                 );
                 continue;
@@ -147,7 +148,7 @@ impl AppState {
                     Err(e) => {
                         tracing::warn!(
                             notebook_id = %notebook.id,
-                            path = %notebook_db_path.display(),
+                            path = %redact_path(&notebook_db_path),
                             error = %e,
                             "Failed to reconcile notebook source count"
                         );
@@ -232,6 +233,12 @@ impl AppState {
         {
             app_db.set_setting("semantic_memory_search_timeout_ms", "8000")?;
         }
+        if app_db
+            .get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?
+            .is_none()
+        {
+            app_db.set_setting(features::FASTEMBED_DOWNLOAD_CONSENT, "false")?;
+        }
         features::ensure_default_feature_settings(&app_db)?;
         let secret_store = SecretStore::new(&data_dir)?;
         Self::migrate_legacy_secrets(&app_db, &secret_store)?;
@@ -240,12 +247,12 @@ impl AppState {
         let model_registry = ModelRegistry::new(&app_db, &secret_store)?;
         let summary_starts_paused = Self::summary_mode_starts_paused(&app_db)?;
 
-        tracing::info!(data_dir = %data_dir.display(), "Gloss initialized");
+        tracing::info!(data_dir = %redact_path(&data_dir), "Gloss initialized");
 
         Ok(Self {
             app_db: Mutex::new(app_db),
             secret_store,
-            notebook_dbs: Mutex::new(HashMap::new()),
+            notebook_pools: NotebookDbPools::new(&data_dir),
             model_registry: Mutex::new(model_registry),
             data_dir,
             embedder: Mutex::new(None),
@@ -294,7 +301,17 @@ impl AppState {
         tracing::info!("Initializing embedding model…");
         let cache_dir = self.data_dir.join("models");
         std::fs::create_dir_all(&cache_dir)?;
-        let service = EmbeddingService::new(&cache_dir)?;
+        let download_consent = {
+            let app_db = self
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            crate::commands::chat::setting_is_enabled(
+                app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
+            )
+        };
+        let service =
+            EmbeddingService::new_with_download_policy(&cache_dir, false, download_consent)?;
         *embedder = Some(service);
 
         if let Some(handle) = app_handle {
@@ -549,44 +566,52 @@ impl AppState {
     }
 
     pub(crate) fn notebook_db_path(&self, notebook_id: &str) -> Result<PathBuf, GlossError> {
-        {
-            let dbs = self
-                .notebook_dbs
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            if let Some(path) = dbs.get(notebook_id) {
-                return Ok(path.clone());
-            }
-        }
-
-        let db_path = {
+        let pool = self.notebook_pools.get_or_create(notebook_id, || {
             let app_db = self
                 .app_db
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
             let notebook = app_db.get_notebook(notebook_id)?;
-            PathBuf::from(notebook.directory).join("notebook.db")
-        };
-
-        let mut dbs = self
-            .notebook_dbs
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        dbs.entry(notebook_id.to_string())
-            .or_insert_with(|| db_path.clone());
-        Ok(db_path)
+            Ok(PathBuf::from(notebook.directory).join("notebook.db"))
+        })?;
+        Ok(pool.db_path().to_path_buf())
     }
 
     /// Execute a function with a notebook database connection.
-    /// A fresh SQLite connection is opened per call so readers are not blocked
-    /// behind long-running work on a shared application mutex.
+    /// Uses the connection pool: read operations use pooled read connections
+    /// (concurrent readers via WAL mode), write operations use the single
+    /// exclusive write connection.
     pub fn with_notebook_db<F, T>(&self, notebook_id: &str, f: F) -> Result<T, GlossError>
     where
         F: FnOnce(&NotebookDb) -> Result<T, GlossError>,
     {
-        let db_path = self.notebook_db_path(notebook_id)?;
-        let db = NotebookDb::connect(&db_path)?;
-        f(&db)
+        let pool = self.notebook_pools.get_or_create(notebook_id, || {
+            let app_db = self
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            let notebook = app_db.get_notebook(notebook_id)?;
+            Ok(PathBuf::from(notebook.directory).join("notebook.db"))
+        })?;
+        pool.read(f)
+    }
+
+    /// Execute a write operation against the notebook database.
+    #[allow(dead_code)]
+    /// Uses the pool's exclusive write connection (only one writer at a time).
+    pub fn with_notebook_db_write<F, T>(&self, notebook_id: &str, f: F) -> Result<T, GlossError>
+    where
+        F: FnOnce(&NotebookDb) -> Result<T, GlossError>,
+    {
+        let pool = self.notebook_pools.get_or_create(notebook_id, || {
+            let app_db = self
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            let notebook = app_db.get_notebook(notebook_id)?;
+            Ok(PathBuf::from(notebook.directory).join("notebook.db"))
+        })?;
+        pool.write(f)
     }
 
     /// Build a truthful local retrieval outcome. BM25/FTS5 always remains the
@@ -756,11 +781,11 @@ mod tests {
 
         app_db.set_setting("openai_api_key", "sk-settings").unwrap();
         app_db
-            .conn
+            .conn()
             .execute("ALTER TABLE providers ADD COLUMN api_key TEXT", [])
             .unwrap();
         app_db
-            .conn
+            .conn()
             .execute(
                 "INSERT OR REPLACE INTO providers (id, enabled, base_url, api_key) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params!["anthropic", 1, "https://api.anthropic.com/v1", "sk-provider"],

@@ -26,12 +26,65 @@ import type {
   ChatAttemptTraceV1,
   RetrievalCoverage,
   EmbeddingDiagnosticsReceipt,
+  ExternalToolAvailabilityReceipt,
+  FailedImportQuarantineReceipt,
+  ImportCapability,
+  DbDoctorReceipt,
+  NotebookExportReceipt,
+  NotebookImportReceipt,
+  NotebookPortableManifest,
+  StudioOutput,
+  StudioExportReceipt,
 } from "./types";
 
 // === Notebooks ===
 
 export async function listNotebooks(): Promise<Notebook[]> {
   return invoke("list_notebooks");
+}
+
+export async function runDatabaseDoctor(repair: boolean): Promise<DbDoctorReceipt> {
+  return invoke("run_database_doctor", { repair });
+}
+
+export async function exportNotebook(
+  notebookId: string,
+  packageDir: string
+): Promise<NotebookExportReceipt> {
+  return invoke("export_notebook", { notebookId, packageDir });
+}
+
+export async function exportNotebookArchive(
+  notebookId: string,
+  archivePath: string
+): Promise<NotebookExportReceipt> {
+  return invoke("export_notebook_archive", { notebookId, archivePath });
+}
+
+export async function validateNotebookImportPackage(
+  packageDir: string
+): Promise<NotebookPortableManifest> {
+  return invoke("validate_notebook_import_package", { packageDir });
+}
+
+export async function validateNotebookImportArchive(
+  archivePath: string
+): Promise<NotebookPortableManifest> {
+  return invoke("validate_notebook_import_archive", { archivePath });
+}
+
+export async function importNotebook(
+  packageDir: string,
+  nameOverride?: string
+): Promise<NotebookImportReceipt> {
+  return invoke("import_notebook", { packageDir, nameOverride });
+}
+
+export async function importNotebookArchive(
+  archivePath: string,
+  nameOverride?: string
+): Promise<NotebookImportReceipt> {
+  return invoke("import_notebook_archive", { archivePath, nameOverride });
 }
 
 export async function createNotebook(name: string): Promise<string> {
@@ -92,6 +145,28 @@ export async function addSourcePaste(
   return invoke("add_source_paste", { notebookId, title, text });
 }
 
+export async function addSourceUrl(
+  notebookId: string,
+  url: string,
+  networkConsent: boolean
+): Promise<string> {
+  return invoke("add_source_url", { notebookId, url, networkConsent });
+}
+
+export async function addSourceYouTubeTranscript(
+  notebookId: string,
+  url: string,
+  language: string | null,
+  networkConsent: boolean
+): Promise<string> {
+  return invoke("add_source_youtube_transcript", {
+    notebookId,
+    url,
+    language,
+    networkConsent,
+  });
+}
+
 export async function deleteSource(
   notebookId: string,
   sourceId: string
@@ -106,11 +181,27 @@ export async function deleteSources(
   return invoke("delete_sources", { notebookId, sourceIds });
 }
 
+export async function quarantineFailedImports(
+  notebookId: string
+): Promise<FailedImportQuarantineReceipt> {
+  return invoke("quarantine_failed_imports", { notebookId });
+}
+
+export async function deleteFailedImports(
+  notebookId: string
+): Promise<FailedImportQuarantineReceipt> {
+  return invoke("delete_failed_imports", { notebookId });
+}
+
 export async function getSourceContent(
   notebookId: string,
   sourceId: string
 ): Promise<SourceContent> {
   return invoke("get_source_content", { notebookId, sourceId });
+}
+
+export async function getImportCapabilityMatrix(): Promise<ImportCapability[]> {
+  return invoke("get_import_capability_matrix");
 }
 
 export async function retrySourceIngestion(
@@ -159,6 +250,35 @@ export async function runRetrievalProbe(
     sourceScope,
     limit,
   });
+}
+
+export async function listStudioOutputs(
+  notebookId: string
+): Promise<StudioOutput[]> {
+  return invoke("list_studio_outputs", { notebookId });
+}
+
+export async function generateStudioOutput(
+  notebookId: string,
+  outputType: string,
+  sourceIds?: string[],
+  title?: string,
+  maxItems?: number
+): Promise<StudioOutput> {
+  return invoke("generate_studio_output", {
+    notebookId,
+    outputType,
+    sourceIds,
+    title,
+    maxItems,
+  });
+}
+
+export async function exportStudioOutput(
+  notebookId: string,
+  outputId: string
+): Promise<StudioExportReceipt> {
+  return invoke("export_studio_output", { notebookId, outputId });
 }
 
 // === Chat ===
@@ -297,6 +417,20 @@ export async function testProvider(providerId: string): Promise<boolean> {
   return invoke("test_provider", { providerId });
 }
 
+export interface ProviderModelTestResult {
+  provider_healthy: boolean;
+  model_found: boolean;
+  model_available: boolean;
+  model_list_error: string | null;
+}
+
+export async function testProviderModel(
+  providerId: string,
+  modelId: string
+): Promise<ProviderModelTestResult> {
+  return invoke("test_provider_model", { providerId, modelId });
+}
+
 export async function refreshModels(
   providerId?: string
 ): Promise<ModelInfo[]> {
@@ -340,7 +474,7 @@ export async function setMemoryBackendProfile(
   return invoke("set_memory_backend_profile", { profile, notebookId });
 }
 
-export async function checkExternalTools(): Promise<Record<string, boolean>> {
+export async function checkExternalTools(): Promise<Record<string, ExternalToolAvailabilityReceipt>> {
   return invoke("check_external_tools");
 }
 

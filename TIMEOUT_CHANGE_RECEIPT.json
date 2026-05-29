@@ -1,0 +1,32 @@
+{
+  "schema": "TimeoutChangeReceiptV1",
+  "run_id": "GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526",
+  "recorded_utc": "2026-05-26T17:06:13Z",
+  "changed_files": [
+    "src-tauri/src/commands/chat/mod.rs",
+    "src/components/chat/ChatPanel.tsx"
+  ],
+  "provider_start_timeout_secs": {
+    "before": 180,
+    "after": 180,
+    "change_percent": 0,
+    "reason": "Provider-start timeout was already at the larger budget before this run."
+  },
+  "first_token_timeout_secs": {
+    "before": 120,
+    "after": 168,
+    "change_percent": 40,
+    "code_owner": "src-tauri/src/commands/chat/mod.rs"
+  },
+  "stream_idle_timeout_secs": {
+    "before": 60,
+    "after": 84,
+    "change_percent": 40,
+    "code_owner": "src-tauri/src/commands/chat/mod.rs"
+  },
+  "partial_output_status": "Backend emits timeout/error stream statuses and frontend preserves streamed content state; full durable partial persistence still needs a runtime fixture.",
+  "continuation_action": "src/components/chat/ChatPanel.tsx sends a continuation turn with the previous source scope.",
+  "static_gate_status": "passes validation/gloss_timeout_partial_continuation_gate.py",
+  "live_timeout_fixture_exercised": false,
+  "blocker": "No live long-generation timeout fixture was exercised in this run; do not claim full timeout reliability beyond static gate coverage."
+}

@@ -1,0 +1,33 @@
+audit,issue_id,file,line_range,evidence
+A1,CHAT-001,src/components/chat/ChatPanel.tsx,71-76,handleSend blocks chat on sourceListStatus loading/partial/error.
+A1,CHAT-001,src/stores/sourceStore.ts,23-30,getSourceScope already degrades those statuses to SourceScope kind none.
+A1,CHAT-002,src-tauri/src/commands/chat/mod.rs,2401-2425,GPU gate cancellation records trace and returns without terminal UI event.
+A1,CHAT-002,src-tauri/src/commands/chat/mod.rs,2456-2469,LLM gate cancellation records trace and returns without terminal UI event.
+A1,CHAT-002,src-tauri/src/commands/chat/mod.rs,2630-2662,CHAT_CANCELLED_NOTEBOOK_SWITCH suppresses chat:error.
+A1,CHAT-003,src-tauri/src/commands/chat/mod.rs,2511-2518,Active notebook epoch changed after stream; emits done and returns before assistant persistence.
+A1,CHAT-003,src-tauri/src/commands/chat/mod.rs,2556-2569,Assistant DB insert failure only logs warning and records trace.
+A1,CHAT-004,src-tauri/src/commands/chat/mod.rs,3216-3288,GenerationReceiptV1 status created before outer assistant DB persistence is proven.
+A1,CHAT-005,src/stores/chatStore.ts,184-203,Frontend stop clears stream locally and says partial output was not saved.
+A1,CHAT-005,src-tauri/src/commands/chat/mod.rs,859-865,Backend stop_chat only bumps active epoch.
+A2,FRONT-001,src/App.tsx,54-56,chat:token dropped if payload notebook is not currently active notebook.
+A2,FRONT-001,src/App.tsx,78-80,chat:status dropped on active notebook mismatch.
+A2,FRONT-001,src/App.tsx,87-90,chat:error dropped on active notebook mismatch.
+A2,FRONT-001,src/App.tsx,107-109,chat:evidence dropped on active notebook mismatch.
+A2,FRONT-002,src/stores/chatStore.ts,152-169,sendMessage returns after backend invoke on context mismatch without clearing streaming.
+A2,FRONT-003,src/stores/chatStore.ts,310-324,resetForNotebookSwitch preserves streaming state.
+A2,FRONT-004,src/stores/sourceStore.ts,511-530,Stats/source mismatch can set sourceListStatus partial/error.
+A2,FRONT-005,src/components/settings/SettingsDialog/index.tsx,683-696,Diagnostics card says ChatAttemptTraceV1 backend-owned but no operator button.
+A3,PROVIDER-001,src-tauri/src/providers/mod.rs,"14,178-184,536-551",Loopback-only local provider policy and test that LAN URL is rejected.
+A3,PROVIDER-002,src/stores/settingsStore.ts,"31,40",Frontend default activeModel qwen3:8b.
+A3,PROVIDER-002,src-tauri/src/db/migrations.rs,72-73,DB default_model seeded to qwen3:8b.
+A3,PROVIDER-003,src/components/settings/SettingsDialog/index.tsx,146-156,"Provider Test checks reachability, not selected-model /api/chat smoke."
+A3,PROVIDER-004,src/components/settings/SettingsDialog/index.tsx,361-380,Provider save updates settings but does not refresh model registry.
+A3,PROVIDER-005,src-tauri/src/providers/ollama.rs,173-220,Streaming path uses StreamingDecoder; invalid JSON behavior must be hardened.
+A4,PERSIST-001,src-tauri/src/db/notebook_db/mod.rs,1467-1488,insert_message relies on DB defaults and can fail; chat path does not terminal-error on failure.
+A4,PERSIST-002,scripts/audit_chat_path_integration.py,command output,Static retrieval/chat integration audit failed.
+A4,PERSIST-003,scripts/audit_retrieval_disclosures.py,command output,Latest retrieval disclosure audit returned no_receipts.
+A5,RELEASE-001,docs/codex-runs/.../FINAL_RECEIPT.json,fields,release_candidate_gate_passed=true.
+A5,RELEASE-001,docs/codex-runs/.../RELEASE_CANDIDATE_GATE_RESULTS.json,fields,release_candidate_gate_passed=false; package scope gate failed.
+A5,RELEASE-002,Gloss-generic-rust-next-codex-context-20260527T064920Z.report.md,validation findings,run_all_checks references missing/excluded secret store gate script.
+A5,RELEASE-003,validation/gloss_package_scope_gate.py,command output,Fails: no package manifest found in extracted current package.
+A5,RELEASE-004,Gloss-generic-rust-next-codex-context-20260527T064920Z.codex-archive.json,current_run,Sidecar current_run=P30.

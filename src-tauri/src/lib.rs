@@ -7,9 +7,11 @@ mod jobs;
 mod memory;
 mod provider_config_store;
 mod providers;
+mod redaction;
 mod retrieval;
 mod state;
 mod studio;
+mod tool_invocation;
 
 use state::AppState;
 use std::sync::Arc;
@@ -118,6 +120,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::notebooks::list_notebooks,
+            commands::notebooks::run_database_doctor,
+            commands::notebooks::export_notebook,
+            commands::notebooks::export_notebook_archive,
+            commands::notebooks::validate_notebook_import_package,
+            commands::notebooks::validate_notebook_import_archive,
+            commands::notebooks::import_notebook,
+            commands::notebooks::import_notebook_archive,
             commands::notebooks::create_notebook,
             commands::notebooks::rename_notebook,
             commands::notebooks::delete_notebook,
@@ -128,9 +137,14 @@ pub fn run() {
             commands::sources::add_source_files,
             commands::sources::add_source_folder,
             commands::sources::add_source_paste,
+            commands::sources::add_source_url,
+            commands::sources::add_source_youtube_transcript,
             commands::sources::delete_source,
             commands::sources::delete_sources,
+            commands::sources::quarantine_failed_imports,
+            commands::sources::delete_failed_imports,
             commands::sources::get_source_content,
+            commands::sources::get_import_capability_matrix,
             commands::sources::retry_source_ingestion,
             commands::sources::get_notebook_stats,
             commands::sources::diagnose_retrieval_coverage,
@@ -157,6 +171,9 @@ pub fn run() {
             commands::chat::get_suggested_questions,
             commands::chat::debug_chat_provider_smoke,
             commands::chat::get_last_chat_attempt_trace,
+            commands::studio::list_studio_outputs,
+            commands::studio::generate_studio_output,
+            commands::studio::export_studio_output,
             commands::notes::list_notes,
             commands::notes::create_note,
             commands::notes::save_response_as_note,
@@ -166,6 +183,7 @@ pub fn run() {
             commands::settings::get_providers,
             commands::settings::update_provider,
             commands::settings::test_provider,
+            commands::settings::test_provider_model,
             commands::settings::refresh_models,
             commands::settings::get_all_models,
             commands::settings::get_settings,
@@ -248,7 +266,7 @@ async fn summary_job_loop(
                 let state = handle_clone.state::<AppState>();
                 state
                     .with_notebook_db(&nb_id_clone, |db| {
-                        let count: i64 = db.conn.query_row(
+                        let count: i64 = db.conn().query_row(
                         "SELECT COUNT(*) FROM sources WHERE status IN ('describing', 'described')",
                         [],
                         |row| row.get(0),
@@ -467,7 +485,7 @@ async fn summary_job_loop(
                                             error = %e,
                                             "finalize_described_source panicked"
                                         );
-                                        let _ = state.with_notebook_db(&nb_for_err, |db| {
+                                        let _ = state.with_notebook_db_write(&nb_for_err, |db| {
                                             db.update_source_status(
                                                 &src_for_err,
                                                 "error",

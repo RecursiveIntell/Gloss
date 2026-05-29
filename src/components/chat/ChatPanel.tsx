@@ -21,6 +21,7 @@ import {
   ShieldAlert,
   ChevronDown,
   ChevronRight,
+  RefreshCw,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import type { ChatEvidenceDisclosure, ChatEvidencePayload, Citation, Message } from "../../lib/types";
@@ -47,7 +48,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     suggestedQuestions,
   } = useChatStore();
   const saveResponse = useNoteStore((s) => s.saveResponse);
-  const { activeModel, models, settings } = useSettingsStore();
+  const { activeModel, models, settings, refreshModels, loading: modelsLoading } = useSettingsStore();
   const getSourceScope = useSourceStore((s) => s.getSourceScope);
   const sources = useSourceStore((s) => s.sources);
   const selectedSourceIds = useSourceStore((s) => s.selectedSourceIds);
@@ -63,13 +64,17 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
   const [editingUserMessageId, setEditingUserMessageId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const lastScrollRef = useRef(0);
 
   useEffect(() => {
+    const now = Date.now();
+    if (now - lastScrollRef.current < 100) return;
+    lastScrollRef.current = now;
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streamingContent]);
 
   const handleSend = async () => {
-    if (!input.trim() || isStreaming || sourceListStatus === "loading" || sourceListStatus === "partial" || sourceListStatus === "error") return;
+    if (!input.trim() || isStreaming) return;
     const query = input.trim();
     setInput("");
     setEditingUserMessageId(null);
@@ -114,6 +119,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     }
   };
 
+  const handleContinue = async () => {
+    if (isStreaming) return;
+    await sendMessage(notebookId, "Continue from the previous partial answer.", getSourceScope(), activeModel);
+  };
+
   const handleEditUserMessage = (message: Message) => {
     setInput(message.content);
     setEditingUserMessageId(message.id);
@@ -155,8 +165,9 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         .filter(Boolean)
         .join(" - ")
     : "Starting chat";
-  const sourceListBlocked = sourceListStatus === "loading" || sourceListStatus === "partial" || sourceListStatus === "error";
-  const scopeMode = sourceListBlocked ? "none" : sourceScopeMode;
+  const sourceListDegraded =
+    sourceListStatus === "loading" || sourceListStatus === "partial" || sourceListStatus === "error";
+  const scopeMode = sourceScopeMode;
 
   return (
     <div className="flex h-full flex-col">
@@ -230,13 +241,21 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             <option value={`::${activeModel}`}>{activeModel}</option>
           )}
         </select>
+        <button
+          onClick={() => refreshModels()}
+          disabled={modelsLoading}
+          className="rounded-full border border-border bg-bg-tertiary p-1 text-text-muted hover:bg-bg-tertiary/80 hover:text-text disabled:opacity-50"
+          title="Refresh model list from providers"
+        >
+          <RefreshCw className={`w-3 h-3 ${modelsLoading ? "animate-spin" : ""}`} />
+        </button>
       </div>
 
       <div className="border-b border-border bg-bg-secondary/80 px-4 py-2">
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <span className="gloss-mono text-[10px] uppercase tracking-[0.04em] text-text-muted">Scope</span>
           <span className={`rounded px-1.5 py-0.5 ${
-            scopeMode === "none" ? "bg-warning/15 text-warning" : "gloss-pill-accent text-text-secondary"
+            scopeMode === "none" || sourceListDegraded ? "bg-warning/15 text-warning" : "gloss-pill-accent text-text-secondary"
           }`}>
             {scopeMode}
           </span>
@@ -263,13 +282,19 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
               {projectionProblemCount} projection pending
             </span>
           )}
-          {scopeMode === "none" && (
-            <span className="text-warning">
+          {sourceListDegraded && (
+            <span className="flex items-center gap-1 text-warning">
+              <AlertCircle className="w-3 h-3" />
               {sourceListStatus === "error"
-                ? sourceListError || "Source list failed to load; chat is disabled."
+                ? sourceListError || "Source list failed to load; chat will run without retrieval."
                 : sourceListStatus === "partial"
-                  ? "Source list is still loading; chat is disabled."
-                : "Selected scope has no valid sources; retrieval will stay empty."}
+                  ? "Source list partially loaded; retrieval may be incomplete."
+                : "Source list still loading; retrieval may be incomplete."}
+            </span>
+          )}
+          {scopeMode === "none" && !sourceListDegraded && (
+            <span className="text-warning">
+              Selected scope has no valid sources; retrieval will stay empty.
             </span>
           )}
         </div>
@@ -392,6 +417,15 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
                     <p>{msg.content}</p>
                     <div className="mt-1 flex justify-end">
                       <button
+                        onClick={handleContinue}
+                        disabled={isStreaming}
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-white/80 hover:bg-white/10 disabled:opacity-60"
+                        title="Continue generation"
+                      >
+                        <RotateCcw className="w-2.5 h-2.5" />
+                        Continue
+                      </button>
+                      <button
                         onClick={() => handleEditUserMessage(msg)}
                         disabled={isStreaming}
                         className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-white/80 hover:bg-white/10 disabled:opacity-60"
@@ -418,6 +452,16 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           </div>
         )}
 
+        {!isStreaming && streamingError && streamingContent && (
+          <div className="mx-auto flex max-w-[900px] justify-start">
+            <div className="gloss-assistant-bubble max-w-[82%] border border-warning/30 px-3 py-2 text-sm text-text">
+              <div className="prose prose-invert prose-sm max-w-none">
+                <ReactMarkdown>{streamingContent}</ReactMarkdown>
+              </div>
+            </div>
+          </div>
+        )}
+
         {isStreaming && !streamingContent && (
           <div className="mx-auto flex max-w-[900px] justify-start">
             <div className="gloss-assistant-bubble flex items-center gap-2 px-3 py-2 text-sm text-text-secondary">
@@ -431,6 +475,15 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           <div className="mx-auto flex max-w-[900px] justify-start">
             <div className="rounded border border-border bg-bg-secondary px-2 py-1 text-xs text-text-muted">
               {streamingStatusLabel}
+            </div>
+          </div>
+        )}
+
+        {streamingStatus && (streamingStatus as { truncated?: boolean }).truncated && (
+          <div className="mx-auto flex max-w-[900px] justify-start">
+            <div className="flex items-start gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-400">
+              <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+              <span>Context budgeted: prompt exceeded model window and was truncated to fit.</span>
             </div>
           </div>
         )}
@@ -456,12 +509,12 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}
             placeholder="Ask about your sources..."
-            disabled={isStreaming || sourceListBlocked}
+            disabled={isStreaming}
             className="flex-1 rounded bg-transparent px-2 py-1.5 text-sm text-text placeholder:text-text-muted focus:outline-none disabled:opacity-50"
           />
           <button
             onClick={isStreaming ? handleStop : handleSend}
-            disabled={!isStreaming && (!input.trim() || sourceListBlocked)}
+            disabled={!isStreaming && !input.trim()}
             className="rounded-lg bg-accent p-2 text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
             title={isStreaming ? "Stop generation" : editingUserMessageId ? "Rerun edited message" : "Send"}
           >
@@ -543,6 +596,39 @@ function nullEvidence(citationCount = 0): ChatEvidenceDisclosure {
     approximate_candidate_count: null,
     semantic_memory_fallback_reason: null,
     retrieval_outcome: null,
+    retrieval_capability_decision: {
+      requested_backend: "unknown",
+      effective_backend: "unknown",
+      decision_reason: null,
+      build_feature_available: false,
+      runtime_enabled: false,
+      projection_ready: false,
+      dense_ready: false,
+      fallback_allowed: false,
+      degraded: false,
+    },
+    semantic_memory_runtime_truth: {
+      schema: "SemanticMemoryRuntimeTruthV1",
+      receipt_id: "not recorded",
+      build: {},
+      settings: {},
+      projection: {},
+      turbo_quant: {},
+      decision: {
+        requested_backend: "unknown",
+        effective_backend: "unknown",
+        decision_reason: null,
+        build_feature_available: false,
+        runtime_enabled: false,
+        projection_ready: false,
+        dense_ready: false,
+        fallback_allowed: false,
+        degraded: false,
+      },
+    },
+    decoding_settings_receipt: null,
+    prompt_receipt: null,
+    generation_receipt: null,
   };
 }
 
@@ -561,6 +647,7 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
       <div className="grid grid-cols-2 gap-x-3 gap-y-1">
         <EvidenceRow label="Backend requested" value={evidence.backend_requested} />
         <EvidenceRow label="Backend used" value={evidence.backend_used} />
+        <EvidenceRow label="Decision" value={evidence.retrieval_capability_decision.decision_reason || (evidence.retrieval_capability_decision.degraded ? "degraded" : "ready")} />
         <EvidenceRow label="Retrieval" value={evidence.retrieval_mode} />
         <EvidenceRow label="Fallback" value={evidence.fallback_used ? evidence.fallback_reason || "yes" : "no"} />
         <EvidenceRow label="Scope" value={`${evidence.source_scope_mode} (${evidence.effective_source_count} selected, ${evidence.excluded_source_count} excluded, ${evidence.invalid_source_count} invalid)`} />
@@ -576,6 +663,15 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
         <EvidenceRow label="Omitted" value={`${evidence.omitted_candidate_count} candidates/passages`} />
         <EvidenceRow label="Index" value={evidence.index_status} />
         <EvidenceRow label="Links" value={evidence.link_status} />
+        {evidence.decoding_settings_receipt && (
+          <EvidenceRow label="Temperature" value={`${evidence.decoding_settings_receipt.effective.temperature}`} />
+        )}
+        {evidence.prompt_receipt && (
+          <EvidenceRow label="Prompt" value={evidence.prompt_receipt.capture_state} />
+        )}
+        {evidence.generation_receipt && (
+          <EvidenceRow label="Generation" value={evidence.generation_receipt.status} />
+        )}
         {evidence.candidate_backend && (
           <EvidenceRow label="Candidate backend" value={evidence.candidate_backend} />
         )}

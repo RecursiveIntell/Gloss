@@ -25,6 +25,7 @@ semantic-memory-turbo-quant = [
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+log = "0.4"
 # === Canonical Libraries crates ===
 llm-pipeline = { path = "../../Libraries/llm-pipeline" }
 tauri-queue = { path = "../../Libraries/tauri-queue" }
@@ -61,10 +62,16 @@ rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
 
 # === Text processing ===
 unicode-segmentation = "1"
+quick-xml = "0.38"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+pdf-extract = "0.10"
+wait-timeout = "0.2"
 
 # === Utilities ===
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+flate2 = "1.1"
+tar = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -75,6 +82,7 @@ async-trait = "0.1"
 regex = "1"
 base64 = "0.22"
 aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

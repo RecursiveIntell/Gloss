@@ -452,7 +452,7 @@ pub(crate) fn search_episodes(
         .map(
             |(
                 episode_id,
-                document_id,
+                _document_id,
                 cause_ids_raw,
                 effect_type,
                 outcome_raw,
@@ -461,7 +461,7 @@ pub(crate) fn search_episodes(
                 experiment_id,
             )| {
                 Ok((
-                    document_id.clone(),
+                    episode_id.clone(),
                     EpisodeMeta {
                         cause_ids: db::parse_string_list_json(
                             "episodes",
@@ -521,15 +521,15 @@ pub(crate) fn get_episode(
             EpisodeMeta {
                 cause_ids: db::parse_string_list_json(
                     "episodes",
-                    &document_id,
+                    &episode_id,
                     "cause_ids",
                     &cause_ids_raw,
                 )?,
                 effect_type,
-                outcome: db::parse_episode_outcome(&document_id, &outcome_raw)?,
+                outcome: db::parse_episode_outcome(&episode_id, &outcome_raw)?,
                 confidence,
                 verification_status: db::parse_verification_status(
-                    &document_id,
+                    &episode_id,
                     &verification_status_raw,
                 )?,
                 experiment_id,

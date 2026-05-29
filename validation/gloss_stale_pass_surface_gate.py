@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse, json, pathlib, re, sys
-RUN_ID = "GLOSS_RELEASE_PROOF_EMBEDDING_UNIFICATION_CLEANUP_20260525"
 OLD_RUN_RE = re.compile(r"(P31|P32|P33|P34|P35|P36|GLOSS_P3[1-6]|p31|p32|p33|p34|p35|p36)")
 FORBIDDEN_ROOT_DIRS = ["p33boot", "phase_prompts", "manual_injections", "prompts"]
 FORBIDDEN_SKILL_PATTERNS = ["p31", "p32", "p33", "p34", "p35", "p36"]
@@ -9,12 +8,17 @@ def read(p):
     try: return p.read_text(errors="ignore")
     except Exception: return ""
 
+def current_run(repo):
+    m = re.search(r"Current run:\s*`?([^`\n]+)`?", read(repo / "docs/codex-runs/CURRENT_RUN.md"))
+    return m.group(1).strip() if m else None
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--repo', default='.')
     args=ap.parse_args()
     repo=pathlib.Path(args.repo).resolve()
     failures=[]; warnings=[]
+    run_id=current_run(repo)
     for d in FORBIDDEN_ROOT_DIRS:
         p=repo/d
         if p.exists(): failures.append(f"stale root pass directory still active: {d}")
@@ -29,9 +33,9 @@ def main():
             if any(pat in child.name.lower() for pat in FORBIDDEN_SKILL_PATTERNS):
                 failures.append(f"stale active skill remains: {child.relative_to(repo)}")
     cur=repo/'docs'/'codex-runs'/'CURRENT_RUN.md'
-    if not cur.exists() or RUN_ID not in read(cur):
-        failures.append(f"CURRENT_RUN.md missing or not set to {RUN_ID}")
-    run_dir=repo/'docs'/'codex-runs'/RUN_ID
+    if not cur.exists() or not run_id:
+        failures.append("CURRENT_RUN.md missing or not parseable")
+    run_dir=repo/'docs'/'codex-runs'/(run_id or "__missing__")
     if not run_dir.exists():
         warnings.append(f"current run dir missing: {run_dir.relative_to(repo)}")
     manifest=run_dir/'STALE_PASS_CLEANUP_MANIFEST.json'

@@ -2,10 +2,12 @@ use crate::db::app_db::{ModelRecord, Provider};
 use crate::error::GlossError;
 use crate::features::{self, FeatureFlagStatus};
 use crate::memory::MemoryBackendStatus;
-use crate::providers::{self, ModelInfo, ModelRegistry, ProviderType};
+use crate::providers::{self, lan_local_providers_allowed, ModelInfo, ModelRegistry, ProviderType};
+use crate::redaction::redact_path;
 use crate::retrieval::source_scope::SourceScope;
 use crate::state::AppState;
-use serde::Serialize;
+use crate::tool_invocation::{run_tool_status_receipt, ToolInvocationReceiptV1};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::State;
 
@@ -96,6 +98,12 @@ pub struct SemanticMemoryProviderDiagnostics {
     pub provider: String,
     pub dims: usize,
     pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalToolAvailabilityReceipt {
+    pub available: bool,
+    pub receipt: ToolInvocationReceiptV1,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -241,6 +249,19 @@ pub async fn update_provider(
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
     if let Some(provider_type) = ProviderType::from_str(&id) {
+        let allow_lan = {
+            let app_db = state
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            lan_local_providers_allowed(&app_db)
+        };
+        let candidate_url = base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| provider_type.default_base_url());
+        providers::validate_provider_base_url(provider_type, candidate_url, allow_lan)?;
         if let Some(secret_key) = secret_setting_key(provider_type) {
             if let Some(api_key) = api_key.as_deref() {
                 state.secret_store.set(secret_key, Some(api_key))?;
@@ -253,7 +274,7 @@ pub async fn update_provider(
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        app_db.update_provider(&id, enabled, base_url.as_deref(), None)?;
+        app_db.update_provider(&id, enabled, base_url.as_deref())?;
     }
 
     rebuild_model_registry(&state)?;
@@ -278,6 +299,66 @@ pub async fn test_provider(
 
     let provider = providers::build_provider(&config);
     provider.health_check().await
+}
+
+/// Test whether a specific model is available on the named provider.
+/// Returns (health_ok, model_found, model_available).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelTestResult {
+    pub provider_healthy: bool,
+    pub model_found: bool,
+    pub model_available: bool,
+    pub model_list_error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn test_provider_model(
+    provider_id: String,
+    model_id: String,
+    state: State<'_, AppState>,
+) -> Result<ProviderModelTestResult, GlossError> {
+    let config = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let provider_type = provider_type_from_id(&provider_id)?;
+        providers::provider_config_from_db(&app_db, &state.secret_store, provider_type)?
+    };
+
+    let provider = providers::build_provider(&config);
+
+    let provider_healthy = match provider.health_check().await {
+        Ok(ok) => ok,
+        Err(e) => {
+            return Ok(ProviderModelTestResult {
+                provider_healthy: false,
+                model_found: false,
+                model_available: false,
+                model_list_error: Some(format!("health_check: {e}")),
+            });
+        }
+    };
+
+    let models = match provider.list_models().await {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(ProviderModelTestResult {
+                provider_healthy,
+                model_found: false,
+                model_available: false,
+                model_list_error: Some(format!("list_models: {e}")),
+            });
+        }
+    };
+
+    let found = models.iter().find(|m| m.id == model_id);
+    Ok(ProviderModelTestResult {
+        provider_healthy,
+        model_found: found.is_some(),
+        model_available: found.is_some(), // list_models already filters unavailable
+        model_list_error: None,
+    })
 }
 
 #[tauri::command]
@@ -494,14 +575,14 @@ pub async fn run_embedding_diagnostics(
                     init_ok: true,
                     embed_one_ok: true,
                     dims: Some(vector.len()),
-                    cache_dir: cache_dir.display().to_string(),
+                    cache_dir: redact_path(&cache_dir),
                     error: None,
                 },
                 Err(err) => NativeFastEmbedDiagnostics {
                     init_ok: true,
                     embed_one_ok: false,
                     dims: None,
-                    cache_dir: cache_dir.display().to_string(),
+                    cache_dir: redact_path(&cache_dir),
                     error: Some(err.to_string()),
                 },
             }
@@ -510,7 +591,7 @@ pub async fn run_embedding_diagnostics(
             init_ok: false,
             embed_one_ok: false,
             dims: None,
-            cache_dir: cache_dir.display().to_string(),
+            cache_dir: redact_path(&cache_dir),
             error: Some(err.to_string()),
         },
     };
@@ -954,26 +1035,28 @@ pub async fn get_semantic_memory_profile_status(
     })
 }
 
-/// Check availability of external tools (ffmpeg, etc.)
+/// Check availability of external tools (ffmpeg, etc.) with invocation receipts.
 #[tauri::command]
-pub async fn check_external_tools() -> Result<HashMap<String, bool>, GlossError> {
+pub async fn check_external_tools(
+) -> Result<HashMap<String, ExternalToolAvailabilityReceipt>, GlossError> {
     let mut tools = HashMap::new();
 
     for tool in ["ffmpeg", "ffprobe"] {
-        let available = tokio::time::timeout(
+        let receipt = run_tool_status_receipt(
+            tool,
+            "settings_availability_probe",
+            &["-version"],
             std::time::Duration::from_secs(3),
-            tokio::process::Command::new(tool)
-                .arg("-version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status(),
         )
         .await
-        .ok()
-        .and_then(Result::ok)
-        .map(|status| status.success())
-        .unwrap_or(false);
-        tools.insert(tool.to_string(), available);
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+        tools.insert(
+            tool.to_string(),
+            ExternalToolAvailabilityReceipt {
+                available: receipt.success,
+                receipt,
+            },
+        );
     }
 
     Ok(tools)

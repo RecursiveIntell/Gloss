@@ -1,15 +1,33 @@
 import { useState } from "react";
 import { useNotebookStore } from "../../stores/notebookStore";
-import { BookOpen, Plus, Trash2, Settings, Pencil, Save, X } from "lucide-react";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { BookOpen, Plus, Trash2, Settings, Pencil, Save, X, Download, Upload } from "lucide-react";
 import { SettingsDialog } from "../settings/SettingsDialog";
+import * as api from "../../lib/tauri";
+import { useToastStore } from "../../stores/toastStore";
+
+function portableDefaultName(name: string): string {
+  const safe = name.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return `${safe || "notebook"}.glosspkg.tar.gz`;
+}
 
 export function NotebookSidebar() {
-  const { notebooks, activeNotebookId, setActive, createNotebook, renameNotebook, deleteNotebook } = useNotebookStore();
+  const {
+    notebooks,
+    activeNotebookId,
+    setActive,
+    createNotebook,
+    renameNotebook,
+    deleteNotebook,
+    loadNotebooks,
+  } = useNotebookStore();
+  const addToast = useToastStore((s) => s.addToast);
   const [newName, setNewName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [editingNotebookId, setEditingNotebookId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [portableBusy, setPortableBusy] = useState<"export" | "import" | null>(null);
 
   const handleCreate = async () => {
     if (!newName.trim()) return;
@@ -39,6 +57,68 @@ export function NotebookSidebar() {
       cancelRename();
     } catch (e) {
       console.error("Failed to rename notebook:", e);
+    }
+  };
+
+  const handleExportNotebook = async () => {
+    const notebook = notebooks.find((nb) => nb.id === activeNotebookId);
+    if (!notebook || portableBusy) return;
+    const packageDir = await save({
+      title: "Export notebook package",
+      defaultPath: portableDefaultName(notebook.name),
+    });
+    if (!packageDir) return;
+    setPortableBusy("export");
+    try {
+      const receipt = await api.exportNotebookArchive(notebook.id, packageDir);
+      addToast({
+        type: "success",
+        title: "Notebook exported",
+        message: `${receipt.file_count} files archived`,
+        duration: 5000,
+      });
+    } catch (e) {
+      addToast({
+        type: "error",
+        title: "Notebook export failed",
+        message: e instanceof Error ? e.message : String(e),
+        duration: 0,
+      });
+    } finally {
+      setPortableBusy(null);
+    }
+  };
+
+  const handleImportNotebook = async () => {
+    if (portableBusy) return;
+    const selected = await open({
+      title: "Import notebook package",
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Gloss notebook package", extensions: ["gz"] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    setPortableBusy("import");
+    try {
+      const manifest = await api.validateNotebookImportArchive(selected);
+      const receipt = await api.importNotebookArchive(selected);
+      await loadNotebooks();
+      await setActive(receipt.imported_notebook_id);
+      addToast({
+        type: "success",
+        title: "Notebook imported",
+        message: `${manifest.notebook_name} verified`,
+        duration: 5000,
+      });
+    } catch (e) {
+      addToast({
+        type: "error",
+        title: "Notebook import failed",
+        message: e instanceof Error ? e.message : String(e),
+        duration: 0,
+      });
+    } finally {
+      setPortableBusy(null);
     }
   };
 
@@ -154,6 +234,24 @@ export function NotebookSidebar() {
 
       {/* Settings footer */}
       <div className="border-t border-border p-2">
+        <div className="mb-1 grid grid-cols-2 gap-1">
+          <button
+            onClick={() => void handleImportNotebook()}
+            disabled={portableBusy !== null}
+            className="flex items-center justify-center rounded border border-transparent px-2 py-1.5 text-text-secondary hover:border-border hover:bg-bg-tertiary hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+            title="Import notebook package"
+          >
+            <Upload className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => void handleExportNotebook()}
+            disabled={!activeNotebookId || portableBusy !== null}
+            className="flex items-center justify-center rounded border border-transparent px-2 py-1.5 text-text-secondary hover:border-border hover:bg-bg-tertiary hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+            title="Export active notebook"
+          >
+            <Download className="w-4 h-4" />
+          </button>
+        </div>
         <button
           onClick={() => setShowSettings(true)}
           className="flex w-full items-center gap-2 rounded border border-transparent px-2 py-1.5 text-sm text-text-secondary hover:border-border hover:bg-bg-tertiary hover:text-text"

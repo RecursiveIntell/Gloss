@@ -158,6 +158,7 @@ pub enum RetrievalReasonCode {
     Bm25NoMatches,
     SourceOrderFallback,
     RawContentFallback,
+    DenseNoQueryMatches,
     NoRetrievalContext,
 }
 
@@ -180,6 +181,7 @@ impl RetrievalReasonCode {
             Self::Bm25NoMatches => "bm25_no_matches",
             Self::SourceOrderFallback => "source_order_fallback",
             Self::RawContentFallback => "raw_content_fallback",
+            Self::DenseNoQueryMatches => "dense_no_query_matches",
             Self::NoRetrievalContext => "no_retrieval_context",
         }
     }

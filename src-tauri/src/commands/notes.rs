@@ -30,7 +30,7 @@ pub async fn create_note(
         created_at: String::new(),
         updated_at: String::new(),
     };
-    state.with_notebook_db(&notebook_id, |db| db.create_note(&note))?;
+    state.with_notebook_db_write(&notebook_id, |db| db.create_note(&note))?;
     Ok(id)
 }
 
@@ -60,7 +60,7 @@ pub async fn save_response_as_note(
         created_at: String::new(),
         updated_at: String::new(),
     };
-    state.with_notebook_db(&notebook_id, |db| db.create_note(&note))?;
+    state.with_notebook_db_write(&notebook_id, |db| db.create_note(&note))?;
     Ok(id)
 }
 
@@ -107,7 +107,7 @@ pub async fn update_note(
     content: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
-    state.with_notebook_db(&notebook_id, |db| {
+    state.with_notebook_db_write(&notebook_id, |db| {
         db.update_note(&note_id, title.as_deref(), content.as_deref())
     })
 }
@@ -118,7 +118,7 @@ pub async fn toggle_pin(
     note_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
-    state.with_notebook_db(&notebook_id, |db| db.toggle_pin(&note_id))
+    state.with_notebook_db_write(&notebook_id, |db| db.toggle_pin(&note_id))
 }
 
 #[tauri::command]
@@ -127,5 +127,5 @@ pub async fn delete_note(
     note_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
-    state.with_notebook_db(&notebook_id, |db| db.delete_note(&note_id))
+    state.with_notebook_db_write(&notebook_id, |db| db.delete_note(&note_id))
 }

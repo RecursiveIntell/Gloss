@@ -1,39 +1,34 @@
-# Gloss
+# Gloss Closing / Hardening Final Repair Pack
 
-Gloss is a local-first desktop notebook for importing source files, indexing them locally, asking scoped questions, and saving cited answers into notes.
+Generated: `2026-05-27T23:29:04Z`
+Active run: `GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526`
 
-The app is built with Tauri, React, TypeScript, and Rust. Its release-proof contract is conservative: public claims in this repository must match source, validation gates, and live receipts under `docs/codex-runs/`.
+This pack converts the prior hostile audits plus current post-run code inspection into a **verification-first Codex closure bundle**. It is designed to fix the real chat/Ollama failure path and every broken proof/tool/addition surfaced by the audits, without guessing.
 
-## Current Scope
+## Controlling evidence
 
-- Local notebook and source management.
-- File import with local indexing.
-- Source-grounded chat with cited evidence.
-- Local dense retrieval as the default retrieval path.
-- Semantic-memory and TurboQuant paths only when enabled and proven by receipts for the active run.
+- Current package: `Gloss-generic-rust-next-codex-context-20260527T064920Z.*`
+- Prior five-angle hostile audit addendum: `gloss_5_hostile_audits_20260527`
+- Current source snippets inspected in extracted package:
+  - `src/components/chat/ChatPanel.tsx`
+  - `src/stores/chatStore.ts`
+  - `src/stores/sourceStore.ts`
+  - `src/App.tsx`
+  - `src/lib/tauri.ts`
+  - `src-tauri/src/commands/chat/mod.rs`
+  - `src-tauri/src/providers/mod.rs`
+  - `src-tauri/src/providers/ollama.rs`
+  - `src-tauri/src/commands/settings.rs`
 
-## Release Proof
+## How to use
 
-The active Codex repair run is:
+1. Copy or attach this entire pack to the next Codex run.
+2. Start Codex with `MASTER_PROMPT.md`.
+3. Use `AGENTS.md` as the repo-level guidance candidate.
+4. Execute phase prompts in `phase_prompts/` in order.
+5. Copy `validation/` scripts into the Gloss repo only after review, then run `validation/run_closing_gates.sh`.
+6. Refuse completion unless `FINAL_HANDOFF_TEMPLATE.md` is fully populated.
 
-```text
-GLOSS_RELEASE_PROOF_EMBEDDING_UNIFICATION_CLEANUP_20260525
-```
+## Hard rule
 
-Run receipts and validation evidence belong under:
-
-```text
-docs/codex-runs/GLOSS_RELEASE_PROOF_EMBEDDING_UNIFICATION_CLEANUP_20260525/
-```
-
-`README.md` is product-facing documentation, not release proof. Use the active run receipt and validation gates for release decisions.
-
-## Development
-
-```bash
-npm install
-npm run build
-npm run tauri:dev
-```
-
-Release-profile checks are defined by the active run instructions in `AGENTS.md` and the current run receipts.
+No release claim, no public claim, no “fixed” claim until the live Ollama smoke + ChatAttemptTraceV1 proves the failing branch is gone.

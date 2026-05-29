@@ -6,7 +6,19 @@ use std::path::Path;
 
 /// App-level database handle (gloss.db).
 pub struct AppDb {
-    pub conn: Connection,
+    conn: Connection,
+}
+
+impl AppDb {
+    /// Provide temporary read-only access to the underlying connection.
+    ///
+    /// This is the only sanctioned way for callers outside `db::app_db`
+    /// to reach the `rusqlite::Connection`.  The field itself is private
+    /// to prevent accidental direct mutation or schema changes.
+    #[allow(dead_code)]
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,14 +189,13 @@ impl AppDb {
     }
 
     /// Update a provider configuration.
+    /// API keys are not stored in the DB — they go through SecretStore.
     pub fn update_provider(
         &self,
         id: &str,
         enabled: bool,
         base_url: Option<&str>,
-        api_key: Option<&str>,
     ) -> Result<(), GlossError> {
-        let _ = api_key;
         self.conn.execute(
             "INSERT OR REPLACE INTO providers (id, enabled, base_url)
              VALUES (?1, ?2, ?3)",
@@ -241,34 +252,39 @@ impl AppDb {
     // -- Models --
 
     /// Replace cached models for a provider.
+    /// Wrapped in a transaction so a crash between DELETE and INSERT cannot
+    /// wipe the model list.
     pub fn replace_models(
         &self,
         provider_id: &str,
         models: &[ModelRecord],
     ) -> Result<(), GlossError> {
-        self.conn
-            .execute("DELETE FROM models WHERE provider_id = ?1", [provider_id])?;
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO models (id, provider_id, display_name, parameter_size, context_window, capabilities, available, stale, last_error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
-        for m in models {
-            stmt.execute(rusqlite::params![
-                m.id,
-                m.provider_id,
-                m.display_name,
-                m.parameter_size,
-                m.context_window,
-                m.capabilities,
-                m.available,
-                m.stale,
-                m.last_error,
-            ])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM models WHERE provider_id = ?1", [provider_id])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO models (id, provider_id, display_name, parameter_size, context_window, capabilities, available, stale, last_error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for m in models {
+                stmt.execute(rusqlite::params![
+                    m.id,
+                    m.provider_id,
+                    m.display_name,
+                    m.parameter_size,
+                    m.context_window,
+                    m.capabilities,
+                    m.available,
+                    m.stale,
+                    m.last_error,
+                ])?;
+            }
         }
-        self.conn.execute(
+        tx.execute(
             "UPDATE providers SET last_refreshed = datetime('now') WHERE id = ?1",
             [provider_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -460,13 +476,9 @@ mod tests {
     #[test]
     fn test_update_provider_does_not_persist_api_key() {
         let db = test_db();
-        db.update_provider(
-            "openai",
-            true,
-            Some("https://api.openai.com/v1"),
-            Some("sk-secret"),
-        )
-        .unwrap();
+        db.update_provider("openai", true, Some("https://api.openai.com/v1"))
+            .unwrap();
+        // API keys are handled exclusively via SecretStore, never the providers table
         assert_eq!(db.get_provider_api_key("openai").unwrap(), None);
     }
 
@@ -488,5 +500,149 @@ mod tests {
         let all = db.get_all_models().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].display_name, "Qwen3 8B");
+    }
+
+    /// Verifies that replace_models is atomic: old models are fully replaced
+    /// by new models with no intermediate state visible.
+    #[test]
+    fn test_replace_models_atomic() {
+        let db = test_db();
+
+        // Insert initial models
+        let old_models = vec![
+            ModelRecord {
+                id: "model-a".to_string(),
+                provider_id: "ollama".to_string(),
+                display_name: "Model A".to_string(),
+                parameter_size: None,
+                context_window: None,
+                capabilities: None,
+                available: true,
+                stale: false,
+                last_error: None,
+            },
+            ModelRecord {
+                id: "model-b".to_string(),
+                provider_id: "ollama".to_string(),
+                display_name: "Model B".to_string(),
+                parameter_size: None,
+                context_window: None,
+                capabilities: None,
+                available: true,
+                stale: false,
+                last_error: None,
+            },
+        ];
+        db.replace_models("ollama", &old_models).unwrap();
+
+        // Verify old models are present
+        let all = db.get_all_models().unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Replace with a completely new set
+        let new_models = vec![
+            ModelRecord {
+                id: "model-x".to_string(),
+                provider_id: "ollama".to_string(),
+                display_name: "Model X".to_string(),
+                parameter_size: Some("7B".to_string()),
+                context_window: Some(8192),
+                capabilities: None,
+                available: true,
+                stale: false,
+                last_error: None,
+            },
+            ModelRecord {
+                id: "model-y".to_string(),
+                provider_id: "ollama".to_string(),
+                display_name: "Model Y".to_string(),
+                parameter_size: Some("13B".to_string()),
+                context_window: Some(16384),
+                capabilities: None,
+                available: true,
+                stale: false,
+                last_error: None,
+            },
+            ModelRecord {
+                id: "model-z".to_string(),
+                provider_id: "ollama".to_string(),
+                display_name: "Model Z".to_string(),
+                parameter_size: None,
+                context_window: None,
+                capabilities: None,
+                available: true,
+                stale: false,
+                last_error: None,
+            },
+        ];
+        db.replace_models("ollama", &new_models).unwrap();
+
+        // After successful replace, old models must be gone and only new ones present
+        let all = db.get_all_models().unwrap();
+        assert_eq!(all.len(), 3);
+        let names: Vec<&str> = all.iter().map(|m| m.display_name.as_str()).collect();
+        assert!(names.contains(&"Model X"));
+        assert!(names.contains(&"Model Y"));
+        assert!(names.contains(&"Model Z"));
+        assert!(!names.contains(&"Model A"));
+        assert!(!names.contains(&"Model B"));
+    }
+
+    /// Verifies that replace_models rolls back when a constraint is violated
+    /// (e.g. duplicate primary key within the same batch) so old models remain.
+    #[test]
+    fn test_replace_models_rollback_on_constraint_violation() {
+        let db = test_db();
+
+        // Insert initial models
+        let old_models = vec![ModelRecord {
+            id: "original".to_string(),
+            provider_id: "ollama".to_string(),
+            display_name: "Original Model".to_string(),
+            parameter_size: None,
+            context_window: None,
+            capabilities: None,
+            available: true,
+            stale: false,
+            last_error: None,
+        }];
+        db.replace_models("ollama", &old_models).unwrap();
+
+        // Try to replace with models that have a duplicate PRIMARY KEY (id, provider_id)
+        // within the same batch — this will cause a constraint violation on the second insert.
+        let bad_models = vec![
+            ModelRecord {
+                id: "dup".to_string(),
+                provider_id: "ollama".to_string(),
+                display_name: "Dup First".to_string(),
+                parameter_size: None,
+                context_window: None,
+                capabilities: None,
+                available: true,
+                stale: false,
+                last_error: None,
+            },
+            ModelRecord {
+                id: "dup".to_string(), // same (id, provider_id) — violates PRIMARY KEY
+                provider_id: "ollama".to_string(),
+                display_name: "Dup Second".to_string(),
+                parameter_size: None,
+                context_window: None,
+                capabilities: None,
+                available: true,
+                stale: false,
+                last_error: None,
+            },
+        ];
+        let result = db.replace_models("ollama", &bad_models);
+        assert!(
+            result.is_err(),
+            "replace_models should fail on duplicate PK"
+        );
+
+        // Old models must still be present after rollback
+        let all = db.get_all_models().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].display_name, "Original Model");
     }
 }

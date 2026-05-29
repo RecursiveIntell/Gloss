@@ -1,9 +1,30 @@
 use crate::error::GlossError;
+use crate::redaction::redact_path;
 use fastembed::{
     EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank,
 };
 use std::path::Path;
 use usearch::ffi::{IndexOptions, MetricKind, ScalarKind};
+
+pub fn fastembed_cache_has_entries(cache_dir: &Path) -> bool {
+    cache_dir
+        .read_dir()
+        .map(|mut entries| entries.any(|entry| entry.is_ok()))
+        .unwrap_or(false)
+}
+
+pub fn require_fastembed_download_consent(
+    cache_dir: &Path,
+    download_consent: bool,
+) -> Result<(), GlossError> {
+    if fastembed_cache_has_entries(cache_dir) || download_consent {
+        return Ok(());
+    }
+    Err(GlossError::Embedding(format!(
+        "FastEmbed model cache is empty at {}; enable FastEmbed download consent or switch semantic-memory embeddings to Ollama before initializing local embeddings",
+        redact_path(cache_dir)
+    )))
+}
 
 /// Wrapper around fastembed TextEmbedding for generating embeddings and reranking.
 pub struct EmbeddingService {
@@ -14,12 +35,23 @@ pub struct EmbeddingService {
 
 impl EmbeddingService {
     /// Initialize the embedding service with NomicEmbedTextV15 (768-dim).
+    #[allow(dead_code)]
     pub fn new(cache_dir: &Path) -> Result<Self, GlossError> {
-        Self::new_with_reranker(cache_dir, false)
+        Self::new_with_download_policy(cache_dir, false, true)
     }
 
     /// Initialize the embedding service and optionally load the cross-encoder reranker.
+    #[allow(dead_code)]
     pub fn new_with_reranker(cache_dir: &Path, load_reranker: bool) -> Result<Self, GlossError> {
+        Self::new_with_download_policy(cache_dir, load_reranker, true)
+    }
+
+    pub fn new_with_download_policy(
+        cache_dir: &Path,
+        load_reranker: bool,
+        download_consent: bool,
+    ) -> Result<Self, GlossError> {
+        require_fastembed_download_consent(cache_dir, download_consent)?;
         let options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15)
             .with_cache_dir(cache_dir.to_path_buf());
 
@@ -242,5 +274,25 @@ impl HnswIndex {
     #[allow(dead_code)]
     pub fn size(&self) -> usize {
         self.index.size()
+    }
+}
+
+#[cfg(test)]
+mod download_policy_tests {
+    use super::*;
+
+    #[test]
+    fn empty_fastembed_cache_requires_explicit_download_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = require_fastembed_download_consent(dir.path(), false).unwrap_err();
+        assert!(err.to_string().contains("FastEmbed model cache is empty"));
+        assert!(require_fastembed_download_consent(dir.path(), true).is_ok());
+    }
+
+    #[test]
+    fn existing_fastembed_cache_entry_allows_offline_initialization_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cached-model-marker"), b"cached").unwrap();
+        assert!(require_fastembed_download_consent(dir.path(), false).is_ok());
     }
 }

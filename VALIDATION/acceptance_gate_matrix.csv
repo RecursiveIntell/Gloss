@@ -1,0 +1,14 @@
+gate,phase_range,command_or_test,expected,failure_action
+current_run_truth,P000-P005,validation/gloss_current_run_truth_gate.py,all run IDs match,block packaging
+package_scope,P000-P005,validation/gloss_package_scope_gate.py,no unrelated root docs,repair packager
+decoding_settings,P006-P012,validation/gloss_decoding_settings_gate.py,effective settings captured,block generation receipts
+prompt_generation_receipts,P013-P018,generation/prompt receipt tests,sample receipts valid,block inspector release
+timeout_partial,P019-P024,timeout continuation tests,partial saved and continued,block RC
+semantic_runtime_truth,P010-P024,runtime truth tests,backend truth attached,block semantic claim
+retrieval_decision,P016-P028,decision tests,one canonical object,block answer evidence
+strict_semantic_memory,P021-P033,live semantic smoke,backend_used semantic-memory-preview,block semantic claim
+turboquant,P034-P036,TQ runtime gate,exact proof or demotion,block TQ claim
+inspector_dock,P040-P048,UI smoke/tests,tabs render and Notes preserved,block RC UI
+queue_truth,P055-P059,queue tests,pending vs processing split,block lag truth
+release_candidate,P066-P075,validation/gloss_release_candidate_gate.py,release_ready legal,block release
+broad_spec,P076-P110,broad spec gate,all broad phases pass,block broad claim

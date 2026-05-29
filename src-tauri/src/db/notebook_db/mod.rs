@@ -8,7 +8,7 @@ use std::path::Path;
 
 /// Per-notebook database handle (notebook.db).
 pub struct NotebookDb {
-    pub conn: Connection,
+    conn: Connection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +209,22 @@ fn source_processing_state_from_row(
     })
 }
 
+fn studio_output_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StudioOutput> {
+    Ok(StudioOutput {
+        id: row.get(0)?,
+        output_type: row.get(1)?,
+        title: row.get(2)?,
+        prompt_used: row.get(3)?,
+        raw_content: row.get(4)?,
+        config: row.get(5)?,
+        source_ids: row.get(6)?,
+        file_path: row.get(7)?,
+        status: row.get(8)?,
+        error_message: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudioOutput {
@@ -227,6 +243,34 @@ pub struct StudioOutput {
 
 #[allow(dead_code)]
 impl NotebookDb {
+    /// Provide read-only access to the underlying connection.
+    ///
+    /// This is the only sanctioned way for callers outside `db::notebook_db`
+    /// to reach the `rusqlite::Connection`.  The field itself is private
+    /// to prevent accidental direct mutation or schema changes.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Wrap an already-opened `Connection` as a `NotebookDb` reference.
+    ///
+    /// Used by the connection pool to vend `NotebookDb` handles from
+    /// pooled connections without re-opening the file.
+    ///
+    /// # Safety
+    ///
+    /// `NotebookDb` is a single-field newtype around `Connection`.  The two
+    /// types have compatible layouts, so casting `&Connection` → `&NotebookDb`
+    /// is sound.  The returned reference borrows the input reference and
+    /// therefore cannot outlive it.
+    pub fn from_conn_ref(conn: &Connection) -> &Self {
+        // SAFETY: `NotebookDb` is `#[repr(C)]`-compatible with a single
+        // `Connection` field.  A reference to the field is therefore also a
+        // valid reference to the whole struct.  The lifetime is tied to the
+        // input reference, so no dangling can occur.
+        unsafe { &*(conn as *const Connection as *const NotebookDb) }
+    }
+
     /// Connect to an existing per-notebook database with runtime pragmas.
     pub fn connect(path: &Path) -> Result<Self, GlossError> {
         let conn = Connection::open(path)?;
@@ -237,7 +281,7 @@ impl NotebookDb {
     /// Open (or create) a per-notebook database and run migrations.
     pub fn open(path: &Path) -> Result<Self, GlossError> {
         let db = Self::connect(path)?;
-        migrations::migrate_notebook_db(&db.conn)?;
+        migrations::migrate_notebook_db(db.conn())?;
         Ok(db)
     }
 
@@ -371,6 +415,20 @@ impl NotebookDb {
         Ok(())
     }
 
+    /// Update source metadata after receipt-bearing enrichment.
+    pub fn update_source_metadata(
+        &self,
+        source_id: &str,
+        metadata: Option<&str>,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "UPDATE sources SET metadata = ?1, updated_at = datetime('now')
+             WHERE id = ?2",
+            rusqlite::params![metadata, source_id],
+        )?;
+        Ok(())
+    }
+
     /// Update source summary.
     pub fn update_source_summary(
         &self,
@@ -459,10 +517,14 @@ impl NotebookDb {
     }
 
     /// Persist the exact set of selected sources for this notebook.
+    /// Wrapped in a transaction so a crash between unselect-all and re-select
+    /// cannot leave all sources unselected.
     pub fn set_selected_sources(&self, selected_ids: &[String]) -> Result<(), GlossError> {
-        self.conn.execute("UPDATE sources SET selected = 0", [])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE sources SET selected = 0", [])?;
 
         if selected_ids.is_empty() {
+            tx.commit()?;
             return Ok(());
         }
 
@@ -477,7 +539,8 @@ impl NotebookDb {
             .iter()
             .map(|id| id as &dyn rusqlite::types::ToSql)
             .collect();
-        self.conn.execute(&sql, params.as_slice())?;
+        tx.execute(&sql, params.as_slice())?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1458,6 +1521,70 @@ impl NotebookDb {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_prompt_receipt(
+        &self,
+        receipt_id: &str,
+        notebook_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        prompt_digest: &str,
+        context_payload_digest: &str,
+        raw_receipt_json: &str,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO prompt_receipts
+             (receipt_id, notebook_id, conversation_id, message_id, prompt_digest,
+              context_payload_digest, raw_receipt_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                receipt_id,
+                notebook_id,
+                conversation_id,
+                message_id,
+                prompt_digest,
+                context_payload_digest,
+                raw_receipt_json
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_generation_receipt(
+        &self,
+        receipt_id: &str,
+        notebook_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        provider: &str,
+        model: &str,
+        provider_request_digest: &str,
+        response_digest: Option<&str>,
+        status: &str,
+        raw_receipt_json: &str,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO generation_receipts
+             (receipt_id, notebook_id, conversation_id, message_id, provider, model,
+              provider_request_digest, response_digest, status, raw_receipt_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                receipt_id,
+                notebook_id,
+                conversation_id,
+                message_id,
+                provider,
+                model,
+                provider_request_digest,
+                response_digest,
+                status,
+                raw_receipt_json
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Get a message by ID.
     pub fn get_message(&self, message_id: &str) -> Result<Message, GlossError> {
         self.conn
@@ -1531,6 +1658,69 @@ impl NotebookDb {
                 note.pinned,
                 note.source_id,
             ],
+        )?;
+        Ok(())
+    }
+
+    // -- Studio outputs --
+
+    pub fn list_studio_outputs(&self) -> Result<Vec<StudioOutput>, GlossError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, output_type, title, prompt_used, raw_content, config, source_ids,
+                    file_path, status, error_message, created_at
+             FROM studio_outputs
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], studio_output_from_row)?;
+        let mut outputs = Vec::new();
+        for row in rows {
+            outputs.push(row?);
+        }
+        Ok(outputs)
+    }
+
+    pub fn get_studio_output(&self, output_id: &str) -> Result<StudioOutput, GlossError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, output_type, title, prompt_used, raw_content, config, source_ids,
+                    file_path, status, error_message, created_at
+             FROM studio_outputs
+             WHERE id = ?1",
+        )?;
+        stmt.query_row([output_id], studio_output_from_row)
+            .map_err(GlossError::from)
+    }
+
+    pub fn insert_studio_output(&self, output: &StudioOutput) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT INTO studio_outputs (
+                id, output_type, title, prompt_used, raw_content, config,
+                source_ids, file_path, status, error_message
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                output.id,
+                output.output_type,
+                output.title,
+                output.prompt_used,
+                output.raw_content,
+                output.config,
+                output.source_ids,
+                output.file_path,
+                output.status,
+                output.error_message,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_studio_output_file_path(
+        &self,
+        output_id: &str,
+        file_path: &str,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "UPDATE studio_outputs SET file_path = ?1 WHERE id = ?2",
+            rusqlite::params![file_path, output_id],
         )?;
         Ok(())
     }
@@ -2290,5 +2480,85 @@ mod tests {
         assert_eq!(failed_summary.failed_sources, 1);
         assert!(failed_summary.projection_required);
         assert_eq!(db.get_source("failed").unwrap().status, "ready");
+    }
+
+    /// Verifies that set_selected_sources is atomic: the selection changes
+    /// from one consistent state to another with no intermediate "all deselected" state.
+    #[test]
+    fn test_set_selected_sources_atomic() {
+        let db = test_db();
+
+        // Insert 4 sources, all initially selected
+        for id in ["s1", "s2", "s3", "s4"] {
+            db.insert_source(&Source {
+                id: id.to_string(),
+                source_type: "text".to_string(),
+                title: id.to_string(),
+                original_filename: None,
+                file_hash: None,
+                url: None,
+                file_path: None,
+                content_text: Some("content".to_string()),
+                word_count: Some(1),
+                metadata: None,
+                summary: None,
+                summary_model: None,
+                status: "ready".to_string(),
+                error_message: None,
+                selected: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+                processing_state: None,
+            })
+            .unwrap();
+        }
+
+        // Verify initial state: all 4 selected
+        let selected = db.get_selected_source_ids().unwrap();
+        assert_eq!(selected.len(), 4);
+
+        // Change selection to only s2 and s4
+        db.set_selected_sources(&["s2".to_string(), "s4".to_string()])
+            .unwrap();
+
+        // After the call, exactly s2 and s4 must be selected — no intermediate
+        // state where all are deselected or only a subset of the old selection remains
+        let selected = db.get_selected_source_ids().unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&"s2".to_string()));
+        assert!(selected.contains(&"s4".to_string()));
+
+        // Also verify via list_sources that the other sources are NOT selected
+        let sources = db.list_sources().unwrap();
+        for source in &sources {
+            if source.id == "s2" || source.id == "s4" {
+                assert!(source.selected, "{} should be selected", source.id);
+            } else {
+                assert!(!source.selected, "{} should NOT be selected", source.id);
+            }
+        }
+
+        // Test emptying the selection entirely
+        db.set_selected_sources(&[]).unwrap();
+        let selected = db.get_selected_source_ids().unwrap();
+        assert!(
+            selected.is_empty(),
+            "no sources should be selected after clearing"
+        );
+
+        // Verify all sources are deselected via list_sources
+        let sources = db.list_sources().unwrap();
+        assert!(sources.iter().all(|s| !s.selected));
+
+        // Select all again
+        db.set_selected_sources(&[
+            "s1".to_string(),
+            "s2".to_string(),
+            "s3".to_string(),
+            "s4".to_string(),
+        ])
+        .unwrap();
+        let selected = db.get_selected_source_ids().unwrap();
+        assert_eq!(selected.len(), 4);
     }
 }

@@ -7,132 +7,200 @@ use crate::jobs;
 #[cfg(feature = "semantic-memory-backend")]
 use crate::memory::semantic_memory_adapter;
 use crate::memory::MemorySearchRequest;
+use crate::memory::{
+    RetrievalCapabilityDecisionV1, RetrievalMode, RetrievalOutcome, RetrievalReasonCode,
+};
 #[cfg(feature = "semantic-memory-backend")]
 use crate::memory::{RetrievalCoverage, RetrievalEngineStatus, RetrievalResult};
-use crate::memory::{RetrievalMode, RetrievalOutcome, RetrievalReasonCode};
 use crate::memory::{MEMORY_BACKEND_GLOSS_LOCAL, MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW};
-use crate::providers::{self, ChatMessage, ChatRequest, ChatToken, LlmProvider};
+use crate::providers::{self, ChatMessage, ChatRequest, ChatToken};
 use crate::retrieval::citations;
-use crate::retrieval::context::{ContextAssembler, ContextPassage};
+use crate::retrieval::context::ContextPassage;
 use crate::retrieval::hybrid_search;
 use crate::retrieval::source_scope::{ResolvedSourceScope, SourceScope};
 use crate::state::AppState;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Serialize;
+
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
 use tauri_queue::QueueManager;
-use tokio::sync::TryAcquireError;
+
+mod emit;
+mod gates;
+pub(crate) mod receipts;
+mod streaming;
+mod types;
+
+// Re-export helpers used by send_message / stream_chat_response and other
+// functions that remain in this file.
+use emit::{emit_chat_error, emit_chat_status, ChatTerminalEmitter};
+use gates::acquire_gate_with_epoch;
+use receipts::{chat_attempt_trace_snapshot, new_chat_attempt_trace, record_chat_attempt_trace};
+
+// Pull in types from the types submodule.
+use types::*;
+// Pull in streaming helpers.
+use streaming::{source_context_digest, stream_chat_response};
+
+#[allow(unused_imports)]
+pub use receipts::{ChatAttemptTraceEvent, ChatAttemptTraceV1};
 
 const CHAT_CANCELLED_NOTEBOOK_SWITCH: &str = "__chat_cancelled_notebook_switch__";
 const CHAT_PROVIDER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const CHAT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(120);
-const CHAT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const CHAT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(168);
+const CHAT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(84);
+const DEFAULT_CHAT_TEMPERATURE: f32 = 0.7;
 #[cfg(feature = "semantic-memory-backend")]
 const SEMANTIC_MEMORY_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8_192;
 const MAX_CONTEXT_WINDOW_TOKENS: u32 = 32_768;
 
-#[derive(Debug, Clone, Serialize)]
-struct ChatEvidenceDisclosure {
-    backend_requested: String,
-    backend_used: String,
-    retrieval_mode: String,
-    fallback_used: bool,
-    fallback_reason: Option<String>,
-    degradation_markers: Vec<String>,
-    source_scope_mode: String,
-    requested_source_ids: Vec<String>,
-    selected_source_ids: Vec<String>,
-    effective_source_ids: Vec<String>,
-    invalid_source_ids: Vec<String>,
-    excluded_source_ids: Vec<String>,
-    invalid_source_count: usize,
-    effective_source_count: usize,
-    excluded_source_count: usize,
-    context_passage_count: usize,
-    citation_valid_count: usize,
-    citation_invalid_count: usize,
-    citation_anchors: Vec<citations::CitationAnchorV1>,
-    citation_filter_reasons: Vec<citations::CitationFilterReasonV1>,
-    omitted_candidate_count: usize,
-    source_scope_preserved: bool,
-    index_status: String,
-    link_status: String,
-    receipt_id: String,
-    context_digest: String,
-    source_context_digest: String,
-    prompt_digest: Option<String>,
-    semantic_memory_receipt_id: Option<String>,
-    candidate_backend: Option<String>,
-    turbo_quant_generation_id: Option<String>,
-    vector_artifact_manifest_digest: Option<String>,
-    exact_rerank: Option<bool>,
-    exact_rerank_count: Option<usize>,
-    approximate_candidate_count: Option<usize>,
-    semantic_memory_fallback_reason: Option<String>,
-    retrieval_outcome: Option<RetrievalOutcome>,
-}
+// All struct/type definitions moved to types.rs; imported via `use types::*` above.
 
-#[derive(Debug, Clone, Serialize)]
-struct SourceScopeIntegrityV1 {
-    requested_ids_valid: bool,
-    effective_ids_match_allowed_set: bool,
-    no_out_of_scope_context: bool,
-    no_unanchored_context: bool,
-    fallback_class_allowed: bool,
-    projection_links_preserved: bool,
-    preserved: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AssistantMessageEvidence {
-    citations: Vec<citations::Citation>,
-    evidence: ChatEvidenceDisclosure,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PromptBudgetReceiptV1 {
-    model_context_window: u32,
-    system_prompt_chars: usize,
-    message_count: usize,
-    source_passage_count: usize,
-    prompt_digest: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct LlmInvocationReceiptV1 {
-    provider: String,
-    model: String,
-    request_digest: String,
-    response_digest: Option<String>,
-    error: Option<String>,
-}
-
-fn digest_text(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-fn source_context_digest(source_context: &[ContextPassage]) -> String {
-    let mut material = String::new();
-    for passage in source_context {
-        material.push_str(&passage.source_id);
-        material.push('\n');
-        material.push_str(passage.chunk_id.as_deref().unwrap_or(""));
-        material.push('\n');
-        material.push_str(&passage.evidence_class);
-        material.push('\n');
-        material.push_str(&digest_text(&passage.content));
-        material.push('\n');
+pub(crate) fn provider_decoding_capability(
+    provider_type: providers::ProviderType,
+) -> ProviderDecodingCapabilityV1 {
+    match provider_type {
+        providers::ProviderType::Ollama => ProviderDecodingCapabilityV1 {
+            supports_temperature: true,
+            supports_top_p: true,
+            supports_top_k: true,
+            supports_min_p: true,
+            supports_repeat_penalty: true,
+        },
+        providers::ProviderType::LlamaCpp | providers::ProviderType::OpenAI => {
+            ProviderDecodingCapabilityV1 {
+                supports_temperature: true,
+                supports_top_p: true,
+                supports_top_k: false,
+                supports_min_p: false,
+                supports_repeat_penalty: false,
+            }
+        }
+        providers::ProviderType::Anthropic => ProviderDecodingCapabilityV1 {
+            supports_temperature: true,
+            supports_top_p: true,
+            supports_top_k: true,
+            supports_min_p: false,
+            supports_repeat_penalty: false,
+        },
     }
-    digest_text(&material)
+}
+
+pub(crate) fn parse_optional_f32(value: Option<String>) -> Option<f32> {
+    value
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+}
+
+pub(crate) fn parse_optional_i64(value: Option<String>) -> Option<i64> {
+    value.and_then(|value| value.trim().parse::<i64>().ok())
+}
+
+pub(crate) fn effective_decoding_settings(
+    state: &AppState,
+    provider_type: providers::ProviderType,
+    model: &str,
+    max_tokens: u32,
+) -> Result<DecodingSettingsReceiptV1, GlossError> {
+    let capability = provider_decoding_capability(provider_type);
+    let (
+        requested_temperature,
+        requested_top_p,
+        requested_top_k,
+        requested_min_p,
+        requested_repeat_penalty,
+    ) = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        (
+            app_db.get_setting("generation_temperature")?,
+            app_db.get_setting("generation_top_p")?,
+            app_db.get_setting("generation_top_k")?,
+            app_db.get_setting("generation_min_p")?,
+            app_db.get_setting("generation_repeat_penalty")?,
+        )
+    };
+    let requested = serde_json::json!({
+        "temperature": requested_temperature,
+        "top_p": requested_top_p,
+        "top_k": requested_top_k,
+        "min_p": requested_min_p,
+        "repeat_penalty": requested_repeat_penalty,
+    });
+    let mut unsupported_fields = Vec::new();
+    let temperature = parse_optional_f32(requested["temperature"].as_str().map(str::to_string))
+        .unwrap_or(DEFAULT_CHAT_TEMPERATURE)
+        .clamp(0.0, 2.0);
+    let top_p = if capability.supports_top_p {
+        parse_optional_f32(requested["top_p"].as_str().map(str::to_string))
+    } else {
+        if requested["top_p"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            unsupported_fields.push("top_p".to_string());
+        }
+        None
+    };
+    let top_k = if capability.supports_top_k {
+        parse_optional_i64(requested["top_k"].as_str().map(str::to_string))
+    } else {
+        if requested["top_k"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            unsupported_fields.push("top_k".to_string());
+        }
+        None
+    };
+    let min_p = if capability.supports_min_p {
+        parse_optional_f32(requested["min_p"].as_str().map(str::to_string))
+    } else {
+        if requested["min_p"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            unsupported_fields.push("min_p".to_string());
+        }
+        None
+    };
+    let repeat_penalty = if capability.supports_repeat_penalty {
+        parse_optional_f32(requested["repeat_penalty"].as_str().map(str::to_string))
+    } else {
+        if requested["repeat_penalty"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            unsupported_fields.push("repeat_penalty".to_string());
+        }
+        None
+    };
+
+    Ok(DecodingSettingsReceiptV1 {
+        schema: "DecodingSettingsReceiptV1".to_string(),
+        receipt_id: uuid::Uuid::new_v4().to_string(),
+        provider: provider_type.as_str().to_string(),
+        model: model.to_string(),
+        requested,
+        effective: EffectiveDecodingSettingsV1 {
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repeat_penalty,
+            max_tokens,
+        },
+        unsupported_fields,
+        provider_capability: capability,
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,215 +213,6 @@ struct ProjectionReadiness {
     healthy_links: usize,
     missing_links: usize,
     skipped_no_chunks: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ChatStatusPayload<'a> {
-    notebook_id: &'a str,
-    conversation_id: &'a str,
-    message_id: &'a str,
-    phase: &'a str,
-    message: &'a str,
-    provider: Option<&'a str>,
-    model: Option<&'a str>,
-    gate: Option<&'a str>,
-    owner: Option<&'a str>,
-    owner_detail: Option<&'a str>,
-    elapsed_ms: u128,
-    timeout_ms: Option<u128>,
-    truncated: bool,
-    error: Option<&'a str>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatAttemptTraceEvent {
-    pub phase: String,
-    pub recorded_at: String,
-    pub elapsed_ms: Option<u128>,
-    pub detail: Option<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatAttemptTraceV1 {
-    pub schema: String,
-    pub attempt_id: String,
-    pub notebook_id: String,
-    pub conversation_id: String,
-    pub message_id: String,
-    pub model: String,
-    pub provider: String,
-    pub provider_base_url: Option<String>,
-    pub memory_backend: Option<String>,
-    pub memory_backend_fallback: Option<bool>,
-    pub source_scope_mode: Option<String>,
-    pub first_token_seen: bool,
-    pub done_seen: bool,
-    pub assistant_persisted: bool,
-    pub error: Option<String>,
-    pub retrieval_trace_ref: Option<String>,
-    pub retrieval_outcome: Option<RetrievalOutcome>,
-    pub events: Vec<ChatAttemptTraceEvent>,
-}
-
-fn new_chat_attempt_trace(
-    notebook_id: &str,
-    conversation_id: &str,
-    message_id: &str,
-    model: &str,
-    memory_backend: Option<String>,
-    memory_backend_fallback: Option<bool>,
-    source_scope_mode: Option<String>,
-) -> ChatAttemptTraceV1 {
-    ChatAttemptTraceV1 {
-        schema: "ChatAttemptTraceV1".to_string(),
-        attempt_id: uuid::Uuid::new_v4().to_string(),
-        notebook_id: notebook_id.to_string(),
-        conversation_id: conversation_id.to_string(),
-        message_id: message_id.to_string(),
-        model: model.to_string(),
-        provider: "unknown".to_string(),
-        provider_base_url: None,
-        memory_backend,
-        memory_backend_fallback,
-        source_scope_mode,
-        first_token_seen: false,
-        done_seen: false,
-        assistant_persisted: false,
-        error: None,
-        retrieval_trace_ref: None,
-        retrieval_outcome: None,
-        events: Vec::new(),
-    }
-}
-
-fn persist_chat_attempt_trace(
-    data_dir: &Path,
-    trace: &ChatAttemptTraceV1,
-) -> Result<(), GlossError> {
-    let trace_dir = data_dir.join("chat-attempt-traces");
-    std::fs::create_dir_all(&trace_dir)?;
-    let bytes = serde_json::to_vec_pretty(trace)?;
-    std::fs::write(trace_dir.join(format!("{}.json", trace.attempt_id)), &bytes)?;
-    Ok(())
-}
-
-fn record_chat_attempt_trace<F>(
-    trace: &Arc<Mutex<ChatAttemptTraceV1>>,
-    data_dir: &Path,
-    phase: &str,
-    elapsed: Option<Duration>,
-    detail: Option<&str>,
-    error: Option<&str>,
-    update: F,
-) where
-    F: FnOnce(&mut ChatAttemptTraceV1),
-{
-    let snapshot = {
-        let mut guard = trace.lock().unwrap_or_else(|e| e.into_inner());
-        update(&mut guard);
-        if let Some(error) = error {
-            guard.error = Some(error.to_string());
-        }
-        guard.events.push(ChatAttemptTraceEvent {
-            phase: phase.to_string(),
-            recorded_at: chrono::Utc::now().to_rfc3339(),
-            elapsed_ms: elapsed.map(|elapsed| elapsed.as_millis()),
-            detail: detail.map(str::to_string),
-            error: error.map(str::to_string),
-        });
-        guard.clone()
-    };
-
-    if let Err(err) = persist_chat_attempt_trace(data_dir, &snapshot) {
-        tracing::warn!(error = %err, "Failed to persist chat attempt trace");
-    }
-}
-
-fn chat_attempt_trace_snapshot(trace: &Arc<Mutex<ChatAttemptTraceV1>>) -> ChatAttemptTraceV1 {
-    trace.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_chat_status(
-    handle: &tauri::AppHandle,
-    notebook_id: &str,
-    conversation_id: &str,
-    message_id: &str,
-    phase: &str,
-    message: &str,
-    provider: Option<&str>,
-    model: Option<&str>,
-    gate: Option<&str>,
-    owner: Option<&str>,
-    owner_detail: Option<&str>,
-    elapsed: Duration,
-    timeout: Option<Duration>,
-    truncated: bool,
-    error: Option<&str>,
-) {
-    let _ = handle.emit(
-        "chat:status",
-        ChatStatusPayload {
-            notebook_id,
-            conversation_id,
-            message_id,
-            phase,
-            message,
-            provider,
-            model,
-            gate,
-            owner,
-            owner_detail,
-            elapsed_ms: elapsed.as_millis(),
-            timeout_ms: timeout.map(|timeout| timeout.as_millis()),
-            truncated,
-            error,
-        },
-    );
-}
-
-fn gate_owner_for(state: &AppState, gate_name: &str) -> Option<crate::state::RuntimeGateOwner> {
-    state
-        .gate_owners_snapshot()
-        .into_iter()
-        .find(|owner| owner.gate == gate_name)
-}
-
-fn emit_chat_done(
-    handle: &tauri::AppHandle,
-    notebook_id: &str,
-    conversation_id: &str,
-    message_id: &str,
-) {
-    let _ = handle.emit(
-        "chat:token",
-        serde_json::json!({
-            "notebook_id": notebook_id,
-            "conversation_id": conversation_id,
-            "message_id": message_id,
-            "token": "",
-            "done": true,
-        }),
-    );
-}
-
-fn emit_chat_error(
-    handle: &tauri::AppHandle,
-    notebook_id: &str,
-    conversation_id: &str,
-    message_id: &str,
-    error: &str,
-) {
-    let _ = handle.emit(
-        "chat:error",
-        serde_json::json!({
-            "notebook_id": notebook_id,
-            "conversation_id": conversation_id,
-            "message_id": message_id,
-            "error": error,
-        }),
-    );
 }
 
 #[cfg(feature = "semantic-memory-backend")]
@@ -396,136 +255,6 @@ fn bounded_semantic_fallback_reason(reason: &str) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn acquire_gate_with_epoch<'a>(
-    app_handle: &tauri::AppHandle,
-    state: &'a AppState,
-    notebook_id: &str,
-    conversation_id: &str,
-    message_id: &str,
-    epoch: u64,
-    gate: &'a tokio::sync::Semaphore,
-    timeout: Duration,
-    gate_name: &str,
-) -> Result<Option<tokio::sync::SemaphorePermit<'a>>, GlossError> {
-    let started = Instant::now();
-    let mut last_wait_status = Instant::now() - Duration::from_secs(2);
-    let owner = gate_owner_for(state, gate_name);
-    emit_chat_status(
-        app_handle,
-        notebook_id,
-        conversation_id,
-        message_id,
-        "waiting_gate",
-        "Waiting for runtime gate",
-        None,
-        None,
-        Some(gate_name),
-        owner.as_ref().map(|owner| owner.owner.as_str()),
-        owner.as_ref().map(|owner| owner.detail.as_str()),
-        started.elapsed(),
-        Some(timeout),
-        false,
-        None,
-    );
-
-    loop {
-        if !state.is_active_notebook_epoch(notebook_id, epoch) {
-            emit_chat_status(
-                app_handle,
-                notebook_id,
-                conversation_id,
-                message_id,
-                "cancelled",
-                "Chat cancelled by notebook switch",
-                None,
-                None,
-                Some(gate_name),
-                None,
-                None,
-                started.elapsed(),
-                Some(timeout),
-                false,
-                None,
-            );
-            return Ok(None);
-        }
-
-        match gate.try_acquire() {
-            Ok(permit) => {
-                state.set_gate_owner(gate_name, "chat", message_id);
-                emit_chat_status(
-                    app_handle,
-                    notebook_id,
-                    conversation_id,
-                    message_id,
-                    "gate_acquired",
-                    "Runtime gate acquired",
-                    None,
-                    None,
-                    Some(gate_name),
-                    Some("chat"),
-                    Some(message_id),
-                    started.elapsed(),
-                    Some(timeout),
-                    false,
-                    None,
-                );
-                return Ok(Some(permit));
-            }
-            Err(TryAcquireError::NoPermits) => {
-                if started.elapsed() >= timeout {
-                    let error = format!("Timed out waiting for {gate_name}.");
-                    let owner = gate_owner_for(state, gate_name);
-                    emit_chat_status(
-                        app_handle,
-                        notebook_id,
-                        conversation_id,
-                        message_id,
-                        "gate_timeout",
-                        "Timed out waiting for runtime gate",
-                        None,
-                        None,
-                        Some(gate_name),
-                        owner.as_ref().map(|owner| owner.owner.as_str()),
-                        owner.as_ref().map(|owner| owner.detail.as_str()),
-                        started.elapsed(),
-                        Some(timeout),
-                        false,
-                        Some(&error),
-                    );
-                    return Err(GlossError::Other(error));
-                }
-                if last_wait_status.elapsed() >= Duration::from_secs(1) {
-                    let owner = gate_owner_for(state, gate_name);
-                    emit_chat_status(
-                        app_handle,
-                        notebook_id,
-                        conversation_id,
-                        message_id,
-                        "waiting_gate",
-                        "Waiting for runtime gate",
-                        None,
-                        None,
-                        Some(gate_name),
-                        owner.as_ref().map(|owner| owner.owner.as_str()),
-                        owner.as_ref().map(|owner| owner.detail.as_str()),
-                        started.elapsed(),
-                        Some(timeout),
-                        false,
-                        None,
-                    );
-                    last_wait_status = Instant::now();
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(TryAcquireError::Closed) => {
-                return Err(GlossError::Other(format!("{gate_name} closed")));
-            }
-        }
-    }
-}
-
 fn load_cached_suggested_questions(
     notebook_id: &str,
     state: &AppState,
@@ -550,7 +279,7 @@ fn compute_dynamic_num_ctx(
     messages: &[ChatMessage],
     model_context_window: Option<i32>,
     max_tokens: u32,
-) -> u32 {
+) -> ContextBudgetResult {
     let prompt_tokens = estimate_tokens(system_prompt)
         + messages
             .iter()
@@ -565,7 +294,20 @@ fn compute_dynamic_num_ctx(
         .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
         .min(MAX_CONTEXT_WINDOW_TOKENS);
 
-    needed.clamp(DEFAULT_CONTEXT_WINDOW_TOKENS.min(model_limit), model_limit)
+    let num_ctx = needed.clamp(DEFAULT_CONTEXT_WINDOW_TOKENS.min(model_limit), model_limit);
+    ContextBudgetResult {
+        num_ctx,
+        needed,
+        prompt_tokens,
+        context_budgeted: needed > model_limit,
+    }
+}
+
+struct ContextBudgetResult {
+    num_ctx: u32,
+    needed: u32,
+    prompt_tokens: u32,
+    context_budgeted: bool,
 }
 
 #[tauri::command]
@@ -582,7 +324,7 @@ pub async fn create_conversation(
     state: State<'_, AppState>,
 ) -> Result<String, GlossError> {
     let id = uuid::Uuid::new_v4().to_string();
-    state.with_notebook_db(&notebook_id, |db| db.create_conversation(&id))?;
+    state.with_notebook_db_write(&notebook_id, |db| db.create_conversation(&id))?;
     Ok(id)
 }
 
@@ -592,7 +334,7 @@ pub async fn delete_conversation(
     conversation_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
-    state.with_notebook_db(&notebook_id, |db| db.delete_conversation(&conversation_id))
+    state.with_notebook_db_write(&notebook_id, |db| db.delete_conversation(&conversation_id))
 }
 
 #[tauri::command]
@@ -766,7 +508,7 @@ pub async fn send_message(
         tokens_response: None,
         created_at: String::new(),
     };
-    state.with_notebook_db(&notebook_id, |db| db.insert_message(&user_msg))?;
+    state.with_notebook_db_write(&notebook_id, |db| db.insert_message(&user_msg))?;
     record_chat_attempt_trace(
         &attempt_trace,
         &trace_data_dir,
@@ -957,6 +699,7 @@ pub async fn send_message(
                     app_db.get_setting("semantic_memory_embedding_url")?,
                     app_db.get_setting("semantic_memory_embedding_model")?,
                     app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+                    setting_is_enabled(app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?),
                     features::turbo_quant_active(&app_db)?,
                     setting_is_enabled(app_db.get_setting(
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
@@ -1222,6 +965,8 @@ pub async fn send_message(
                     query: query.clone(),
                     limit: top_k,
                     trace_id: Some(retrieval_receipt_id.clone()),
+                    // allow_fallback: true — semantic_fallback_allowed controls whether
+                    // the memory backend may degrade to gloss-local when preview fails.
                     allow_fallback: semantic_fallback_allowed,
                 };
 
@@ -1734,6 +1479,7 @@ pub async fn send_message(
     } else if resolved_scope.is_none() {
         Vec::new()
     } else {
+        // GlossLocalMemoryBackend::new — gloss-local retrieval path (ranked before raw-content-text-fallback)
         let mut local_outcome = state.local_retrieval_outcome(
             &notebook_id,
             &query,
@@ -1828,6 +1574,8 @@ pub async fn send_message(
                 })
                 .collect()
         } else {
+            // raw-content-text-fallback — indexed retrieval produced no proof-grade context;
+            // chat continues without retrieval context; answer must disclose missing support.
             local_outcome.degraded = true;
             retrieval_fallback_reason.get_or_insert_with(|| {
                 "indexed retrieval produced no proof-grade context; answer must disclose missing support"
@@ -1948,9 +1696,53 @@ pub async fn send_message(
         }
     };
 
+    let retrieval_capability_decision = RetrievalCapabilityDecisionV1 {
+        requested_backend: retrieval_backend_requested.clone(),
+        effective_backend: retrieval_backend_used.clone(),
+        decision_reason: retrieval_fallback_reason.clone(),
+        build_feature_available: cfg!(feature = "semantic-memory-backend"),
+        runtime_enabled: semantic_preview_gate_open,
+        projection_ready: !retrieval_degradation_markers.iter().any(|marker| {
+            marker == RetrievalReasonCode::SemanticMemoryLinksMissing.as_str()
+                || marker == RetrievalReasonCode::SemanticMemoryLinksDegraded.as_str()
+        }),
+        dense_ready: native_dense_possible,
+        fallback_allowed: semantic_fallback_allowed,
+        degraded: retrieval_fallback_reason.is_some() || !retrieval_degradation_markers.is_empty(),
+    };
+    let semantic_memory_projection_truth = state
+        .with_notebook_db(&notebook_id, |db| {
+            db.semantic_memory_projection_summary(&notebook_id, &resolved_scope)
+        })
+        .ok()
+        .and_then(|summary| serde_json::to_value(summary).ok())
+        .unwrap_or_else(|| serde_json::json!({"projection_summary_unavailable": true}));
+    let semantic_memory_runtime_truth = SemanticMemoryRuntimeTruthV1 {
+        schema: "SemanticMemoryRuntimeTruthV1".to_string(),
+        receipt_id: uuid::Uuid::new_v4().to_string(),
+        build: serde_json::json!({
+            "semantic_memory_backend_compiled": cfg!(feature = "semantic-memory-backend"),
+            "turbo_quant_compiled": cfg!(feature = "semantic-memory-turbo-quant"),
+        }),
+        settings: serde_json::json!({
+            "requested_backend": retrieval_backend_requested,
+            "fallback_allowed": semantic_fallback_allowed,
+            "runtime_enabled": semantic_preview_gate_open,
+        }),
+        projection: semantic_memory_projection_truth,
+        turbo_quant: serde_json::json!({
+            "candidate_backend": candidate_backend.clone(),
+            "artifact_generation_id": turbo_quant_generation_id.clone(),
+            "vector_artifact_manifest_digest": vector_artifact_manifest_digest.clone(),
+            "exact_rerank": exact_rerank,
+            "exact_rerank_count": exact_rerank_count,
+        }),
+        decision: retrieval_capability_decision.clone(),
+    };
+
     let evidence_base = ChatEvidenceDisclosure {
-        backend_requested: retrieval_backend_requested,
-        backend_used: retrieval_backend_used,
+        backend_requested: retrieval_backend_requested.clone(),
+        backend_used: retrieval_backend_used.clone(),
         retrieval_mode,
         fallback_used: retrieval_fallback_reason.is_some(),
         fallback_reason: retrieval_fallback_reason,
@@ -1996,6 +1788,12 @@ pub async fn send_message(
         approximate_candidate_count,
         semantic_memory_fallback_reason,
         retrieval_outcome: retrieval_outcome_for_evidence,
+        retrieval_capability_decision,
+        semantic_memory_runtime_truth,
+        decoding_settings_receipt: None,
+        prompt_receipt: None,
+        generation_receipt: None,
+        prompt_budget_receipt: None,
     };
 
     if !state.is_active_notebook_epoch(&notebook_id, request_epoch) {
@@ -2081,6 +1879,15 @@ pub async fn send_message(
     let spawned_attempt_trace = Arc::clone(&attempt_trace);
     let spawned_trace_data_dir = trace_data_dir.clone();
 
+    // Create the terminal emitter — guarantees exactly one terminal event
+    // (chat:done / chat:error / chat:cancelled) for this chat stream.
+    let terminal = ChatTerminalEmitter::new(
+        app_handle.clone(),
+        &notebook_id,
+        &conversation_id,
+        &message_id,
+    );
+
     tokio::spawn(async move {
         use tauri::Manager;
         let app_state: tauri::State<'_, AppState> = handle.state();
@@ -2112,11 +1919,12 @@ pub async fn send_message(
                     Some("chat cancelled before acquiring GPU gate"),
                     |_| {},
                 );
+                terminal.emit_cancelled("Chat cancelled before acquiring GPU gate");
                 return;
             }
             Err(e) => {
                 tracing::error!(message_id = %msg_id, error = %e, "GPU gate acquisition failed");
-                emit_chat_error(&handle, &nb_id, &conv_id, &msg_id, &e.to_string());
+                terminal.emit_error(&e.to_string());
                 record_chat_attempt_trace(
                     &spawned_attempt_trace,
                     &spawned_trace_data_dir,
@@ -2156,12 +1964,13 @@ pub async fn send_message(
                     Some("chat cancelled before acquiring LLM gate"),
                     |_| {},
                 );
+                terminal.emit_cancelled("Chat cancelled before acquiring LLM gate");
                 return;
             }
             Err(e) => {
                 app_state.clear_gate_owner("GPU gate", "chat");
                 drop(gpu_permit);
-                emit_chat_error(&handle, &nb_id, &conv_id, &msg_id, &e.to_string());
+                terminal.emit_error(&e.to_string());
                 record_chat_attempt_trace(
                     &spawned_attempt_trace,
                     &spawned_trace_data_dir,
@@ -2196,9 +2005,11 @@ pub async fn send_message(
         .await;
 
         match &result {
-            Ok(full_response) => {
+            Ok(stream_result) => {
+                let full_response = &stream_result.full_response;
                 if !app_state.is_active_notebook_epoch(&nb_id, epoch) {
-                    emit_chat_done(&handle, &nb_id, &conv_id, &msg_id);
+                    // Notebook switched after stream completed — emit cancelled terminal
+                    terminal.emit_cancelled(CHAT_CANCELLED_NOTEBOOK_SWITCH);
                     app_state.clear_gate_owner("GPU gate", "chat");
                     app_state.clear_gate_owner("LLM gate", "chat");
                     drop(gpu_permit);
@@ -2220,13 +2031,19 @@ pub async fn send_message(
                 evidence.citation_filter_reasons = citation_filter_reasons;
                 evidence.omitted_candidate_count =
                     source_context.len().saturating_sub(extracted.len());
+                evidence.decoding_settings_receipt =
+                    Some(stream_result.decoding_settings_receipt.clone());
+                evidence.prompt_receipt = Some(stream_result.prompt_receipt.clone());
+                evidence.generation_receipt = Some(stream_result.generation_receipt.clone());
+                evidence.prompt_budget_receipt = stream_result.prompt_budget_receipt.clone();
                 let citations_payload = AssistantMessageEvidence {
                     citations: extracted,
                     evidence,
                 };
                 let citations_json = serde_json::to_string(&citations_payload).ok();
 
-                // Persist assistant message to DB
+                // Persist assistant message to DB — BEFORE chat:done.
+                // If persistence fails, emit chat:error (not chat:done).
                 let assistant_msg = Message {
                     id: msg_id.clone(),
                     conversation_id: conv_id.clone(),
@@ -2239,7 +2056,7 @@ pub async fn send_message(
                     created_at: String::new(),
                 };
                 if let Err(e) =
-                    app_state.with_notebook_db(&nb_id, |db| db.insert_message(&assistant_msg))
+                    app_state.with_notebook_db_write(&nb_id, |db| db.insert_message(&assistant_msg))
                 {
                     tracing::error!(message_id = %msg_id, "Failed to persist assistant message: {}", e);
                     record_chat_attempt_trace(
@@ -2251,7 +2068,50 @@ pub async fn send_message(
                         Some(&e.to_string()),
                         |_| {},
                     );
+                    // DB insert failure → chat:error, NOT chat:done.
+                    terminal.emit_error(&format!("Assistant message persistence failed: {e}"));
+                    app_state.clear_gate_owner("GPU gate", "chat");
+                    app_state.clear_gate_owner("LLM gate", "chat");
+                    drop(gpu_permit);
+                    drop(permit);
+                    return;
                 } else {
+                    let prompt_json = serde_json::to_string(&stream_result.prompt_receipt).ok();
+                    let generation_json =
+                        serde_json::to_string(&stream_result.generation_receipt).ok();
+                    if let Some(prompt_json) = prompt_json.as_deref() {
+                        if let Err(e) = app_state.with_notebook_db_write(&nb_id, |db| {
+                            db.insert_prompt_receipt(
+                                &stream_result.prompt_receipt.receipt_id,
+                                &nb_id,
+                                &conv_id,
+                                &msg_id,
+                                &stream_result.prompt_receipt.prompt_digest,
+                                &stream_result.prompt_receipt.context_payload_digest,
+                                prompt_json,
+                            )
+                        }) {
+                            tracing::warn!(message_id = %msg_id, error = %e, "Failed to persist PromptReceiptV1");
+                        }
+                    }
+                    if let Some(generation_json) = generation_json.as_deref() {
+                        if let Err(e) = app_state.with_notebook_db_write(&nb_id, |db| {
+                            db.insert_generation_receipt(
+                                &stream_result.generation_receipt.receipt_id,
+                                &nb_id,
+                                &conv_id,
+                                &msg_id,
+                                &stream_result.generation_receipt.provider,
+                                &stream_result.generation_receipt.model,
+                                &stream_result.generation_receipt.provider_request_digest,
+                                stream_result.generation_receipt.response_digest.as_deref(),
+                                &stream_result.generation_receipt.status,
+                                generation_json,
+                            )
+                        }) {
+                            tracing::warn!(message_id = %msg_id, error = %e, "Failed to persist GenerationReceiptV1");
+                        }
+                    }
                     record_chat_attempt_trace(
                         &spawned_attempt_trace,
                         &spawned_trace_data_dir,
@@ -2264,6 +2124,7 @@ pub async fn send_message(
                         },
                     );
                 }
+                // Assistant message persisted successfully — now emit evidence and chat:done.
                 let _ = handle.emit(
                     "chat:evidence",
                     serde_json::json!({
@@ -2274,9 +2135,22 @@ pub async fn send_message(
                         "evidence": citations_payload.evidence,
                     }),
                 );
+                terminal.emit_done();
             }
             Err(e) => {
-                if e.to_string() != CHAT_CANCELLED_NOTEBOOK_SWITCH {
+                if e.to_string() == CHAT_CANCELLED_NOTEBOOK_SWITCH {
+                    // Notebook-switch cancellation — emit chat:cancelled so frontend can clear state.
+                    terminal.emit_cancelled(CHAT_CANCELLED_NOTEBOOK_SWITCH);
+                    record_chat_attempt_trace(
+                        &spawned_attempt_trace,
+                        &spawned_trace_data_dir,
+                        "cancelled",
+                        Some(Duration::ZERO),
+                        Some("Chat cancelled by notebook switch during streaming"),
+                        Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
+                        |_| {},
+                    );
+                } else {
                     let error_text = e.to_string();
                     tracing::error!(message_id = %msg_id, "Chat streaming failed: {}", error_text);
                     emit_chat_status(
@@ -2296,7 +2170,7 @@ pub async fn send_message(
                         false,
                         Some(&error_text),
                     );
-                    emit_chat_error(&handle, &nb_id, &conv_id, &msg_id, &error_text);
+                    terminal.emit_error(&error_text);
                     record_chat_attempt_trace(
                         &spawned_attempt_trace,
                         &spawned_trace_data_dir,
@@ -2318,554 +2192,6 @@ pub async fn send_message(
     });
 
     Ok(message_id)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn stream_chat_response(
-    app_handle: &tauri::AppHandle,
-    provider: &dyn LlmProvider,
-    notebook_id: &str,
-    epoch: u64,
-    conversation_id: &str,
-    message_id: &str,
-    query: &str,
-    model: &str,
-    history: &[Message],
-    custom_goal: Option<&str>,
-    style: &str,
-    resolved_scope: &ResolvedSourceScope,
-    source_context: &[ContextPassage],
-    model_context_window: Option<i32>,
-    attempt_trace: &Arc<Mutex<ChatAttemptTraceV1>>,
-    trace_data_dir: &Path,
-) -> Result<String, GlossError> {
-    use tauri::Manager;
-
-    // Build system prompt with source manifest and authority rules only.
-    let system_prompt = ContextAssembler::build_system_prompt(
-        custom_goal,
-        style,
-        resolved_scope.kind(),
-        resolved_scope.manifest_sources(),
-    );
-
-    tracing::info!(
-        system_prompt_len = system_prompt.len(),
-        provider = provider.provider_type().as_str(),
-        "System prompt built for LLM"
-    );
-    emit_chat_status(
-        app_handle,
-        notebook_id,
-        conversation_id,
-        message_id,
-        "building_context",
-        "Building prompt context",
-        Some(provider.provider_type().as_str()),
-        Some(model),
-        None,
-        None,
-        None,
-        Duration::ZERO,
-        None,
-        false,
-        None,
-    );
-
-    // Build chat messages: history + user query
-    let mut chat_messages: Vec<ChatMessage> = Vec::new();
-
-    let history_msgs = ContextAssembler::format_history(history, 10);
-    for (role, content) in &history_msgs {
-        chat_messages.push(ChatMessage {
-            role: role.clone(),
-            content: content.clone(),
-            images: None,
-        });
-    }
-
-    let user_turn = ContextAssembler::build_user_turn(query, source_context);
-    chat_messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: user_turn,
-        images: None,
-    });
-
-    let max_tokens = 2048;
-    let num_ctx = compute_dynamic_num_ctx(
-        &system_prompt,
-        &chat_messages,
-        model_context_window,
-        max_tokens,
-    );
-    let request_material = serde_json::json!({
-        "system": &system_prompt,
-        "messages": &chat_messages,
-        "model": model,
-        "num_ctx": num_ctx,
-        "max_tokens": max_tokens,
-    })
-    .to_string();
-    let request_digest = digest_text(&request_material);
-    let prompt_budget_receipt = PromptBudgetReceiptV1 {
-        model_context_window: num_ctx,
-        system_prompt_chars: request_material.len(),
-        message_count: history_msgs.len() + 1,
-        source_passage_count: source_context.len(),
-        prompt_digest: request_digest.clone(),
-    };
-    let prompt_budget_detail = serde_json::to_string(&prompt_budget_receipt).ok();
-    record_chat_attempt_trace(
-        attempt_trace,
-        trace_data_dir,
-        "prompt_budget_receipt",
-        Some(Duration::ZERO),
-        prompt_budget_detail.as_deref(),
-        None,
-        |_| {},
-    );
-
-    // Build the provider-agnostic chat request
-    let request = ChatRequest {
-        model: model.to_string(),
-        system_prompt: Some(system_prompt),
-        messages: chat_messages,
-        max_tokens,
-        temperature: 0.7,
-        stream: true,
-        num_ctx: Some(num_ctx),
-    };
-
-    let state: tauri::State<'_, AppState> = app_handle.state();
-
-    if !state.is_active_notebook_epoch(notebook_id, epoch) {
-        record_chat_attempt_trace(
-            attempt_trace,
-            trace_data_dir,
-            "cancelled",
-            Some(Duration::ZERO),
-            Some("Active notebook epoch changed before provider request"),
-            Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
-            |_| {},
-        );
-        return Err(GlossError::Other(CHAT_CANCELLED_NOTEBOOK_SWITCH.into()));
-    }
-
-    // Call the provider, but keep checking notebook epoch while waiting for the
-    // first response so a switch can cancel the HTTP request promptly.
-    let started = Instant::now();
-    emit_chat_status(
-        app_handle,
-        notebook_id,
-        conversation_id,
-        message_id,
-        "provider_request_start",
-        "Starting provider request",
-        Some(provider.provider_type().as_str()),
-        Some(model),
-        None,
-        None,
-        None,
-        started.elapsed(),
-        Some(CHAT_PROVIDER_START_TIMEOUT),
-        false,
-        None,
-    );
-    record_chat_attempt_trace(
-        attempt_trace,
-        trace_data_dir,
-        "provider_request_start",
-        Some(started.elapsed()),
-        Some("Starting provider request"),
-        None,
-        |_| {},
-    );
-    let chat_future = provider.chat(request);
-    tokio::pin!(chat_future);
-    let mut token_stream = loop {
-        if !state.is_active_notebook_epoch(notebook_id, epoch) {
-            record_chat_attempt_trace(
-                attempt_trace,
-                trace_data_dir,
-                "cancelled",
-                Some(started.elapsed()),
-                Some("Active notebook epoch changed during provider start"),
-                Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
-                |_| {},
-            );
-            return Err(GlossError::Other(CHAT_CANCELLED_NOTEBOOK_SWITCH.into()));
-        }
-        if started.elapsed() >= CHAT_PROVIDER_START_TIMEOUT {
-            let error = "Provider did not start streaming before the provider-start timeout";
-            emit_chat_status(
-                app_handle,
-                notebook_id,
-                conversation_id,
-                message_id,
-                "provider_start_timeout",
-                error,
-                Some(provider.provider_type().as_str()),
-                Some(model),
-                None,
-                None,
-                None,
-                started.elapsed(),
-                Some(CHAT_PROVIDER_START_TIMEOUT),
-                false,
-                Some(error),
-            );
-            record_chat_attempt_trace(
-                attempt_trace,
-                trace_data_dir,
-                "provider_start_timeout",
-                Some(started.elapsed()),
-                Some("Provider did not return a stream before timeout"),
-                Some(error),
-                |_| {},
-            );
-            return Err(GlossError::Provider {
-                provider: provider.provider_type().as_str().to_string(),
-                source: anyhow::anyhow!(error),
-            });
-        }
-
-        tokio::select! {
-            result = &mut chat_future => match result {
-                Ok(stream) => break stream,
-                Err(err) => {
-                    let error = err.to_string();
-                    let invocation = LlmInvocationReceiptV1 {
-                        provider: provider.provider_type().as_str().to_string(),
-                        model: model.to_string(),
-                        request_digest: request_digest.clone(),
-                        response_digest: None,
-                        error: Some(error.clone()),
-                    };
-                    let invocation_detail = serde_json::to_string(&invocation).ok();
-                    record_chat_attempt_trace(
-                        attempt_trace,
-                        trace_data_dir,
-                        "llm_invocation_receipt",
-                        Some(started.elapsed()),
-                        invocation_detail.as_deref(),
-                        Some(&error),
-                        |_| {},
-                    );
-                    return Err(err);
-                }
-            },
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-        }
-    };
-    let first_token_wait_started = Instant::now();
-    emit_chat_status(
-        app_handle,
-        notebook_id,
-        conversation_id,
-        message_id,
-        "first_token_wait",
-        "Waiting for first token",
-        Some(provider.provider_type().as_str()),
-        Some(model),
-        None,
-        None,
-        None,
-        first_token_wait_started.elapsed(),
-        Some(CHAT_FIRST_TOKEN_TIMEOUT),
-        false,
-        None,
-    );
-    record_chat_attempt_trace(
-        attempt_trace,
-        trace_data_dir,
-        "first_token_wait",
-        Some(first_token_wait_started.elapsed()),
-        Some("Waiting for first provider token"),
-        None,
-        |_| {},
-    );
-
-    let mut full_response = String::new();
-    let mut sent_done = false;
-    let mut first_token_seen = false;
-    let mut last_token_at = Instant::now();
-
-    loop {
-        if !state.is_active_notebook_epoch(notebook_id, epoch) {
-            record_chat_attempt_trace(
-                attempt_trace,
-                trace_data_dir,
-                "cancelled",
-                Some(started.elapsed()),
-                Some("Active notebook epoch changed during provider stream"),
-                Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
-                |_| {},
-            );
-            return Err(GlossError::Other(CHAT_CANCELLED_NOTEBOOK_SWITCH.into()));
-        }
-
-        let next = match tokio::time::timeout(Duration::from_millis(250), token_stream.next()).await
-        {
-            Ok(next) => next,
-            Err(_) => {
-                let timeout = if first_token_seen {
-                    CHAT_STREAM_IDLE_TIMEOUT
-                } else {
-                    CHAT_FIRST_TOKEN_TIMEOUT
-                };
-                let elapsed = if first_token_seen {
-                    last_token_at.elapsed()
-                } else {
-                    first_token_wait_started.elapsed()
-                };
-                if elapsed >= timeout {
-                    let phase = if first_token_seen {
-                        "stream_idle_timeout"
-                    } else {
-                        "first_token_timeout"
-                    };
-                    let error = if first_token_seen {
-                        "Provider stream was idle past the stream-idle timeout"
-                    } else {
-                        "Provider did not produce a first token before timeout"
-                    };
-                    emit_chat_status(
-                        app_handle,
-                        notebook_id,
-                        conversation_id,
-                        message_id,
-                        phase,
-                        error,
-                        Some(provider.provider_type().as_str()),
-                        Some(model),
-                        None,
-                        None,
-                        None,
-                        elapsed,
-                        Some(timeout),
-                        first_token_seen,
-                        Some(error),
-                    );
-                    record_chat_attempt_trace(
-                        attempt_trace,
-                        trace_data_dir,
-                        phase,
-                        Some(elapsed),
-                        Some(error),
-                        Some(error),
-                        |_| {},
-                    );
-                    return Err(GlossError::Provider {
-                        provider: provider.provider_type().as_str().to_string(),
-                        source: anyhow::anyhow!(error),
-                    });
-                }
-                continue;
-            }
-        };
-        let Some(result) = next else {
-            break;
-        };
-
-        let ChatToken { token, done } = match result {
-            Ok(token) => token,
-            Err(err) => {
-                let error = err.to_string();
-                let invocation = LlmInvocationReceiptV1 {
-                    provider: provider.provider_type().as_str().to_string(),
-                    model: model.to_string(),
-                    request_digest: request_digest.clone(),
-                    response_digest: None,
-                    error: Some(error.clone()),
-                };
-                let invocation_detail = serde_json::to_string(&invocation).ok();
-                record_chat_attempt_trace(
-                    attempt_trace,
-                    trace_data_dir,
-                    "llm_invocation_receipt",
-                    Some(started.elapsed()),
-                    invocation_detail.as_deref(),
-                    Some(&error),
-                    |_| {},
-                );
-                return Err(err);
-            }
-        };
-        if !first_token_seen {
-            first_token_seen = true;
-            emit_chat_status(
-                app_handle,
-                notebook_id,
-                conversation_id,
-                message_id,
-                "streaming",
-                "Streaming response",
-                Some(provider.provider_type().as_str()),
-                Some(model),
-                None,
-                None,
-                None,
-                started.elapsed(),
-                None,
-                false,
-                None,
-            );
-            record_chat_attempt_trace(
-                attempt_trace,
-                trace_data_dir,
-                "streaming",
-                Some(started.elapsed()),
-                Some("First provider token received"),
-                None,
-                |trace| {
-                    trace.first_token_seen = true;
-                },
-            );
-        }
-        if !token.is_empty() {
-            last_token_at = Instant::now();
-        }
-
-        full_response.push_str(&token);
-
-        if done {
-            sent_done = true;
-        }
-
-        let _ = app_handle.emit(
-            "chat:token",
-            serde_json::json!({
-                "notebook_id": notebook_id,
-                "conversation_id": conversation_id,
-                "message_id": message_id,
-                "token": token,
-                "done": false,
-            }),
-        );
-    }
-
-    if !sent_done {
-        let error = "Provider stream ended before a clean completion; response is incomplete";
-        emit_chat_status(
-            app_handle,
-            notebook_id,
-            conversation_id,
-            message_id,
-            "incomplete_stream",
-            error,
-            Some(provider.provider_type().as_str()),
-            Some(model),
-            None,
-            None,
-            None,
-            started.elapsed(),
-            None,
-            true,
-            Some(error),
-        );
-        record_chat_attempt_trace(
-            attempt_trace,
-            trace_data_dir,
-            "incomplete_stream",
-            Some(started.elapsed()),
-            Some(error),
-            Some(error),
-            |_| {},
-        );
-        return Err(GlossError::Provider {
-            provider: provider.provider_type().as_str().to_string(),
-            source: anyhow::anyhow!(error),
-        });
-    }
-
-    if full_response.trim().is_empty() {
-        let error = "Provider stream completed without response content";
-        emit_chat_status(
-            app_handle,
-            notebook_id,
-            conversation_id,
-            message_id,
-            "empty_response",
-            error,
-            Some(provider.provider_type().as_str()),
-            Some(model),
-            None,
-            None,
-            None,
-            started.elapsed(),
-            None,
-            false,
-            Some(error),
-        );
-        record_chat_attempt_trace(
-            attempt_trace,
-            trace_data_dir,
-            "empty_response",
-            Some(started.elapsed()),
-            Some(error),
-            Some(error),
-            |_| {},
-        );
-        return Err(GlossError::Provider {
-            provider: provider.provider_type().as_str().to_string(),
-            source: anyhow::anyhow!(error),
-        });
-    }
-
-    emit_chat_status(
-        app_handle,
-        notebook_id,
-        conversation_id,
-        message_id,
-        "complete",
-        "Response complete",
-        Some(provider.provider_type().as_str()),
-        Some(model),
-        None,
-        None,
-        None,
-        started.elapsed(),
-        None,
-        false,
-        None,
-    );
-    record_chat_attempt_trace(
-        attempt_trace,
-        trace_data_dir,
-        "complete",
-        Some(started.elapsed()),
-        Some("Provider stream completed cleanly"),
-        None,
-        |trace| {
-            trace.done_seen = true;
-        },
-    );
-    let invocation = LlmInvocationReceiptV1 {
-        provider: provider.provider_type().as_str().to_string(),
-        model: model.to_string(),
-        request_digest,
-        response_digest: Some(digest_text(&full_response)),
-        error: None,
-    };
-    let invocation_detail = serde_json::to_string(&invocation).ok();
-    record_chat_attempt_trace(
-        attempt_trace,
-        trace_data_dir,
-        "llm_invocation_receipt",
-        Some(started.elapsed()),
-        invocation_detail.as_deref(),
-        None,
-        |_| {},
-    );
-    emit_chat_done(app_handle, notebook_id, conversation_id, message_id);
-
-    tracing::debug!(
-        message_id,
-        len = full_response.len(),
-        "Chat response complete"
-    );
-
-    Ok(full_response)
 }
 
 #[tauri::command]
@@ -2958,6 +2284,10 @@ pub async fn debug_chat_provider_smoke(
         }],
         max_tokens: 64,
         temperature: 0.0,
+        top_p: None,
+        top_k: None,
+        min_p: None,
+        repeat_penalty: None,
         stream: true,
         num_ctx: None,
     };
@@ -3007,6 +2337,7 @@ pub async fn debug_chat_provider_smoke(
     let mut full_response = String::new();
     let mut first_token_seen = false;
     let mut done_seen = false;
+    let mut eof_seen = false;
     let mut last_token_at = Instant::now();
     loop {
         let next = match tokio::time::timeout(Duration::from_millis(250), token_stream.next()).await
@@ -3048,6 +2379,7 @@ pub async fn debug_chat_provider_smoke(
             }
         };
         let Some(result) = next else {
+            eof_seen = true;
             break;
         };
         let ChatToken { token, done } = match result {
@@ -3086,6 +2418,18 @@ pub async fn debug_chat_provider_smoke(
         full_response.push_str(&token);
         if done {
             done_seen = true;
+            record_chat_attempt_trace(
+                &attempt_trace,
+                &trace_data_dir,
+                "provider_done_frame",
+                Some(started.elapsed()),
+                Some("Provider-only smoke saw done=true and stopped before HTTP EOF"),
+                None,
+                |trace| {
+                    trace.done_seen = true;
+                },
+            );
+            break;
         }
     }
 
@@ -3121,11 +2465,13 @@ pub async fn debug_chat_provider_smoke(
         &trace_data_dir,
         "complete",
         Some(started.elapsed()),
-        Some("Provider-only smoke completed with response content"),
+        Some(if eof_seen {
+            "Provider-only smoke completed with response content after EOF"
+        } else {
+            "Provider-only smoke completed with response content on provider done frame"
+        }),
         None,
-        |trace| {
-            trace.done_seen = true;
-        },
+        |_| {},
     );
     Ok(chat_attempt_trace_snapshot(&attempt_trace))
 }
@@ -3159,4 +2505,25 @@ pub async fn get_last_chat_attempt_trace(
     };
     let text = std::fs::read_to_string(path)?;
     Ok(Some(serde_json::from_str(&text)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_stream_contract_done_frame_no_eof_terminal_metadata() {
+        let decision = provider_done_terminal_decision();
+
+        assert_eq!(decision.terminal_cause, "provider_done_frame");
+        assert!(decision.done_frame_seen);
+        assert!(!decision.eof_seen);
+        assert!(decision.emit_done_on_current_token);
+        assert!(decision.break_stream_loop);
+    }
+
+    #[test]
+    fn chat_done_frame_without_eof() {
+        chat_stream_contract_done_frame_no_eof_terminal_metadata();
+    }
 }

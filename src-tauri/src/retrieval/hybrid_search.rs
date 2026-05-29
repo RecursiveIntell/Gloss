@@ -124,8 +124,8 @@ pub fn local_retrieval_outcome(
                     }
                 }
                 if dense_chunks.is_empty() {
-                    dense_reason = Some(RetrievalReasonCode::DenseEngineUnavailable);
-                    fallback_chain.push(RetrievalReasonCode::DenseEngineUnavailable);
+                    dense_reason = Some(RetrievalReasonCode::DenseNoQueryMatches);
+                    fallback_chain.push(RetrievalReasonCode::DenseNoQueryMatches);
                 }
             }
         }

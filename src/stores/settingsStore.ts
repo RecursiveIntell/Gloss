@@ -1,6 +1,7 @@
 import { create } from 'zustand';
-import type { Provider, ModelRecord, FeatureFlagStatus } from '../lib/types';
+import type { Provider, ModelRecord, FeatureFlagStatus, ExternalToolAvailabilityReceipt } from '../lib/types';
 import * as api from '../lib/tauri';
+import { useToastStore } from './toastStore';
 
 interface SettingsStore {
   providers: Provider[];
@@ -9,7 +10,7 @@ interface SettingsStore {
   featureFlags: FeatureFlagStatus[];
   activeModel: string;
   loading: boolean;
-  externalTools: Record<string, boolean>;
+  externalTools: Record<string, ExternalToolAvailabilityReceipt>;
   loadSettings: () => Promise<void>;
   loadFeatureFlags: () => Promise<void>;
   loadProviders: () => Promise<void>;
@@ -41,6 +42,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       });
     } catch (e) {
       console.error('Failed to load settings:', e);
+      useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load settings', duration: 5000 });
     }
   },
 
@@ -50,6 +52,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       set({ featureFlags });
     } catch (e) {
       console.error('Failed to load feature flags:', e);
+      useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load feature flags', duration: 5000 });
     }
   },
 
@@ -59,6 +62,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       set({ providers });
     } catch (e) {
       console.error('Failed to load providers:', e);
+      useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load providers', duration: 5000 });
     }
   },
 
@@ -68,6 +72,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       set({ models });
     } catch (e) {
       console.error('Failed to load models:', e);
+      useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load models', duration: 5000 });
     }
   },
 
@@ -78,6 +83,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       await get().loadModels();
     } catch (e) {
       console.error('Failed to refresh models:', e);
+      useToastStore.getState().addToast({ type: 'error', title: 'Refresh Failed', message: 'Failed to refresh models', duration: 5000 });
     } finally {
       set({ loading: false });
     }

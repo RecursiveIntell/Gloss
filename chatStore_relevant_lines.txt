@@ -1,0 +1,320 @@
+     1	import { create } from 'zustand';
+     2	import type { ChatEvidencePayload, ChatStatusPayload, Conversation, Message, SourceScope } from '../lib/types';
+     3	import * as api from '../lib/tauri';
+     4	
+     5	const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
+     6	
+     7	function errorMessage(error: unknown): string {
+     8	  if (error instanceof Error) return error.message;
+     9	  if (typeof error === 'string') return error;
+    10	  try {
+    11	    return JSON.stringify(error);
+    12	  } catch {
+    13	    return 'Chat request failed';
+    14	  }
+    15	}
+    16	
+    17	interface ChatStore {
+    18	  conversations: Conversation[];
+    19	  activeConversationId: string | null;
+    20	  messages: Message[];
+    21	  isStreaming: boolean;
+    22	  streamingContent: string;
+    23	  streamingNotebookId: string | null;
+    24	  streamingMessageId: string | null;
+    25	  streamingError: string | null;
+    26	  streamingStatus: ChatStatusPayload | null;
+    27	  pendingEvidence: Record<string, ChatEvidencePayload>;
+    28	  suggestedQuestions: string[];
+    29	  loadConversations: (notebookId: string) => Promise<void>;
+    30	  createConversation: (notebookId: string) => Promise<string>;
+    31	  deleteConversation: (notebookId: string, conversationId: string) => Promise<void>;
+    32	  setActiveConversation: (id: string | null) => void;
+    33	  loadMessages: (notebookId: string, conversationId: string) => Promise<void>;
+    34	  sendMessage: (notebookId: string, query: string, sourceScope: SourceScope, model: string) => Promise<void>;
+    35	  stopStreaming: (notebookId: string) => Promise<void>;
+    36	  attachAssistantEvidence: (notebookId: string, conversationId: string, messageId: string, payload: ChatEvidencePayload) => void;
+    37	  appendToken: (notebookId: string, conversationId: string, messageId: string, token: string) => void;
+    38	  finalizeMessage: (notebookId: string, conversationId: string, messageId: string) => void;
+    39	  setStreamingError: (notebookId: string, conversationId: string, messageId: string, error: string) => void;
+    40	  setStreamingStatus: (payload: ChatStatusPayload) => void;
+    41	  resetForNotebookSwitch: () => void;
+    42	  loadSuggestedQuestions: (notebookId: string) => Promise<void>;
+    43	  clearSuggestedQuestions: () => void;
+    44	}
+    45	
+    46	export const useChatStore = create<ChatStore>((set, get) => ({
+    47	  conversations: [],
+    48	  activeConversationId: null,
+    49	  messages: [],
+    50	  isStreaming: false,
+    51	  streamingContent: '',
+    52	  streamingNotebookId: null,
+    53	  streamingMessageId: null,
+    54	  streamingError: null,
+    55	  streamingStatus: null,
+    56	  pendingEvidence: {},
+    57	  suggestedQuestions: [],
+    58	
+    59	  loadConversations: async (notebookId) => {
+    60	    try {
+    61	      const conversations = await api.listConversations(notebookId);
+    62	      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+    63	        return;
+    64	      }
+    65	      set({ conversations });
+    66	    } catch (e) {
+    67	      console.error('Failed to load conversations:', e);
+    68	    }
+    69	  },
+    70	
+    71	  createConversation: async (notebookId) => {
+    72	    const id = await api.createConversation(notebookId);
+    73	    await get().loadConversations(notebookId);
+    74	    if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+    75	      return id;
+    76	    }
+    77	    set({ activeConversationId: id, messages: [] });
+    78	    return id;
+    79	  },
+    80	
+    81	  deleteConversation: async (notebookId, conversationId) => {
+    82	    await api.deleteConversation(notebookId, conversationId);
+    83	    const { activeConversationId } = get();
+    84	    if (activeConversationId === conversationId) {
+    85	      set({
+    86	        activeConversationId: null,
+    87	        messages: [],
+    88	        isStreaming: false,
+    89	        streamingContent: '',
+    90	        streamingNotebookId: null,
+    91	        streamingMessageId: null,
+    92	        streamingError: null,
+    93	        streamingStatus: null,
+    94	        pendingEvidence: {},
+    95	      });
+    96	    }
+    97	    await get().loadConversations(notebookId);
+    98	  },
+    99	
+   100	  setActiveConversation: (id) => set({ activeConversationId: id }),
+   101	
+   102	  loadMessages: async (notebookId, conversationId) => {
+   103	    set({ activeConversationId: conversationId });
+   104	    try {
+   105	      const messages = await api.loadMessages(notebookId, conversationId);
+   106	      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+   107	        return;
+   108	      }
+   109	      if (get().activeConversationId !== conversationId) {
+   110	        return;
+   111	      }
+   112	      set({ messages });
+   113	    } catch (e) {
+   114	      console.error('Failed to load messages:', e);
+   115	    }
+   116	  },
+   117	
+   118	  sendMessage: async (notebookId, query, sourceScope, model) => {
+   119	    let { activeConversationId } = get();
+   120	    if (!activeConversationId) {
+   121	      activeConversationId = await get().createConversation(notebookId);
+   122	    }
+   123	
+   124	    const assistantMessageId = crypto.randomUUID();
+   125	
+   126	    // Add user message to local state immediately
+   127	    const userMsg: Message = {
+   128	      id: crypto.randomUUID(),
+   129	      conversation_id: activeConversationId,
+   130	      role: 'user',
+   131	      content: query,
+   132	      created_at: new Date().toISOString(),
+   133	    };
+   134	    set((state) => ({
+   135	      messages: [...state.messages, userMsg],
+   136	      isStreaming: true,
+   137	      streamingContent: '',
+   138	      streamingNotebookId: notebookId,
+   139	      streamingMessageId: assistantMessageId,
+   140	      streamingError: null,
+   141	      streamingStatus: {
+   142	        notebook_id: notebookId,
+   143	        conversation_id: activeConversationId,
+   144	        message_id: assistantMessageId,
+   145	        phase: 'queued',
+   146	        message: 'Queued',
+   147	        elapsed_ms: 0,
+   148	        truncated: false,
+   149	      },
+   150	    }));
+   151	
+   152	    try {
+   153	      const messageId = await api.sendMessage(
+   154	        notebookId,
+   155	        activeConversationId,
+   156	        query,
+   157	        sourceScope,
+   158	        model,
+   159	        assistantMessageId
+   160	      );
+   161	      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+   162	        return;
+   163	      }
+   164	      if (get().activeConversationId !== activeConversationId) {
+   165	        return;
+   166	      }
+   167	      if (messageId !== assistantMessageId) {
+   168	        set({ streamingMessageId: messageId });
+   169	      }
+   170	    } catch (e) {
+   171	      const message = errorMessage(e);
+   172	      console.error('Failed to send message:', e);
+   173	      set({
+   174	        streamingError: message,
+   175	        isStreaming: false,
+   176	        streamingContent: '',
+   177	        streamingNotebookId: null,
+   178	        streamingMessageId: null,
+   179	        streamingStatus: null,
+   180	      });
+   181	    }
+   182	  },
+   183	
+   184	  stopStreaming: async (notebookId) => {
+   185	    try {
+   186	      await api.stopChat(notebookId);
+   187	    } finally {
+   188	      const { isStreaming, streamingMessageId, activeConversationId, streamingContent } = get();
+   189	      if (!isStreaming || !streamingMessageId || !activeConversationId) return;
+   190	      const pendingEvidence = get().pendingEvidence[streamingMessageId];
+   191	      const assistantMsg: Message = {
+   192	        id: streamingMessageId,
+   193	        conversation_id: activeConversationId,
+   194	        role: 'assistant',
+   195	        content: streamingContent || '[Stopped]',
+   196	        citations: pendingEvidence,
+   197	        created_at: new Date().toISOString(),
+   198	      };
+   199	      set((state) => ({
+   200	        messages: streamingContent ? [...state.messages, assistantMsg] : state.messages,
+   201	        pendingEvidence: Object.fromEntries(
+   202	          Object.entries(state.pendingEvidence).filter(([id]) => id !== streamingMessageId)
+   203	        ),
+   204	        isStreaming: false,
+   205	        streamingContent: '',
+   206	        streamingNotebookId: null,
+   207	        streamingMessageId: null,
+   208	        streamingError: null,
+   209	        streamingStatus: null,
+   210	      }));
+   211	    }
+   212	  },
+   213	
+   214	  attachAssistantEvidence: (notebookId, _conversationId, messageId, payload) => {
+   215	    const { streamingNotebookId } = get();
+   216	    if (streamingNotebookId && streamingNotebookId !== notebookId) return;
+   217	    set((state) => ({
+   218	      pendingEvidence: { ...state.pendingEvidence, [messageId]: payload },
+   219	      messages: state.messages.map((message) =>
+   220	        message.id === messageId ? { ...message, citations: payload } : message
+   221	      ),
+   222	    }));
+   223	  },
+   224	
+   225	  appendToken: (notebookId, _conversationId, messageId, token) => {
+   226	    const {
+   227	      isStreaming,
+   228	      streamingNotebookId,
+   229	      streamingMessageId,
+   230	    } = get();
+   231	    if (!isStreaming) return;
+   232	    if (streamingNotebookId !== notebookId) return;
+   233	    if (!streamingMessageId || streamingMessageId !== messageId) return;
+   234	    set((state) => ({
+   235	      streamingContent: state.streamingContent + token,
+   236	    }));
+   237	  },
+   238	
+   239	  finalizeMessage: (notebookId, conversationId, messageId) => {
+   240	    const {
+   241	      isStreaming,
+   242	      streamingNotebookId,
+   243	      streamingMessageId,
+   244	    } = get();
+   245	    if (!isStreaming) return;
+   246	    if (streamingNotebookId !== notebookId) return;
+   247	    if (!streamingMessageId || streamingMessageId !== messageId) return;
+   248	    const finalContent = get().streamingContent;
+   249	    if (!finalContent.trim()) {
+   250	      set((state) => ({
+   251	        streamingError: 'Chat completed without response content.',
+   252	        isStreaming: false,
+   253	        streamingContent: '',
+   254	        streamingNotebookId: null,
+   255	        streamingMessageId: null,
+   256	        streamingStatus: null,
+   257	        pendingEvidence: Object.fromEntries(
+   258	          Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
+   259	        ),
+   260	      }));
+   261	      return;
+   262	    }
+   263	    const pendingEvidence = get().pendingEvidence[messageId];
+   264	    const assistantMsg: Message = {
+   265	      id: messageId,
+   266	      conversation_id: conversationId,
+   267	      role: 'assistant',
+   268	      content: finalContent,
+   269	      citations: pendingEvidence,
+   270	      created_at: new Date().toISOString(),
+   271	    };
+   272	    set((state) => ({
+   273	      messages: [...state.messages, assistantMsg],
+   274	      pendingEvidence: Object.fromEntries(
+   275	        Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
+   276	      ),
+   277	      isStreaming: false,
+   278	      streamingContent: '',
+   279	      streamingNotebookId: null,
+   280	      streamingMessageId: null,
+   281	      streamingError: null,
+   282	      streamingStatus: null,
+   283	    }));
+   284	  },
+   285	
+   286	  setStreamingError: (notebookId, _conversationId, messageId, error) => {
+   287	    const {
+   288	      isStreaming,
+   289	      streamingNotebookId,
+   290	      streamingMessageId,
+   291	    } = get();
+   292	    if (!isStreaming) return;
+   293	    if (streamingNotebookId !== notebookId) return;
+   294	    if (!streamingMessageId || streamingMessageId !== messageId) return;
+   295	    set({
+   296	      streamingError: error,
+   297	      isStreaming: false,
+   298	      streamingContent: '',
+   299	      streamingNotebookId: null,
+   300	      streamingMessageId: null,
+   301	      pendingEvidence: {},
+   302	      streamingStatus: null,
+   303	    });
+   304	  },
+   305	
+   306	  setStreamingStatus: (payload) => {
+   307	    const {
+   308	      isStreaming,
+   309	      streamingNotebookId,
+   310	      streamingMessageId,
+   311	    } = get();
+   312	    if (!isStreaming) return;
+   313	    if (streamingNotebookId !== payload.notebook_id) return;
+   314	    if (!streamingMessageId || streamingMessageId !== payload.message_id) return;
+   315	    set({ streamingStatus: payload });
+   316	  },
+   317	
+   318	  resetForNotebookSwitch: () => {
+   319	    const current = get();
+   320	    set({

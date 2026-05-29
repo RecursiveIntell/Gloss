@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FinalReceiptV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "release_ready",
+    "changed_files",
+    "commands_run",
+    "checks"
+  ],
+  "properties": {
+    "schema": {
+      "const": "FinalReceiptV1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "release_ready": {
+      "type": "boolean"
+    },
+    "changed_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "commands_run": {
+      "type": "array"
+    },
+    "checks": {
+      "type": "object"
+    },
+    "remaining_blockers": {
+      "type": "array"
+    }
+  }
+}

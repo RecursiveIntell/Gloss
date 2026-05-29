@@ -1,4 +1,4 @@
-use super::{ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
+use super::{provider_http_error, ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
@@ -16,7 +16,6 @@ impl OllamaProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
@@ -64,6 +63,18 @@ fn build_ollama_chat_body(request: &ChatRequest) -> serde_json::Value {
         "temperature": request.temperature,
         "num_predict": request.max_tokens,
     });
+    if let Some(top_p) = request.top_p {
+        options["top_p"] = serde_json::json!(top_p);
+    }
+    if let Some(top_k) = request.top_k {
+        options["top_k"] = serde_json::json!(top_k);
+    }
+    if let Some(min_p) = request.min_p {
+        options["min_p"] = serde_json::json!(min_p);
+    }
+    if let Some(repeat_penalty) = request.repeat_penalty {
+        options["repeat_penalty"] = serde_json::json!(repeat_penalty);
+    }
     if let Some(num_ctx) = request.num_ctx {
         options["num_ctx"] = serde_json::json!(num_ctx);
     }
@@ -156,10 +167,7 @@ impl LlmProvider for OllamaProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(GlossError::Provider {
-                provider: "ollama".into(),
-                source: anyhow::anyhow!("HTTP {}: {}", status, text),
-            });
+            return Err(provider_http_error("ollama", status, &text));
         }
 
         if request.stream {
@@ -239,7 +247,9 @@ impl LlmProvider for OllamaProvider {
     }
 
     async fn health_check(&self) -> Result<bool, GlossError> {
-        let url = format!("{}/", self.base_url);
+        // Hit /api/tags instead of root — verifies Ollama can list models,
+        // which is the meaningful availability check for chat.
+        let url = format!("{}/api/tags", self.base_url);
         match self.client.get(&url).send().await {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
@@ -267,6 +277,10 @@ mod tests {
             }],
             max_tokens: 64,
             temperature: 0.0,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
             stream: true,
             num_ctx: Some(8192),
         }

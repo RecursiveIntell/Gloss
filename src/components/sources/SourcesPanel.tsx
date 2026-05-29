@@ -10,6 +10,8 @@ import {
   ClipboardPaste,
   Code,
   Image,
+  Link,
+  Music,
   Video,
   Trash2,
   CheckSquare,
@@ -27,6 +29,7 @@ interface SourcesPanelProps {
 
 const SUPPORTED_EXTENSIONS = [
   "txt", "md", "markdown", "rst",
+  "csv", "tsv", "pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "epub",
   "py", "js", "jsx", "ts", "tsx", "rs", "go", "java", "c", "cpp", "cc", "cxx",
   "h", "hpp", "cs", "rb", "php", "swift", "kt", "kts", "scala", "lua", "r",
   "sql", "sh", "bash", "zsh", "css", "scss", "sass", "html", "htm", "xml",
@@ -34,6 +37,7 @@ const SUPPORTED_EXTENSIONS = [
   "dart", "ex", "exs", "zig", "nim", "pl", "pm", "proto", "graphql", "gql",
   "tf", "hcl", "dockerfile", "makefile",
   "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tiff", "tif",
+  "mp3", "wav", "ogg", "flac", "m4a", "aac", "wma",
   "mp4", "webm", "mov", "avi", "mkv",
 ];
 
@@ -43,10 +47,14 @@ function sourceIcon(sourceType: string) {
       return <Code className="w-4 h-4 text-text-muted shrink-0" />;
     case "image":
       return <Image className="w-4 h-4 text-text-muted shrink-0" />;
+    case "audio":
+      return <Music className="w-4 h-4 text-text-muted shrink-0" />;
     case "video":
       return <Video className="w-4 h-4 text-text-muted shrink-0" />;
     case "paste":
       return <ClipboardPaste className="w-4 h-4 text-text-muted shrink-0" />;
+    case "url":
+      return <Link className="w-4 h-4 text-text-muted shrink-0" />;
     default:
       return <FileText className="w-4 h-4 text-text-muted shrink-0" />;
   }
@@ -78,6 +86,10 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     addSourceFolder,
     deleteSource,
     addSourcePaste,
+    addSourceUrl,
+    addSourceYouTubeTranscript,
+    quarantineFailedImports,
+    deleteFailedImports,
     retrySource,
     reindexSource,
     reindexNotebook,
@@ -85,8 +97,12 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     loadSources,
   } = useSourceStore();
   const [showPaste, setShowPaste] = useState(false);
+  const [showUrl, setShowUrl] = useState(false);
   const [pasteTitle, setPasteTitle] = useState("");
   const [pasteText, setPasteText] = useState("");
+  const [urlInput, setUrlInput] = useState("");
+  const [urlConsent, setUrlConsent] = useState(false);
+  const [youtubeLanguage, setYoutubeLanguage] = useState("en");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
@@ -124,6 +140,10 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   const sourceListUnavailable = sourceListStatus === "error";
   const sourceListLoading = sourceListStatus === "loading";
   const sourceListPartial = sourceListStatus === "partial" || sources.length < expectedSourceCount;
+  const failedSources = useMemo(
+    () => sources.filter((source) => source.status === "error"),
+    [sources]
+  );
 
   const handleFileUpload = async () => {
     const selected = await open({
@@ -151,6 +171,29 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     setPasteTitle("");
     setPasteText("");
     setShowPaste(false);
+  };
+
+  const handleUrlImport = async () => {
+    const trimmed = urlInput.trim();
+    if (!trimmed) return;
+    await addSourceUrl(notebookId, trimmed, urlConsent);
+    setUrlInput("");
+    setUrlConsent(false);
+    setShowUrl(false);
+  };
+
+  const handleYouTubeTranscriptImport = async () => {
+    const trimmed = urlInput.trim();
+    if (!trimmed) return;
+    await addSourceYouTubeTranscript(
+      notebookId,
+      trimmed,
+      youtubeLanguage.trim() || "en",
+      urlConsent
+    );
+    setUrlInput("");
+    setUrlConsent(false);
+    setShowUrl(false);
   };
 
   const handleDrop = async (event: React.DragEvent<HTMLDivElement>) => {
@@ -190,6 +233,10 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   };
 
   const statusNote = (source: Source) => {
+    if (source.source_type === "audio") {
+      if (source.status === "pending") return " · Queued for metadata extraction";
+      if (source.status === "describing") return " · Extracting metadata...";
+    }
     if (source.source_type === "image" || source.source_type === "video") {
       if (source.status === "pending") return " · Queued for vision analysis";
       if (source.status === "describing") return " · Describing with vision model...";
@@ -304,6 +351,18 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
           >
             <ClipboardPaste className="w-3 h-3" /> Paste
           </button>
+          <button
+            onClick={() => setShowUrl(!showUrl)}
+            className="flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
+          >
+            <Link className="w-3 h-3" /> URL
+          </button>
+        </div>
+        <div className="mt-2 flex items-start gap-1.5 rounded border border-border bg-bg-tertiary px-2 py-1 text-[10px] leading-snug text-text-muted">
+          <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+          <span>
+            Strict import: text, markdown, code, paste, local PDF/DOCX/DOC/XLSX/XLS/PPTX/PPT/EPUB extraction, URL text fetch, YouTube transcript fetch, audio metadata, and cached Whisper audio transcription are supported; CSV, HTML, image, video, and legacy Office CLI extraction are degraded.
+          </span>
         </div>
 
         {hasLoadedSources && (
@@ -328,6 +387,39 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             <span className="gloss-mono ml-auto text-[10px]">
               Loaded {sources.length} of {expectedSourceCount}
             </span>
+          </div>
+        )}
+        {failedSources.length > 0 && (
+          <div className="mt-2 rounded border border-error/40 bg-error/10 p-2">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="h-3.5 w-3.5 text-error" />
+              <span className="text-xs font-medium text-text">
+                Failed imports
+              </span>
+              <span className="ml-auto text-[10px] text-text-muted">
+                {failedSources.length}
+              </span>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
+              <button
+                onClick={() => setStatusFilter("error")}
+                className="rounded border border-border px-2 py-0.5 text-text-secondary hover:bg-border hover:text-text"
+              >
+                Review
+              </button>
+              <button
+                onClick={() => quarantineFailedImports(notebookId)}
+                className="rounded border border-border px-2 py-0.5 text-text-secondary hover:bg-border hover:text-text"
+              >
+                Quarantine
+              </button>
+              <button
+                onClick={() => deleteFailedImports(notebookId)}
+                className="rounded border border-error/50 px-2 py-0.5 text-error hover:bg-error/10"
+              >
+                Delete Failed
+              </button>
+            </div>
           </div>
         )}
         {(sourceListLoading || sourceListPartial || sourceListUnavailable || hasStatsSources) && (
@@ -411,6 +503,48 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             className="w-full py-1 text-xs bg-accent text-white rounded hover:bg-accent-hover"
           >
             Add Source
+          </button>
+        </div>
+      )}
+
+      {showUrl && (
+        <div className="p-2 border-b border-border space-y-2">
+          <input
+            type="url"
+            value={urlInput}
+            onChange={(e) => setUrlInput(e.target.value)}
+            placeholder="https://example.com/article"
+            className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
+          />
+          <label className="flex items-start gap-2 text-[10px] leading-snug text-text-muted">
+            <input
+              type="checkbox"
+              checked={urlConsent}
+              onChange={(e) => setUrlConsent(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>Allow this one web fetch. No crawling, credentials, localhost, intranet hosts, video download, or authenticated YouTube access.</span>
+          </label>
+          <input
+            type="text"
+            value={youtubeLanguage}
+            onChange={(e) => setYoutubeLanguage(e.target.value)}
+            placeholder="Transcript language, e.g. en"
+            className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
+          />
+          <button
+            onClick={handleUrlImport}
+            disabled={!urlInput.trim() || !urlConsent}
+            className="w-full py-1 text-xs bg-accent text-white rounded hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Add URL
+          </button>
+          <button
+            onClick={handleYouTubeTranscriptImport}
+            disabled={!urlInput.trim() || !urlConsent}
+            className="w-full py-1 text-xs bg-bg-tertiary border border-border text-text rounded hover:bg-border disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Add YouTube Transcript
           </button>
         </div>
       )}

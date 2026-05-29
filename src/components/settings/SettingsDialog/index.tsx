@@ -13,7 +13,9 @@ import {
   FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
 } from "../../../lib/features";
 import type {
+  ChatAttemptTraceV1,
   FeatureFlagStatus,
+  DbDoctorReceipt,
   MemoryBackendStatus,
   SemanticMemoryProfileStatus,
   SemanticMemoryLinkStatus,
@@ -22,6 +24,7 @@ import {
   AlertCircle,
   BookOpen,
   Check,
+  Copy,
   Cpu,
   Database,
   Eye,
@@ -71,6 +74,25 @@ function isVisionCapableModel(model: {
     "vision",
     "vl",
   ].some((needle) => fingerprint.includes(needle));
+}
+
+function providerUrlClass(rawUrl: string | undefined): string {
+  if (!rawUrl?.trim()) return "default";
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1") return "loopback";
+    if (
+      host.startsWith("10.") ||
+      host.startsWith("192.168.") ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+    ) {
+      return "lan";
+    }
+    return parsed.protocol === "https:" ? "cloud_https" : "remote";
+  } catch {
+    return "invalid";
+  }
 }
 
 function SettingsSection({
@@ -294,6 +316,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const [rebuildingTurboQuant, setRebuildingTurboQuant] = useState(false);
   const [runningRetrievalProbe, setRunningRetrievalProbe] = useState(false);
   const [runningEmbeddingDiagnostics, setRunningEmbeddingDiagnostics] = useState(false);
+  const [runningDbDoctor, setRunningDbDoctor] = useState<"check" | "repair" | null>(null);
+  const [dbDoctorReceipt, setDbDoctorReceipt] = useState<DbDoctorReceipt | null>(null);
+  const [runningChatSmoke, setRunningChatSmoke] = useState(false);
+  const [lastTrace, setLastTrace] = useState<ChatAttemptTraceV1 | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -342,6 +368,8 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   };
   const summaryModels = models.filter((model) => model.provider_id === "ollama");
   const visionModels = summaryModels.filter(isVisionCapableModel);
+  const activeModelRow = models.find((model) => model.id === activeModel);
+  const activeProviderId = activeModelRow?.provider_id ?? settings["default_provider"] ?? "ollama";
 
   useEffect(() => {
     if (!open || models.length === 0) return;
@@ -524,6 +552,31 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     }
   };
 
+  const handleRunDatabaseDoctor = async (repair: boolean) => {
+    setRunningDbDoctor(repair ? "repair" : "check");
+    try {
+      const receipt = await api.runDatabaseDoctor(repair);
+      setDbDoctorReceipt(receipt);
+      useToastStore.getState().addToast({
+        type: receipt.findings.some((finding) => finding.severity === "error") ? "error" : "success",
+        title: repair ? "Database repair complete" : "Database check complete",
+        message: `${receipt.findings.length} findings, ${receipt.repaired_source_count_mismatches + receipt.repaired_orphan_rows + receipt.quarantined_failed_import_sources + receipt.repaired_stale_queue_jobs} repairs.`,
+        duration: 7000,
+      });
+    } catch (error) {
+      useToastStore.getState().addToast({
+        type: "error",
+        title: repair ? "Database repair failed" : "Database check failed",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 7000,
+      });
+    } finally {
+      setRunningDbDoctor(null);
+    }
+  };
+  const handleCheckDatabaseDoctor = () => handleRunDatabaseDoctor(false);
+  const handleRepairDatabaseDoctor = () => handleRunDatabaseDoctor(true);
+
   const handleFeatureToggle = async (id: string, enabled: boolean) => {
     try {
       await updateFeatureFlag(id, enabled);
@@ -536,6 +589,86 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       });
       await loadFeatureFlags();
     }
+  };
+
+  const handleRunChatProviderSmoke = async () => {
+    setRunningChatSmoke(true);
+    try {
+      const trace = await api.debugChatProviderSmoke(activeProviderId, activeModel);
+      setLastTrace(trace);
+      await navigator.clipboard.writeText(JSON.stringify(trace, null, 2));
+      const summary = `${trace.provider}:${trace.model} first=${trace.first_token_seen} done=${trace.done_seen} persisted=${trace.assistant_persisted} error=${trace.error ?? "none"}`;
+      useToastStore.getState().addToast({
+        type: trace.error ? "error" : trace.first_token_seen && trace.done_seen ? "success" : "warning",
+        title: "Chat smoke trace copied",
+        message: summary,
+        duration: 7000,
+      });
+    } catch (error) {
+      useToastStore.getState().addToast({
+        type: "error",
+        title: "Chat smoke failed",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 7000,
+      });
+    } finally {
+      setRunningChatSmoke(false);
+    }
+  };
+
+  const handleCopyLastChatTrace = async () => {
+    try {
+      const trace = await api.getLastChatAttemptTrace();
+      if (!trace) {
+        setLastTrace(null);
+        useToastStore.getState().addToast({
+          type: "warning",
+          title: "No chat trace found",
+          message: "Run a chat or provider smoke first.",
+          duration: 5000,
+        });
+        return;
+      }
+      setLastTrace(trace);
+      const summary = `${trace.provider}:${trace.model} first=${trace.first_token_seen} done=${trace.done_seen} persisted=${trace.assistant_persisted} error=${trace.error ?? "none"}`;
+      await navigator.clipboard.writeText(JSON.stringify(trace, null, 2));
+      useToastStore.getState().addToast({
+        type: "success",
+        title: "Chat trace copied",
+        message: summary,
+        duration: 5000,
+      });
+    } catch (error) {
+      useToastStore.getState().addToast({
+        type: "error",
+        title: "Could not copy chat trace",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 7000,
+      });
+    }
+  };
+
+  const handleCopyProviderConfigSummary = async () => {
+    const summary = {
+      schema: "ProviderConfigSummaryV1",
+      active_provider: activeProviderId,
+      active_model: activeModel,
+      selected_model_available: activeModelRow?.available ?? null,
+      selected_model_stale: activeModelRow?.stale ?? null,
+      providers: [
+        { id: "ollama", base_url_class: providerUrlClass(settings["ollama_url"] || "http://localhost:11434") },
+        { id: "openai", base_url_class: providerUrlClass(settings["openai_base_url"] || "https://api.openai.com/v1"), api_key_configured: settings["openai_api_key_configured"] === "1" },
+        { id: "anthropic", base_url_class: providerUrlClass(settings["anthropic_base_url"] || "https://api.anthropic.com/v1"), api_key_configured: settings["anthropic_api_key_configured"] === "1" },
+        { id: "llamacpp", base_url_class: providerUrlClass(settings["llamacpp_url"] || "http://localhost:8080/v1") },
+      ],
+    };
+    await navigator.clipboard.writeText(JSON.stringify(summary, null, 2));
+    useToastStore.getState().addToast({
+      type: "success",
+      title: "Provider config copied",
+      message: `${summary.active_provider}:${summary.active_model}`,
+      duration: 4000,
+    });
   };
 
   const handleBackdropClick = (e: React.MouseEvent) => {
@@ -598,6 +731,18 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 onSave={handleProviderSave}
               />
             </div>
+            <label className="mt-3 flex items-center gap-2 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={settings["allow_lan_local_providers"] === "true" || settings["allow_lan_local_providers"] === "1"}
+                onChange={(e) => {
+                  updateSetting("allow_lan_local_providers", e.target.checked ? "true" : "false");
+                }}
+                className="rounded border-border"
+              />
+              Allow LAN local providers (RFC1918)
+              <span className="text-text-tertiary">— permits Ollama/llama.cpp on private-network IPs (e.g. 192.168.x.x, 10.x.x.x). Default: loopback only.</span>
+            </label>
           </SettingsSection>
 
           <SettingsSection title="Models" icon={<Cpu className="h-4 w-4" />}>
@@ -657,15 +802,93 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               <HealthCard
                 title="Provider"
                 status={activeModel}
-                detail={`Chat provider: ${models.find((model) => model.id === activeModel)?.provider_id ?? settings["default_provider"] ?? "ollama"}`}
+                detail={`Chat provider: ${activeProviderId}`}
                 tone="neutral"
               />
               <HealthCard
                 title="Diagnostics"
                 status={featureById(featureFlags, "feature_chat_diagnostics_enabled")?.active ? "active" : "off"}
-                detail="ChatAttemptTraceV1 evidence is backend-owned."
-                tone={featureById(featureFlags, "feature_chat_diagnostics_enabled")?.active ? "success" : "warning"}
+                detail={
+                  lastTrace
+                    ? `${lastTrace.provider}:${lastTrace.model} first=${lastTrace.first_token_seen} done=${lastTrace.done_seen} persisted=${lastTrace.assistant_persisted}`
+                    : "ChatAttemptTraceV1 evidence is copyable."
+                }
+                tone={
+                  lastTrace
+                    ? lastTrace.error
+                      ? "error"
+                      : lastTrace.first_token_seen && lastTrace.done_seen
+                        ? "success"
+                        : "warning"
+                    : featureById(featureFlags, "feature_chat_diagnostics_enabled")?.active
+                      ? "success"
+                      : "warning"
+                }
               />
+            </div>
+            {lastTrace && (
+              <div className="mt-2 rounded border border-border bg-bg-tertiary p-3 text-xs font-mono">
+                <div className="mb-1 font-semibold text-text-secondary">Last ChatAttemptTraceV1</div>
+                <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+                  <span className="text-text-secondary">provider:</span>
+                  <span>{lastTrace.provider}</span>
+                  <span className="text-text-secondary">base_url:</span>
+                  <span>{lastTrace.provider_base_url ?? "(default)"}</span>
+                  <span className="text-text-secondary">model:</span>
+                  <span>{lastTrace.model}</span>
+                  <span className="text-text-secondary">first_token_seen:</span>
+                  <span className={lastTrace.first_token_seen ? "text-green-500" : "text-red-500"}>
+                    {String(lastTrace.first_token_seen)}
+                  </span>
+                  <span className="text-text-secondary">done_seen:</span>
+                  <span className={lastTrace.done_seen ? "text-green-500" : "text-red-500"}>
+                    {String(lastTrace.done_seen)}
+                  </span>
+                  <span className="text-text-secondary">assistant_persisted:</span>
+                  <span className={lastTrace.assistant_persisted ? "text-green-500" : "text-red-500"}>
+                    {String(lastTrace.assistant_persisted)}
+                  </span>
+                  {lastTrace.error && (
+                    <>
+                      <span className="text-text-secondary">error:</span>
+                      <span className="text-red-500">{lastTrace.error}</span>
+                    </>
+                  )}
+                  {lastTrace.events && lastTrace.events.length > 0 && (
+                    <>
+                      <span className="text-text-secondary">phase:</span>
+                      <span>{lastTrace.events[lastTrace.events.length - 1].phase}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={handleRunChatProviderSmoke}
+                disabled={runningChatSmoke}
+                className="flex items-center gap-1.5 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text disabled:opacity-50"
+              >
+                {runningChatSmoke ? <Loader2 className="h-3 w-3 animate-spin" /> : <TestTube2 className="h-3 w-3" />}
+                Run Chat Provider Smoke
+              </button>
+              <button
+                type="button"
+                onClick={handleCopyLastChatTrace}
+                className="flex items-center gap-1.5 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
+              >
+                <Copy className="h-3 w-3" />
+                Copy Last ChatAttemptTraceV1
+              </button>
+              <button
+                type="button"
+                onClick={handleCopyProviderConfigSummary}
+                className="flex items-center gap-1.5 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
+              >
+                <ShieldCheck className="h-3 w-3" />
+                Copy Provider Config Summary
+              </button>
             </div>
           </SettingsSection>
 
@@ -843,6 +1066,17 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               />
               Require fresh TurboQuant artifact evidence
             </label>
+            <label className="flex items-center gap-2 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={(settings["fastembed_download_consent"] || "false") === "true"}
+                onChange={(e) =>
+                  updateSetting("fastembed_download_consent", e.target.checked ? "true" : "false")
+                }
+                className="accent-accent"
+              />
+              Permit first-use FastEmbed model download
+            </label>
             <div className="flex flex-wrap items-center gap-2">
               <button
                 onClick={handleReindexSemanticMemoryNotebook}
@@ -968,12 +1202,111 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
 
           <SettingsSection title="External Tools" icon={<Wrench className="h-4 w-4" />}>
             <FeatureStatusGrid flags={sections["External Tools"] || []} />
-            <ToolStatus name="ffmpeg" ready={externalTools["ffmpeg"]} />
-            <ToolStatus name="ffprobe" ready={externalTools["ffprobe"]} />
+            <ToolStatus name="ffmpeg" ready={externalTools["ffmpeg"]?.available ?? false} />
+            <ToolStatus name="ffprobe" ready={externalTools["ffprobe"]?.available ?? false} />
           </SettingsSection>
 
           <SettingsSection title="Diagnostics" icon={<TestTube2 className="h-4 w-4" />}>
             <FeatureStatusGrid flags={sections["Diagnostics"] || []} />
+            <div className="space-y-3 rounded border border-border bg-bg-tertiary/40 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-text">Database doctor</p>
+                  <p className="truncate text-[11px] text-text-muted">
+                    {dbDoctorReceipt
+                      ? `${dbDoctorReceipt.schema} ${dbDoctorReceipt.receipt_id}`
+                      : "Check first; repair writes provenance receipts only for material fixes."}
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-2">
+                  <button
+                    onClick={handleCheckDatabaseDoctor}
+                    disabled={runningDbDoctor !== null}
+                    className="inline-flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {runningDbDoctor === "check" ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <TestTube2 className="h-3.5 w-3.5" />
+                    )}
+                    Check
+                  </button>
+                  <button
+                    onClick={handleRepairDatabaseDoctor}
+                    disabled={runningDbDoctor !== null}
+                    className="inline-flex items-center gap-1 rounded border border-warning/40 bg-warning/10 px-2 py-1.5 text-xs text-warning hover:border-warning disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {runningDbDoctor === "repair" ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Wrench className="h-3.5 w-3.5" />
+                    )}
+                    Repair
+                  </button>
+                </div>
+              </div>
+              {dbDoctorReceipt && (
+                <div className="grid gap-2 sm:grid-cols-4">
+                  <HealthCard
+                    title="Notebooks"
+                    status={String(dbDoctorReceipt.notebooks_checked)}
+                    detail={dbDoctorReceipt.repair ? "repair mode" : "check mode"}
+                    tone="neutral"
+                  />
+                  <HealthCard
+                    title="Findings"
+                    status={String(dbDoctorReceipt.findings.length)}
+                    detail={
+                      dbDoctorReceipt.findings[0]?.code || "No database findings"
+                    }
+                    tone={
+                      dbDoctorReceipt.findings.some((finding) => finding.severity === "error")
+                        ? "error"
+                        : dbDoctorReceipt.findings.length > 0
+                          ? "warning"
+                          : "success"
+                    }
+                  />
+                  <HealthCard
+                    title="Source counts"
+                    status={String(dbDoctorReceipt.repaired_source_count_mismatches)}
+                    detail="source-count drift repairs"
+                    tone={dbDoctorReceipt.repaired_source_count_mismatches > 0 ? "warning" : "success"}
+                  />
+                  <HealthCard
+                    title="Orphans"
+                    status={String(dbDoctorReceipt.repaired_orphan_rows)}
+                    detail="auxiliary rows repaired"
+                    tone={dbDoctorReceipt.repaired_orphan_rows > 0 ? "warning" : "success"}
+                  />
+                  <HealthCard
+                    title="Failed imports"
+                    status={String(dbDoctorReceipt.failed_import_sources)}
+                    detail={`${dbDoctorReceipt.quarantined_failed_import_sources} quarantined`}
+                    tone={dbDoctorReceipt.failed_import_sources > 0 ? "warning" : "success"}
+                  />
+                  <HealthCard
+                    title="Queue jobs"
+                    status={String(dbDoctorReceipt.queue_jobs_checked)}
+                    detail={`${dbDoctorReceipt.repaired_stale_queue_jobs}/${dbDoctorReceipt.stale_queue_jobs} stale repaired`}
+                    tone={dbDoctorReceipt.stale_queue_jobs > 0 ? "warning" : "success"}
+                  />
+                </div>
+              )}
+              {dbDoctorReceipt?.findings.length ? (
+                <div className="max-h-32 space-y-1 overflow-y-auto rounded border border-border bg-bg-secondary/70 p-2">
+                  {dbDoctorReceipt.findings.slice(0, 8).map((finding, index) => (
+                    <div key={`${finding.notebook_id}:${finding.code}:${index}`} className="text-[11px] text-text-secondary">
+                      <span className="font-medium text-text">{finding.code}</span>{" "}
+                      <span className="text-text-muted">x{finding.count}</span>{" "}
+                      <span className={finding.repaired ? "text-success" : "text-warning"}>
+                        {finding.repaired ? "repaired" : finding.severity}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
           </SettingsSection>
 
           <SettingsSection title="Experimental Features" icon={<ShieldCheck className="h-4 w-4" />}>

@@ -1,0 +1,39 @@
+     1	#!/usr/bin/env bash
+     2	set -euo pipefail
+     3	
+     4	npm run build
+     5	npm test
+     6	cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+     7	cargo test --manifest-path src-tauri/Cargo.toml
+     8	cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-backend
+     9	cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant
+    10	
+    11	python3 scripts/check_gloss_active_validation_scope.py --repo .
+    12	python3 scripts/check_feature_flags_static.py --repo .
+    13	python3 scripts/chat_runtime_static_audit.py --repo .
+    14	python3 validation/gloss_current_run_truth_gate.py --repo .
+    15	python3 validation/gloss_stale_pass_surface_gate.py --repo .
+    16	python3 validation/gloss_package_scope_gate.py --repo .
+    17	python3 validation/gloss_release_candidate_gate.py --repo . --run-id CURRENT
+    18	python3 validation/gloss_security_egress_gate.py --repo .
+    19	python3 validation/gloss_fastembed_download_consent_gate.py --repo .
+    20	python3 validation/gloss_secret_store_permissions_gate.py --repo .
+    21	python3 validation/gloss_tool_invocation_receipt_gate.py --repo .
+    22	python3 validation/gloss_path_redaction_gate.py --repo .
+    23	python3 validation/gloss_import_capability_gate.py --repo .
+    24	python3 validation/gloss_document_extractors_gate.py --repo .
+    25	python3 validation/gloss_legacy_office_extractors_gate.py --repo .
+    26	python3 validation/gloss_audio_metadata_gate.py --repo .
+    27	python3 validation/gloss_audio_transcription_gate.py --repo .
+    28	python3 validation/gloss_url_import_gate.py --repo .
+    29	python3 validation/gloss_youtube_transcript_gate.py --repo .
+    30	python3 validation/gloss_studio_artifacts_gate.py --repo .
+    31	python3 validation/gloss_db_doctor_gate.py --repo .
+    32	python3 validation/gloss_failed_import_quarantine_gate.py --repo .
+    33	python3 validation/gloss_import_performance_gate.py --repo .
+    34	python3 validation/gloss_notebook_portability_gate.py --repo .
+    35	npm run desktop-smoke
+    36	python3 validation/gloss_desktop_smoke_gate.py --repo .
+    37	python3 validation/gloss_fresh_unzip_replay_gate.py --repo .
+    38	
+    39	echo "all Gloss active checks passed"

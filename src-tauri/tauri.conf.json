@@ -39,7 +39,7 @@
     "linux": {
       "rpm": {
         "epoch": 0,
-        "release": "1",
+        "release": "2",
         "desktopTemplate": null
       }
     }

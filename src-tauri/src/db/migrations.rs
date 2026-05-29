@@ -85,7 +85,7 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
         // Insert default settings
         conn.execute_batch(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('default_provider', 'ollama');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('default_model', 'qwen3:8b');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('default_model', 'qwen3.5:4b');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('default_embedding_model', 'NomicEmbedTextV15');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('summary_mode', 'manual');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend', 'gloss-local');

@@ -29,7 +29,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   models: [],
   settings: {},
   featureFlags: [],
-  activeModel: 'qwen3:8b',
+  activeModel: 'qwen3.5:4b',
   loading: false,
   externalTools: {},
 
@@ -38,7 +38,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       const settings = await api.getSettings();
       set({
         settings,
-        activeModel: settings['default_model'] || 'qwen3:8b',
+        activeModel: settings['default_model'] || 'qwen3.5:4b',
       });
     } catch (e) {
       console.error('Failed to load settings:', e);

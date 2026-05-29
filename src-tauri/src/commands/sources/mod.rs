@@ -876,6 +876,8 @@ fn has_vision_capability(model: &ModelRecord) -> bool {
         "qwen-vl",
         "qwen2-vl",
         "qwen2.5-vl",
+        "gemma3",
+        "gemma4",
         "vision",
         "vl",
     ]

@@ -588,6 +588,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boundary-compiler"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5452,6 +5463,7 @@ dependencies = [
 name = "semantic-memory"
 version = "0.5.0"
 dependencies = [
+ "boundary-compiler",
  "bytemuck",
  "chrono",
  "forge-memory-bridge",

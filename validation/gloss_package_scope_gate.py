@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 from pathlib import Path
 
 ALLOWED_TOP = {"Gloss", "Libraries"}
@@ -46,7 +47,7 @@ def main():
         warnings.append("no Gloss package manifest found (generated sidecar absent is clean)")
         print(json.dumps({"ok": True, "manifest": None, "failures": failures, "warnings": warnings}, indent=2))
         return 0
-    violations = sorted({p for p in included_paths(data) if p.split("/", 1)[0] not in ALLOWED_TOP})
+    violations = sorted({p for p in included_paths(data) if p.split(os.sep, 1)[0] not in ALLOWED_TOP})
     if violations:
         failures.append(f"package manifest includes {len(violations)} paths outside Gloss/Libraries")
     print(json.dumps({

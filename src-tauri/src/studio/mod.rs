@@ -166,13 +166,14 @@ pub fn build_snippets(
             .cloned()
             .collect::<Vec<_>>();
         if !not_ready.is_empty() {
-            return Err(GlossError::Studio {
-                output_type: "source_scope".to_string(),
-                message: format!(
-                    "requested source ids are not ready: {}",
-                    not_ready.join(", ")
-                ),
-            });
+            // Log which sources are still processing but don't hard-fail —
+            // proceed with the ready subset instead.
+            tracing::info!(
+                "[studio] {} of {} requested source(s) not yet ready (skipping): {:?}",
+                not_ready.len(),
+                requested.len(),
+                not_ready,
+            );
         }
     }
 
@@ -204,9 +205,20 @@ pub fn build_snippets(
     }
 
     if snippets.is_empty() {
+        let eligible_count = sources.iter().filter(|s| s.status == "ready").count();
+        let total_count = sources.len();
         return Err(GlossError::Studio {
             output_type: "source_scope".to_string(),
-            message: "no ready source snippets available for Studio output".to_string(),
+            message: if total_count == 0 {
+                "Add sources to this notebook first, then generate Studio outputs.".to_string()
+            } else if eligible_count == 0 {
+                format!(
+                    "None of the {total_count} source(s) are ready yet. \
+                     Wait for processing to finish or check for errors."
+                )
+            } else {
+                "No ready source snippets available for Studio output.".to_string()
+            },
         });
     }
 
@@ -592,5 +604,32 @@ mod tests {
         let err = build_snippets(&sources, &[], Some(&["missing".to_string()]), 4, 8)
             .expect_err("missing explicit source id must fail");
         assert!(err.to_string().contains("requested source ids not found"));
+    }
+
+    #[test]
+    fn explicit_studio_scope_skips_not_ready_sources_instead_of_failing() {
+        // Two sources: one ready, one still processing.  Explicitly requesting both
+        // should succeed using the ready one rather than erroring out.
+        let mut ready_src = source("s1", "Ready", true);
+        let mut processing_src = source("s2", "Processing", true);
+        processing_src.status = "processing".to_string();
+
+        let sources = vec![ready_src, processing_src];
+        let result = build_snippets(
+            &sources,
+            &[],
+            Some(&["s1".to_string(), "s2".to_string()]),
+            4,
+            8,
+        );
+        // Should succeed by using the ready source, not error on the processing one.
+        assert!(
+            result.is_ok(),
+            "expected Ok with partial ready sources, got Err: {:?}",
+            result
+        );
+        let (scope, snippets) = result.unwrap();
+        assert_eq!(scope.effective_source_ids, vec!["s1"]);
+        assert!(!snippets.is_empty());
     }
 }

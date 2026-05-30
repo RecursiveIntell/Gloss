@@ -3,6 +3,7 @@ import { NotebookSidebar } from "./components/notebooks/NotebookSidebar";
 import { PanelLayout } from "./components/layout/PanelLayout";
 import { StatusBar } from "./components/layout/StatusBar";
 import { ToastContainer } from "./components/layout/ToastContainer";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useNotebookStore } from "./stores/notebookStore";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useChatStore } from "./stores/chatStore";
@@ -258,6 +259,7 @@ export function App() {
   }, []);
 
   return (
+    <ErrorBoundary>
     <div className="gloss-root flex h-screen flex-col bg-bg">
       <GlossTopBar
         activeNotebookName={activeNotebook?.name ?? null}
@@ -284,6 +286,7 @@ export function App() {
       <StatusBar />
       <ToastContainer />
     </div>
+    </ErrorBoundary>
   );
 }
 

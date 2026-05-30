@@ -41,7 +41,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         activeModel: settings['default_model'] || 'qwen3.5:4b',
       });
     } catch (e) {
-      console.error('Failed to load settings:', e);
+      console.warn('Failed to load settings:', e);
       useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load settings', duration: 5000 });
     }
   },
@@ -51,7 +51,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       const featureFlags = await api.getFeatureFlags();
       set({ featureFlags });
     } catch (e) {
-      console.error('Failed to load feature flags:', e);
+      console.warn('Failed to load feature flags:', e);
       useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load feature flags', duration: 5000 });
     }
   },
@@ -61,7 +61,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       const providers = await api.getProviders();
       set({ providers });
     } catch (e) {
-      console.error('Failed to load providers:', e);
+      console.warn('Failed to load providers:', e);
       useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load providers', duration: 5000 });
     }
   },
@@ -71,7 +71,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       const models = await api.getAllModels();
       set({ models });
     } catch (e) {
-      console.error('Failed to load models:', e);
+      console.warn('Failed to load models:', e);
       useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load models', duration: 5000 });
     }
   },
@@ -82,7 +82,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       await api.refreshModels();
       await get().loadModels();
     } catch (e) {
-      console.error('Failed to refresh models:', e);
+      console.warn('Failed to refresh models:', e);
       useToastStore.getState().addToast({ type: 'error', title: 'Refresh Failed', message: 'Failed to refresh models', duration: 5000 });
     } finally {
       set({ loading: false });

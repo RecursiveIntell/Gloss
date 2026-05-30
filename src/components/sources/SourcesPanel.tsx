@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { useSourceStore } from "../../stores/sourceStore";
 import { open } from "@tauri-apps/plugin-dialog";
 import * as api from "../../lib/tauri";
@@ -17,10 +17,10 @@ import {
   CheckSquare,
   Square,
   ChevronRight,
-  RefreshCw,
   AlertCircle,
   Search,
   Layers,
+  RotateCcw,
 } from "lucide-react";
 
 interface SourcesPanelProps {
@@ -111,6 +111,40 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   const [dragActive, setDragActive] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
 
+  // Error retry state for source operations
+  const [operationErrors, setOperationErrors] = useState<
+    Record<string, { message: string; retry: () => Promise<void> }>
+  >({});
+
+  const addOperationError = useCallback(
+    (key: string, message: string, retry: () => Promise<void>) => {
+      setOperationErrors((prev) => ({ ...prev, [key]: { message, retry } }));
+    },
+    []
+  );
+
+  const clearOperationError = useCallback((key: string) => {
+    setOperationErrors((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
+  const handleRetryOperation = useCallback(
+    async (key: string) => {
+      const entry = operationErrors[key];
+      if (!entry) return;
+      clearOperationError(key);
+      try {
+        await entry.retry();
+      } catch (e) {
+        addOperationError(key, String(e), entry.retry);
+      }
+    },
+    [operationErrors, clearOperationError, addOperationError]
+  );
+
   const MAX_VISIBLE_PER_GROUP = 100;
   const MAX_EXPANDED_PER_GROUP = 300;
 
@@ -154,46 +188,78 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     });
     if (selected) {
       const paths = Array.isArray(selected) ? selected : [selected];
-      await addSourceFiles(notebookId, paths.filter(Boolean));
+      const validPaths = paths.filter(Boolean);
+      clearOperationError("fileUpload");
+      try {
+        await addSourceFiles(notebookId, validPaths);
+      } catch (e) {
+        const retry = () => addSourceFiles(notebookId, validPaths);
+        addOperationError("fileUpload", String(e), retry);
+      }
     }
   };
 
   const handleFolderUpload = async () => {
     const selected = await open({ directory: true });
     if (selected) {
-      await addSourceFolder(notebookId, selected);
+      clearOperationError("folderUpload");
+      try {
+        await addSourceFolder(notebookId, selected);
+      } catch (e) {
+        const retry = () => addSourceFolder(notebookId, selected);
+        addOperationError("folderUpload", String(e), retry);
+      }
     }
   };
 
   const handlePaste = async () => {
     if (!pasteText.trim()) return;
-    await addSourcePaste(notebookId, pasteTitle || "Pasted Text", pasteText);
-    setPasteTitle("");
-    setPasteText("");
-    setShowPaste(false);
+    const title = pasteTitle || "Pasted Text";
+    const text = pasteText;
+    clearOperationError("paste");
+    try {
+      await addSourcePaste(notebookId, title, text);
+      setPasteTitle("");
+      setPasteText("");
+      setShowPaste(false);
+    } catch (e) {
+      const retry = () => addSourcePaste(notebookId, title, text);
+      addOperationError("paste", String(e), retry);
+    }
   };
 
   const handleUrlImport = async () => {
     const trimmed = urlInput.trim();
     if (!trimmed) return;
-    await addSourceUrl(notebookId, trimmed, urlConsent);
-    setUrlInput("");
-    setUrlConsent(false);
-    setShowUrl(false);
+    const consent = urlConsent;
+    clearOperationError("urlImport");
+    try {
+      await addSourceUrl(notebookId, trimmed, consent);
+      setUrlInput("");
+      setUrlConsent(false);
+      setShowUrl(false);
+    } catch (e) {
+      const retry = () => addSourceUrl(notebookId, trimmed, consent);
+      addOperationError("urlImport", String(e), retry);
+    }
   };
 
   const handleYouTubeTranscriptImport = async () => {
     const trimmed = urlInput.trim();
     if (!trimmed) return;
-    await addSourceYouTubeTranscript(
-      notebookId,
-      trimmed,
-      youtubeLanguage.trim() || "en",
-      urlConsent
-    );
-    setUrlInput("");
-    setUrlConsent(false);
-    setShowUrl(false);
+    const lang = youtubeLanguage.trim() || "en";
+    const consent = urlConsent;
+    clearOperationError("youtubeImport");
+    try {
+      await addSourceYouTubeTranscript(notebookId, trimmed, lang, consent);
+      setUrlInput("");
+      setUrlConsent(false);
+      setShowUrl(false);
+    } catch (e) {
+      const retry = () =>
+        addSourceYouTubeTranscript(notebookId, trimmed, lang, consent);
+      addOperationError("youtubeImport", String(e), retry);
+    }
   };
 
   const handleDrop = async (event: React.DragEvent<HTMLDivElement>) => {
@@ -203,14 +269,24 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     const paths = files
       .map((file) => (file as File & { path?: string }).path)
       .filter((path): path is string => Boolean(path));
-    await addSourceFiles(notebookId, paths);
+    clearOperationError("drop");
+    try {
+      await addSourceFiles(notebookId, paths);
+    } catch (e) {
+      const retry = () => addSourceFiles(notebookId, paths);
+      addOperationError("drop", String(e), retry);
+    }
   };
 
   const handleSummarize = async () => {
     if (summarizing) return;
     setSummarizing(true);
+    clearOperationError("summarize");
     try {
       await api.regenerateMissingSummaries(notebookId);
+    } catch (e) {
+      const retry = async () => { await api.regenerateMissingSummaries(notebookId); };
+      addOperationError("summarize", String(e), retry);
     } finally {
       setSummarizing(false);
     }
@@ -299,10 +375,11 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
       {source.status === "error" && (
         <button
           onClick={() => retrySource(notebookId, source.id)}
-          className="p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent"
+          className="p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent flex items-center gap-1"
           title="Retry ingestion"
         >
-          <RefreshCw className="w-3 h-3" />
+          <RotateCcw className="w-3 h-3" />
+          <span className="text-[10px] hidden group-hover:inline">Retry</span>
         </button>
       )}
       <button
@@ -402,6 +479,16 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             </div>
             <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
               <button
+                onClick={() => {
+                  for (const source of failedSources) {
+                    retrySource(notebookId, source.id);
+                  }
+                }}
+                className="rounded border border-accent/50 px-2 py-0.5 text-accent hover:bg-accent/10"
+              >
+                Retry All
+              </button>
+              <button
                 onClick={() => setStatusFilter("error")}
                 className="rounded border border-border px-2 py-0.5 text-text-secondary hover:bg-border hover:text-text"
               >
@@ -420,6 +507,34 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
                 Delete Failed
               </button>
             </div>
+          </div>
+        )}
+        {Object.keys(operationErrors).length > 0 && (
+          <div className="mt-2 space-y-1">
+            {Object.entries(operationErrors).map(([key, { message }]) => (
+              <div
+                key={key}
+                className="flex items-center gap-2 rounded border border-error/40 bg-error/10 px-2 py-1.5 text-xs text-text-secondary"
+              >
+                <AlertCircle className="h-3 w-3 text-error shrink-0" />
+                <span className="min-w-0 flex-1 truncate" title={message}>
+                  {message}
+                </span>
+                <button
+                  onClick={() => handleRetryOperation(key)}
+                  className="shrink-0 flex items-center gap-1 rounded border border-accent/50 px-2 py-0.5 text-[10px] text-accent hover:bg-accent/10"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  Retry
+                </button>
+                <button
+                  onClick={() => clearOperationError(key)}
+                  className="shrink-0 rounded border border-border px-2 py-0.5 text-[10px] text-text-muted hover:bg-border"
+                >
+                  Dismiss
+                </button>
+              </div>
+            ))}
           </div>
         )}
         {(sourceListLoading || sourceListPartial || sourceListUnavailable || hasStatsSources) && (
@@ -654,9 +769,10 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             <p className="text-error">{sourceListError || "Source list failed to load."}</p>
             <button
               onClick={() => loadSources(notebookId)}
-              className="mt-2 rounded border border-border px-2 py-1 text-text-secondary hover:bg-border hover:text-text"
+              className="mt-2 inline-flex items-center gap-1 rounded border border-accent/50 px-3 py-1 text-accent hover:bg-accent/10"
             >
-              Reload Sources
+              <RotateCcw className="w-3 h-3" />
+              Retry Load Sources
             </button>
           </div>
         )}
@@ -665,9 +781,10 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             <p>Notebook stats report {expectedSourceCount} sources, but the source list is not loaded.</p>
             <button
               onClick={() => loadSources(notebookId)}
-              className="mt-2 rounded border border-border px-2 py-1 text-text-secondary hover:bg-border hover:text-text"
+              className="mt-2 inline-flex items-center gap-1 rounded border border-accent/50 px-3 py-1 text-accent hover:bg-accent/10"
             >
-              Reload Sources
+              <RotateCcw className="w-3 h-3" />
+              Retry Load Sources
             </button>
           </div>
         )}

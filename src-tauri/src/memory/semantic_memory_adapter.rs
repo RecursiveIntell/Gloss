@@ -565,6 +565,7 @@ fn upsert_synced_subchunk_link_rows(
 fn chunk_manifest_entries(chunks: &[Chunk]) -> Vec<ChunkManifestEntry> {
     chunks
         .iter()
+        .filter(|chunk| !chunk.content.trim().is_empty())
         .map(|chunk| ChunkManifestEntry {
             external_chunk_id: chunk.id.clone(),
             content: chunk.content.clone(),
@@ -629,6 +630,7 @@ fn projection_subchunk_manifest_entries(
 ) -> Vec<ChunkManifestEntry> {
     subchunks
         .iter()
+        .filter(|sc| !sc.content.trim().is_empty())
         .map(|subchunk| ChunkManifestEntry {
             external_chunk_id: subchunk.gloss_subchunk_id.clone(),
             content: subchunk.content.clone(),
@@ -733,13 +735,29 @@ pub async fn reindex_source_with_options(
     options: ReindexSourceOptions,
 ) -> Result<IndexSourceReceipt, GlossError> {
     let receipt_id = trace_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let (source, chunks) = {
+    let (source, all_chunks) = {
         let nb_db = NotebookDb::connect(notebook_db_path)?;
         (
             nb_db.get_source(source_id)?,
             nb_db.get_chunks_for_source(source_id)?,
         )
     };
+    // Filter out chunks with empty/whitespace-only content — semantic-memory
+    // rejects them with "content must not be empty" and they carry no
+    // searchable signal anyway.
+    let total_chunks = all_chunks.len();
+    let chunks: Vec<_> = all_chunks
+        .into_iter()
+        .filter(|c| !c.content.trim().is_empty())
+        .collect();
+    let skipped = total_chunks.saturating_sub(chunks.len());
+    if skipped > 0 {
+        tracing::warn!(
+            source_id,
+            skipped,
+            "[semantic-memory] Skipping {skipped} chunk(s) with empty content for source"
+        );
+    }
     if chunks.is_empty() {
         let nb_db = NotebookDb::connect(notebook_db_path)?;
         let status = if options.classify_zero_chunks_as_skip {
@@ -890,9 +908,16 @@ pub async fn reindex_source_with_options(
             source_path: source.file_path.clone(),
             metadata: Some(metadata.clone()),
         };
+        let manifest_entries = chunk_manifest_entries(&batch);
+        if manifest_entries.is_empty() {
+            tracing::warn!(
+                source_id,
+                "[semantic-memory] Skipping batch with empty-content chunks"
+            );
+            continue;
+        }
         let batch_receipt =
-            ingest_document_chunk_manifest(&store, batch_options, chunk_manifest_entries(&batch))
-                .await;
+            ingest_document_chunk_manifest(&store, batch_options, manifest_entries).await;
         let manifest_receipt = match batch_receipt {
             Ok(receipt) => receipt,
             Err(error) if is_context_length_error(&error) && batch.len() > 1 => {
@@ -903,12 +928,16 @@ pub async fn reindex_source_with_options(
                         source_path: source.file_path.clone(),
                         metadata: Some(metadata.clone()),
                     };
-                    match ingest_document_chunk_manifest(
-                        &store,
-                        single_options,
-                        chunk_manifest_entries(std::slice::from_ref(&chunk)),
-                    )
-                    .await
+                    let single_entries = chunk_manifest_entries(std::slice::from_ref(&chunk));
+                    if single_entries.is_empty() {
+                        tracing::warn!(
+                            chunk_id = %chunk.id,
+                            "[semantic-memory] Skipping empty-content chunk in retry"
+                        );
+                        continue;
+                    }
+                    match ingest_document_chunk_manifest(&store, single_options, single_entries)
+                        .await
                     {
                         Ok(receipt) => {
                             let mappings = receipt

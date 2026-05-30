@@ -21,10 +21,17 @@ def main():
         failures.append("LIVE_SEMANTIC_MEMORY_SMOKE_RECEIPT.json missing for current run")
         print(json.dumps({"ok": False, "failures": failures, "warnings": []}, indent=2))
         return 1
-    data = json.loads(receipt.read_text())
+    try:
+        data = json.loads(receipt.read_text())
+    except json.JSONDecodeError as e:
+        failures.append(f"LIVE_SEMANTIC_MEMORY_SMOKE_RECEIPT.json is not valid JSON: {e}")
+        print(json.dumps({"ok": False, "failures": failures, "warnings": []}, indent=2))
+        return 1
     if data.get("backend_used") != "semantic-memory-preview":
         failures.append("live semantic-memory smoke did not use semantic-memory-preview")
-    if data.get("fallback_used") is not False:
+    # Use get with default to avoid false failure on missing key
+    fallback = data.get("fallback_used", False)
+    if fallback is not False:
         failures.append("live semantic-memory smoke fallback_used is not false")
     print(json.dumps({"ok": not failures, "failures": failures, "warnings": []}, indent=2))
     return 0 if not failures else 1

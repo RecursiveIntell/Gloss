@@ -1,9 +1,0 @@
-{
-  "generated_utc": "2026-05-27T23:29:04Z",
-  "issue_count": 31,
-  "s0_count": 10,
-  "s1_count": 17,
-  "s2_count": 4,
-  "primary_goal": "verification-first Gloss chat/Ollama repair plus package/run-truth hardening",
-  "release_ready": false
-}

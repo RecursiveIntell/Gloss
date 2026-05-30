@@ -20,21 +20,22 @@ function buildSourceScope(
   sourceListStatus: SourceListStatus,
   stats: NotebookStats | null
 ): SourceScope {
-  if (
-    sourceListStatus === 'loading' ||
-    sourceListStatus === 'partial' ||
-    sourceListStatus === 'error' ||
-    sourceListStatus === 'idle'
-  ) {
+  // When user explicitly selects no-retrieval, honour it regardless of source
+  // list status so chat always works without retrieval.
+  if (sourceScopeMode === 'none') {
+    return { kind: 'none' };
+  }
+  // When source list is degraded, do NOT silently downgrade an explicit
+  // retrieval request — pass it through so the backend can decide how to
+  // handle incomplete source data. Only fall back to 'none' when we have
+  // no source information at all (idle).
+  if (sourceListStatus === 'idle') {
     return { kind: 'none' };
   }
   if (sources.length === 0) {
     if (sourceListStatus === 'ready' && stats?.source_count && stats.source_count > 0) {
       return { kind: 'none' };
     }
-    return { kind: 'none' };
-  }
-  if (sourceScopeMode === 'none') {
     return { kind: 'none' };
   }
   if (sourceScopeMode === 'all') {
@@ -72,7 +73,7 @@ async function flushSelectedSources(): Promise<void> {
   try {
     await api.setSelectedSources(snapshot.notebookId, snapshot.ids);
   } catch (e) {
-    console.error('Failed to persist selected sources:', e);
+    console.warn('Failed to persist selected sources:', e);
     useToastStore.getState().addToast({ type: 'error', title: 'Save Failed', message: 'Failed to persist selected sources', duration: 5000 });
   } finally {
     persistSelectedSourcesInFlight = false;
@@ -153,7 +154,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
         return;
       }
-      console.error('Failed to load sources:', e);
+      console.warn('Failed to load sources:', e);
       set({
         loading: false,
         sourceListStatus: 'error',

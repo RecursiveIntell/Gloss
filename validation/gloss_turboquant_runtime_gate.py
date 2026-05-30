@@ -20,7 +20,12 @@ def main():
     if not receipt.exists():
         failures.append("TURBOQUANT_RUNTIME_RECEIPT.json missing for current run")
     else:
-        data = json.loads(receipt.read_text())
+        try:
+            data = json.loads(receipt.read_text())
+        except json.JSONDecodeError as e:
+            failures.append(f"TURBOQUANT_RUNTIME_RECEIPT.json is not valid JSON: {e}")
+            print(json.dumps({"ok": False, "failures": failures, "warnings": []}, indent=2))
+            return 1
         if data.get("runtime_claimed") is True:
             if data.get("exact_rerank") is not True:
                 failures.append("TurboQuant runtime claimed without exact_rerank=true")

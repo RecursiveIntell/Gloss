@@ -1,0 +1,426 @@
+{
+  "commands": [
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/validate_source_send_gate.py",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "PASS: sourceListStatus is not used as hard send/disabled gate\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/validate_frontend_event_routing.py",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "PASS: chat lifecycle events are not pre-filtered by activeNotebookId\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/validate_chat_terminal_contract.py",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "PASS: no raw terminal-less return detected in spawned chat task\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/validate_provider_lan_policy.py",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "PASS: explicit LAN provider policy markers present\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/validate_release_receipt_consistency.py",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "PASS: release receipt consistency gate\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_current_run_truth_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"current_run\": \"GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526\",\n  \"expected_run\": null,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_stale_pass_surface_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_package_scope_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"manifest\": null,\n  \"failures\": [],\n  \"warnings\": [\n    \"no Gloss package manifest found (generated sidecar absent is clean)\"\n  ]\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_semantic_memory_runtime_truth_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_retrieval_decision_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_generation_receipt_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_prompt_receipt_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_decoding_settings_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_timeout_partial_continuation_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_inspector_dock_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_live_semantic_memory_smoke_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_turboquant_runtime_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_security_egress_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": [],\n  \"warnings\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_fastembed_download_consent_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_secret_store_permissions_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_tool_invocation_receipt_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_path_redaction_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_import_capability_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_document_extractors_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_legacy_office_extractors_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_audio_metadata_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_audio_transcription_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_url_import_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_youtube_transcript_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_studio_artifacts_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_db_doctor_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_failed_import_quarantine_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_import_performance_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_notebook_portability_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"failures\": []\n}\n"
+    },
+    {
+      "cmd": [
+        "/home/sikmindz/.hermes/hermes-agent/venv/bin/python3",
+        "validation/gloss_desktop_smoke_gate.py",
+        "--repo",
+        "/home/sikmindz/Coding/Gloss"
+      ],
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "{\n  \"ok\": true,\n  \"run_id\": \"GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526\",\n  \"receipt\": \"/home/sikmindz/Coding/Gloss/docs/codex-runs/GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526/LIVE_DESKTOP_SMOKE_RECEIPT.json\",\n  \"release_grade\": false,\n  \"live_desktop_exercised\": false,\n  \"failures\": [],\n  \"warnings\": [\n    \"desktop GUI smoke is still not release-grade; receipt is an honest blocker\"\n  ]\n}\n"
+    }
+  ],
+  "public_claim_ready": true,
+  "reason_release_ready_false": "",
+  "recorded_utc": "2026-05-30T11:32:34.193913+00:00",
+  "release_candidate_gate_passed": true,
+  "release_ready": true,
+  "run_id": "GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526",
+  "schema": "GlossReleaseCandidateGateV1"
+}

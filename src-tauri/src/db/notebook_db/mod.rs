@@ -1665,13 +1665,33 @@ impl NotebookDb {
     // -- Studio outputs --
 
     pub fn list_studio_outputs(&self) -> Result<Vec<StudioOutput>, GlossError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = match self.conn.prepare(
             "SELECT id, output_type, title, prompt_used, raw_content, config, source_ids,
                     file_path, status, error_message, created_at
              FROM studio_outputs
              ORDER BY created_at DESC",
-        )?;
-        let rows = stmt.query_map([], studio_output_from_row)?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                if format!("{e}").contains("no such table") {
+                    tracing::warn!(
+                        "studio_outputs table missing — returning empty list (run ensure_studio_outputs)"
+                    );
+                    return Ok(Vec::new());
+                }
+                return Err(e.into());
+            }
+        };
+        let rows = match stmt.query_map([], studio_output_from_row) {
+            Ok(r) => r,
+            Err(e) => {
+                if format!("{e}").contains("no such table") {
+                    tracing::warn!("studio_outputs table missing on query_map");
+                    return Ok(Vec::new());
+                }
+                return Err(e.into());
+            }
+        };
         let mut outputs = Vec::new();
         for row in rows {
             outputs.push(row?);

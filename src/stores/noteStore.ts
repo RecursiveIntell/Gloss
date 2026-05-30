@@ -32,7 +32,7 @@ export const useNoteStore = create<NoteStore>((set, get) => ({
       if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
         return;
       }
-      console.error('Failed to load notes:', e);
+      console.warn('Failed to load notes:', e);
       set({ loading: false });
     }
   },

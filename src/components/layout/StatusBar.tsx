@@ -120,7 +120,7 @@ export function StatusBar() {
       const status = await api.getQueueStatus();
       setQueueStatus(status);
     } catch (e) {
-      console.error("Failed to toggle summary pause:", e);
+      console.warn("Failed to toggle summary pause:", e);
     }
   }, [queueStatus]);
 
@@ -144,7 +144,7 @@ export function StatusBar() {
       const status = await api.getQueueStatus();
       setQueueStatus(status);
     } catch (e) {
-      console.error("Failed to generate summaries:", e);
+      console.warn("Failed to generate summaries:", e);
     } finally {
       setGenerating(false);
     }

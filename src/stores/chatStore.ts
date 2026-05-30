@@ -66,7 +66,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       }
       set({ conversations });
     } catch (e) {
-      console.error('Failed to load conversations:', e);
+      console.warn('Failed to load conversations:', e);
       useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load conversations', duration: 5000 });
     }
   },
@@ -114,7 +114,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       }
       set({ messages });
     } catch (e) {
-      console.error('Failed to load messages:', e);
+      console.warn('Failed to load messages:', e);
       useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load messages', duration: 5000 });
     }
   },
@@ -173,7 +173,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       }
     } catch (e) {
       const message = errorMessage(e);
-      console.error('Failed to send message:', e);
+      console.warn('Failed to send message:', e);
       set({
         streamingError: message,
         isStreaming: false,

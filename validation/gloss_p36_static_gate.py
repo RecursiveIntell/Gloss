@@ -11,7 +11,12 @@ import re
 import sys
 from pathlib import Path
 
-RUN_ID = "GLOSS_P36_RELEASE_COMPLETION_DENSE_TQ_RELEASE_20260525"
+def current_run(repo: Path) -> str | None:
+    text = (repo / "docs/codex-runs/CURRENT_RUN.md").read_text(errors="ignore")
+    match = re.search(r"Current run:\s*`?([^`\n]+)`?", text)
+    return match.group(1).strip() if match else None
+
+RUN_ID = current_run(Path(".").resolve()) or "GLOSS_P36_RELEASE_COMPLETION_DENSE_TQ_RELEASE_20260525"
 
 
 def read(path: Path) -> str:
@@ -46,7 +51,9 @@ def main() -> int:
     state = read(repo / "src-tauri" / "src" / "state.rs")
     if "NATIVE_SEMANTIC_INDEXING_ENABLED: bool = false" in state:
         fail("Native dense indexing is still hard-disabled in state.rs", failures)
-    if "NATIVE_SEMANTIC_INDEXING_ENABLED" in state and "false" in state.split("NATIVE_SEMANTIC_INDEXING_ENABLED", 1)[1][:120]:
+    # Robust check: find the actual constant assignment, not just "false" in nearby text
+    idx_match = re.search(r'NATIVE_SEMANTIC_INDEXING_ENABLED\s*:\s*bool\s*=\s*(true|false)', state)
+    if idx_match and idx_match.group(1) == "false":
         fail("Native dense indexing constant still appears false/disabled", failures)
 
     sources_mod = read(repo / "src-tauri" / "src" / "commands" / "sources" / "mod.rs")

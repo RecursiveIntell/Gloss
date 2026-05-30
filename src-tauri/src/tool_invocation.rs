@@ -168,13 +168,27 @@ fn sanitized_preview(bytes: &[u8]) -> Option<String> {
 
 fn redact_stderr_token(token: &str) -> String {
     let lower = token.to_ascii_lowercase();
-    if token.contains('/')
-        || token.contains('\\')
+    let trimmed = token
+        .trim_matches(|c: char| matches!(c, '\"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';' | ':'));
+    if trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with("./")
+        || trimmed.contains("\\Users\\")
+        || trimmed.contains(":\\")
+        || trimmed.contains("/")
+        || trimmed.contains('\\')
         || lower.contains("token")
         || lower.contains("secret")
         || lower.contains("authorization")
         || lower.contains("api_key")
-        || token.starts_with("sk-")
+        || lower.contains("key")
+        || lower.contains("password")
+        || lower.contains("auth")
+        || lower.contains("bearer")
+        || trimmed.starts_with("sk-")
+        || trimmed.starts_with("ak-")
+        || trimmed.starts_with("gl-")
     {
         "[redacted]".to_string()
     } else {

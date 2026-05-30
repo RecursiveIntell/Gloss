@@ -27,11 +27,14 @@ pub fn redact_text_paths(text: &str) -> String {
 }
 
 /// Redact API-key-like patterns inside JSON string values.
-/// Catches keys that start with known prefixes (sk-, key-, gl-) followed by
-/// 20+ alphanumeric characters, even when embedded inside quoted JSON values.
+/// Catches keys that start with known prefixes (sk-, key-, gl-, ak-) followed by
+/// 20+ alphanumeric characters, or Bearer tokens, even when embedded inside
+/// quoted JSON values.
 pub fn redact_json_embedded_secrets(text: &str) -> String {
-    let re = regex::Regex::new(r#"(sk-|key-|gl-)[A-Za-z0-9_-]{20,}"#).unwrap();
-    re.replace_all(text, "$1[REDACTED]").to_string()
+    let re =
+        regex::Regex::new(r#"(sk-|key-|gl-|ak-)[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9_\-\.]{20,}"#)
+            .unwrap();
+    re.replace_all(text, "[REDACTED]").to_string()
 }
 
 fn looks_like_path(token: &str) -> bool {

@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 import argparse, json, pathlib, re
-RUN_ID="GLOSS_RELEASE_PROOF_EMBEDDING_UNIFICATION_CLEANUP_20260525"
+
+def current_run(repo: pathlib.Path) -> str | None:
+    try:
+        text = (repo / "docs/codex-runs/CURRENT_RUN.md").read_text(errors="ignore")
+        match = re.search(r"Current run:\s*`?([^`\n]+)`?", text)
+        return match.group(1).strip() if match else None
+    except Exception:
+        return None
+
+RUN_ID = current_run(pathlib.Path(".").resolve()) or "GLOSS_RELEASE_PROOF_EMBEDDING_UNIFICATION_CLEANUP_20260525"
 
 def text(p):
     try: return p.read_text(errors='ignore')
@@ -9,6 +18,7 @@ def text(p):
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--repo', default='.')
     repo=pathlib.Path(ap.parse_args().repo).resolve()
+    run_id = current_run(repo) or RUN_ID
     failures=[]; warnings=[]
     sm_adapter=text(repo/'src-tauri/src/memory/semantic_memory_adapter.rs')
     embed_rs=text(repo/'src-tauri/src/ingestion/embed.rs')
@@ -26,7 +36,7 @@ def main():
         failures.append('semantic adapter still appears hardwired to MemoryStore::open/Ollama')
     if 'Run embedding diagnostics' not in text(repo/'src/components/settings/SettingsDialog/index.tsx') and 'embedding_diagnostics' not in all_rs:
         failures.append('embedding diagnostics UI/command not found')
-    receipt=repo/'docs'/'codex-runs'/RUN_ID/'EMBEDDING_PROVIDER_RECEIPT.json'
+    receipt=repo/'docs'/'codex-runs'/run_id/'EMBEDDING_PROVIDER_RECEIPT.json'
     if receipt.exists():
         try:
             data=json.loads(receipt.read_text())

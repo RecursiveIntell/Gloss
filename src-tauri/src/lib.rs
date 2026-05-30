@@ -69,7 +69,7 @@ pub fn run() {
         )
         .init();
 
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
@@ -195,8 +195,14 @@ pub fn run() {
             commands::settings::get_semantic_memory_profile_status,
             commands::settings::check_external_tools,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+    match result {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("Fatal: Tauri application failed to start: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Custom job processing loop that enforces all scheduling contracts:

@@ -36,7 +36,7 @@ export function NotebookSidebar() {
       setNewName("");
       setShowCreate(false);
     } catch (e) {
-      console.error('Failed to create notebook:', e);
+      console.warn('Failed to create notebook:', e);
     }
   };
 
@@ -56,7 +56,7 @@ export function NotebookSidebar() {
       await renameNotebook(id, editingName.trim());
       cancelRename();
     } catch (e) {
-      console.error("Failed to rename notebook:", e);
+      console.warn("Failed to rename notebook:", e);
     }
   };
 

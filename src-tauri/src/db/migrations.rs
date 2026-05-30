@@ -354,6 +354,7 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
     ensure_semantic_memory_retrieval_probe_receipts(conn)?;
     ensure_prompt_generation_receipts(conn)?;
     ensure_provenance_receipts(conn)?;
+    ensure_studio_outputs(conn)?;
 
     Ok(())
 }
@@ -738,6 +739,27 @@ fn set_schema_version(conn: &Connection, version: i32) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?1)",
         [version.to_string()],
+    )?;
+    Ok(())
+}
+
+fn ensure_studio_outputs(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS studio_outputs (
+            id            TEXT PRIMARY KEY,
+            output_type   TEXT NOT NULL,
+            title         TEXT,
+            prompt_used   TEXT NOT NULL,
+            raw_content   TEXT,
+            config        TEXT,
+            source_ids    TEXT,
+            file_path     TEXT,
+            status        TEXT DEFAULT 'pending',
+            error_message TEXT,
+            created_at    TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_studio_type ON studio_outputs(output_type, created_at DESC);",
     )?;
     Ok(())
 }

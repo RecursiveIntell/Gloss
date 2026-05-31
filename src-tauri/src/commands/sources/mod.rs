@@ -37,6 +37,17 @@ use tauri_queue::{QueueJob, QueueManager, QueuePriority};
 
 // Profile status is owned by settings.rs through get_semantic_memory_profile_status.
 
+/// Read the configured chunk target tokens from app_db settings.
+fn read_chunk_target_tokens(state: &AppState) -> usize {
+    state
+        .app_db
+        .lock()
+        .ok()
+        .and_then(|db| db.get_setting("chunk_target_tokens").ok().flatten())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1100)
+}
+
 #[derive(Debug, Serialize)]
 pub struct SourceContent {
     pub content_text: Option<String>,
@@ -461,6 +472,19 @@ fn run_ingestion_inner(
             PathBuf::from(nb.directory)
         };
 
+        let target_tokens = {
+            let app_db = state
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            app_db
+                .get_setting("chunk_target_tokens")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1100)
+        };
+
         let source = state.with_notebook_db(notebook_id, |db| db.get_source(source_id))?;
 
         // 1. Extract text
@@ -496,7 +520,7 @@ fn run_ingestion_inner(
         if opts.emit_progress {
             emit_status(app_handle, notebook_id, source_id, "chunking", None);
         }
-        let chunks = chunk_text_with_title(&text, source_id, &source.title);
+        let chunks = chunk_text_with_title(&text, source_id, &source.title, Some(target_tokens));
         tracing::debug!(source_id, chunks = chunks.len(), "Chunking complete");
 
         // 3. Insert chunks into DB
@@ -518,24 +542,6 @@ fn run_ingestion_inner(
         state.with_notebook_db_write(notebook_id, |db| db.insert_chunks(&db_chunks))?;
 
         if opts.embed_chunks {
-            // Acquire GPU gate to prevent ONNX + Ollama VRAM contention
-            if opts.emit_progress {
-                emit_status(app_handle, notebook_id, source_id, "waiting_for_gpu", None);
-            }
-            let _gpu_permit = loop {
-                match state.gpu_gate.try_acquire() {
-                    Ok(permit) => break permit,
-                    Err(tokio::sync::TryAcquireError::NoPermits) => {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    Err(tokio::sync::TryAcquireError::Closed) => {
-                        return Err(GlossError::Other(
-                            "GPU gate closed — app shutting down".into(),
-                        ));
-                    }
-                }
-            };
-
             // 4. Embed chunks + add to HNSW
             if opts.emit_progress {
                 emit_status(app_handle, notebook_id, source_id, "embedding", None);
@@ -572,7 +578,7 @@ fn run_ingestion_inner(
                             db.update_chunk_embedding(
                                 &chunk_data.id,
                                 label as i64,
-                                "NomicEmbedTextV15",
+                                "local",
                             )?;
                         }
                     }
@@ -1228,6 +1234,7 @@ fn queue_describe_image_job(
         data_dir: state.data_dir.to_string_lossy().to_string(),
         ollama_url: config.base_url,
         model: config.model,
+        chunk_target_tokens: read_chunk_target_tokens(state),
     })
     .with_priority(QueuePriority::Low);
 
@@ -1278,6 +1285,7 @@ fn queue_describe_video_job(
         data_dir: state.data_dir.to_string_lossy().to_string(),
         ollama_url: config.base_url,
         model: config.model,
+        chunk_target_tokens: read_chunk_target_tokens(state),
     })
     .with_priority(QueuePriority::Low);
 
@@ -1315,6 +1323,7 @@ fn queue_audio_metadata_job(
         source_id: source_id.to_string(),
         source_title,
         data_dir: state.data_dir.to_string_lossy().to_string(),
+        chunk_target_tokens: read_chunk_target_tokens(state),
     })
     .with_priority(QueuePriority::Low);
 
@@ -3362,7 +3371,7 @@ pub async fn delete_source(
                 let mut removed = 0usize;
                 for embedding_id in &old_embedding_ids {
                     match index.remove(*embedding_id) {
-                        Ok(()) => removed += 1,
+                        Ok(_) => removed += 1,
                         Err(e) => tracing::warn!(
                             notebook_id,
                             source_id,
@@ -3661,7 +3670,7 @@ pub async fn retry_source_ingestion(
                 let mut removed = 0usize;
                 for eid in &old_embedding_ids {
                     match index.remove(*eid) {
-                        Ok(()) => removed += 1,
+                        Ok(_) => removed += 1,
                         Err(e) => tracing::warn!(
                             notebook_id,
                             source_id,

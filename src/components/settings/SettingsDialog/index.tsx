@@ -1160,7 +1160,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 })()}
               </div>
               <input
-                value={settings["semantic_memory_embedding_model"] || "nomic-embed-text"}
+                value={settings["semantic_memory_embedding_model"] || "bge-m3"}
                 onChange={(e) => updateSetting("semantic_memory_embedding_model", e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
                 aria-label="Embedding model"
@@ -1180,6 +1180,15 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 onChange={(e) => updateSetting("semantic_memory_search_timeout_ms", e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
                 aria-label="Search timeout milliseconds"
+              />
+              <input
+                type="number"
+                min="100"
+                max="3000"
+                value={settings["chunk_target_tokens"] || "1100"}
+                onChange={(e) => updateSetting("chunk_target_tokens", e.target.value)}
+                className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
+                aria-label="Chunk target tokens"
               />
             </div>
           </SettingsSection>

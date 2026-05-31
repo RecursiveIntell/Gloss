@@ -38,6 +38,8 @@ pub enum GlossJob {
         data_dir: String,
         ollama_url: String,
         model: String,
+        #[serde(default = "default_chunk_target_tokens")]
+        chunk_target_tokens: usize,
     },
     /// Extract frames from a video and describe them using a vision model.
     DescribeVideo {
@@ -49,6 +51,8 @@ pub enum GlossJob {
         data_dir: String,
         ollama_url: String,
         model: String,
+        #[serde(default = "default_chunk_target_tokens")]
+        chunk_target_tokens: usize,
     },
     /// Extract bounded audio metadata through ffprobe and cached Whisper transcript when available.
     ExtractAudioMetadata {
@@ -58,7 +62,13 @@ pub enum GlossJob {
         source_id: String,
         source_title: String,
         data_dir: String,
+        #[serde(default = "default_chunk_target_tokens")]
+        chunk_target_tokens: usize,
     },
+}
+
+fn default_chunk_target_tokens() -> usize {
+    1100
 }
 
 impl JobHandler for GlossJob {
@@ -92,6 +102,7 @@ impl JobHandler for GlossJob {
                 data_dir,
                 ollama_url,
                 model,
+                chunk_target_tokens,
             } => {
                 execute_describe_image(
                     ctx,
@@ -101,6 +112,7 @@ impl JobHandler for GlossJob {
                     data_dir,
                     ollama_url,
                     model,
+                    *chunk_target_tokens,
                 )
                 .await
             }
@@ -112,6 +124,7 @@ impl JobHandler for GlossJob {
                 data_dir,
                 ollama_url,
                 model,
+                chunk_target_tokens,
             } => {
                 execute_describe_video(
                     ctx,
@@ -121,6 +134,7 @@ impl JobHandler for GlossJob {
                     data_dir,
                     ollama_url,
                     model,
+                    *chunk_target_tokens,
                 )
                 .await
             }
@@ -130,7 +144,8 @@ impl JobHandler for GlossJob {
                 source_id,
                 source_title,
                 data_dir,
-            } => execute_audio_metadata(ctx, notebook_id, source_id, source_title, data_dir).await,
+                chunk_target_tokens,
+            } => execute_audio_metadata(ctx, notebook_id, source_id, source_title, data_dir, *chunk_target_tokens).await,
         }
     }
 
@@ -292,6 +307,7 @@ async fn execute_audio_metadata(
     source_id: &str,
     source_title: &str,
     data_dir: &str,
+    chunk_target_tokens: usize,
 ) -> Result<JobResult, QueueError> {
     let nb_dir = PathBuf::from(data_dir).join("notebooks").join(notebook_id);
     let db_path = nb_dir.join("notebook.db");
@@ -405,7 +421,7 @@ async fn execute_audio_metadata(
     db.update_source_metadata(source_id, Some(&metadata_json))
         .map_err(|e| QueueError::Execution(e.to_string()))?;
 
-    let chunks = chunk_text_with_title(&description, source_id, source_title);
+    let chunks = chunk_text_with_title(&description, source_id, source_title, Some(chunk_target_tokens));
     for chunk_data in &chunks {
         let chunk = crate::db::notebook_db::Chunk {
             id: chunk_data.id.clone(),
@@ -964,6 +980,7 @@ async fn execute_describe_image(
     data_dir: &str,
     ollama_url: &str,
     model: &str,
+    chunk_target_tokens: usize,
 ) -> Result<JobResult, QueueError> {
     let nb_dir = PathBuf::from(data_dir).join("notebooks").join(notebook_id);
     let db_path = nb_dir.join("notebook.db");
@@ -1106,7 +1123,7 @@ async fn execute_describe_image(
         .map_err(|e| QueueError::Execution(e.to_string()))?;
 
     // Create chunks from the description
-    let chunks = chunk_text_with_title(&description, source_id, source_title);
+    let chunks = chunk_text_with_title(&description, source_id, source_title, Some(chunk_target_tokens));
     for chunk_data in &chunks {
         let chunk = crate::db::notebook_db::Chunk {
             id: chunk_data.id.clone(),
@@ -1159,6 +1176,7 @@ async fn execute_describe_video(
     data_dir: &str,
     ollama_url: &str,
     model: &str,
+    chunk_target_tokens: usize,
 ) -> Result<JobResult, QueueError> {
     let nb_dir = PathBuf::from(data_dir).join("notebooks").join(notebook_id);
     let db_path = nb_dir.join("notebook.db");
@@ -1488,7 +1506,7 @@ async fn execute_describe_video(
         .map_err(|e| QueueError::Execution(e.to_string()))?;
 
     // Create chunks
-    let chunks = chunk_text_with_title(&description, source_id, source_title);
+    let chunks = chunk_text_with_title(&description, source_id, source_title, Some(chunk_target_tokens));
     for chunk_data in &chunks {
         let chunk = crate::db::notebook_db::Chunk {
             id: chunk_data.id.clone(),

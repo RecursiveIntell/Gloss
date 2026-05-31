@@ -95,7 +95,7 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_provider', 'fastembed');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_url', 'http://localhost:11434');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_model', 'nomic-embed-text');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_model', 'bge-m3');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_timeout_secs', '10');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_search_timeout_ms', '8000');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_temperature', '0.7');
@@ -139,7 +139,13 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
          INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_p', '');
          INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_k', '');
          INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_min_p', '');
-         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_repeat_penalty', '');",
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_repeat_penalty', '');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('chunk_target_tokens', '1100');",
+    )?;
+
+    conn.execute(
+        "UPDATE settings SET value = 'bge-m3' WHERE key = 'semantic_memory_embedding_model' AND value = 'all-minilm'",
+        [],
     )?;
 
     ensure_provider_rows(conn)?;

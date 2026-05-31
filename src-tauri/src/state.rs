@@ -207,7 +207,7 @@ impl AppState {
             .get_setting("semantic_memory_embedding_provider")?
             .is_none()
         {
-            app_db.set_setting("semantic_memory_embedding_provider", "fastembed")?;
+            app_db.set_setting("semantic_memory_embedding_provider", "ollama")?;
         }
         if app_db
             .get_setting("semantic_memory_embedding_url")?
@@ -219,7 +219,13 @@ impl AppState {
             .get_setting("semantic_memory_embedding_model")?
             .is_none()
         {
-            app_db.set_setting("semantic_memory_embedding_model", "nomic-embed-text")?;
+            app_db.set_setting("semantic_memory_embedding_model", "bge-m3")?;
+        }
+        if app_db
+            .get_setting("chunk_target_tokens")?
+            .is_none()
+        {
+            app_db.set_setting("chunk_target_tokens", "1100")?;
         }
         if app_db
             .get_setting("semantic_memory_embedding_timeout_secs")?
@@ -274,8 +280,10 @@ impl AppState {
         })
     }
 
-    /// Ensure the embedding model is initialized. Returns an error message on failure.
-    /// Emits status events for UI feedback (Fix 8).
+    /// Ensure the embedding model is initialized. Reads the configured provider
+    /// from settings: "ollama" uses the external Ollama /api/embed endpoint
+    /// (crash-isolated, preferred); anything else falls back to in-process
+    /// FastEmbed (CPU ONNX, kept for offline fallback).
     pub fn ensure_embedder(&self, app_handle: Option<&tauri::AppHandle>) -> Result<(), GlossError> {
         let mut embedder = self
             .embedder
@@ -286,50 +294,65 @@ impl AppState {
             return Ok(());
         }
 
-        // Notify frontend
-        if let Some(handle) = app_handle {
-            use tauri::Emitter;
-            if let Err(e) = handle.emit(
-                "status:embedding_model",
-                serde_json::json!({
-                    "state": "downloading",
-                    "message": "Loading embedding model (first time may download ~100MB)…"
-                }),
-            ) {
-                tracing::debug!("failed to emit status:embedding_model: {e}");
-            }
-        }
-
-        tracing::info!("Initializing embedding model…");
-        let cache_dir = self.data_dir.join("models");
-        std::fs::create_dir_all(&cache_dir)?;
-        let download_consent = {
+        let (provider, url, model) = {
             let app_db = self
                 .app_db
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
-            crate::commands::chat::setting_is_enabled(
-                app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
-            )
+            let provider = app_db
+                .get_setting("semantic_memory_embedding_provider")?
+                .unwrap_or_else(|| "ollama".to_string());
+            let url = app_db
+                .get_setting("semantic_memory_embedding_url")?
+                .unwrap_or_else(|| "http://localhost:11434".to_string());
+            let model = app_db
+                .get_setting("semantic_memory_embedding_model")?
+                .unwrap_or_else(|| "all-minilm".to_string());
+            (provider, url, model)
         };
-        let service =
-            EmbeddingService::new_with_download_policy(&cache_dir, false, download_consent)?;
-        *embedder = Some(service);
+
+        let service = if provider.trim().eq_ignore_ascii_case("ollama") {
+            tracing::info!(url = %url, model = %model, "Initializing Ollama embedding backend");
+            EmbeddingService::new_ollama(&url, &model)?
+        } else {
+            tracing::info!("Initializing FastEmbed embedding backend (CPU ONNX)");
+            if let Some(handle) = app_handle {
+                use tauri::Emitter;
+                let _ = handle.emit(
+                    "status:embedding_model",
+                    serde_json::json!({
+                        "state": "downloading",
+                        "message": "Loading embedding model (first time may download ~100MB)…"
+                    }),
+                );
+            }
+            let cache_dir = self.data_dir.join("models");
+            std::fs::create_dir_all(&cache_dir)?;
+            let download_consent = {
+                let app_db = self
+                    .app_db
+                    .lock()
+                    .map_err(|e| GlossError::Other(e.to_string()))?;
+                crate::commands::chat::setting_is_enabled(
+                    app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
+                )
+            };
+            EmbeddingService::new_with_download_policy(&cache_dir, false, download_consent)?
+        };
 
         if let Some(handle) = app_handle {
             use tauri::Emitter;
-            if let Err(e) = handle.emit(
+            let _ = handle.emit(
                 "status:embedding_model",
                 serde_json::json!({
                     "state": "ready",
-                    "message": "Embedding model loaded"
+                    "message": "Embedding backend loaded"
                 }),
-            ) {
-                tracing::debug!("failed to emit status:embedding_model: {e}");
-            }
+            );
         }
 
-        tracing::info!("Embedding model ready");
+        tracing::info!("Embedding backend ready");
+        *embedder = Some(service);
         Ok(())
     }
 
@@ -387,11 +410,11 @@ impl AppState {
                 ?max_embedding_id,
                 "Loading existing HNSW index"
             );
-            HnswIndex::load_with_hwm(&index_path, max_embedding_id)?
+            HnswIndex::load_with_hwm(&index_path, max_embedding_id.unwrap_or(0), 384)?
         } else {
             std::fs::create_dir_all(nb_dir.join("embeddings"))?;
             tracing::debug!(notebook_id, "Creating new HNSW index");
-            HnswIndex::new()?
+            HnswIndex::new(384)?
         };
 
         indices.insert(notebook_id.to_string(), index);

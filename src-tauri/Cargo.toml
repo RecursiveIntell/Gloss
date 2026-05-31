@@ -46,7 +46,7 @@ serde_json = "1"
 toml = "0.8"
 
 # === HTTP (for Ollama provider) ===
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "blocking"] }
 
 # === Embeddings + Reranking ===
 fastembed = "4"

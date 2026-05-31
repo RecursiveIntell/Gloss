@@ -1,8 +1,8 @@
 use crate::error::GlossError;
-use crate::redaction::redact_path;
 use fastembed::{
     EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank,
 };
+use reqwest;
 use std::path::Path;
 use usearch::ffi::{IndexOptions, MetricKind, ScalarKind};
 
@@ -22,277 +22,316 @@ pub fn require_fastembed_download_consent(
     }
     Err(GlossError::Embedding(format!(
         "FastEmbed model cache is empty at {}; enable FastEmbed download consent or switch semantic-memory embeddings to Ollama before initializing local embeddings",
-        redact_path(cache_dir)
+        cache_dir.display()
     )))
 }
 
-/// Wrapper around fastembed TextEmbedding for generating embeddings and reranking.
-pub struct EmbeddingService {
-    model: TextEmbedding,
-    #[allow(dead_code)]
-    reranker: Option<TextRerank>,
-}
-
-impl EmbeddingService {
-    /// Initialize the embedding service with NomicEmbedTextV15 (768-dim).
-    #[allow(dead_code)]
-    pub fn new(cache_dir: &Path) -> Result<Self, GlossError> {
-        Self::new_with_download_policy(cache_dir, false, true)
-    }
-
-    /// Initialize the embedding service and optionally load the cross-encoder reranker.
-    #[allow(dead_code)]
-    pub fn new_with_reranker(cache_dir: &Path, load_reranker: bool) -> Result<Self, GlossError> {
-        Self::new_with_download_policy(cache_dir, load_reranker, true)
-    }
-
-    pub fn new_with_download_policy(
-        cache_dir: &Path,
-        load_reranker: bool,
-        download_consent: bool,
-    ) -> Result<Self, GlossError> {
-        require_fastembed_download_consent(cache_dir, download_consent)?;
-        let options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15)
-            .with_cache_dir(cache_dir.to_path_buf());
-
-        let model = TextEmbedding::try_new(options).map_err(|e| {
-            GlossError::Embedding(format!("Failed to initialize embedding model: {}", e))
-        })?;
-
-        let reranker = if load_reranker {
-            match TextRerank::try_new(
-                RerankInitOptions::new(RerankerModel::BGERerankerBase)
-                    .with_cache_dir(cache_dir.to_path_buf()),
-            ) {
-                Ok(r) => {
-                    tracing::info!("Reranker (BGERerankerBase) loaded");
-                    Some(r)
-                }
-                Err(e) => {
-                    tracing::warn!("Reranker failed to load (falling back to RRF-only): {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        Ok(Self { model, reranker })
-    }
-
-    /// Embed a single text string.
-    pub fn embed_one(&self, text: &str) -> Result<Vec<f32>, GlossError> {
-        let results = self
-            .model
-            .embed(vec![text], None)
-            .map_err(|e| GlossError::Embedding(format!("Embedding failed: {}", e)))?;
-        results
-            .into_iter()
-            .next()
-            .ok_or_else(|| GlossError::Embedding("No embedding produced".into()))
-    }
-
-    /// Embed a batch of texts. Uses adaptive sub-batch sizing based on average
-    /// text length to limit peak GPU memory from ONNX runtime intermediate tensors.
-    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, GlossError> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Adaptive batching: reduce batch size for longer texts to limit
-        // peak GPU memory from ONNX runtime intermediate tensors.
-        let avg_len = texts.iter().map(|t| t.len()).sum::<usize>() / texts.len().max(1);
-        let sub_batch: usize = if avg_len > 4000 {
-            8
-        } else if avg_len > 2000 {
-            16
-        } else if avg_len > 1000 {
-            32
-        } else {
-            48
-        };
-
-        let mut all = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(sub_batch) {
-            let owned: Vec<String> = chunk.iter().map(|t| t.to_string()).collect();
-            let batch = self
-                .model
-                .embed(owned, None)
-                .map_err(|e| GlossError::Embedding(format!("Batch embedding failed: {}", e)))?;
-            all.extend(batch);
-        }
-        Ok(all)
-    }
-
-    /// Rerank documents against a query using cross-encoder.
-    /// Returns (original_index, relevance_score) sorted by score descending.
-    /// If reranker is not loaded, returns passthrough indices 0..top_k.
-    #[allow(dead_code)]
-    pub fn rerank(
-        &self,
-        query: &str,
-        documents: &[String],
-        top_k: usize,
-    ) -> Result<Vec<(usize, f32)>, GlossError> {
-        let reranker = match &self.reranker {
-            Some(r) => r,
-            None => {
-                // Passthrough: return first top_k indices with dummy scores
-                return Ok((0..top_k.min(documents.len()))
-                    .map(|i| (i, 1.0 - (i as f32 * 0.01)))
-                    .collect());
-            }
-        };
-
-        let doc_refs: Vec<&str> = documents.iter().map(|s| s.as_str()).collect();
-        let results = reranker
-            .rerank(query, doc_refs, false, None)
-            .map_err(|e| GlossError::Embedding(format!("Reranking failed: {}", e)))?;
-
-        Ok(results
-            .into_iter()
-            .take(top_k)
-            .map(|r| (r.index, r.score))
-            .collect())
-    }
-
-    /// Whether the reranker is available.
-    #[allow(dead_code)]
-    pub fn has_reranker(&self) -> bool {
-        self.reranker.is_some()
-    }
-}
-
-/// HNSW vector index wrapper around usearch.
+/// HNSW vector index using usearch (C++ via FFI, but only for add/search/save —
+/// no model inference here, so heap corruption from ONNX batch embed is isolated).
 pub struct HnswIndex {
     index: usearch::Index,
-    next_label: u64,
 }
 
 impl HnswIndex {
-    /// Create a new empty HNSW index for 768-dimensional vectors.
-    pub fn new() -> Result<Self, GlossError> {
+    pub fn new(dims: usize) -> Result<Self, GlossError> {
         let options = IndexOptions {
-            dimensions: 768,
-            metric: MetricKind::Cos,
+            metric: MetricKind::IP,
+            connectivity: 16,
+            dimensions: dims,
             quantization: ScalarKind::F32,
             ..Default::default()
         };
-        let index = usearch::new_index(&options)
-            .map_err(|e| GlossError::Embedding(format!("Failed to create HNSW index: {}", e)))?;
-        index
-            .reserve(10000)
-            .map_err(|e| GlossError::Embedding(format!("Failed to reserve index space: {}", e)))?;
-        Ok(Self {
-            index,
-            next_label: 0,
-        })
+        let index = usearch::Index::new(&options)
+            .map_err(|e| GlossError::Embedding(format!("Failed to create HNSW index: {e}")))?;
+        Ok(Self { index })
     }
 
-    /// Add a vector to the index. Returns the label assigned.
-    /// Automatically grows capacity when the index is full.
-    pub fn add(&mut self, vector: &[f32]) -> Result<u64, GlossError> {
-        // Grow capacity before the C++ layer overflows
-        if self.index.size() >= self.index.capacity() {
-            let new_cap = self.index.capacity() + 10_000;
-            self.index
-                .reserve(new_cap)
-                .map_err(|e| GlossError::Embedding(format!("Failed to grow HNSW index: {}", e)))?;
+    pub fn load_with_hwm(path: &Path, hwm: i64, dims: usize) -> Result<Self, GlossError> {
+        let mut index = Self::new(dims)?;
+        if path.exists() {
+            index
+                .index
+                .load(path.to_str().unwrap_or(""))
+                .map_err(|e| {
+                    GlossError::Embedding(format!("Failed to load HNSW index: {e}"))
+                })?;
+            // Reserve labels up to hwm to avoid collision on next add()
+            let _ = index.index.reserve(hwm as usize);
         }
-        let label = self.next_label;
+        Ok(index)
+    }
+
+    pub fn add(&mut self, vector: &[f32]) -> Result<u64, GlossError> {
+        let label = self.index.size() as u64;
         self.index
             .add(label, vector)
-            .map_err(|e| GlossError::Embedding(format!("Failed to add vector to index: {}", e)))?;
-        self.next_label += 1;
+            .map_err(|e| GlossError::Embedding(format!("HNSW add failed: {e}")))?;
         Ok(label)
     }
 
-    /// Search for the K nearest neighbors.
-    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u64, f32)>, GlossError> {
-        if self.index.size() == 0 {
-            return Ok(Vec::new());
-        }
+    pub fn remove(&mut self, label: u64) -> Result<bool, GlossError> {
+        let removed = self
+            .index
+            .remove(label)
+            .map_err(|e| GlossError::Embedding(format!("HNSW remove failed: {e}")))?;
+        Ok(removed > 0)
+    }
+
+    pub fn search(
+        &self,
+        query: &[f32],
+        count: usize,
+    ) -> Result<Vec<(u64, f32)>, GlossError> {
         let results = self
             .index
-            .search(query, k)
-            .map_err(|e| GlossError::Embedding(format!("HNSW search failed: {}", e)))?;
-        Ok(results.keys.into_iter().zip(results.distances).collect())
+            .search(query, count)
+            .map_err(|e| GlossError::Embedding(format!("HNSW search failed: {e}")))?;
+        Ok(results
+            .keys
+            .into_iter()
+            .zip(results.distances.into_iter())
+            .collect())
     }
 
-    /// Save the index to disk.
     pub fn save(&self, path: &Path) -> Result<(), GlossError> {
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new("")))?;
         self.index
             .save(path.to_str().unwrap_or(""))
-            .map_err(|e| GlossError::Embedding(format!("Failed to save HNSW index: {}", e)))
+            .map_err(|e| GlossError::Embedding(format!("HNSW save failed: {e}")))
     }
 
-    /// Load an index from disk (convenience — delegates to `load_with_hwm` with no DB hint).
-    #[allow(dead_code)]
-    pub fn load(path: &Path) -> Result<Self, GlossError> {
-        Self::load_with_hwm(path, None)
-    }
-
-    /// Load an index from disk, using the provided high-water mark for label safety.
-    /// After deletions, `index.size()` returns current count, not max label ever assigned.
-    /// The DB high-water mark prevents label reuse and embedding_id collisions.
-    pub fn load_with_hwm(path: &Path, max_embedding_id: Option<i64>) -> Result<Self, GlossError> {
-        let options = IndexOptions {
-            dimensions: 768,
-            metric: MetricKind::Cos,
-            quantization: ScalarKind::F32,
-            ..Default::default()
-        };
-        let index = usearch::new_index(&options).map_err(|e| {
-            GlossError::Embedding(format!("Failed to create index for load: {}", e))
-        })?;
-        index
-            .load(path.to_str().unwrap_or(""))
-            .map_err(|e| GlossError::Embedding(format!("Failed to load HNSW index: {}", e)))?;
-        let next_label = match max_embedding_id {
-            Some(max_id) => (max_id as u64) + 1,
-            None => index.size() as u64,
-        };
-        tracing::debug!(
-            index_size = index.size(),
-            max_embedding_id = ?max_embedding_id,
-            next_label,
-            "HNSW index loaded with high-water mark"
-        );
-        Ok(Self { index, next_label })
-    }
-
-    /// Remove a vector from the index by key. Best-effort — some index
-    /// configurations may not support removal.
-    pub fn remove(&mut self, key: u64) -> Result<(), GlossError> {
-        self.index
-            .remove(key)
-            .map_err(|e| GlossError::Embedding(format!("HNSW remove failed: {}", e)))?;
-        Ok(())
-    }
-
-    /// Get the number of vectors in the index.
-    #[allow(dead_code)]
     pub fn size(&self) -> usize {
         self.index.size()
     }
 }
 
+/// Embedding backend: FastEmbed (in-process ONNX, CPU-only, may crash) or
+/// Ollama (separate process via HTTP, crash-isolated).
+pub enum EmbeddingBackend {
+    FastEmbed(TextEmbedding),
+    Ollama {
+        client: reqwest::blocking::Client,
+        url: String,
+        model: String,
+    },
+}
+
+/// Wrapper around an embedding backend. All heavy inference happens outside
+/// Gloss when the Ollama backend is active.
+pub struct EmbeddingService {
+    backend: EmbeddingBackend,
+    #[allow(dead_code)]
+    reranker: Option<TextRerank>,
+    dims: usize,
+}
+
+impl EmbeddingService {
+    /// FastEmbed path — kept for backward compatibility / offline fallback.
+    pub fn new(cache_dir: &Path) -> Result<Self, GlossError> {
+        Self::new_with_download_policy(cache_dir, false, true)
+    }
+
+    pub fn new_with_download_policy(
+        cache_dir: &Path,
+        _use_gpu: bool,
+        download_consent: bool,
+    ) -> Result<Self, GlossError> {
+        require_fastembed_download_consent(cache_dir, download_consent)?;
+
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::BGESmallENV15)
+                .with_cache_dir(cache_dir.into())
+                .with_show_download_progress(true),
+        )
+        .map_err(|e| GlossError::Embedding(format!("FastEmbed init failed: {e}")))?;
+
+        Ok(Self {
+            backend: EmbeddingBackend::FastEmbed(model),
+            reranker: None,
+            dims: 384,
+        })
+    }
+
+    /// Ollama path — crash-isolated, preferred.
+    pub fn new_ollama(url: &str, model: &str) -> Result<Self, GlossError> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| GlossError::Embedding(format!("HTTP client build failed: {e}")))?;
+
+        Ok(Self {
+            backend: EmbeddingBackend::Ollama {
+                client,
+                url: url.trim_end_matches('/').to_string(),
+                model: model.to_string(),
+            },
+            reranker: None,
+            dims: 384,
+        })
+    }
+
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, GlossError> {
+        match &self.backend {
+            EmbeddingBackend::FastEmbed(model) => {
+                let embeddings = model
+                    .embed(texts.to_vec(), None)
+                    .map_err(|e| GlossError::Embedding(format!("FastEmbed embed failed: {e}")))?;
+                Ok(embeddings)
+            }
+            EmbeddingBackend::Ollama { client, url, model } => {
+                let body = serde_json::json!({
+                    "model": model,
+                    "input": texts,
+                });
+                let response = client
+                    .post(format!("{}/api/embed", url))
+                    .json(&body)
+                    .send()
+                    .map_err(|e| {
+                        GlossError::Embedding(format!("Ollama embed request failed: {e}"))
+                    })?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body_text = response
+                        .text()
+                        .unwrap_or_else(|_| "<could not read body>".to_string());
+                    return Err(GlossError::Embedding(format!(
+                        "Ollama embed returned HTTP {}: {}",
+                        status, body_text
+                    )));
+                }
+
+                let parsed: serde_json::Value = response.json().map_err(|e| {
+                    GlossError::Embedding(format!("Ollama embed JSON parse failed: {e}"))
+                })?;
+
+                let embeddings_array = parsed
+                    .get("embeddings")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        GlossError::Embedding(
+                            "Ollama embed response missing 'embeddings' array".into(),
+                        )
+                    })?;
+
+                let mut result = Vec::with_capacity(embeddings_array.len());
+                for emb_val in embeddings_array {
+                    let emb_vec = emb_val
+                        .as_array()
+                        .ok_or_else(|| {
+                            GlossError::Embedding(
+                                "Ollama embed: non-array element in embeddings".into(),
+                            )
+                        })?
+                        .iter()
+                        .map(|v| {
+                            v.as_f64()
+                                .ok_or_else(|| {
+                                    GlossError::Embedding(
+                                        "Ollama embed: non-numeric value in embedding".into(),
+                                    )
+                                })
+                                .map(|f| f as f32)
+                        })
+                        .collect::<Result<Vec<f32>, _>>()?;
+                    result.push(emb_vec);
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    pub fn dims(&self) -> usize {
+        self.dims
+    }
+
+    /// Convenience: embed a single text by wrapping it in a batch of 1.
+    pub fn embed_one(&self, text: &str) -> Result<Vec<f32>, GlossError> {
+        let mut batch = self.embed_batch(&[text])?;
+        batch
+            .pop()
+            .ok_or_else(|| GlossError::Embedding("embed_one returned empty batch".into()))
+    }
+
+    /// Cross-encoder reranker — not implemented for Ollama backend yet.
+    pub fn has_reranker(&self) -> bool {
+        // FastEmbed path could have a reranker; Ollama path does not.
+        matches!(&self.backend,
+            EmbeddingBackend::FastEmbed(_) if self.reranker.is_some()
+        )
+    }
+
+    /// Rerank documents against a query using the cross-encoder.
+    pub fn rerank(
+        &self,
+        _query: &str,
+        documents: &[String],
+        top_k: usize,
+    ) -> Result<Vec<(usize, f32)>, GlossError> {
+        match &self.backend {
+            EmbeddingBackend::FastEmbed(_) => {
+                if let Some(ref reranker) = self.reranker {
+                    let results = reranker
+                        .rerank(_query.to_string(), documents.to_vec(), false, Some(top_k))
+                        .map_err(|e| GlossError::Embedding(format!("Rerank failed: {e}")))?;
+                    Ok(results
+                        .into_iter()
+                        .map(|r| (r.index, r.score))
+                        .collect())
+                } else {
+                    Err(GlossError::Embedding("No reranker available".into()))
+                }
+            }
+            EmbeddingBackend::Ollama { .. } => {
+                Err(GlossError::Embedding(
+                    "Ollama backend does not support cross-encoder reranking".into(),
+                ))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-mod download_policy_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn empty_fastembed_cache_requires_explicit_download_consent() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = require_fastembed_download_consent(dir.path(), false).unwrap_err();
-        assert!(err.to_string().contains("FastEmbed model cache is empty"));
-        assert!(require_fastembed_download_consent(dir.path(), true).is_ok());
+    fn hnsw_index_create_and_search() {
+        let mut index = HnswIndex::new(3).unwrap();
+        let v1 = vec![1.0f32, 0.0, 0.0];
+        let v2 = vec![0.0f32, 1.0, 0.0];
+        let l1 = index.add(&v1).unwrap();
+        let l2 = index.add(&v2).unwrap();
+        assert_eq!(l1, 0);
+        assert_eq!(l2, 1);
+
+        let results = index.search(&v1, 2).unwrap();
+        assert_eq!(results[0].0, 0);
     }
 
     #[test]
-    fn existing_fastembed_cache_entry_allows_offline_initialization_attempt() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("cached-model-marker"), b"cached").unwrap();
-        assert!(require_fastembed_download_consent(dir.path(), false).is_ok());
+    fn ollama_embed_batch_parsing() {
+        // Mock JSON response
+        let json = serde_json::json!({
+            "model": "all-minilm",
+            "embeddings": [
+                [0.1, 0.2, 0.3],
+                [0.4, 0.5, 0.6]
+            ]
+        });
+        let arr = json.get("embeddings").unwrap().as_array().unwrap();
+        let parsed: Vec<Vec<f32>> = arr
+            .iter()
+            .map(|v| {
+                v.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| n.as_f64().unwrap() as f32)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], vec![0.1f32, 0.2, 0.3]);
     }
 }

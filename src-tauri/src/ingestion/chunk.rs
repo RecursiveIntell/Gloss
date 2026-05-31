@@ -536,7 +536,7 @@ mod tests {
                 "    let x = 42;\n".repeat(40)
             ));
         }
-        let chunks = chunk_text_with_title(&code, "s1", "example.rs");
+        let chunks = chunk_text_with_title(&code, "s1", "example.rs", None);
         assert!(chunks.len() > 1, "Should split into multiple chunks");
         // Each chunk should tend to start at a function boundary
         for chunk in &chunks {

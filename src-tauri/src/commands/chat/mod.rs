@@ -19,6 +19,7 @@ use crate::retrieval::context::ContextPassage;
 use crate::retrieval::hybrid_search;
 use crate::retrieval::source_scope::{ResolvedSourceScope, SourceScope};
 use crate::state::AppState;
+use crate::studio::build_snippets;
 use futures::StreamExt;
 use serde::Serialize;
 

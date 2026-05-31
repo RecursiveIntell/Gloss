@@ -46,6 +46,12 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     setActiveConversation,
     loadMessages,
     suggestedQuestions,
+    style,
+    customGoal,
+    responseLength,
+    setStyle,
+    setCustomGoal,
+    setResponseLength,
   } = useChatStore();
   const saveResponse = useNoteStore((s) => s.saveResponse);
   const { activeModel, models, settings, refreshModels, loading: modelsLoading } = useSettingsStore();
@@ -105,7 +111,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   };
 
   const handleCopy = async (content: string) => {
-    await navigator.clipboard.writeText(content);
+    try {
+      await navigator.clipboard.writeText(content);
+    } catch (err) {
+      console.warn("Failed to copy to clipboard:", err);
+    }
   };
 
   const handleRegenerate = async (messageIndex: number) => {
@@ -249,6 +259,38 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         >
           <RefreshCw className={`w-3 h-3 ${modelsLoading ? "animate-spin" : ""}`} />
         </button>
+        <select
+          value={style}
+          onChange={(e) => setStyle(e.target.value)}
+          disabled={isStreaming}
+          className="rounded-full border border-border bg-bg-tertiary px-2 py-1 text-xs text-text focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+          title="Conversational style"
+        >
+          <option value="default">Default</option>
+          <option value="learning_guide">Learning Guide</option>
+          <option value="custom">Custom</option>
+        </select>
+        {style === "custom" && (
+          <input
+            type="text"
+            value={customGoal}
+            onChange={(e) => setCustomGoal(e.target.value)}
+            placeholder="Custom goal (e.g. You are a code reviewer...)"
+            disabled={isStreaming}
+            className="min-w-[180px] rounded-full border border-border bg-bg-tertiary px-2 py-1 text-xs text-text placeholder:text-text-muted focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+          />
+        )}
+        <select
+          value={responseLength}
+          onChange={(e) => setResponseLength(e.target.value)}
+          disabled={isStreaming}
+          className="rounded-full border border-border bg-bg-tertiary px-2 py-1 text-xs text-text focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+          title="Response length"
+        >
+          <option value="default">Default Length</option>
+          <option value="short">Short</option>
+          <option value="long">Long</option>
+        </select>
       </div>
 
       <div className="border-b border-border bg-bg-secondary/80 px-4 py-2">
@@ -310,9 +352,10 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             </p>
             {suggestedQuestions.length > 0 && (
               <div className="flex flex-wrap gap-2 justify-center">
-                {suggestedQuestions.map((q, i) => (
+                {suggestedQuestions.map((q, _i) => (
                   <button
-                    key={i}
+                    key={q}
+                    aria-label={`Suggested question: ${q}`}
                     onClick={() => handleSuggestionClick(q)}
                     className="rounded-full border border-border bg-bg-secondary px-3 py-1.5 text-xs text-text-secondary hover:bg-bg-tertiary hover:text-text"
                   >
@@ -479,7 +522,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           </div>
         )}
 
-        {streamingStatus && (streamingStatus as { truncated?: boolean }).truncated && (
+        {streamingStatus && streamingStatus.truncated && (
           <div className="mx-auto flex max-w-[900px] justify-start">
             <div className="flex items-start gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-400">
               <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
@@ -517,6 +560,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             disabled={!isStreaming && !input.trim()}
             className="rounded-lg bg-accent p-2 text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
             title={isStreaming ? "Stop generation" : editingUserMessageId ? "Rerun edited message" : "Send"}
+            aria-label={isStreaming ? "Stop generation" : editingUserMessageId ? "Rerun edited message" : "Send message"}
           >
             {isStreaming ? <StopCircle className="w-4 h-4" /> : <Send className="w-4 h-4" />}
           </button>
@@ -713,9 +757,9 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
           <button
             type="button"
             onClick={() => {
-              void navigator.clipboard?.writeText(
+              navigator.clipboard?.writeText(
                 JSON.stringify(evidence.retrieval_outcome, null, 2),
-              );
+              ).catch((err) => console.warn("Failed to copy retrieval outcome:", err));
             }}
             className="mt-2 rounded border border-border px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-tertiary hover:text-text"
           >
@@ -740,13 +784,13 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
           <button
             type="button"
             onClick={() => {
-              void navigator.clipboard?.writeText(JSON.stringify({
+              navigator.clipboard?.writeText(JSON.stringify({
                 requested_source_ids: evidence.requested_source_ids,
                 selected_source_ids: evidence.selected_source_ids,
                 effective_source_ids: evidence.effective_source_ids,
                 excluded_source_ids: evidence.excluded_source_ids,
                 invalid_source_ids: evidence.invalid_source_ids,
-              }, null, 2));
+              }, null, 2)).catch((err) => console.warn("Failed to copy source selection:", err));
             }}
             className="mt-2 rounded border border-border px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-tertiary hover:text-text"
           >

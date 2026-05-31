@@ -59,6 +59,7 @@ pub(crate) async fn stream_chat_response(
     history: &[Message],
     custom_goal: Option<&str>,
     style: &str,
+    response_length: &str,
     resolved_scope: &ResolvedSourceScope,
     source_context: &[ContextPassage],
     model_context_window: Option<i32>,
@@ -119,7 +120,15 @@ pub(crate) async fn stream_chat_response(
         images: None,
     });
 
-    let max_tokens = 2048;
+    let base_max_tokens: u32 = 2048;
+    let response_length_multiplier: f64 = match response_length {
+        "short" => 0.5,
+        "long" => 2.0,
+        _ => 1.0,
+    };
+    let max_tokens = (base_max_tokens as f64 * response_length_multiplier)
+        .round()
+        .max(1.0) as u32;
     let decoding_settings_receipt =
         super::effective_decoding_settings(&state, provider.provider_type(), model, max_tokens)?;
     let num_ctx_result = super::compute_dynamic_num_ctx(
@@ -155,6 +164,7 @@ pub(crate) async fn stream_chat_response(
         capture_state: "captured_digest_only".to_string(),
         redaction_state: "content_not_stored_in_receipt".to_string(),
         system_prompt_digest: digest_text(&system_prompt),
+        system_prompt_text: Some(system_prompt.clone()),
         user_turn_digest,
         source_passage_count: source_context.len(),
         recorded_at: chrono::Utc::now().to_rfc3339(),
@@ -532,7 +542,7 @@ pub(crate) async fn stream_chat_response(
             );
         }
 
-        let _ = app_handle.emit(
+        if let Err(e) = app_handle.emit(
             "chat:token",
             serde_json::json!({
                 "notebook_id": notebook_id,
@@ -541,7 +551,9 @@ pub(crate) async fn stream_chat_response(
                 "token": token,
                 "done": done && provider_done_terminal_decision().emit_done_on_current_token,
             }),
-        );
+        ) {
+            tracing::warn!("failed to emit chat:token: {e}");
+        }
 
         if done_frame_seen && provider_done_terminal_decision().break_stream_loop {
             break;

@@ -1,7 +1,7 @@
 import { useChatStore } from "../../stores/chatStore";
 import type { GenerationReceiptV1, DecodingSettingsReceiptV1, PromptReceiptV1 } from "../../lib/types";
 import { CheckCircle, XCircle, AlertTriangle, Copy } from "lucide-react";
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 
 /**
  * Receipt Inspector panel — summarizes the generation, decoding, and prompt
@@ -187,10 +187,17 @@ function ReceiptCard({
   fields: { label: string; value: string; mono?: boolean; warn?: boolean }[];
 }) {
   const [copied, setCopied] = useState(false);
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
   const handleCopy = async () => {
-    await navigator.clipboard.writeText(receiptId);
+    try {
+      await navigator.clipboard.writeText(receiptId);
+    } catch (err) {
+      console.warn("Failed to copy receipt ID:", err);
+      return;
+    }
     setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    setTimeout(() => { if (mountedRef.current) setCopied(false); }, 1500);
   };
 
   return (
@@ -227,6 +234,8 @@ function CopyAllReceipts({
   evidenceId: string;
 }) {
   const [copied, setCopied] = useState(false);
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
   const handleCopy = async () => {
     const lines = [
       `Evidence receipt: ${evidenceId}`,
@@ -234,9 +243,14 @@ function CopyAllReceipts({
       decodingId ? `Decoding receipt: ${decodingId}` : "",
       promptId ? `Prompt receipt: ${promptId}` : "",
     ].filter(Boolean).join("\n");
-    await navigator.clipboard.writeText(lines);
+    try {
+      await navigator.clipboard.writeText(lines);
+    } catch (err) {
+      console.warn("Failed to copy receipt IDs:", err);
+      return;
+    }
     setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setTimeout(() => { if (mountedRef.current) setCopied(false); }, 2000);
   };
 
   return (

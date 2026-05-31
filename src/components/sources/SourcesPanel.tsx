@@ -1,8 +1,10 @@
 import { useState, useMemo, useCallback } from "react";
 import { useSourceStore } from "../../stores/sourceStore";
+import { useSettingsStore } from "../../stores/settingsStore";
 import { open } from "@tauri-apps/plugin-dialog";
 import * as api from "../../lib/tauri";
 import type { Source } from "../../lib/types";
+import { featureById } from "../../lib/features";
 import {
   FileText,
   Upload,
@@ -111,6 +113,11 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   const [dragActive, setDragActive] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
 
+  // Feature flags
+  const featureFlags = useSettingsStore((s) => s.featureFlags);
+  const visionEnabled = featureById(featureFlags, "feature_vision_jobs_enabled")?.active === true;
+  const videoImportEnabled = featureById(featureFlags, "feature_video_import_enabled")?.active === true;
+
   // Error retry state for source operations
   const [operationErrors, setOperationErrors] = useState<
     Record<string, { message: string; retry: () => Promise<void> }>
@@ -208,6 +215,45 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
       } catch (e) {
         const retry = () => addSourceFolder(notebookId, selected);
         addOperationError("folderUpload", String(e), retry);
+      }
+    }
+  };
+
+  const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp"];
+  const VIDEO_EXTENSIONS = ["mp4", "mkv", "webm", "avi", "mov"];
+
+  const handleImageImport = async () => {
+    const selected = await open({
+      multiple: true,
+      filters: [{ name: "Images", extensions: IMAGE_EXTENSIONS }],
+    });
+    if (selected) {
+      const paths = Array.isArray(selected) ? selected : [selected];
+      const validPaths = paths.filter(Boolean);
+      clearOperationError("imageImport");
+      try {
+        await addSourceFiles(notebookId, validPaths);
+      } catch (e) {
+        const retry = () => addSourceFiles(notebookId, validPaths);
+        addOperationError("imageImport", String(e), retry);
+      }
+    }
+  };
+
+  const handleVideoImport = async () => {
+    const selected = await open({
+      multiple: true,
+      filters: [{ name: "Videos", extensions: VIDEO_EXTENSIONS }],
+    });
+    if (selected) {
+      const paths = Array.isArray(selected) ? selected : [selected];
+      const validPaths = paths.filter(Boolean);
+      clearOperationError("videoImport");
+      try {
+        await addSourceFiles(notebookId, validPaths);
+      } catch (e) {
+        const retry = () => addSourceFiles(notebookId, validPaths);
+        addOperationError("videoImport", String(e), retry);
       }
     }
   };
@@ -434,6 +480,22 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
           >
             <Link className="w-3 h-3" /> URL
           </button>
+          {visionEnabled && (
+            <button
+              onClick={handleImageImport}
+              className="flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
+            >
+              <Image className="w-3 h-3" /> Image
+            </button>
+          )}
+          {videoImportEnabled && (
+            <button
+              onClick={handleVideoImport}
+              className="flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
+            >
+              <Video className="w-3 h-3" /> Video
+            </button>
+          )}
         </div>
         <div className="mt-2 flex items-start gap-1.5 rounded border border-border bg-bg-tertiary px-2 py-1 text-[10px] leading-snug text-text-muted">
           <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
@@ -563,6 +625,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Filter sources"
+              aria-label="Filter sources"
               className="w-full rounded border border-border bg-bg-tertiary py-1 pl-7 pr-2 text-xs text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
             />
           </div>
@@ -570,6 +633,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             <select
               value={statusFilter}
               onChange={(event) => setStatusFilter(event.target.value)}
+              aria-label="Filter by status"
               className="rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text focus:border-accent focus:outline-none"
             >
               <option value="all">All statuses</option>
@@ -580,6 +644,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             <select
               value={typeFilter}
               onChange={(event) => setTypeFilter(event.target.value)}
+              aria-label="Filter by type"
               className="rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text focus:border-accent focus:outline-none"
             >
               <option value="all">All types</option>
@@ -629,6 +694,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             value={urlInput}
             onChange={(e) => setUrlInput(e.target.value)}
             placeholder="https://example.com/article"
+            aria-label="URL to import"
             className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
           />
           <label className="flex items-start gap-2 text-[10px] leading-snug text-text-muted">
@@ -645,6 +711,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             value={youtubeLanguage}
             onChange={(e) => setYoutubeLanguage(e.target.value)}
             placeholder="Transcript language, e.g. en"
+            aria-label="YouTube transcript language"
             className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
           />
           <button

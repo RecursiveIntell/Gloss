@@ -702,7 +702,7 @@ impl MemoryStore {
     }
 
     fn validate_content(&self, field: &'static str, content: &str) -> Result<(), MemoryError> {
-        if content.is_empty() {
+        if content.trim().is_empty() {
             return Err(MemoryError::InvalidConfig {
                 field,
                 reason: "content must not be empty".to_string(),

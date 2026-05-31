@@ -16,7 +16,13 @@ def current_run(repo: Path) -> str | None:
     match = re.search(r"Current run:\s*`?([^`\n]+)`?", text)
     return match.group(1).strip() if match else None
 
-RUN_ID = current_run(Path(".").resolve()) or "GLOSS_P36_RELEASE_COMPLETION_DENSE_TQ_RELEASE_20260525"
+
+# fallback — overridden inside main() once --repo is parsed
+_RUN_ID = "GLOSS_P36_RELEASE_COMPLETION_DENSE_TQ_RELEASE_20260525"
+
+
+def resolve_run_id(repo: Path) -> str:
+    return current_run(repo) or _RUN_ID
 
 
 def read(path: Path) -> str:
@@ -32,6 +38,7 @@ def main() -> int:
     parser.add_argument("--repo", default=".")
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
+    run_id = resolve_run_id(repo)
     failures: list[str] = []
     warnings: list[str] = []
 
@@ -89,7 +96,7 @@ def main() -> int:
     if "source_processing_state" not in migrations:
         fail("DB migration for source_processing_state missing", failures)
 
-    if RUN_ID not in "\n".join([read(p) for p in [repo / "AGENTS.md", repo / "README.md"] if p.exists()]):
+    if run_id not in "\n".join([read(p) for p in [repo / "AGENTS.md", repo / "README.md"] if p.exists()]):
         warnings.append("Run ID not visible in AGENTS.md/README.md; acceptable only if docs/codex-runs/CURRENT_RUN.md owns it")
 
     result = {"gate": "gloss_p36_static_gate", "failures": failures, "warnings": warnings}

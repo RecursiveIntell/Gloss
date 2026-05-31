@@ -221,7 +221,8 @@ fn studio_output_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StudioOut
         file_path: row.get(7)?,
         status: row.get(8)?,
         error_message: row.get(9)?,
-        created_at: row.get(10)?,
+        prose_content: row.get(10)?,
+        created_at: row.get(11)?,
     })
 }
 
@@ -238,6 +239,7 @@ pub struct StudioOutput {
     pub file_path: Option<String>,
     pub status: String,
     pub error_message: Option<String>,
+    pub prose_content: Option<String>,
     pub created_at: String,
 }
 
@@ -814,7 +816,6 @@ impl NotebookDb {
                         .collect(),
                 )
         };
-
         let embedded: i64 = self
             .conn
             .query_row(&embedded_sql, params.as_slice(), |row| row.get(0))?;
@@ -1034,6 +1035,9 @@ impl NotebookDb {
         notebook_id: &str,
         source_id: &str,
     ) -> Result<Option<SemanticMemoryProjectionStatus>, GlossError> {
+        if !self.table_exists("semantic_memory_projection_status")? {
+            return Ok(None);
+        }
         self.conn
             .query_row(
                 "SELECT notebook_id, source_id, status, chunk_count, projected_chunk_count,
@@ -1052,6 +1056,9 @@ impl NotebookDb {
         &self,
         notebook_id: &str,
     ) -> Result<Vec<SemanticMemoryProjectionStatus>, GlossError> {
+        if !self.table_exists("semantic_memory_projection_status")? {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare(
             "SELECT notebook_id, source_id, status, chunk_count, projected_chunk_count,
                     healthy_link_count, degraded_link_count, last_receipt_id, last_error,
@@ -1144,6 +1151,16 @@ impl NotebookDb {
                 total_chunks: 0,
                 projected_chunks: 0,
                 projection_required: false,
+            });
+        }
+        if !self.table_exists("semantic_memory_projection_status")? {
+            return Ok(SemanticMemoryProjectionSummary {
+                notebook_id: notebook_id.to_string(),
+                total_sources: 0, chunk_bearing_sources: 0, zero_chunk_sources: 0,
+                projected_sources: 0, failed_sources: 0, skipped_no_chunks: 0,
+                stale_sources: 0, partial_sources: 0, projecting_sources: 0,
+                healthy_links: 0, degraded_links: 0, missing_links: 0,
+                total_chunks: 0, projected_chunks: 0, projection_required: false,
             });
         }
         let placeholders = (0..scoped_ids.len())
@@ -1269,7 +1286,7 @@ impl NotebookDb {
         })
     }
 
-    fn table_exists(&self, table: &str) -> Result<bool, GlossError> {
+    pub fn table_exists(&self, table: &str) -> Result<bool, GlossError> {
         let exists: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
             [table],
@@ -1667,7 +1684,7 @@ impl NotebookDb {
     pub fn list_studio_outputs(&self) -> Result<Vec<StudioOutput>, GlossError> {
         let mut stmt = match self.conn.prepare(
             "SELECT id, output_type, title, prompt_used, raw_content, config, source_ids,
-                    file_path, status, error_message, created_at
+                    file_path, status, error_message, prose_content, created_at
              FROM studio_outputs
              ORDER BY created_at DESC",
         ) {
@@ -1702,7 +1719,7 @@ impl NotebookDb {
     pub fn get_studio_output(&self, output_id: &str) -> Result<StudioOutput, GlossError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, output_type, title, prompt_used, raw_content, config, source_ids,
-                    file_path, status, error_message, created_at
+                    file_path, status, error_message, prose_content, created_at
              FROM studio_outputs
              WHERE id = ?1",
         )?;
@@ -1714,9 +1731,9 @@ impl NotebookDb {
         self.conn.execute(
             "INSERT INTO studio_outputs (
                 id, output_type, title, prompt_used, raw_content, config,
-                source_ids, file_path, status, error_message
+                source_ids, file_path, status, error_message, prose_content
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 output.id,
                 output.output_type,
@@ -1728,6 +1745,7 @@ impl NotebookDb {
                 output.file_path,
                 output.status,
                 output.error_message,
+                output.prose_content,
             ],
         )?;
         Ok(())

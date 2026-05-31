@@ -190,27 +190,54 @@ pub fn validate_provider_base_url(
     base_url: &str,
     allow_lan: bool,
 ) -> Result<NetworkScopeReceiptV1, GlossError> {
+    validate_base_url_inner(provider_type, base_url, allow_lan, false)
+}
+
+/// Validate an embedding URL against the same LAN/loopback policy as provider URLs.
+/// Embedding endpoints (Ollama for nomic-embed-text, etc.) must obey the same
+/// network scope restrictions: loopback always allowed, LAN requires opt-in,
+/// public/cloud always rejected.
+pub fn validate_embedding_url(
+    base_url: &str,
+    allow_lan: bool,
+) -> Result<NetworkScopeReceiptV1, GlossError> {
+    // Embedding endpoints are treated as local providers (Ollama/LlamaCpp)
+    // — they must be loopback or LAN-with-opt-in.
+    validate_base_url_inner(ProviderType::Ollama, base_url, allow_lan, true)
+}
+
+fn validate_base_url_inner(
+    provider_type: ProviderType,
+    base_url: &str,
+    allow_lan: bool,
+    is_embedding: bool,
+) -> Result<NetworkScopeReceiptV1, GlossError> {
+    let label = if is_embedding {
+        "Embedding endpoint"
+    } else {
+        "Provider"
+    };
     let parsed = reqwest::Url::parse(base_url.trim()).map_err(|e| {
         GlossError::Config(format!(
-            "Provider '{}' base URL is invalid: {e}",
+            "{label} '{}' base URL is invalid: {e}",
             provider_type.as_str()
         ))
     })?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(GlossError::Config(format!(
-            "Provider '{}' base URL must use http or https",
+            "{label} '{}' base URL must use http or https",
             provider_type.as_str()
         )));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(GlossError::Config(format!(
-            "Provider '{}' base URL must not include credentials",
+            "{label} '{}' base URL must not include credentials",
             provider_type.as_str()
         )));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(GlossError::Config(format!(
-            "Provider '{}' base URL must not include query strings or fragments",
+            "{label} '{}' base URL must not include query strings or fragments",
             provider_type.as_str()
         )));
     }
@@ -218,7 +245,7 @@ pub fn validate_provider_base_url(
         .host_str()
         .ok_or_else(|| {
             GlossError::Config(format!(
-                "Provider '{}' base URL must include a host",
+                "{label} '{}' base URL must include a host",
                 provider_type.as_str()
             ))
         })?
@@ -328,6 +355,42 @@ fn redact_url_for_error(url: &str) -> String {
             let _ = parsed.set_password(None);
             parsed.set_query(None);
             parsed.set_fragment(None);
+            // Redact LAN/private host details: if the host is not loopback,
+            // truncate IP to first octet or domain to first label, to avoid
+            // leaking internal network topology in log/error output.
+            if let Some(host) = parsed.host_str() {
+                if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+                    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                        match ip {
+                            std::net::IpAddr::V4(v4) => {
+                                let octets = v4.octets();
+                                let _ = parsed.set_host(Some(&format!(
+                                    "{}.x.x.x:{}",
+                                    octets[0],
+                                    parsed.port().unwrap_or(0)
+                                )));
+                            }
+                            std::net::IpAddr::V6(v6) => {
+                                let segments = v6.segments();
+                                let _ = parsed.set_host(Some(&format!(
+                                    "[{}:x:x:x:...]:{}",
+                                    segments[0],
+                                    parsed.port().unwrap_or(0)
+                                )));
+                            }
+                        }
+                    } else {
+                        // Domain name: keep only first label
+                        if let Some(dot_pos) = host.find('.') {
+                            let _ = parsed.set_host(Some(&format!(
+                                "{}.***:{}",
+                                &host[..dot_pos],
+                                parsed.port().unwrap_or(0)
+                            )));
+                        }
+                    }
+                }
+            }
             parsed.as_str().to_string()
         }
         Err(_) => "[invalid-url]".to_string(),
@@ -335,18 +398,34 @@ fn redact_url_for_error(url: &str) -> String {
 }
 
 /// Construct a boxed LlmProvider from a config.
-pub fn build_provider(config: &ProviderConfig) -> Box<dyn LlmProvider> {
+pub fn build_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>, GlossError> {
     match config.provider_type {
-        ProviderType::Ollama => Box::new(ollama::OllamaProvider::new(&config.base_url)),
-        ProviderType::OpenAI => Box::new(openai::OpenAIProvider::new(
-            &config.base_url,
-            config.api_key.as_deref().unwrap_or(""),
-        )),
-        ProviderType::Anthropic => Box::new(anthropic::AnthropicProvider::new(
-            &config.base_url,
-            config.api_key.as_deref().unwrap_or(""),
-        )),
-        ProviderType::LlamaCpp => Box::new(llamacpp::LlamaCppProvider::new(&config.base_url)),
+        ProviderType::OpenAI | ProviderType::Anthropic => {
+            let api_key = config
+                .api_key
+                .as_deref()
+                .map(|k| k.trim())
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| {
+                    GlossError::Other(
+                        "API key not configured for this provider. Add an API key in Settings."
+                            .into(),
+                    )
+                })?;
+            match config.provider_type {
+                ProviderType::OpenAI => Ok(Box::new(openai::OpenAIProvider::new(
+                    &config.base_url,
+                    api_key,
+                ))),
+                ProviderType::Anthropic => Ok(Box::new(anthropic::AnthropicProvider::new(
+                    &config.base_url,
+                    api_key,
+                ))),
+                _ => unreachable!(),
+            }
+        }
+        ProviderType::Ollama => Ok(Box::new(ollama::OllamaProvider::new(&config.base_url))),
+        ProviderType::LlamaCpp => Ok(Box::new(llamacpp::LlamaCppProvider::new(&config.base_url))),
     }
 }
 

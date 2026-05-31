@@ -15,8 +15,14 @@ import {
 } from "lucide-react";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useStudioStore } from "../../stores/studioStore";
+import { useSettingsStore } from "../../stores/settingsStore";
 import { useToastStore } from "../../stores/toastStore";
 import type { StudioOutput } from "../../lib/types";
+import { featureById } from "../../lib/features";
+import ReactMarkdown from "react-markdown";
+import { FlashcardWidget } from "./FlashcardWidget";
+import { QuizWidget } from "./QuizWidget";
+import { MindMapGraph } from "./MindMapGraph";
 
 interface StudioPanelProps {
   notebookId: string;
@@ -147,62 +153,57 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1 overflow-hidden">
-        <div className="w-[38%] min-w-[128px] overflow-y-auto border-r border-border">
-          {outputs.length === 0 ? (
-            <div className="p-3 text-xs text-text-muted">No Studio outputs</div>
-          ) : (
-            outputs.map((output) => (
-              <button
-                key={output.id}
-                type="button"
-                onClick={() => setActiveOutputId(output.id)}
-                className={`block w-full border-b border-border px-2 py-2 text-left ${
-                  activeOutput?.id === output.id ? "bg-bg-tertiary text-text" : "text-text-secondary hover:bg-bg-secondary"
-                }`}
-              >
-                <div className="truncate text-xs font-medium">{output.title ?? output.output_type}</div>
-                <div className="gloss-mono mt-1 truncate text-[10px] text-text-muted">{output.output_type}</div>
-              </button>
-            ))
-          )}
+      {/* Compact output selector — replaces the old sidebar */}
+      {outputs.length > 0 && (
+        <div className="flex gap-1 overflow-x-auto border-b border-border px-2 py-1">
+          {outputs.map((output) => (
+            <button
+              key={output.id}
+              type="button"
+              onClick={() => setActiveOutputId(output.id)}
+              className={`shrink-0 rounded border px-3 py-1 text-xs ${
+                activeOutput?.id === output.id
+                  ? "border-accent bg-accent/10 text-text"
+                  : "border-border bg-bg-tertiary text-text-muted hover:text-text"
+              }`}
+            >
+              {output.title ?? output.output_type}
+            </button>
+          ))}
         </div>
+      )}
 
-        <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          {activeOutput ? (
-            <>
-              <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium text-text">{activeOutput.title ?? activeOutput.output_type}</div>
-                  <div className="gloss-mono truncate text-[10px] text-text-muted">
-                    {activeOutput.config?.receipt_id ?? activeOutput.id}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleExport}
-                  disabled={busy}
-                  title="Export Studio output"
-                  className="rounded border border-border p-1.5 text-text-muted hover:bg-bg-tertiary hover:text-text disabled:opacity-50"
-                >
-                  {status === "exporting" ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
-                </button>
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {activeOutput ? (
+          <>
+            <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-medium text-text">{activeOutput.title ?? activeOutput.output_type}</div>
               </div>
-              <StudioOutputBody output={activeOutput} />
-              <div className="border-t border-border px-3 py-2 text-[11px] text-text-muted">
-                <span className="gloss-mono">sources {activeOutput.source_ids.length}</span>
-                {activeOutput.file_path && <span className="ml-2 truncate">export {activeOutput.file_path}</span>}
-                {lastExportReceipt?.output_id === activeOutput.id && (
-                  <span className="ml-2 gloss-mono">sha {lastExportReceipt.sha256.slice(0, 12)}</span>
-                )}
-              </div>
-            </>
-          ) : (
-            <div className="flex h-full items-center justify-center p-4 text-center text-xs text-text-muted">
-              Select an output type
+              <button
+                type="button"
+                onClick={handleExport}
+                disabled={busy}
+                title="Export Studio output"
+                className="rounded border border-border p-1 text-text-muted hover:bg-bg-tertiary hover:text-text disabled:opacity-50"
+              >
+                {status === "exporting" ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+              </button>
             </div>
-          )}
-        </div>
+            <StudioOutputBody output={activeOutput} />
+            <div className="border-t border-border px-3 py-1.5 text-[10px] text-text-muted">
+              <span className="gloss-mono">sources {activeOutput.source_ids.length}</span>
+              {activeOutput.file_path && <span className="ml-2 truncate">export {activeOutput.file_path}</span>}
+              {lastExportReceipt?.output_id === activeOutput.id && (
+                <span className="ml-2 gloss-mono">sha {lastExportReceipt.sha256.slice(0, 12)}</span>
+              )}
+            </div>
+          </>
+        ) : (
+          <div className="flex h-full items-center justify-center p-4 text-center text-xs text-text-muted">
+            Select an output type
+          </div>
+        )}
       </div>
     </div>
   );
@@ -211,10 +212,55 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
 function StudioOutputBody({ output }: { output: StudioOutput }) {
   const artifact = useMemo(() => parseArtifact(output.raw_content), [output.raw_content]);
   const content = artifact?.content ?? artifact ?? output.raw_content ?? "";
+  const featureFlags = useSettingsStore((s) => s.featureFlags);
+  const prose = output.prose_content;
+
+  const flashcardActive = featureById(featureFlags, "feature_flashcard_widget_enabled")?.active === true;
+  const quizActive = featureById(featureFlags, "feature_quiz_widget_enabled")?.active === true;
+  const mindMapActive = featureById(featureFlags, "feature_mind_map_widget_enabled")?.active === true;
+
+  if (output.output_type === "flashcards" && flashcardActive) {
+    return (
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <FlashcardWidget output={output} />
+      </div>
+    );
+  }
+  if (output.output_type === "quiz" && quizActive) {
+    return (
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <QuizWidget output={output} />
+      </div>
+    );
+  }
+  if (output.output_type === "mind_map" && mindMapActive) {
+    return (
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <MindMapGraph output={output} />
+      </div>
+    );
+  }
+
+  // LLM-refined prose takes priority — full width, no sidebar
+  if (prose) {
+    return (
+      <div className="min-h-0 flex-1 overflow-y-auto p-4 prose prose-sm prose-invert max-w-none w-full">
+        <ReactMarkdown>{prose}</ReactMarkdown>
+        {artifact?.validation != null && (
+          <div className="mt-4 border-t border-border pt-2 text-[11px] text-text-muted">
+            <span className="gloss-mono">refined ✓</span>
+            <span className="ml-2 gloss-mono">schema {String(artifact.validation.schema_validated)}</span>
+            <span className="ml-2 gloss-mono">cited {String(artifact.validation.all_items_source_cited)}</span>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto p-3">
+    <div className="min-h-0 flex-1 overflow-y-auto p-4">
       {renderValue(content)}
-      {artifact?.validation && (
+      {artifact?.validation != null && (
         <div className="mt-3 border-t border-border pt-2 text-[11px] text-text-muted">
           <span className="gloss-mono">schema {String(artifact.validation.schema_validated)}</span>
           <span className="ml-2 gloss-mono">cited {String(artifact.validation.all_items_source_cited)}</span>
@@ -224,19 +270,38 @@ function StudioOutputBody({ output }: { output: StudioOutput }) {
   );
 }
 
-function parseArtifact(raw?: string): any | null {
+interface ArtifactCitation {
+  source_title?: string;
+  source_id?: string;
+  [key: string]: unknown;
+}
+
+interface ArtifactValidation {
+  schema_validated?: boolean;
+  all_items_source_cited?: boolean;
+  [key: string]: unknown;
+}
+
+interface ArtifactContent {
+  content?: unknown;
+  validation?: ArtifactValidation;
+  citations?: ArtifactCitation[];
+  [key: string]: unknown;
+}
+
+function parseArtifact(raw?: string): ArtifactContent | null {
   if (!raw) return null;
   try {
-    return JSON.parse(raw);
+    return JSON.parse(raw) as ArtifactContent;
   } catch {
     return null;
   }
 }
 
-function renderValue(value: any): ReactNode {
+function renderValue(value: unknown): ReactNode {
   if (value == null) return <span className="text-xs text-text-muted">No content</span>;
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return <p className="whitespace-pre-wrap text-xs leading-relaxed text-text-secondary">{String(value)}</p>;
+    return <p className="whitespace-pre-wrap text-sm leading-relaxed text-text-secondary">{String(value)}</p>;
   }
   if (Array.isArray(value)) {
     return (
@@ -249,27 +314,31 @@ function renderValue(value: any): ReactNode {
       </div>
     );
   }
-  return (
-    <div className="space-y-2">
-      {Object.entries(value)
-        .filter(([key]) => key !== "citations")
-        .map(([key, item]) => (
-          <div key={key}>
-            <div className="gloss-mono mb-1 text-[10px] uppercase tracking-[0.03em] text-text-muted">
-              {key.replace(/_/g, " ")}
+  if (typeof value === "object" && value !== null) {
+    const obj = value as Record<string, unknown>;
+    return (
+      <div className="space-y-2">
+        {Object.entries(obj)
+          .filter(([key]) => key !== "citations")
+          .map(([key, item]) => (
+            <div key={key}>
+              <div className="gloss-mono mb-1 text-[10px] uppercase tracking-[0.03em] text-text-muted">
+                {key.replace(/_/g, " ")}
+              </div>
+              {renderValue(item)}
             </div>
-            {renderValue(item)}
-          </div>
-        ))}
-      {Array.isArray(value.citations) && value.citations.length > 0 && (
-        <div className="flex flex-wrap gap-1">
-          {value.citations.map((citation: any, index: number) => (
-            <span key={index} className="rounded border border-border bg-bg-secondary px-1.5 py-0.5 text-[10px] text-text-muted">
-              {citation.source_title ?? citation.source_id}
-            </span>
           ))}
-        </div>
-      )}
-    </div>
-  );
+        {Array.isArray(obj.citations) && obj.citations.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {obj.citations.map((citation: ArtifactCitation, index: number) => (
+              <span key={index} className="rounded border border-border bg-bg-secondary px-1.5 py-0.5 text-[10px] text-text-muted">
+                {citation.source_title ?? citation.source_id}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+  return <span className="text-xs text-text-muted">{String(value)}</span>;
 }

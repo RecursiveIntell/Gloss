@@ -149,6 +149,7 @@ export function NotebookSidebar() {
             onKeyDown={(e) => e.key === "Enter" && handleCreate()}
             placeholder="Notebook name..."
             className="w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-sm text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+            aria-label="New notebook name"
             autoFocus
           />
         </div>

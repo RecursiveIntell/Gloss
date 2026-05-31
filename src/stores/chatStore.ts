@@ -27,6 +27,9 @@ interface ChatStore {
   streamingStatus: ChatStatusPayload | null;
   pendingEvidence: Record<string, ChatEvidencePayload>;
   suggestedQuestions: string[];
+  style: string;
+  customGoal: string;
+  responseLength: string;
   loadConversations: (notebookId: string) => Promise<void>;
   createConversation: (notebookId: string) => Promise<string>;
   deleteConversation: (notebookId: string, conversationId: string) => Promise<void>;
@@ -43,6 +46,9 @@ interface ChatStore {
   resetForNotebookSwitch: () => void;
   loadSuggestedQuestions: (notebookId: string) => Promise<void>;
   clearSuggestedQuestions: () => void;
+  setStyle: (style: string) => void;
+  setCustomGoal: (goal: string) => void;
+  setResponseLength: (length: string) => void;
 }
 
 export const useChatStore = create<ChatStore>((set, get) => ({
@@ -57,6 +63,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   streamingStatus: null,
   pendingEvidence: {},
   suggestedQuestions: [],
+  style: 'default',
+  customGoal: '',
+  responseLength: 'default',
 
   loadConversations: async (notebookId) => {
     try {
@@ -154,13 +163,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }));
 
     try {
+      const { style, customGoal, responseLength } = get();
       const messageId = await api.sendMessage(
         notebookId,
         activeConversationId,
         query,
         sourceScope,
         model,
-        assistantMessageId
+        assistantMessageId,
+        style !== 'default' ? style : undefined,
+        customGoal || undefined,
+        responseLength !== 'default' ? responseLength : undefined,
       );
       if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
         return;
@@ -290,15 +303,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // to ensure we close the correct stream.
     if (!isStreaming) return;
     if (!streamingMessageId || streamingMessageId !== messageId) return;
-    set({
+    set((state) => ({
       streamingError: error,
       isStreaming: false,
       streamingContent: get().streamingContent,
       streamingNotebookId: null,
       streamingMessageId: null,
-      pendingEvidence: {},
+      pendingEvidence: Object.fromEntries(
+        Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
+      ),
       streamingStatus: null,
-    });
+    }));
   },
 
   handleChatCancelled: (_notebookId, _conversationId, messageId, reason) => {
@@ -311,15 +326,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // messageId to ensure we close the correct stream.
     if (!isStreaming) return;
     if (!streamingMessageId || streamingMessageId !== messageId) return;
-    set({
+    set((state) => ({
       streamingError: reason,
       isStreaming: false,
       streamingContent: '',
       streamingNotebookId: null,
       streamingMessageId: null,
-      pendingEvidence: {},
+      pendingEvidence: Object.fromEntries(
+        Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
+      ),
       streamingStatus: null,
-    });
+    }));
   },
 
   setStreamingStatus: (payload) => {
@@ -369,4 +386,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   clearSuggestedQuestions: () => {
     set({ suggestedQuestions: [] });
   },
+
+  setStyle: (style) => set({ style }),
+  setCustomGoal: (goal) => set({ customGoal: goal }),
+  setResponseLength: (length) => set({ responseLength: length }),
 }));

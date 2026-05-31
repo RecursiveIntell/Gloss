@@ -185,6 +185,7 @@ pub(crate) struct PromptReceiptV1 {
     pub capture_state: String,
     pub redaction_state: String,
     pub system_prompt_digest: String,
+    pub system_prompt_text: Option<String>,
     pub user_turn_digest: String,
     pub source_passage_count: usize,
     pub recorded_at: String,

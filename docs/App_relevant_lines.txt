@@ -1,0 +1,180 @@
+     1	import { useEffect, useRef } from "react";
+     2	import { NotebookSidebar } from "./components/notebooks/NotebookSidebar";
+     3	import { PanelLayout } from "./components/layout/PanelLayout";
+     4	import { StatusBar } from "./components/layout/StatusBar";
+     5	import { ToastContainer } from "./components/layout/ToastContainer";
+     6	import { useNotebookStore } from "./stores/notebookStore";
+     7	import { useSettingsStore } from "./stores/settingsStore";
+     8	import { useChatStore } from "./stores/chatStore";
+     9	import { useToastStore } from "./stores/toastStore";
+    10	import { onChatToken, onChatStatus, onChatError, onChatEvidence, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
+    11	import { useSourceStore } from "./stores/sourceStore";
+    12	import { BookOpen, Database, Search, Sparkles } from "lucide-react";
+    13	
+    14	export function App() {
+    15	  const { notebooks, activeNotebookId, loadNotebooks } = useNotebookStore();
+    16	  const { activeModel, models, settings, loadSettings, loadProviders, loadModels } = useSettingsStore();
+    17	  const stats = useSourceStore((s) => s.stats);
+    18	  const activeNotebook = notebooks.find((notebook) => notebook.id === activeNotebookId) ?? null;
+    19	  const activeProvider =
+    20	    settings["default_provider"] ||
+    21	    models.find((model) => model.id === activeModel)?.provider_id ||
+    22	    null;
+    23	
+    24	  // --- Batching/debouncing refs ---
+    25	  const pendingStatusRef = useRef<Map<string, { status: string; errorMessage?: string }>>(new Map());
+    26	  const statusFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    27	  const statsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    28	  const batchReadyCountRef = useRef(0);
+    29	  const batchToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    30	  const batchCreatedDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    31	  const jobCompletedDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    32	
+    33	  useEffect(() => {
+    34	    loadNotebooks().then(() => {
+    35	      // Sync persisted activeNotebookId to backend on startup
+    36	      const nbId = useNotebookStore.getState().activeNotebookId;
+    37	      if (nbId) {
+    38	        const exists = useNotebookStore.getState().notebooks.some(n => n.id === nbId);
+    39	        if (exists) {
+    40	          void useNotebookStore.getState().setActive(nbId);
+    41	        } else {
+    42	          // Stale ID — notebook was deleted
+    43	          useNotebookStore.getState().setActive(null);
+    44	        }
+    45	      }
+    46	    });
+    47	    loadSettings();
+    48	    loadProviders();
+    49	    loadModels();
+    50	  }, []);
+    51	
+    52	  // Listen for chat token events
+    53	  useEffect(() => {
+    54	    const unlisten = onChatToken((payload) => {
+    55	      const chatStore = useChatStore.getState();
+    56	      if (payload.token) {
+    57	        chatStore.appendToken(
+    58	          payload.notebook_id,
+    59	          payload.conversation_id,
+    60	          payload.message_id,
+    61	          payload.token
+    62	        );
+    63	      }
+    64	      if (payload.done) {
+    65	        chatStore.finalizeMessage(
+    66	          payload.notebook_id,
+    67	          payload.conversation_id,
+    68	          payload.message_id
+    69	        );
+    70	      }
+    71	    });
+    72	    return () => { unlisten.then(fn => fn()); };
+    73	  }, []);
+    74	
+    75	  // Listen for chat lifecycle status events
+    76	  useEffect(() => {
+    77	    const unlisten = onChatStatus((payload) => {
+    78	      useChatStore.getState().setStreamingStatus(payload);
+    79	    });
+    80	    return () => { unlisten.then(fn => fn()); };
+    81	  }, []);
+    82	
+    83	  // Listen for chat error events
+    84	  useEffect(() => {
+    85	    const unlisten = onChatError((payload) => {
+    86	      const chatStore = useChatStore.getState();
+    87	      chatStore.setStreamingError(
+    88	        payload.notebook_id,
+    89	        payload.conversation_id,
+    90	        payload.message_id,
+    91	        payload.error
+    92	      );
+    93	      useToastStore.getState().addToast({
+    94	        type: 'error',
+    95	        title: 'Chat Error',
+    96	        message: payload.error,
+    97	        duration: 8000,
+    98	      });
+    99	    });
+   100	    return () => { unlisten.then(fn => fn()); };
+   101	  }, []);
+   102	
+   103	  useEffect(() => {
+   104	    const unlisten = onChatEvidence((payload) => {
+   105	      useChatStore.getState().attachAssistantEvidence(
+   106	        payload.notebook_id,
+   107	        payload.conversation_id,
+   108	        payload.message_id,
+   109	        { citations: payload.citations, evidence: payload.evidence }
+   110	      );
+   111	    });
+   112	    return () => { unlisten.then(fn => fn()); };
+   113	  }, []);
+   114	
+   115	  // Listen for source status events — BATCHED + THROTTLED
+   116	  useEffect(() => {
+   117	    const unlisten = onSourceStatus((payload) => {
+   118	      const currentNotebookId = useNotebookStore.getState().activeNotebookId;
+   119	      if (payload.notebook_id !== currentNotebookId) return;
+   120	
+   121	      // Accumulate into pending map (latest status wins per source)
+   122	      pendingStatusRef.current.set(payload.source_id, {
+   123	        status: payload.status,
+   124	        errorMessage: payload.error_message,
+   125	      });
+   126	
+   127	      // Flush accumulated updates every 75ms
+   128	      if (statusFlushTimerRef.current == null) {
+   129	        statusFlushTimerRef.current = setTimeout(() => {
+   130	          statusFlushTimerRef.current = null;
+   131	          const updates = Array.from(pendingStatusRef.current.entries()).map(
+   132	            ([sourceId, v]) => ({ sourceId, status: v.status, errorMessage: v.errorMessage })
+   133	          );
+   134	          pendingStatusRef.current.clear();
+   135	          if (updates.length > 0) {
+   136	            useSourceStore.getState().updateSourceStatusBulk(updates);
+   137	          }
+   138	        }, 75);
+   139	      }
+   140	
+   141	      // Debounced stats reload (1s after last ready/error)
+   142	      if (payload.status === "ready" || payload.status === "error") {
+   143	        if (statsDebounceRef.current) clearTimeout(statsDebounceRef.current);
+   144	        statsDebounceRef.current = setTimeout(() => {
+   145	          statsDebounceRef.current = null;
+   146	          const nbId = useNotebookStore.getState().activeNotebookId;
+   147	          if (nbId) useSourceStore.getState().loadStats(nbId);
+   148	        }, 1000);
+   149	      }
+   150	
+   151	      // Aggregate "ready" toasts — single toast after 2s of quiet
+   152	      if (payload.status === "ready") {
+   153	        batchReadyCountRef.current++;
+   154	        if (batchToastTimerRef.current) clearTimeout(batchToastTimerRef.current);
+   155	        batchToastTimerRef.current = setTimeout(() => {
+   156	          batchToastTimerRef.current = null;
+   157	          const count = batchReadyCountRef.current;
+   158	          batchReadyCountRef.current = 0;
+   159	          useToastStore.getState().addToast({
+   160	            type: 'success',
+   161	            title: 'Ingestion Complete',
+   162	            message: count === 1 ? 'Source ingestion complete' : `${count} sources ingested`,
+   163	            duration: 3000,
+   164	          });
+   165	        }, 2000);
+   166	      }
+   167	
+   168	      // Individual error toasts are still important (capped by Fix 1)
+   169	      if (payload.status === "error" && payload.error_message) {
+   170	        useToastStore.getState().addToast({
+   171	          type: 'error',
+   172	          title: 'Source Ingestion Failed',
+   173	          message: payload.error_message,
+   174	          duration: 8000,
+   175	        });
+   176	      }
+   177	    });
+   178	
+   179	    return () => {
+   180	      unlisten.then(fn => fn());

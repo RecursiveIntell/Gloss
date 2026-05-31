@@ -20,7 +20,7 @@ use crate::redaction::redact_path;
 use crate::retrieval::source_scope::SourceScope;
 use crate::state::{ActiveCounterGuard, AppState, SUMMARY_MODE_AUTO, SUMMARY_MODE_MANUAL};
 use futures::StreamExt;
-use regex::Regex;
+use regex;
 use reqwest::Url;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
@@ -687,9 +687,25 @@ fn semantic_memory_runtime_config_from_state(
 fn semantic_memory_runtime_config_from_app_db(
     app_db: &crate::db::app_db::AppDb,
 ) -> Result<semantic_memory_adapter::SemanticMemoryRuntimeConfig, GlossError> {
+    let embedding_url = app_db.get_setting("semantic_memory_embedding_url")?;
+    // Mirror provider LAN policy for embedding endpoints.
+    // Embedding URL must be loopback (or LAN with opt-in); public/cloud rejected.
+    let embedding_provider = app_db.get_setting("semantic_memory_embedding_provider")?;
+    if embedding_provider
+        .as_deref()
+        .map(|p| p != "fastembed")
+        .unwrap_or(true)
+    {
+        if let Some(ref url) = embedding_url {
+            if !url.trim().is_empty() {
+                let allow_lan = crate::providers::lan_local_providers_allowed(app_db);
+                let _receipt = crate::providers::validate_embedding_url(url, allow_lan)?;
+            }
+        }
+    }
     let config = semantic_memory_adapter::runtime_config_from_settings(
-        app_db.get_setting("semantic_memory_embedding_provider")?,
-        app_db.get_setting("semantic_memory_embedding_url")?,
+        embedding_provider,
+        embedding_url,
         app_db.get_setting("semantic_memory_embedding_model")?,
         app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
         crate::commands::chat::setting_is_enabled(
@@ -1803,8 +1819,11 @@ fn content_type_is_textual(content_type: &str) -> bool {
         || lowered.contains("application/atom+xml")
 }
 
+static HTML_TITLE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
 fn html_title(raw: &str) -> Option<String> {
-    let re = Regex::new("(?is)<title[^>]*>(.*?)</title>").ok()?;
+    let re = HTML_TITLE_RE
+        .get_or_init(|| regex::Regex::new("(?is)<title[^>]*>(.*?)</title>").expect("static regex"));
     let title = re
         .captures(raw)
         .and_then(|captures| captures.get(1))
@@ -1813,13 +1832,19 @@ fn html_title(raw: &str) -> Option<String> {
     Some(title.chars().take(160).collect())
 }
 
+static SCRIPT_STYLE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static TAGS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static WHITESPACE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
 fn html_to_readable_text(raw: &str) -> String {
-    let script_style = Regex::new(
-        "(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>",
-    )
-    .unwrap();
-    let tags = Regex::new("(?is)<[^>]+>").unwrap();
-    let whitespace = Regex::new(r"\s+").unwrap();
+    let script_style = SCRIPT_STYLE_RE.get_or_init(|| {
+        regex::Regex::new(
+            "(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>",
+        )
+        .expect("static regex")
+    });
+    let tags = TAGS_RE.get_or_init(|| regex::Regex::new("(?is)<[^>]+>").expect("static regex"));
+    let whitespace = WHITESPACE_RE.get_or_init(|| regex::Regex::new(r"\s+").expect("static regex"));
     let without_hidden = script_style.replace_all(raw, " ");
     let without_tags = tags.replace_all(&without_hidden, " ");
     whitespace
@@ -4053,6 +4078,21 @@ fn link_status_for_notebook(
     notebook_id: &str,
 ) -> Result<SemanticMemoryLinkStatus, GlossError> {
     state.with_notebook_db(notebook_id, |db| {
+        // Guard: if the semantic_memory_links table doesn't exist (fresh DB, no SM config),
+        // return a safe empty status instead of crashing on the query.
+        if !db.table_exists("semantic_memory_links")? {
+            return Ok(SemanticMemoryLinkStatus {
+                notebook_id: notebook_id.to_string(),
+                total_links: 0,
+                synced_links: 0,
+                stale_links: 0,
+                failed_links: 0,
+                missing_document_links: 0,
+                degraded_links: 0,
+                reason_codes: vec!["semantic_memory_links_table_missing".to_string()],
+                last_sync_error: None,
+            });
+        }
         let (total, synced, stale, failed, missing_docs, last_error): (
             i64,
             i64,

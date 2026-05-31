@@ -1,7 +1,7 @@
 import { useChatStore } from "../../stores/chatStore";
 import type { DecodingSettingsReceiptV1, PromptReceiptV1, GenerationReceiptV1 } from "../../lib/types";
 import { Copy, CheckCircle, XCircle } from "lucide-react";
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 
 /**
  * Prompt Inspector panel — shows system prompt info, retrieval context,
@@ -54,6 +54,30 @@ export function PromptPanel() {
           <KVRow label="Source passages" value={`${promptReceipt.source_passage_count}`} />
           <KVRow label="Prompt digest" value={promptReceipt.prompt_digest.slice(0, 16)} mono />
           <CopyableLabel label="Prompt receipt ID" value={promptReceipt.receipt_id} />
+        </Section>
+      )}
+
+      {/* System Prompt — the actual text sent to the model */}
+      {promptReceipt?.system_prompt_text && (
+        <Section title="System Prompt">
+          <div className="rounded border border-border bg-bg-tertiary p-2 font-mono text-[11px] text-text-secondary whitespace-pre-wrap leading-relaxed max-h-96 overflow-y-auto">
+            {promptReceipt.system_prompt_text}
+          </div>
+          <div className="flex items-center gap-2 mt-1">
+            <button
+              onClick={() => {
+                navigator.clipboard?.writeText(promptReceipt.system_prompt_text!)
+                  .catch((err: unknown) => console.warn("Failed to copy system prompt:", err));
+              }}
+              className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] text-text-muted hover:bg-bg-tertiary hover:text-text"
+            >
+              <Copy className="w-3 h-3" />
+              Copy full prompt
+            </button>
+            <span className="text-[10px] text-text-muted">
+              ~{promptReceipt.system_prompt_text.length.toLocaleString()} chars
+            </span>
+          </div>
         </Section>
       )}
 
@@ -150,10 +174,17 @@ function KVRow({ label, value, warn, mono }: { label: string; value: string; war
 
 function CopyableLabel({ label, value }: { label: string; value: string }) {
   const [copied, setCopied] = useState(false);
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
   const handleCopy = async () => {
-    await navigator.clipboard.writeText(value);
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch (err) {
+      console.warn("Failed to copy:", err);
+      return;
+    }
     setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    setTimeout(() => { if (mountedRef.current) setCopied(false); }, 1500);
   };
   return (
     <div className="flex items-center gap-1">

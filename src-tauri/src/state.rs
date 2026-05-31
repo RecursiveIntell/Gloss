@@ -192,7 +192,7 @@ impl AppState {
             .get_setting("semantic_memory_auto_project")?
             .is_none()
         {
-            app_db.set_setting("semantic_memory_auto_project", "false")?;
+            app_db.set_setting("semantic_memory_auto_project", "true")?;
         }
         if app_db
             .get_setting("semantic_memory_turbo_quant_require_fresh_artifacts")?
@@ -289,13 +289,15 @@ impl AppState {
         // Notify frontend
         if let Some(handle) = app_handle {
             use tauri::Emitter;
-            let _ = handle.emit(
+            if let Err(e) = handle.emit(
                 "status:embedding_model",
                 serde_json::json!({
                     "state": "downloading",
                     "message": "Loading embedding model (first time may download ~100MB)…"
                 }),
-            );
+            ) {
+                tracing::debug!("failed to emit status:embedding_model: {e}");
+            }
         }
 
         tracing::info!("Initializing embedding model…");
@@ -316,13 +318,15 @@ impl AppState {
 
         if let Some(handle) = app_handle {
             use tauri::Emitter;
-            let _ = handle.emit(
+            if let Err(e) = handle.emit(
                 "status:embedding_model",
                 serde_json::json!({
                     "state": "ready",
                     "message": "Embedding model loaded"
                 }),
-            );
+            ) {
+                tracing::debug!("failed to emit status:embedding_model: {e}");
+            }
         }
 
         tracing::info!("Embedding model ready");

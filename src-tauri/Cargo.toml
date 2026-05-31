@@ -11,10 +11,8 @@ name = "gloss_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-# Release/default builds compile semantic-memory and TurboQuant candidate
-# artifacts. Runtime settings still keep Gloss local as the default unless the
-# user enables the preview profile.
-default = ["semantic-memory-turbo-quant"]
+# semantic-memory is always compiled and is the only backend. No preview toggle.
+default = ["semantic-memory-backend", "semantic-memory-turbo-quant"]
 semantic-memory-backend = ["dep:semantic-memory"]
 semantic-memory-turbo-quant = [
     "semantic-memory-backend",

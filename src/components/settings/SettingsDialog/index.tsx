@@ -213,6 +213,7 @@ function ProviderSection({
           }}
           className="min-w-0 flex-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
           placeholder={urlDefault}
+          aria-label={`${label} server URL`}
         />
         <button
           onClick={handleSave}
@@ -330,10 +331,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       loadModels();
       loadFeatureFlags();
       loadExternalTools();
-      api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => setMemoryStatus(null));
+      api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch((err) => { console.warn("memoryBackendStatus failed:", err); setMemoryStatus(null); });
       if (activeNotebookId) {
-        api.semanticMemoryLinkStatus(activeNotebookId).then(setLinkStatus).catch(() => setLinkStatus(null));
-        api.getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" }).then(setProfileStatus).catch(() => setProfileStatus(null));
+        api.semanticMemoryLinkStatus(activeNotebookId).then(setLinkStatus).catch((err) => { console.warn("linkStatus failed:", err); setLinkStatus(null); });
+        api.getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" }).then(setProfileStatus).catch((err) => { console.warn("profileStatus failed:", err); setProfileStatus(null); });
       } else {
         setLinkStatus(null);
         setProfileStatus(null);
@@ -447,10 +448,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   };
 
   const refreshMemoryEvidence = async () => {
-    await api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => setMemoryStatus(null));
+    await api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch((err) => { console.warn("memoryBackendStatus failed:", err); setMemoryStatus(null); });
     if (activeNotebookId) {
-      await api.semanticMemoryLinkStatus(activeNotebookId).then(setLinkStatus).catch(() => setLinkStatus(null));
-      await api.getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" }).then(setProfileStatus).catch(() => setProfileStatus(null));
+      await api.semanticMemoryLinkStatus(activeNotebookId).then(setLinkStatus).catch((err) => { console.warn("linkStatus failed:", err); setLinkStatus(null); });
+      await api.getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" }).then(setProfileStatus).catch((err) => { console.warn("profileStatus failed:", err); setProfileStatus(null); });
     } else {
       setLinkStatus(null);
       setProfileStatus(null);
@@ -651,6 +652,8 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   };
 
   const handleCopyProviderConfigSummary = async () => {
+    // Redact base URLs — only include classification, not full URLs,
+    // to avoid leaking internal network topology via clipboard.
     const summary = {
       schema: "ProviderConfigSummaryV1",
       active_provider: activeProviderId,
@@ -664,13 +667,17 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
         { id: "llamacpp", base_url_class: providerUrlClass(settings["llamacpp_url"] || "http://localhost:8080/v1") },
       ],
     };
-    await navigator.clipboard.writeText(JSON.stringify(summary, null, 2));
-    useToastStore.getState().addToast({
-      type: "success",
-      title: "Provider config copied",
-      message: `${summary.active_provider}:${summary.active_model}`,
-      duration: 4000,
-    });
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(summary, null, 2));
+      useToastStore.getState().addToast({
+        type: "success",
+        title: "Provider config copied",
+        message: `${summary.active_provider}:${summary.active_model}`,
+        duration: 4000,
+      });
+    } catch (err) {
+      console.warn("Failed to copy provider config summary:", err);
+    }
   };
 
   const handleBackdropClick = (e: React.MouseEvent) => {
@@ -1133,12 +1140,25 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               </button>
             </div>
             <div className="grid gap-2 sm:grid-cols-2">
-              <input
-                value={settings["semantic_memory_embedding_url"] || "http://localhost:11434"}
-                onChange={(e) => updateSetting("semantic_memory_embedding_url", e.target.value)}
-                className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
-                aria-label="Embedding URL"
-              />
+              <div className="relative">
+                <input
+                  value={settings["semantic_memory_embedding_url"] || "http://localhost:11434"}
+                  onChange={(e) => updateSetting("semantic_memory_embedding_url", e.target.value)}
+                  className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none w-full"
+                  aria-label="Embedding URL"
+                />
+                {(() => {
+                  const urlClass = providerUrlClass(settings["semantic_memory_embedding_url"]);
+                  if (urlClass === "lan" || urlClass === "remote" || urlClass === "cloud_https") {
+                    return (
+                      <p className="text-xs text-yellow-400 mt-1">
+                        ⚠ Non-loopback embedding URL ({urlClass}) — ensure provider authority is explicit.
+                      </p>
+                    );
+                  }
+                  return null;
+                })()}
+              </div>
               <input
                 value={settings["semantic_memory_embedding_model"] || "nomic-embed-text"}
                 onChange={(e) => updateSetting("semantic_memory_embedding_model", e.target.value)}

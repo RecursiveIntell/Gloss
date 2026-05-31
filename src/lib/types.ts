@@ -385,6 +385,7 @@ export interface PromptReceiptV1 {
   capture_state: string;
   redaction_state: string;
   system_prompt_digest: string;
+  system_prompt_text?: string | null;
   user_turn_digest: string;
   source_passage_count: number;
   recorded_at: string;
@@ -457,6 +458,7 @@ export interface StudioOutput {
   title?: string;
   prompt_used: string;
   raw_content?: string;
+  prose_content?: string;
   config?: StudioOutputConfig;
   source_ids: string[];
   file_path?: string;

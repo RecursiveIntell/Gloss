@@ -20,8 +20,10 @@ function ToastItem({ toast }: { toast: Toast }) {
 
   return (
     <div
-      className={`flex items-start gap-2 px-3 py-2 rounded-lg border bg-bg-secondary
-                  shadow-lg max-w-sm animate-in slide-in-from-right ${borderMap[toast.type]}`}
+      className={`flex items-start gap-2 px-3 py-2 rounded-lg border bg-bg-secondary\n                  shadow-lg max-w-sm animate-in slide-in-from-right ${borderMap[toast.type]}`}
+      role="alert"
+      aria-live="polite"
+      aria-label={`${toast.type}: ${toast.title}. ${toast.message}`}
     >
       {iconMap[toast.type]}
       <div className="flex-1 min-w-0">

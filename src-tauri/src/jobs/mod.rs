@@ -341,7 +341,9 @@ async fn execute_audio_metadata(
         .map_err(|e| QueueError::Execution(e.to_string()))?;
 
     if ctx.is_cancelled() {
-        let _ = db.update_source_status(source_id, "pending", None);
+        if let Err(e) = db.update_source_status(source_id, "pending", None) {
+            tracing::warn!("failed to update source status to pending: {e}");
+        }
         return Err(QueueError::Cancelled);
     }
 
@@ -379,7 +381,9 @@ async fn execute_audio_metadata(
         } else {
             "ffprobe failed while extracting audio metadata".to_string()
         };
-        let _ = db.update_source_status(source_id, "error", Some(&msg));
+        if let Err(e) = db.update_source_status(source_id, "error", Some(&msg)) {
+            tracing::warn!("failed to update source status to error: {e}");
+        }
         return Err(QueueError::Execution(msg));
     }
 
@@ -1041,7 +1045,9 @@ async fn execute_describe_image(
     tokio::pin!(description_future);
     let (description, vision_call_receipt) = loop {
         if ctx.is_cancelled() {
-            let _ = db.update_source_status(source_id, "pending", None);
+            if let Err(e) = db.update_source_status(source_id, "pending", None) {
+                tracing::warn!("failed to update source status to pending: {e}");
+            }
             return Err(QueueError::Cancelled);
         }
 
@@ -1049,7 +1055,9 @@ async fn execute_describe_image(
             result = &mut description_future => {
                 break result.map_err(|e| {
                     // Reset status on failure
-                    let _ = db.update_source_status(source_id, "error", Some(&e.to_string()));
+                    if let Err(db_err) = db.update_source_status(source_id, "error", Some(&e.to_string())) {
+                        tracing::warn!("failed to update source status to error: {db_err}");
+                    }
                     QueueError::Execution(format!("Vision description failed: {}", e))
                 })?;
             }
@@ -1086,7 +1094,9 @@ async fn execute_describe_image(
     }
 
     if ctx.is_cancelled() {
-        let _ = db.update_source_status(source_id, "pending", None);
+        if let Err(e) = db.update_source_status(source_id, "pending", None) {
+            tracing::warn!("failed to update source status to pending: {e}");
+        }
         return Err(QueueError::Cancelled);
     }
 
@@ -1208,7 +1218,9 @@ async fn execute_describe_video(
     tool_receipts.push(ffmpeg_probe_receipt);
     if !ffmpeg_ok {
         let msg = "ffmpeg not found — install ffmpeg to enable video frame analysis";
-        let _ = db.update_source_status(source_id, "error", Some(msg));
+        if let Err(e) = db.update_source_status(source_id, "error", Some(msg)) {
+            tracing::warn!("failed to update source status to error: {e}");
+        }
         return Err(QueueError::Execution(msg.to_string()));
     }
 
@@ -1216,7 +1228,9 @@ async fn execute_describe_video(
         .map_err(|e| QueueError::Execution(e.to_string()))?;
 
     if ctx.is_cancelled() {
-        let _ = db.update_source_status(source_id, "pending", None);
+        if let Err(e) = db.update_source_status(source_id, "pending", None) {
+            tracing::warn!("failed to update source status to pending: {e}");
+        }
         return Err(QueueError::Cancelled);
     }
 
@@ -1287,21 +1301,27 @@ async fn execute_describe_video(
                 let td = temp_dir.clone();
                 let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
                 let msg = format!("ffmpeg exited with status {code}");
-                let _ = db.update_source_status(source_id, "error", Some(&msg));
+                if let Err(e) = db.update_source_status(source_id, "error", Some(&msg)) {
+                    tracing::warn!("failed to update source status to error: {e}");
+                }
                 return Err(QueueError::Execution(msg));
             }
             (false, None) => {
                 let td = temp_dir.clone();
                 let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
                 let msg = "Failed to run ffmpeg";
-                let _ = db.update_source_status(source_id, "error", Some(msg));
+                if let Err(e) = db.update_source_status(source_id, "error", Some(msg)) {
+                    tracing::warn!("failed to update source status to error: {e}");
+                }
                 return Err(QueueError::Execution(msg.to_string()));
             }
             (true, _) => {
                 let td = temp_dir.clone();
                 let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
                 let msg = "ffmpeg timed out while extracting video frames";
-                let _ = db.update_source_status(source_id, "error", Some(msg));
+                if let Err(e) = db.update_source_status(source_id, "error", Some(msg)) {
+                    tracing::warn!("failed to update source status to error: {e}");
+                }
                 return Err(QueueError::Execution(msg.to_string()));
             }
         }
@@ -1329,7 +1349,9 @@ async fn execute_describe_video(
         let td = temp_dir.clone();
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
         let msg = "ffmpeg extracted 0 frames from video";
-        let _ = db.update_source_status(source_id, "error", Some(msg));
+        if let Err(e) = db.update_source_status(source_id, "error", Some(msg)) {
+            tracing::warn!("failed to update source status to error: {e}");
+        }
         return Err(QueueError::Execution(msg.to_string()));
     }
 
@@ -1350,7 +1372,9 @@ async fn execute_describe_video(
 
     for (i, frame_path) in frame_paths.iter().enumerate() {
         if ctx.is_cancelled() {
-            let _ = db.update_source_status(source_id, "pending", None);
+            if let Err(e) = db.update_source_status(source_id, "pending", None) {
+                tracing::warn!("failed to update source status to pending: {e}");
+            }
             let td = temp_dir.clone();
             let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
             return Err(QueueError::Cancelled);
@@ -1373,7 +1397,9 @@ async fn execute_describe_video(
         tokio::pin!(frame_future);
         let frame_result = loop {
             if ctx.is_cancelled() {
-                let _ = db.update_source_status(source_id, "pending", None);
+                if let Err(e) = db.update_source_status(source_id, "pending", None) {
+                    tracing::warn!("failed to update source status to pending: {e}");
+                }
                 let td = temp_dir.clone();
                 let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
                 return Err(QueueError::Cancelled);
@@ -1432,7 +1458,9 @@ async fn execute_describe_video(
     }
 
     if ctx.is_cancelled() {
-        let _ = db.update_source_status(source_id, "pending", None);
+        if let Err(e) = db.update_source_status(source_id, "pending", None) {
+            tracing::warn!("failed to update source status to pending: {e}");
+        }
         let td = temp_dir.clone();
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
         return Err(QueueError::Cancelled);

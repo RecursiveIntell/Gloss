@@ -315,7 +315,10 @@ export async function sendMessage(
   query: string,
   sourceScope: SourceScope,
   model: string,
-  messageId?: string
+  messageId?: string,
+  style?: string,
+  customGoal?: string,
+  responseLength?: string,
 ): Promise<string> {
   return invoke("send_message", {
     notebookId,
@@ -324,6 +327,9 @@ export async function sendMessage(
     sourceScope,
     model,
     messageId,
+    style,
+    customGoal,
+    responseLength,
   });
 }
 

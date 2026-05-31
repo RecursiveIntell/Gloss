@@ -248,7 +248,12 @@ pub async fn update_provider(
     api_key: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
-    if let Some(provider_type) = ProviderType::from_str(&id) {
+    let provider_type = ProviderType::from_str(&id).ok_or_else(|| {
+        GlossError::Other(format!(
+            "Unrecognized provider type '{id}'; cannot update an unknown provider"
+        ))
+    })?;
+    {
         let allow_lan = {
             let app_db = state
                 .app_db
@@ -297,7 +302,7 @@ pub async fn test_provider(
         providers::provider_config_from_db(&app_db, &state.secret_store, provider_type)?
     };
 
-    let provider = providers::build_provider(&config);
+    let provider = providers::build_provider(&config)?;
     provider.health_check().await
 }
 
@@ -326,7 +331,7 @@ pub async fn test_provider_model(
         providers::provider_config_from_db(&app_db, &state.secret_store, provider_type)?
     };
 
-    let provider = providers::build_provider(&config);
+    let provider = providers::build_provider(&config)?;
 
     let provider_healthy = match provider.health_check().await {
         Ok(ok) => ok,
@@ -432,7 +437,7 @@ pub async fn refresh_models(
     let mut refreshed_models = Vec::new();
     let mut failed_providers = Vec::new();
     for config in &configs {
-        let provider = providers::build_provider(config);
+        let provider = providers::build_provider(config)?;
         match provider.list_models().await {
             Ok(models) => refreshed_models.extend(models),
             Err(e) => {
@@ -639,6 +644,56 @@ pub async fn update_setting(
     value: String,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
+    /// Known setting keys that may be written via update_setting.
+    const KNOWN_SETTINGS: &[&str] = &[
+        "summary_mode",
+        "theme",
+        "default_model",
+        "default_provider",
+        "memory_backend",
+        "memory_backend_fallback",
+        "semantic_memory_auto_project",
+        "semantic_memory_turbo_quant_require_fresh_artifacts",
+        "semantic_memory_strict_testing",
+        "semantic_memory_embedding_provider",
+        "semantic_memory_embedding_url",
+        "semantic_memory_embedding_model",
+        "semantic_memory_embedding_timeout_secs",
+        "semantic_memory_search_timeout_ms",
+        "generation_temperature",
+        "generation_top_p",
+        "generation_top_k",
+        "generation_min_p",
+        "generation_repeat_penalty",
+        // Feature flags
+        "experimental_features_enabled",
+        "feature_semantic_memory_preview_enabled",
+        "feature_semantic_memory_turbo_quant_enabled",
+        "feature_chat_diagnostics_enabled",
+        "feature_provider_smoke_tools_enabled",
+        "feature_advanced_retrieval_controls_enabled",
+        "feature_index_replay_tools_enabled",
+        "feature_package_release_panel_enabled",
+        "feature_vision_jobs_enabled",
+        "feature_video_import_enabled",
+        "feature_background_summaries_enabled",
+        "feature_external_tools_enabled",
+        "feature_local_rag_enabled",
+        "feature_source_scope_enabled",
+        "fastembed_download_consent",
+    ];
+
+    let is_known = KNOWN_SETTINGS.contains(&key.as_str())
+        || key.ends_with("_configured")
+        || key.starts_with("openai_api_key")
+        || key.starts_with("anthropic_api_key");
+
+    if !is_known {
+        return Err(GlossError::Config(format!(
+            "Unrecognized setting key '{key}'"
+        )));
+    }
+
     if matches!(
         key.as_str(),
         "ollama_url" | "openai_base_url" | "anthropic_base_url" | "llamacpp_url"

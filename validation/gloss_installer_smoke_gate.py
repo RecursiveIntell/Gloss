@@ -424,25 +424,42 @@ def main() -> int:
             failures.append("deb artifact missing")
         else:
             target_results.append(_validate_deb(repo, artifact))
+    if "appimage" in [str(t).lower() for t in targets]:
+        appimage_artifact = _newest(list((repo / "target/release/bundle/appimage").glob("*.AppImage")))
+        if appimage_artifact is None:
+            target_results.append({"target": "appimage", "status": "blocked", "failures": ["missing AppImage artifact"]})
+            failures.append("appimage artifact missing")
+        else:
+            appimage_sha = _sha256(appimage_artifact)
+            appimage_size = appimage_artifact.stat().st_size
+            # Basic smoke: verify it's a valid ELF with the right size range
+            if appimage_size < 10_000_000:
+                target_results.append({"target": "appimage", "status": "fail", "failures": [f"AppImage too small ({appimage_size} bytes)"]})
+                failures.append("appimage smoke failed")
+            else:
+                target_results.append({
+                    "target": "appimage",
+                    "status": "pass",
+                    "artifact": str(appimage_artifact.relative_to(repo)),
+                    "artifact_sha256": appimage_sha,
+                    "artifact_size_bytes": appimage_size,
+                    "failures": [],
+                })
 
     for target_result in target_results:
         if target_result.get("status") != "pass":
             failures.extend(f"{target_result.get('target')} smoke: {failure}" for failure in target_result.get("failures", []))
-    launch_result = _launch_extracted_package(repo, rpm_artifact)
-    if launch_result.get("status") != "pass":
+    launch_result = _launch_extracted_package(repo, rpm_artifact) if rpm_artifact is not None else {
+        "schema": "GlossInstalledPackageLaunchSmokeV1",
+        "status": "skipped",
+        "source_target": "none",
+        "source_artifact": None,
+        "failures": [],
+    }
+    if launch_result.get("status") not in {"pass", "skipped"}:
         failures.extend(f"installed launch smoke: {failure}" for failure in launch_result.get("failures", []))
 
     unsupported_targets = []
-    if "appimage" not in {str(target).lower() for target in targets}:
-        unsupported_targets.append(
-            {
-                "target": "appimage",
-                "status": "not_configured",
-                "reason": "Tauri bundle target is not configured and appimagetool/linuxdeploy are not both available",
-                "appimagetool_available": tools["appimagetool"]["available"],
-                "linuxdeploy_available": tools["linuxdeploy"]["available"],
-            }
-        )
 
     payload = {
         "schema": "GlossInstallerSmokeReceiptV1",

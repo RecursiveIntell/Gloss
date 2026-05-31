@@ -100,7 +100,7 @@ export function StatusBar() {
         api
           .getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" })
           .then(setProfileStatus)
-          .catch(() => setProfileStatus(null));
+          .catch((err) => { console.warn("Profile status unavailable:", err); setProfileStatus(null); });
       } else {
         setProfileStatus(null);
       }
@@ -216,6 +216,7 @@ export function StatusBar() {
         onClick={() => setHealthOpen((open) => !open)}
         className="relative flex items-center gap-1.5 hover:text-text"
         title={memoryTooltip}
+        aria-label="Health status"
       >
         {memoryStatus?.degraded ? (
           <AlertTriangle className="w-3 h-3 text-warning" />

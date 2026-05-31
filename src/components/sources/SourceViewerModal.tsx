@@ -47,6 +47,7 @@ export function SourceViewerModal({
       })
       .catch((err) => {
         if (cancelled) return;
+        setContent(null);
         setError(String(err));
       })
       .finally(() => {

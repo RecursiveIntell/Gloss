@@ -27,13 +27,16 @@ pub fn redact_text_paths(text: &str) -> String {
 }
 
 /// Redact API-key-like patterns inside JSON string values.
-/// Catches keys that start with known prefixes (sk-, key-, gl-, ak-) followed by
-/// 20+ alphanumeric characters, or Bearer tokens, even when embedded inside
-/// quoted JSON values.
+/// Catches keys that start with known prefixes (sk-, key-, gl-, ak-, cpat-, cw-)
+/// followed by 20+ alphanumeric characters, Google keys (AIza + 30+ chars),
+/// or Bearer tokens, even when embedded inside quoted JSON values.
 pub fn redact_json_embedded_secrets(text: &str) -> String {
-    let re =
-        regex::Regex::new(r#"(sk-|key-|gl-|ak-)[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9_\-\.]{20,}"#)
-            .unwrap();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(sk-|key-|gl-|ak-|cpat-|cw-)[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,}|Bearer\s+[A-Za-z0-9_\-\.]{20,}"#,
+        ).expect("static redaction regex")
+    });
     re.replace_all(text, "[REDACTED]").to_string()
 }
 

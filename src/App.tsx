@@ -14,7 +14,7 @@ import { BookOpen, Database, Search, Sparkles } from "lucide-react";
 
 export function App() {
   const { notebooks, activeNotebookId, loadNotebooks } = useNotebookStore();
-  const { activeModel, models, settings, loadSettings, loadProviders, loadModels } = useSettingsStore();
+  const { activeModel, models, settings, loadSettings, loadProviders, loadModels, loadFeatureFlags } = useSettingsStore();
   const stats = useSourceStore((s) => s.stats);
   const activeNotebook = notebooks.find((notebook) => notebook.id === activeNotebookId) ?? null;
   const activeProvider =
@@ -48,6 +48,7 @@ export function App() {
     loadSettings();
     loadProviders();
     loadModels();
+    loadFeatureFlags();
   }, []);
 
   // Listen for all Tauri events — consolidated cleanup

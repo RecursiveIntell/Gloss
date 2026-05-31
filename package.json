@@ -30,6 +30,8 @@
     "@tauri-apps/plugin-clipboard-manager": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-fs": "^2",
+    "@types/d3-force": "^3.0.10",
+    "d3-force": "^3.0.0",
     "lucide-react": "^0.564",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

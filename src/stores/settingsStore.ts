@@ -90,7 +90,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   updateSetting: async (key, value) => {
-    await api.updateSetting(key, value);
+    try {
+      await api.updateSetting(key, value);
+    } catch (err) {
+      console.warn("Failed to update setting:", key, err);
+    }
     set((state) => {
       const nextSettings = { ...state.settings };
       if (key === 'openai_api_key' || key === 'anthropic_api_key') {
@@ -122,7 +126,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   testProvider: async (providerId) => {
     try {
       return await api.testProvider(providerId);
-    } catch {
+    } catch (err) {
+      console.warn("testProvider failed:", err);
       return false;
     }
   },
@@ -131,7 +136,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     try {
       const tools = await api.checkExternalTools();
       set({ externalTools: tools });
-    } catch {
+    } catch (err) {
+      console.warn("loadExternalTools failed:", err);
       // Non-critical — default to empty
     }
   },

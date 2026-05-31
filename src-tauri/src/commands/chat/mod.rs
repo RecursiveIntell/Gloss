@@ -364,6 +364,9 @@ pub async fn send_message(
     source_scope: SourceScope,
     model: String,
     message_id: Option<String>,
+    style: Option<String>,
+    custom_goal: Option<String>,
+    response_length: Option<String>,
     state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
     app_handle: tauri::AppHandle,
@@ -487,14 +490,16 @@ pub async fn send_message(
     }
 
     // Load history BEFORE inserting user message to avoid duplicate
-    let (history, custom_goal, style) = state.with_notebook_db(&notebook_id, |db| {
-        let history = db.load_messages(&conversation_id)?;
-        let goal = db.get_config("custom_goal")?;
-        let style = db
-            .get_config("default_style")?
-            .unwrap_or_else(|| "default".to_string());
-        Ok((history, goal, style))
-    })?;
+    // style and custom_goal come from the frontend as command parameters (per-conversation),
+    // not from notebook_config global settings.
+    let effective_style = style
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let effective_custom_goal = custom_goal.filter(|g| !g.trim().is_empty());
+    let effective_response_length = response_length
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let history = state.with_notebook_db(&notebook_id, |db| db.load_messages(&conversation_id))?;
 
     // Store user message
     let user_msg = Message {
@@ -692,7 +697,7 @@ pub async fn send_message(
             (
                 app_db
                     .get_setting("memory_backend")?
-                    .unwrap_or_else(|| "gloss-local".to_string()),
+                    .unwrap_or_else(|| MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string()),
                 setting_is_enabled(app_db.get_setting("memory_backend_fallback")?),
                 semantic_memory_adapter::runtime_config_from_settings(
                     app_db.get_setting("semantic_memory_embedding_provider")?,
@@ -1847,6 +1852,9 @@ pub async fn send_message(
     let handle = app_handle.clone();
     let prompt_scope: ResolvedSourceScope = resolved_scope.clone();
     let evidence_for_message = evidence_base.clone();
+    let spawned_style = effective_style.clone();
+    let spawned_custom_goal = effective_custom_goal.clone();
+    let spawned_response_length = effective_response_length.clone();
     emit_chat_status(
         &app_handle,
         &notebook_id,
@@ -1875,7 +1883,7 @@ pub async fn send_message(
     );
 
     // Construct the provider outside any lock (provider_config was extracted above)
-    let provider = providers::build_provider(&provider_config);
+    let provider = providers::build_provider(&provider_config)?;
     let spawned_attempt_trace = Arc::clone(&attempt_trace);
     let spawned_trace_data_dir = trace_data_dir.clone();
 
@@ -1994,8 +2002,9 @@ pub async fn send_message(
             &query,
             &model,
             &history,
-            custom_goal.as_deref(),
-            &style,
+            spawned_custom_goal.as_deref(),
+            &spawned_style,
+            &spawned_response_length,
             &prompt_scope,
             &source_context,
             model_context_window,
@@ -2125,7 +2134,7 @@ pub async fn send_message(
                     );
                 }
                 // Assistant message persisted successfully — now emit evidence and chat:done.
-                let _ = handle.emit(
+                if let Err(e) = handle.emit(
                     "chat:evidence",
                     serde_json::json!({
                         "notebook_id": nb_id,
@@ -2134,7 +2143,9 @@ pub async fn send_message(
                         "citations": citations_payload.citations,
                         "evidence": citations_payload.evidence,
                     }),
-                );
+                ) {
+                    tracing::debug!("failed to emit chat:evidence: {e}");
+                }
                 terminal.emit_done();
             }
             Err(e) => {
@@ -2273,7 +2284,7 @@ pub async fn debug_chat_provider_smoke(
         },
     );
 
-    let provider = providers::build_provider(&config);
+    let provider = providers::build_provider(&config)?;
     let request = ChatRequest {
         model: model.clone(),
         system_prompt: None,

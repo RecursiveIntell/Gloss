@@ -5,7 +5,7 @@ import type { MemoryBackendStatus, QueueStatus, SemanticMemoryProfileStatus } fr
 import {
   Wifi, WifiOff, RefreshCw,
 } from "lucide-react";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 /**
  * Diagnostics panel — shows provider health, model availability,
@@ -35,15 +35,17 @@ export function DiagnosticsPanel({ notebookId }: { notebookId: string }) {
   const [profileStatus, setProfileStatus] = useState<SemanticMemoryProfileStatus | null>(null);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const pollEpochRef = useRef(0);
 
   const poll = useCallback(() => {
+    const newEpoch = ++pollEpochRef.current;
     if (activeProviderId) {
-      testProvider(activeProviderId).then(setChatConnected).catch(() => setChatConnected(false));
+      testProvider(activeProviderId).then((result) => { if (pollEpochRef.current === newEpoch) setChatConnected(result); }).catch((err) => { console.warn("testProvider failed:", err); if (pollEpochRef.current === newEpoch) setChatConnected(false); });
     }
     if (notebookId) {
-      api.memoryBackendStatus(notebookId).then(setMemoryStatus).catch(() => setMemoryStatus(null));
-      api.getSemanticMemoryProfileStatus(notebookId, { kind: "all" }).then(setProfileStatus).catch(() => setProfileStatus(null));
-      api.getQueueStatus().then(setQueueStatus).catch(() => setQueueStatus(null));
+      api.memoryBackendStatus(notebookId).then((result) => { if (pollEpochRef.current === newEpoch) setMemoryStatus(result); }).catch((err) => { console.warn("memoryBackendStatus failed:", err); if (pollEpochRef.current === newEpoch) setMemoryStatus(null); });
+      api.getSemanticMemoryProfileStatus(notebookId, { kind: "all" }).then((result) => { if (pollEpochRef.current === newEpoch) setProfileStatus(result); }).catch((err) => { console.warn("profileStatus failed:", err); if (pollEpochRef.current === newEpoch) setProfileStatus(null); });
+      api.getQueueStatus().then((result) => { if (pollEpochRef.current === newEpoch) setQueueStatus(result); }).catch((err) => { console.warn("queueStatus failed:", err); if (pollEpochRef.current === newEpoch) setQueueStatus(null); });
       useSourceStore.getState().loadStats(notebookId);
     }
   }, [activeProviderId, notebookId, testProvider]);

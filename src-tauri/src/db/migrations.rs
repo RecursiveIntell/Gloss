@@ -88,9 +88,9 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
              INSERT OR IGNORE INTO settings (key, value) VALUES ('default_model', 'qwen3.5:4b');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('default_embedding_model', 'NomicEmbedTextV15');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('summary_mode', 'manual');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend', 'gloss-local');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend', 'semantic-memory-preview');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend_fallback', 'true');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_auto_project', 'false');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_auto_project', 'true');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_strict_testing', 'false');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_provider', 'fastembed');
@@ -355,6 +355,7 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
     ensure_prompt_generation_receipts(conn)?;
     ensure_provenance_receipts(conn)?;
     ensure_studio_outputs(conn)?;
+    ensure_studio_outputs_prose_column(conn)?;
 
     Ok(())
 }
@@ -756,11 +757,19 @@ fn ensure_studio_outputs(conn: &Connection) -> rusqlite::Result<()> {
             file_path     TEXT,
             status        TEXT DEFAULT 'pending',
             error_message TEXT,
+            prose_content TEXT,
             created_at    TEXT DEFAULT (datetime('now'))
         );
 
         CREATE INDEX IF NOT EXISTS idx_studio_type ON studio_outputs(output_type, created_at DESC);",
     )?;
+    Ok(())
+}
+
+fn ensure_studio_outputs_prose_column(conn: &Connection) -> rusqlite::Result<()> {
+    if !table_has_column(conn, "studio_outputs", "prose_content")? {
+        conn.execute("ALTER TABLE studio_outputs ADD COLUMN prose_content TEXT", [])?;
+    }
     Ok(())
 }
 

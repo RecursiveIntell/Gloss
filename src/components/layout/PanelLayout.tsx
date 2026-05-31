@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { SourcesPanel } from "../sources/SourcesPanel";
 import { ChatPanel } from "../chat/ChatPanel";
@@ -41,7 +41,7 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
   const loadNotes = useNoteStore((s) => s.loadNotes);
   const notes = useNoteStore((s) => s.notes);
   const [leftWidth, setLeftWidth] = useState(() => Number(localStorage.getItem("gloss:layout:leftWidth") || 320));
-  const [rightWidth, setRightWidth] = useState(() => Number(localStorage.getItem("gloss:layout:rightWidth") || 320));
+  const [rightWidth, setRightWidth] = useState(() => Number(localStorage.getItem("gloss:layout:rightWidth") || 560));
   const [leftCollapsed, setLeftCollapsed] = useState(() => localStorage.getItem("gloss:layout:leftCollapsed") !== "0");
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("gloss:layout:rightCollapsed") !== "0");
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("notes");
@@ -70,21 +70,41 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
     localStorage.setItem("gloss:layout:rightCollapsed", rightCollapsed ? "1" : "0");
   }, [rightCollapsed]);
 
+  const dragActiveRef = useRef(false);
+  const dragMoveHandlerRef = useRef<((event: MouseEvent) => void) | null>(null);
+  const dragUpHandlerRef = useRef<(() => void) | null>(null);
+
   const startResize = (side: "left" | "right", startX: number) => {
     const initialWidth = side === "left" ? leftWidth : rightWidth;
     const onMove = (event: MouseEvent) => {
       const delta = side === "left" ? event.clientX - startX : startX - event.clientX;
-      const next = Math.min(460, Math.max(220, initialWidth + delta));
+      const next = Math.min(700, Math.max(320, initialWidth + delta));
       if (side === "left") setLeftWidth(next);
       else setRightWidth(next);
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      dragActiveRef.current = false;
+      dragMoveHandlerRef.current = null;
+      dragUpHandlerRef.current = null;
     };
+    dragActiveRef.current = true;
+    dragMoveHandlerRef.current = onMove;
+    dragUpHandlerRef.current = onUp;
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   };
+
+  useEffect(() => {
+    return () => {
+      if (dragActiveRef.current) {
+        if (dragMoveHandlerRef.current) window.removeEventListener("mousemove", dragMoveHandlerRef.current);
+        if (dragUpHandlerRef.current) window.removeEventListener("mouseup", dragUpHandlerRef.current);
+        dragActiveRef.current = false;
+      }
+    };
+  }, []);
 
   return (
     <div className="flex flex-1 overflow-hidden">
@@ -187,6 +207,7 @@ function InspectorDock({
             key={tab.id}
             type="button"
             title={tab.label}
+            aria-label={`Inspector tab: ${tab.label}`}
             onClick={() => onTabChange(tab.id)}
             className={`flex h-9 flex-1 items-center justify-center gap-1 text-[11px] ${
               activeTab === tab.id ? "bg-bg-tertiary text-text" : "text-text-muted hover:text-text"

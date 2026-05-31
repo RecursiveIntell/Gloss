@@ -65,10 +65,45 @@ pub fn extract_text_with_metadata(
             // Read from file (code files are treated as UTF-8 text)
             let text = if let Some(ref file_path) = source.file_path {
                 let full_path = notebook_dir.join("sources").join(file_path);
-                std::fs::read_to_string(&full_path).map_err(|e| GlossError::Ingestion {
-                    source_id: source.id.clone(),
-                    message: format!("Failed to read file: {}", e),
-                })
+                // Prevent path traversal: canonicalize and verify the path stays
+                // within the notebook sources directory.
+                let sources_dir = notebook_dir.join("sources");
+                match full_path.canonicalize() {
+                    Ok(canonical) => {
+                        let canonical_root = match sources_dir.canonicalize() {
+                            Ok(root) => root,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Cannot canonicalize sources dir {:?}: {} — rejecting path as unsafe",
+                                    sources_dir, e
+                                );
+                                return Err(GlossError::Ingestion {
+                                    source_id: source.id.clone(),
+                                    message: "Cannot verify source path safety (sources dir not canonicalizable)".into(),
+                                });
+                            }
+                        };
+                        if !canonical.starts_with(&canonical_root) {
+                            return Err(GlossError::Ingestion {
+                                source_id: source.id.clone(),
+                                message: "Path traversal detected in source file_path".into(),
+                            });
+                        }
+                        std::fs::read_to_string(&canonical).map_err(|e| GlossError::Ingestion {
+                            source_id: source.id.clone(),
+                            message: format!("Failed to read file: {}", e),
+                        })
+                    }
+                    Err(e) => {
+                        std::fs::read_to_string(&full_path).map_err(|e2| GlossError::Ingestion {
+                            source_id: source.id.clone(),
+                            message: format!(
+                                "Failed to read file (canonicalize: {}, read: {})",
+                                e, e2
+                            ),
+                        })
+                    }
+                }
             } else if let Some(ref content) = source.content_text {
                 Ok(content.clone())
             } else {
@@ -126,7 +161,39 @@ fn extract_document_text(
         .file_path
         .as_ref()
         .ok_or_else(|| extraction_error(source, "document source has no file_path"))?;
-    let full_path = notebook_dir.join("sources").join(file_path);
+    let untrusted_full_path = notebook_dir.join("sources").join(file_path);
+    // Prevent path traversal: canonicalize and verify the path stays
+    // within the notebook sources directory.
+    let sources_dir = notebook_dir.join("sources");
+    let full_path = match untrusted_full_path.canonicalize() {
+        Ok(canonical) => {
+            let canonical_root = match sources_dir.canonicalize() {
+                Ok(root) => root,
+                Err(e) => {
+                    tracing::warn!(
+                        "Cannot canonicalize sources dir {:?}: {} — rejecting path as unsafe",
+                        sources_dir,
+                        e
+                    );
+                    return Err(extraction_error(
+                        source,
+                        "Cannot verify source path safety (sources dir not canonicalizable)",
+                    ));
+                }
+            };
+            if !canonical.starts_with(&canonical_root) {
+                return Err(extraction_error(
+                    source,
+                    "Path traversal detected in source file_path",
+                ));
+            }
+            canonical
+        }
+        Err(e) => {
+            tracing::debug!("Cannot canonicalize source path: {e}; attempting direct read");
+            untrusted_full_path
+        }
+    };
     let format = source_document_format(source).ok_or_else(|| {
         extraction_error(
             source,

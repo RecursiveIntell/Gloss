@@ -1,6 +1,6 @@
 #[cfg(feature = "semantic-memory-backend")]
 use crate::db::notebook_db::NotebookDb;
-use crate::db::notebook_db::{Conversation, Message, Source};
+use crate::db::notebook_db::{Chunk, Conversation, Message, Source};
 use crate::error::GlossError;
 use crate::features;
 use crate::jobs;
@@ -689,33 +689,38 @@ pub async fn send_message(
         semantic_fallback_allowed,
         semantic_memory_runtime_config,
         semantic_memory_search_timeout,
-    ) =
-        {
-            let app_db = state
-                .app_db
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            (
-                app_db
-                    .get_setting("memory_backend")?
-                    .unwrap_or_else(|| MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string()),
-                setting_is_enabled(app_db.get_setting("memory_backend_fallback")?),
-                semantic_memory_adapter::runtime_config_from_settings(
-                    app_db.get_setting("semantic_memory_embedding_provider")?,
-                    app_db.get_setting("semantic_memory_embedding_url")?,
-                    app_db.get_setting("semantic_memory_embedding_model")?,
-                    app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
-                    setting_is_enabled(app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?),
-                    features::turbo_quant_active(&app_db)?,
-                    setting_is_enabled(app_db.get_setting(
+    ) = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        (
+            app_db
+                .get_setting("memory_backend")?
+                .unwrap_or_else(|| MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string()),
+            setting_is_enabled(app_db.get_setting("memory_backend_fallback")?),
+            semantic_memory_adapter::runtime_config_from_settings(
+                app_db.get_setting("semantic_memory_embedding_provider")?,
+                app_db.get_setting("semantic_memory_embedding_url")?,
+                app_db.get_setting("semantic_memory_embedding_model")?,
+                app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+                setting_is_enabled(app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?),
+                features::turbo_quant_active(&app_db)?,
+                setting_is_enabled(
+                    app_db.get_setting(
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
-                    )?),
+                    )?,
                 ),
-                semantic_memory_search_timeout_from_setting(
-                    app_db.get_setting("semantic_memory_search_timeout_ms")?,
+                setting_is_enabled(
+                    app_db
+                        .get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?,
                 ),
-            )
-        };
+            ),
+            semantic_memory_search_timeout_from_setting(
+                app_db.get_setting("semantic_memory_search_timeout_ms")?,
+            ),
+        )
+    };
     #[cfg(not(feature = "semantic-memory-backend"))]
     let (memory_backend, semantic_fallback_allowed) = {
         let app_db = state
@@ -1581,15 +1586,15 @@ pub async fn send_message(
                 .collect()
         } else {
             // raw-content-text-fallback — indexed retrieval produced no proof-grade context;
-            // chat continues without retrieval context; answer must disclose missing support.
+            // fallback to Studio-style grounding using ready-source chunks/content text.
             local_outcome.degraded = true;
             retrieval_fallback_reason.get_or_insert_with(|| {
-                "indexed retrieval produced no proof-grade context; answer must disclose missing support"
+                "indexed retrieval produced no proof-grade context; using source-order fallback"
                     .to_string()
             });
             tracing::info!(
                 reason = %local_outcome.user_visible_summary,
-                "Indexed retrieval unavailable; continuing without proof-grade context"
+                "Indexed retrieval unavailable; falling back to source-order grounding"
             );
             record_chat_attempt_trace(
                 &attempt_trace,
@@ -1603,8 +1608,55 @@ pub async fn send_message(
                     trace.retrieval_outcome = Some(local_outcome.clone());
                 },
             );
-            retrieval_outcome_for_evidence = Some(local_outcome);
-            Vec::new()
+            retrieval_outcome_for_evidence = Some(local_outcome.clone());
+
+            // Build Studio-style snippets from ready sources as grounding fallback.
+            let fallback_chunks_by_source: Vec<(String, Vec<Chunk>)> = state
+                .with_notebook_db(&notebook_id, |db| {
+                    let mut out = Vec::new();
+                    for source in resolved_scope.manifest_sources() {
+                        let chunks = db.get_chunks_for_source(&source.id)?;
+                        out.push((source.id.clone(), chunks));
+                    }
+                    Ok(out)
+                })
+                .unwrap_or_default();
+
+            let manifest_sources = resolved_scope.manifest_sources().to_vec();
+            let effective_ids_list: Vec<String> = resolved_scope.source_ids().to_vec();
+            let requested_scope = if effective_ids_list.is_empty() {
+                None
+            } else {
+                Some(effective_ids_list.as_slice())
+            };
+            let top_k_val = hybrid_search::compute_top_k(resolved_scope.source_count());
+
+            match build_snippets(
+                &manifest_sources,
+                &fallback_chunks_by_source,
+                requested_scope,
+                top_k_val,
+                top_k_val,
+            ) {
+                Ok((_, snippets)) => snippets
+                    .iter()
+                    .enumerate()
+                    .map(|(_i, snippet)| ContextPassage {
+                        source_id: snippet.source_id.clone(),
+                        chunk_id: snippet.chunk_id.clone(),
+                        title: snippet.source_title.clone(),
+                        content: snippet.text.clone(),
+                        evidence_class: "source-order-fallback".to_string(),
+                    })
+                    .collect::<Vec<_>>(),
+                Err(err) => {
+                    tracing::warn!(
+                        "Fallback snippet build failed: {}; returning empty context",
+                        err
+                    );
+                    Vec::new()
+                }
+            }
         }
     };
 

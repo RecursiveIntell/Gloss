@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Gloss P36 Live Smoke Receipt",
+  "type": "object",
+  "required": [
+    "run_id",
+    "recorded_utc",
+    "app_launch",
+    "provider",
+    "chat",
+    "studio",
+    "portability",
+    "evidence",
+    "failures"
+  ],
+  "properties": {}
+}

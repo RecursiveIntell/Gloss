@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 import { SourcesPanel } from "../sources/SourcesPanel";
 import { ChatPanel } from "../chat/ChatPanel";
 import { NotesPanel } from "../notes/NotesPanel";
@@ -27,6 +27,23 @@ import {
 
 type InspectorTab = "notes" | "studio" | "prompt" | "evidence" | "receipt" | "diagnostics" | "sources";
 
+const PANEL_MIN_WIDTH = 320;
+const PANEL_MAX_WIDTH = 700;
+const LEFT_PANEL_FALLBACK_WIDTH = 320;
+const RIGHT_PANEL_FALLBACK_WIDTH = 560;
+
+export function clampPanelWidth(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, parsed));
+}
+
+function readStoredPanelWidth(key: string, fallback: number): number {
+  const next = clampPanelWidth(localStorage.getItem(key), fallback);
+  localStorage.setItem(key, String(next));
+  return next;
+}
+
 interface PanelLayoutProps {
   notebookId: string;
 }
@@ -40,8 +57,8 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
   const loadSuggestedQuestions = useChatStore((s) => s.loadSuggestedQuestions);
   const loadNotes = useNoteStore((s) => s.loadNotes);
   const notes = useNoteStore((s) => s.notes);
-  const [leftWidth, setLeftWidth] = useState(() => Number(localStorage.getItem("gloss:layout:leftWidth") || 320));
-  const [rightWidth, setRightWidth] = useState(() => Number(localStorage.getItem("gloss:layout:rightWidth") || 560));
+  const [leftWidth, setLeftWidth] = useState(() => readStoredPanelWidth("gloss:layout:leftWidth", LEFT_PANEL_FALLBACK_WIDTH));
+  const [rightWidth, setRightWidth] = useState(() => readStoredPanelWidth("gloss:layout:rightWidth", RIGHT_PANEL_FALLBACK_WIDTH));
   const [leftCollapsed, setLeftCollapsed] = useState(() => localStorage.getItem("gloss:layout:leftCollapsed") !== "0");
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("gloss:layout:rightCollapsed") !== "0");
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("notes");
@@ -78,7 +95,7 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
     const initialWidth = side === "left" ? leftWidth : rightWidth;
     const onMove = (event: MouseEvent) => {
       const delta = side === "left" ? event.clientX - startX : startX - event.clientX;
-      const next = Math.min(700, Math.max(320, initialWidth + delta));
+      const next = clampPanelWidth(initialWidth + delta, initialWidth);
       if (side === "left") setLeftWidth(next);
       else setRightWidth(next);
     };
@@ -94,6 +111,20 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
     dragUpHandlerRef.current = onUp;
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
+  };
+
+  const resizeWithKeyboard = (side: "left" | "right", event: KeyboardEvent<HTMLDivElement>) => {
+    const currentWidth = side === "left" ? leftWidth : rightWidth;
+    const setWidth = side === "left" ? setLeftWidth : setRightWidth;
+    const direction = side === "left" ? 1 : -1;
+    let next: number | null = null;
+    if (event.key === "ArrowLeft") next = currentWidth - 24 * direction;
+    if (event.key === "ArrowRight") next = currentWidth + 24 * direction;
+    if (event.key === "Home") next = PANEL_MIN_WIDTH;
+    if (event.key === "End") next = PANEL_MAX_WIDTH;
+    if (next == null) return;
+    event.preventDefault();
+    setWidth(clampPanelWidth(next, currentWidth));
   };
 
   useEffect(() => {
@@ -138,8 +169,15 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
           <SourcesPanel notebookId={notebookId} />
           <div
             role="separator"
-            className="absolute right-0 top-0 h-full w-1 cursor-col-resize hover:bg-accent/40"
+            tabIndex={0}
+            aria-label="Resize sources panel"
+            aria-orientation="vertical"
+            aria-valuemin={PANEL_MIN_WIDTH}
+            aria-valuemax={PANEL_MAX_WIDTH}
+            aria-valuenow={leftWidth}
+            className="absolute right-0 top-0 h-full w-1 cursor-col-resize hover:bg-accent/40 focus:bg-accent/40 focus:outline-none"
             onMouseDown={(event) => startResize("left", event.clientX)}
+            onKeyDown={(event) => resizeWithKeyboard("left", event)}
           />
         </div>
       ) : null}
@@ -161,8 +199,15 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
           />
           <div
             role="separator"
-            className="absolute left-0 top-0 h-full w-1 cursor-col-resize hover:bg-accent/40"
+            tabIndex={0}
+            aria-label="Resize inspector dock"
+            aria-orientation="vertical"
+            aria-valuemin={PANEL_MIN_WIDTH}
+            aria-valuemax={PANEL_MAX_WIDTH}
+            aria-valuenow={rightWidth}
+            className="absolute left-0 top-0 h-full w-1 cursor-col-resize hover:bg-accent/40 focus:bg-accent/40 focus:outline-none"
             onMouseDown={(event) => startResize("right", event.clientX)}
+            onKeyDown={(event) => resizeWithKeyboard("right", event)}
           />
         </div>
       ) : null}

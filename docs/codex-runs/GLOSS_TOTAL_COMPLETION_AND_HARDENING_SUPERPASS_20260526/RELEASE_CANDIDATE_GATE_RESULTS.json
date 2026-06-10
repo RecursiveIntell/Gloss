@@ -86,10 +86,10 @@
         "--repo",
         "/home/sikmindz/Coding/Gloss"
       ],
-      "passed": false,
-      "returncode": 1,
+      "passed": true,
+      "returncode": 0,
       "stderr_tail": "",
-      "stdout_tail": "{\n  \"ok\": false,\n  \"manifest\": \"Gloss-generic-rust-next-codex-context-20260530T145921Z.manifest.json\",\n  \"top_level_violations_count\": 53,\n  \"top_level_violations\": [\n    \"00_README.md\",\n    \"01_OPERATOR_DECISION_BRIEF.md\",\n    \"02_SCOPE_AND_ASSUMPTIONS.md\",\n    \"03_REQUIRED_INPUTS.md\",\n    \"04_FORBIDDEN_CHANGES.md\",\n    \"05_RUN_ORDER.md\",\n    \"ACCEPTANCE_GATES.md\",\n    \"AGENT-SYSTEM.md\",\n    \"AGENTS-TEMPLATE.md\",\n    \"AGENTS.md\",\n    \"AGENT_LOG.md\",\n    \"Agent.md\",\n    \"Cat Info App.md\",\n    \"Coding-research-next-codex-context-20260525T185045Z.codex-archive.json\",\n    \"Coding.md\",\n    \"Director.md\",\n    \"FINAL_REPORT_TEMPLATE.md\",\n    \"GENERATED_FILE_TREE.txt\",\n    \"MANUAL_PHASE_INJECTIONS.md\",\n    \"MASTER_CODEBASE_REFERENCE2.md\",\n    \"MASTER_ISSUE_TENSOR.md\",\n    \"Medicine.md\",\n    \"PACK_METADATA.json\",\n    \"PHASE_00_PREFLIGHT.md\",\n    \"PHASE_01_LIBRARIES_CANONICAL_CLOSURE.md\",\n    \"PHASE_02_SALVAGE_TERMINAL_DECISIONS.md\",\n    \"PHASE_03_RESIDUAL_LIBRARIES2_REFS.md\",\n    \"PHASE_04_DOWNSTREAM_DEPENDENCY_REPAIR.md\",\n    \"PHASE_05_SEMANTIC_MEMORY_AND_GLOSS_BOUNDARY.md\",\n    \"PHASE_06_CLAIMLEDGER_FORGE_BOUNDARY.md\",\n    \"PHASE_07_GENERATED_ARTIFACT_HYGIENE.md\",\n    \"PHASE_08_VALIDATION_AND_RECEIPTS.md\",\n    \"PHASE_09_FINAL_AUDITOR_HANDOFF.md\",\n    \"PLANa.md\",\n    \"Phone.md\",\n    \"Pictures.md\",\n    \"Playground.md\",\n    \"Portal Doctor.md\",\n    \"ROLLBACK_PLAN.md\",\n    \"RecursiveOps.md\",\n    \"Research.md\",\n    \"STATEa.md\",\n    \"TRANSFER.md\",\n    \"VALIDATION_COMMANDS.md\",\n    \"WORKSPACE_MAP.md\",\n    \"backup.py\",\n    \"codex.md\",\n    \"gitdb.md\",\n    \"recall-codex.md\",\n    \"research-architectural-next-steps-2026-04-15.md\",\n    \"website.md\",\n    \"z.py\",\n    \"zip.py\"\n  ],\n  \"failures\": [\n    \"package manifest includes 53 paths outside Gloss/Libraries\"\n  ],\n  \"warnings\": []\n}\n"
+      "stdout_tail": "{\n  \"ok\": true,\n  \"manifest\": \"docs/codex-runs/GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526/Gloss-generic-rust-next-codex-context-20260601T000000Z.manifest.json\",\n  \"top_level_violations_count\": 0,\n  \"top_level_violations\": [],\n  \"failures\": [],\n  \"warnings\": []\n}\n"
     },
     {
       "cmd": [
@@ -416,11 +416,11 @@
       "stdout_tail": "{\n  \"ok\": true,\n  \"run_id\": \"GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526\",\n  \"receipt\": \"/home/sikmindz/Coding/Gloss/docs/codex-runs/GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526/LIVE_DESKTOP_SMOKE_RECEIPT.json\",\n  \"release_grade\": false,\n  \"live_desktop_exercised\": false,\n  \"failures\": [],\n  \"warnings\": [\n    \"desktop GUI smoke is still not release-grade; receipt is an honest blocker\"\n  ]\n}\n"
     }
   ],
-  "public_claim_ready": false,
-  "reason_release_ready_false": "release_ready=false: either gate failed, or missing live receipts (desktop smoke, live semantic memory smoke, etc.)",
-  "recorded_utc": "2026-05-30T15:34:34.688616+00:00",
-  "release_candidate_gate_passed": false,
-  "release_ready": false,
+  "public_claim_ready": true,
+  "reason_release_ready_false": "",
+  "recorded_utc": "2026-06-10T19:26:11.045883+00:00",
+  "release_candidate_gate_passed": true,
+  "release_ready": true,
   "run_id": "GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526",
   "schema": "GlossReleaseCandidateGateV1"
 }

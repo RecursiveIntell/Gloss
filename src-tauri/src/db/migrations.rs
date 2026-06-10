@@ -774,7 +774,10 @@ fn ensure_studio_outputs(conn: &Connection) -> rusqlite::Result<()> {
 
 fn ensure_studio_outputs_prose_column(conn: &Connection) -> rusqlite::Result<()> {
     if !table_has_column(conn, "studio_outputs", "prose_content")? {
-        conn.execute("ALTER TABLE studio_outputs ADD COLUMN prose_content TEXT", [])?;
+        conn.execute(
+            "ALTER TABLE studio_outputs ADD COLUMN prose_content TEXT",
+            [],
+        )?;
     }
     Ok(())
 }

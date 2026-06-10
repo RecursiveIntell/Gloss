@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { useChatStore } from '../chatStore';
+import * as api from '../../lib/tauri';
 
 // Mock the Tauri API layer so we never need a running backend
 vi.mock('../../lib/tauri', () => ({
@@ -130,5 +131,38 @@ describe('chatStore', () => {
     const after = useChatStore.getState();
     expect(after.activeConversationId).toBe('conv-1');
     expect(after.messages).toEqual([]);
+  });
+
+  it('sendMessage reports first-conversation creation failure without throwing', async () => {
+    vi.mocked(api.createConversation).mockRejectedValueOnce(new Error('conversation db unavailable'));
+
+    await expect(
+      useChatStore.getState().sendMessage('nb-1', 'preserve this prompt', { kind: 'none' }, 'model-1')
+    ).resolves.toBeUndefined();
+
+    const after = useChatStore.getState();
+    expect(after.streamingError).toContain('conversation db unavailable');
+    expect(after.isStreaming).toBe(false);
+    expect(after.messages).toEqual([]);
+  });
+
+  it('does not append a completed stream from a previous notebook into the active notebook', () => {
+    const msgId = 'old-stream-msg';
+    useChatStore.setState({
+      isStreaming: true,
+      streamingContent: 'old notebook answer',
+      streamingNotebookId: 'nb-1',
+      streamingMessageId: msgId,
+      activeConversationId: 'conv-1',
+    });
+
+    useChatStore.getState().resetForNotebookSwitch();
+    localStorageMock.setItem('gloss:activeNotebookId', 'nb-2');
+    useChatStore.getState().finalizeMessage('nb-1', 'conv-1', msgId);
+
+    const after = useChatStore.getState();
+    expect(after.isStreaming).toBe(false);
+    expect(after.messages).toEqual([]);
+    expect(after.streamingError).toBeNull();
   });
 });

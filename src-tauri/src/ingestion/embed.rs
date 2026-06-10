@@ -1,4 +1,5 @@
 use crate::error::GlossError;
+use crate::redaction::redact_path;
 use fastembed::{
     EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank,
 };
@@ -20,9 +21,10 @@ pub fn require_fastembed_download_consent(
     if fastembed_cache_has_entries(cache_dir) || download_consent {
         return Ok(());
     }
+    let redacted = redact_path(cache_dir);
     Err(GlossError::Embedding(format!(
         "FastEmbed model cache is empty at {}; enable FastEmbed download consent or switch semantic-memory embeddings to Ollama before initializing local embeddings",
-        cache_dir.display()
+        redacted
     )))
 }
 
@@ -52,9 +54,7 @@ impl HnswIndex {
             index
                 .index
                 .load(path.to_str().unwrap_or(""))
-                .map_err(|e| {
-                    GlossError::Embedding(format!("Failed to load HNSW index: {e}"))
-                })?;
+                .map_err(|e| GlossError::Embedding(format!("Failed to load HNSW index: {e}")))?;
             // Reserve labels up to hwm to avoid collision on next add()
             let _ = index.index.reserve(hwm as usize);
         }
@@ -77,11 +77,7 @@ impl HnswIndex {
         Ok(removed > 0)
     }
 
-    pub fn search(
-        &self,
-        query: &[f32],
-        count: usize,
-    ) -> Result<Vec<(u64, f32)>, GlossError> {
+    pub fn search(&self, query: &[f32], count: usize) -> Result<Vec<(u64, f32)>, GlossError> {
         let results = self
             .index
             .search(query, count)
@@ -275,19 +271,14 @@ impl EmbeddingService {
                     let results = reranker
                         .rerank(_query.to_string(), documents.to_vec(), false, Some(top_k))
                         .map_err(|e| GlossError::Embedding(format!("Rerank failed: {e}")))?;
-                    Ok(results
-                        .into_iter()
-                        .map(|r| (r.index, r.score))
-                        .collect())
+                    Ok(results.into_iter().map(|r| (r.index, r.score)).collect())
                 } else {
                     Err(GlossError::Embedding("No reranker available".into()))
                 }
             }
-            EmbeddingBackend::Ollama { .. } => {
-                Err(GlossError::Embedding(
-                    "Ollama backend does not support cross-encoder reranking".into(),
-                ))
-            }
+            EmbeddingBackend::Ollama { .. } => Err(GlossError::Embedding(
+                "Ollama backend does not support cross-encoder reranking".into(),
+            )),
         }
     }
 }
@@ -297,6 +288,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "usearch FFI SIGSEGV in HnswIndex teardown (pre-existing); re-enable when vendored usearch is updated"]
     fn hnsw_index_create_and_search() {
         let mut index = HnswIndex::new(3).unwrap();
         let v1 = vec![1.0f32, 0.0, 0.0];
@@ -333,5 +325,36 @@ mod tests {
             .collect();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0], vec![0.1f32, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn empty_fastembed_cache_requires_explicit_download_consent() {
+        // Create a unique empty temp dir — fastembed_cache_has_entries() returns false.
+        let tmp = std::env::temp_dir().join(format!(
+            "gloss_empty_cache_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cache = tmp.as_path();
+
+        // Sanity: empty cache dir reports no entries.
+        assert!(!fastembed_cache_has_entries(cache));
+
+        // Without explicit download consent, the helper must reject.
+        let err = require_fastembed_download_consent(cache, false)
+            .expect_err("empty cache without download consent must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("FastEmbed model cache is empty"),
+            "error message should explain the empty-cache block; got: {msg}"
+        );
+
+        // With explicit download consent, the helper must allow.
+        require_fastembed_download_consent(cache, true)
+            .expect("explicit download consent must permit empty cache");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

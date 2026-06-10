@@ -129,40 +129,42 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   sendMessage: async (notebookId, query, sourceScope, model) => {
-    let { activeConversationId } = get();
-    if (!activeConversationId) {
-      activeConversationId = await get().createConversation(notebookId);
-    }
-
-    const assistantMessageId = crypto.randomUUID();
-
-    // Add user message to local state immediately
-    const userMsg: Message = {
-      id: crypto.randomUUID(),
-      conversation_id: activeConversationId,
-      role: 'user',
-      content: query,
-      created_at: new Date().toISOString(),
-    };
-    set((state) => ({
-      messages: [...state.messages, userMsg],
-      isStreaming: true,
-      streamingContent: '',
-      streamingNotebookId: notebookId,
-      streamingMessageId: assistantMessageId,
-      streamingError: null,
-      streamingStatus: {
-        notebook_id: notebookId,
-        conversation_id: activeConversationId,
-        message_id: assistantMessageId,
-        phase: 'queued',
-        message: 'Queued',
-        elapsed_ms: 0,
-        truncated: false,
-      },
-    }));
-
     try {
+      let { activeConversationId } = get();
+      if (!activeConversationId) {
+        activeConversationId = await get().createConversation(notebookId);
+      }
+
+      const assistantMessageId = crypto.randomUUID();
+
+      // Add user message to local state immediately only after a conversation exists.
+      // If first-conversation creation fails, the prompt remains recoverable in the input
+      // owner and the store exposes a real error instead of throwing out of band.
+      const userMsg: Message = {
+        id: crypto.randomUUID(),
+        conversation_id: activeConversationId,
+        role: 'user',
+        content: query,
+        created_at: new Date().toISOString(),
+      };
+      set((state) => ({
+        messages: [...state.messages, userMsg],
+        isStreaming: true,
+        streamingContent: '',
+        streamingNotebookId: notebookId,
+        streamingMessageId: assistantMessageId,
+        streamingError: null,
+        streamingStatus: {
+          notebook_id: notebookId,
+          conversation_id: activeConversationId,
+          message_id: assistantMessageId,
+          phase: 'queued',
+          message: 'Queued',
+          elapsed_ms: 0,
+          truncated: false,
+        },
+      }));
+
       const { style, customGoal, responseLength } = get();
       const messageId = await api.sendMessage(
         notebookId,
@@ -245,16 +247,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }));
   },
 
-  finalizeMessage: (_notebookId, conversationId, messageId) => {
+  finalizeMessage: (notebookId, conversationId, messageId) => {
     const {
       isStreaming,
       streamingMessageId,
+      streamingNotebookId,
     } = get();
-    // Terminal event: MUST be processed regardless of notebookId — the
-    // frontend must always exit streaming state when the backend says we're
-    // done. Match on messageId to ensure we close the correct stream.
+    // Terminal event: MUST be processed even after a notebook switch so the
+    // frontend exits streaming state. But an old notebook's assistant text must
+    // not be appended into the newly active notebook message list.
     if (!isStreaming) return;
     if (!streamingMessageId || streamingMessageId !== messageId) return;
+    const activeNotebookId = localStorage.getItem(ACTIVE_NB_KEY);
+    const shouldAppendToVisibleMessages =
+      streamingNotebookId === notebookId && (!activeNotebookId || activeNotebookId === notebookId);
     const finalContent = get().streamingContent;
     if (!finalContent.trim()) {
       set((state) => ({
@@ -280,7 +286,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       created_at: new Date().toISOString(),
     };
     set((state) => ({
-      messages: [...state.messages, assistantMsg],
+      messages: shouldAppendToVisibleMessages ? [...state.messages, assistantMsg] : state.messages,
       pendingEvidence: Object.fromEntries(
         Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
       ),

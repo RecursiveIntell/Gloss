@@ -204,6 +204,15 @@ impl AppState {
             )?;
         }
         if app_db
+            .get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?
+            .is_none()
+        {
+            app_db.set_setting(
+                features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED,
+                "false",
+            )?;
+        }
+        if app_db
             .get_setting("semantic_memory_embedding_provider")?
             .is_none()
         {
@@ -221,10 +230,7 @@ impl AppState {
         {
             app_db.set_setting("semantic_memory_embedding_model", "bge-m3")?;
         }
-        if app_db
-            .get_setting("chunk_target_tokens")?
-            .is_none()
-        {
+        if app_db.get_setting("chunk_target_tokens")?.is_none() {
             app_db.set_setting("chunk_target_tokens", "1100")?;
         }
         if app_db

@@ -145,7 +145,17 @@ impl JobHandler for GlossJob {
                 source_title,
                 data_dir,
                 chunk_target_tokens,
-            } => execute_audio_metadata(ctx, notebook_id, source_id, source_title, data_dir, *chunk_target_tokens).await,
+            } => {
+                execute_audio_metadata(
+                    ctx,
+                    notebook_id,
+                    source_id,
+                    source_title,
+                    data_dir,
+                    *chunk_target_tokens,
+                )
+                .await
+            }
         }
     }
 
@@ -351,7 +361,9 @@ async fn execute_audio_metadata(
     let file_path = source.file_path.as_deref().ok_or_else(|| {
         QueueError::Execution(format!("Audio source {} has no file_path", source_id))
     })?;
-    let full_path = nb_dir.join("sources").join(file_path);
+    let sources_dir = nb_dir.join("sources");
+    let full_path = crate::redaction::safe_join_under(&sources_dir, file_path)
+        .map_err(QueueError::Execution)?;
 
     db.update_source_status(source_id, "describing", None)
         .map_err(|e| QueueError::Execution(e.to_string()))?;
@@ -421,7 +433,12 @@ async fn execute_audio_metadata(
     db.update_source_metadata(source_id, Some(&metadata_json))
         .map_err(|e| QueueError::Execution(e.to_string()))?;
 
-    let chunks = chunk_text_with_title(&description, source_id, source_title, Some(chunk_target_tokens));
+    let chunks = chunk_text_with_title(
+        &description,
+        source_id,
+        source_title,
+        Some(chunk_target_tokens),
+    );
     for chunk_data in &chunks {
         let chunk = crate::db::notebook_db::Chunk {
             id: chunk_data.id.clone(),
@@ -1026,7 +1043,9 @@ async fn execute_describe_image(
     let file_path = source.file_path.as_deref().ok_or_else(|| {
         QueueError::Execution(format!("Image source {} has no file_path", source_id))
     })?;
-    let full_path = nb_dir.join("sources").join(file_path);
+    let sources_dir = nb_dir.join("sources");
+    let full_path = crate::redaction::safe_join_under(&sources_dir, file_path)
+        .map_err(QueueError::Execution)?;
     let full_path_clone = full_path.clone();
     let image_bytes = tokio::task::spawn_blocking(move || std::fs::read(&full_path_clone))
         .await
@@ -1123,7 +1142,12 @@ async fn execute_describe_image(
         .map_err(|e| QueueError::Execution(e.to_string()))?;
 
     // Create chunks from the description
-    let chunks = chunk_text_with_title(&description, source_id, source_title, Some(chunk_target_tokens));
+    let chunks = chunk_text_with_title(
+        &description,
+        source_id,
+        source_title,
+        Some(chunk_target_tokens),
+    );
     for chunk_data in &chunks {
         let chunk = crate::db::notebook_db::Chunk {
             id: chunk_data.id.clone(),
@@ -1221,7 +1245,9 @@ async fn execute_describe_video(
     let file_path = source.file_path.as_deref().ok_or_else(|| {
         QueueError::Execution(format!("Video source {} has no file_path", source_id))
     })?;
-    let full_path = nb_dir.join("sources").join(file_path);
+    let sources_dir = nb_dir.join("sources");
+    let full_path = crate::redaction::safe_join_under(&sources_dir, file_path)
+        .map_err(QueueError::Execution)?;
 
     let mut tool_receipts: Vec<ToolInvocationReceiptV1> = Vec::new();
     let ffmpeg_probe_receipt = run_tool_status_receipt(
@@ -1506,7 +1532,12 @@ async fn execute_describe_video(
         .map_err(|e| QueueError::Execution(e.to_string()))?;
 
     // Create chunks
-    let chunks = chunk_text_with_title(&description, source_id, source_title, Some(chunk_target_tokens));
+    let chunks = chunk_text_with_title(
+        &description,
+        source_id,
+        source_title,
+        Some(chunk_target_tokens),
+    );
     for chunk_data in &chunks {
         let chunk = crate::db::notebook_db::Chunk {
             id: chunk_data.id.clone(),

@@ -1,5 +1,7 @@
 # Gloss
 
+**Current run:** `GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526`
+
 **Privacy-first local RAG, right on your desktop.**
 
 Gloss is a local-first desktop application for intelligent document research, retrieval-augmented generation (RAG) chat, and AI-assisted knowledge work. Import your sources, chat with them using local or cloud LLMs, and generate structured study materials — all without sending your documents to third parties.

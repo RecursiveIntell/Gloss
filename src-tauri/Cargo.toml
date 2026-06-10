@@ -17,6 +17,7 @@ semantic-memory-backend = ["dep:semantic-memory"]
 semantic-memory-turbo-quant = [
     "semantic-memory-backend",
     "semantic-memory/turbo-quant-codec",
+    "semantic-memory/poly-kv-pool",
 ]
 
 [build-dependencies]
@@ -52,7 +53,7 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "block
 fastembed = "4"
 
 # === Vector search ===
-usearch = "2"
+usearch = "2.25"
 semantic-memory = { path = "../../Libraries/semantic-memory", optional = true }
 
 # === Database ===

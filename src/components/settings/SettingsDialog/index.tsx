@@ -300,6 +300,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     activeModel,
     loading,
     externalTools,
+    providers,
     loadSettings,
     loadProviders,
     loadModels,
@@ -369,7 +370,17 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     anthropic: "Anthropic",
     llamacpp: "llama.cpp",
   };
-  const summaryModels = models.filter((model) => model.provider_id === "ollama");
+  // Summary and vision models may be served by any enabled provider — not
+  // just Ollama. Filter on `provider.enabled` rather than hardcoding a
+  // provider id so OpenAI, Anthropic, and llama.cpp are selectable too.
+  const enabledProviderIds = new Set(
+    providers.filter((p) => p.enabled).map((p) => p.id)
+  );
+  const summaryModels = models.filter(
+    (model) =>
+      model.provider_id !== undefined &&
+      enabledProviderIds.has(model.provider_id)
+  );
   const visionModels = summaryModels.filter(isVisionCapableModel);
   const activeModelRow = models.find((model) => model.id === activeModel);
   const activeProviderId = activeModelRow?.provider_id ?? settings["default_provider"] ?? "ollama";
@@ -1074,6 +1085,24 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 className="accent-accent"
               />
               Require fresh TurboQuant artifact evidence
+            </label>
+            <label className="flex items-center gap-2 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={
+                  (settings["semantic_memory_provekv_pool_candidates_enabled"] || "false") ===
+                  "true"
+                }
+                onChange={(e) =>
+                  updateSetting(
+                    "semantic_memory_provekv_pool_candidates_enabled",
+                    e.target.checked ? "true" : "false"
+                  )
+                }
+                disabled={!turboQuant?.available}
+                className="accent-accent"
+              />
+              Use proveKV pool candidates; exact f32 rerank stays mandatory
             </label>
             <label className="flex items-center gap-2 text-xs text-text-secondary">
               <input

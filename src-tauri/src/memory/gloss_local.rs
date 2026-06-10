@@ -6,6 +6,7 @@ use crate::memory::types::{
     IndexSourceReceipt, IndexSourceRequest, MemoryBackendStatus, MemorySearchCandidate,
     MemorySearchRequest, MemorySearchResponse, MEMORY_BACKEND_GLOSS_LOCAL,
 };
+use crate::retrieval::hybrid_search::{local_intent_rerank_boost, sanitize_fts_query};
 use std::collections::HashMap;
 
 pub struct GlossLocalMemoryBackend<'a> {
@@ -22,33 +23,6 @@ impl<'a> GlossLocalMemoryBackend<'a> {
             all_sources,
         }
     }
-}
-
-fn sanitize_fts_query(query: &str) -> String {
-    query
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .filter_map(|word| {
-            let sanitized = word
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
-                .collect::<String>();
-            if sanitized.is_empty() {
-                None
-            } else {
-                Some(sanitized)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
@@ -129,8 +103,9 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
                                 notebook_id: Some(self.notebook_id.clone()),
                                 source_title: title_map.get(&chunk.source_id).cloned(),
                                 citation_anchor: Some(format!("{}#{}", chunk.source_id, chunk.id)),
-                                content: chunk.content,
-                                score: -rank,
+                                content: chunk.content.clone(),
+                                score: -rank
+                                    + local_intent_rerank_boost(&request.query, &chunk.content),
                                 backend: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
                                 receipt_ref: None,
                                 degradation: Vec::new(),
@@ -177,6 +152,15 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
                 }
             }
         }
+
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.source_id.cmp(&b.source_id))
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
+        candidates.truncate(request.limit);
 
         let receipt_id = request
             .trace_id
@@ -321,6 +305,53 @@ mod tests {
             .candidates
             .iter()
             .all(|candidate| candidate.source_id == "s1"));
+    }
+
+    #[test]
+    fn local_search_prefers_actionable_later_source_over_first_source_noise() {
+        let db = test_db();
+        let sources = vec![
+            source("aaa-first", "First Source"),
+            source("zzz-actionable", "Actionable Source"),
+        ];
+        for source in &sources {
+            db.insert_source(source).unwrap();
+        }
+        for idx in 0..25 {
+            db.insert_chunk(&chunk(
+                &format!("first-{idx}"),
+                "aaa-first",
+                idx,
+                &format!(
+                    "General improve background note {idx}. This is descriptive historical context only."
+                ),
+            ))
+            .unwrap();
+        }
+        db.insert_chunk(&chunk(
+            "later-action",
+            "zzz-actionable",
+            0,
+            "Actionable improvement plan: fix retrieval ranking, implement fair source candidate pooling, and verify with a regression test.",
+        ))
+        .unwrap();
+
+        let backend = GlossLocalMemoryBackend::new("nb".to_string(), &db, &sources);
+        let response = backend
+            .search(MemorySearchRequest {
+                notebook_id: "nb".to_string(),
+                source_scope: SourceScope::All,
+                query: "How should I improve this?".to_string(),
+                limit: 4,
+                trace_id: Some("trace-actionable-local".to_string()),
+                allow_fallback: true,
+            })
+            .unwrap();
+
+        assert_eq!(response.backend_used, MEMORY_BACKEND_GLOSS_LOCAL);
+        assert!(!response.fallback_used);
+        assert_eq!(response.candidates[0].chunk_id, "later-action");
+        assert_eq!(response.candidates[0].source_id, "zzz-actionable");
     }
 
     #[test]

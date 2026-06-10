@@ -575,11 +575,7 @@ fn run_ingestion_inner(
                     for (i, chunk_data) in chunks.iter().enumerate() {
                         if let Some(embedding) = embeddings.get(i) {
                             let label = index.add(embedding)?;
-                            db.update_chunk_embedding(
-                                &chunk_data.id,
-                                label as i64,
-                                "local",
-                            )?;
+                            db.update_chunk_embedding(&chunk_data.id, label as i64, "local")?;
                         }
                     }
                     Ok(())
@@ -720,6 +716,9 @@ fn semantic_memory_runtime_config_from_app_db(
         features::turbo_quant_active(app_db)?,
         crate::commands::chat::setting_is_enabled(
             app_db.get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
+        ),
+        crate::commands::chat::setting_is_enabled(
+            app_db.get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?,
         ),
     );
     semantic_memory_adapter::validate_embedding_model_role(&config)?;
@@ -3414,17 +3413,31 @@ pub async fn delete_source(
     invalidate_suggested_questions(&state, &notebook_id);
 
     if let Some(file_path) = source.file_path.as_deref() {
-        let source_file = notebook_dir.join("sources").join(file_path);
-        if source_file.exists() {
-            if let Err(e) = std::fs::remove_file(&source_file) {
+        let sources_dir = notebook_dir.join("sources");
+        match crate::redaction::safe_join_under(&sources_dir, file_path) {
+            Ok(source_file) if source_file.exists() => {
+                if let Err(e) = std::fs::remove_file(&source_file) {
+                    tracing::warn!(
+                        notebook_id,
+                        source_id,
+                        path = %redact_path(&source_file),
+                        error = %e,
+                        "Failed to remove deleted source file from disk"
+                    );
+                }
+            }
+            // Path is malicious (escapes sources dir) — log and skip.
+            Err(e) => {
                 tracing::warn!(
                     notebook_id,
                     source_id,
-                    path = %redact_path(&source_file),
+                    file_path = %file_path,
                     error = %e,
-                    "Failed to remove deleted source file from disk"
+                    "Skipping unlink: file_path fails sources-dir safety check"
                 );
             }
+            // File not present on disk — nothing to clean up.
+            Ok(_) => {}
         }
     }
 
@@ -3541,17 +3554,31 @@ fn delete_source_ids_for_notebook(
         })?;
 
         if let Some(file_path) = source.file_path.as_deref() {
-            let source_file = notebook_dir.join("sources").join(file_path);
-            if source_file.exists() {
-                if let Err(e) = std::fs::remove_file(&source_file) {
+            let sources_dir = notebook_dir.join("sources");
+            match crate::redaction::safe_join_under(&sources_dir, file_path) {
+                Ok(source_file) if source_file.exists() => {
+                    if let Err(e) = std::fs::remove_file(&source_file) {
+                        tracing::warn!(
+                            notebook_id,
+                            source_id,
+                            path = %redact_path(&source_file),
+                            error = %e,
+                            "Failed to remove deleted source file from disk"
+                        );
+                    }
+                }
+                // Path is malicious (escapes sources dir) — log and skip.
+                Err(e) => {
                     tracing::warn!(
                         notebook_id,
                         source_id,
-                        path = %redact_path(&source_file),
+                        file_path = %file_path,
                         error = %e,
-                        "Failed to remove deleted source file from disk"
+                        "Skipping unlink: file_path fails sources-dir safety check"
                     );
                 }
+                // File not present on disk — nothing to clean up.
+                Ok(_) => {}
             }
         }
     }
@@ -4524,6 +4551,9 @@ pub async fn compare_memory_backends(
             crate::commands::chat::setting_is_enabled(
                 app_db
                     .get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
+            ),
+            crate::commands::chat::setting_is_enabled(
+                app_db.get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?,
             ),
         )
     };

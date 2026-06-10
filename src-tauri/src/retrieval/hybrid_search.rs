@@ -132,7 +132,7 @@ pub fn local_retrieval_outcome(
     }
     let dense_elapsed = dense_started.elapsed().as_millis();
 
-    let fused = rrf_fuse(&dense_chunks, &bm25_chunks, top_k);
+    let fused = rrf_fuse(query, &dense_chunks, &bm25_chunks, top_k);
     let mode = match (!dense_chunks.is_empty(), !bm25_chunks.is_empty()) {
         (true, true) => RetrievalMode::HybridRrf,
         (true, false) => RetrievalMode::DenseOnly,
@@ -215,6 +215,7 @@ fn unavailable_outcome(
 }
 
 fn rrf_fuse(
+    query: &str,
     dense_chunks: &[(Chunk, usize)],
     bm25_chunks: &[(Chunk, usize)],
     top_k: usize,
@@ -235,15 +236,98 @@ fn rrf_fuse(
     }
     let mut results = scores
         .into_values()
-        .map(|(score, chunk)| SearchResult { chunk, score })
+        .map(|(score, chunk)| SearchResult {
+            score: score + local_intent_rerank_boost(query, &chunk.content),
+            chunk,
+        })
         .collect::<Vec<_>>();
     results.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk.source_id.cmp(&b.chunk.source_id))
+            .then_with(|| a.chunk.chunk_index.cmp(&b.chunk.chunk_index))
+            .then_with(|| a.chunk.id.cmp(&b.chunk.id))
     });
     results.truncate(top_k);
     results
+}
+
+pub(crate) fn local_intent_rerank_boost(query: &str, content: &str) -> f64 {
+    let query_terms = normalized_terms(query);
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+    let content_terms = normalized_terms(content);
+    let overlap = query_terms
+        .iter()
+        .filter(|term| content_terms.iter().any(|candidate| candidate == *term))
+        .count() as f64;
+    let overlap_boost = (overlap * 0.002).min(0.012);
+    let action_boost = if is_action_or_improvement_query(&query_terms)
+        && content_terms
+            .iter()
+            .any(|term| is_actionable_content_marker(term))
+    {
+        0.025
+    } else {
+        0.0
+    };
+    overlap_boost + action_boost
+}
+
+fn normalized_terms(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .filter(|word| !word.is_empty() && !is_query_stopword(word))
+        .collect()
+}
+
+fn is_action_or_improvement_query(terms: &[String]) -> bool {
+    terms.iter().any(|term| {
+        matches!(
+            term.as_str(),
+            "action"
+                | "actionable"
+                | "act"
+                | "do"
+                | "fix"
+                | "improve"
+                | "improvement"
+                | "implement"
+                | "next"
+                | "recommend"
+                | "recommendation"
+                | "should"
+                | "todo"
+        )
+    })
+}
+
+fn is_actionable_content_marker(term: &str) -> bool {
+    matches!(
+        term,
+        "action"
+            | "actionable"
+            | "blocker"
+            | "fix"
+            | "implement"
+            | "must"
+            | "next"
+            | "plan"
+            | "priority"
+            | "recommend"
+            | "recommended"
+            | "should"
+            | "step"
+            | "todo"
+            | "verify"
+    )
 }
 
 fn dedupe_reason_codes(reasons: Vec<RetrievalReasonCode>) -> Vec<RetrievalReasonCode> {
@@ -438,11 +522,49 @@ pub fn sanitize_fts_query(query: &str) -> String {
     } else {
         content_terms
     };
-    selected_terms
+    let mut expanded_terms = Vec::new();
+    for term in selected_terms {
+        if !expanded_terms.contains(&term) {
+            expanded_terms.push(term.clone());
+        }
+        for expanded in action_intent_expansions(&term) {
+            let expanded = expanded.to_string();
+            if !expanded_terms.contains(&expanded) {
+                expanded_terms.push(expanded);
+            }
+        }
+    }
+    expanded_terms
         .into_iter()
         .map(|term| format!("\"{}\"", term))
         .collect::<Vec<_>>()
         .join(" OR ")
+}
+
+fn action_intent_expansions(term: &str) -> &'static [&'static str] {
+    match term.to_ascii_lowercase().as_str() {
+        "improve" | "improvement" => &[
+            "action",
+            "actionable",
+            "fix",
+            "implement",
+            "improve",
+            "improvement",
+            "next",
+            "plan",
+            "recommend",
+        ],
+        "should" | "do" | "next" | "recommend" | "recommendation" | "action" | "actionable" => &[
+            "action",
+            "actionable",
+            "fix",
+            "implement",
+            "next",
+            "plan",
+            "recommend",
+        ],
+        _ => &[],
+    }
 }
 
 fn is_query_stopword(term: &str) -> bool {
@@ -568,7 +690,7 @@ mod tests {
     fn rrf_fuses_dense_and_bm25_without_requiring_identical_sets() {
         let dense = vec![(chunk("dense-only", "selected"), 0)];
         let bm25 = vec![(chunk("bm25-only", "selected"), 0)];
-        let fused = rrf_fuse(&dense, &bm25, 10);
+        let fused = rrf_fuse("needle", &dense, &bm25, 10);
         let ids = fused
             .iter()
             .map(|result| result.chunk.id.as_str())
@@ -658,6 +780,47 @@ mod tests {
         assert_eq!(outcome.mode, RetrievalMode::Bm25Only);
         assert_eq!(outcome.results.len(), 1);
         assert!(outcome.results[0].content.contains("ORCHID-913"));
+    }
+
+    #[test]
+    fn actionable_later_source_beats_first_source_noise_for_improvement_query() {
+        let dir = tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let first = source("aaa-first");
+        let later = source("zzz-actionable");
+        db.insert_source(&first).unwrap();
+        db.insert_source(&later).unwrap();
+
+        for idx in 0..25 {
+            let mut record = chunk(&format!("first-{idx}"), "aaa-first");
+            record.chunk_index = idx;
+            record.content = format!(
+                "General improve background note {idx}. This is descriptive historical context only."
+            );
+            db.insert_chunk(&record).unwrap();
+        }
+        let mut actionable = chunk("later-action", "zzz-actionable");
+        actionable.content = "Actionable improvement plan: fix retrieval ranking, implement fair source candidate pooling, and verify with a regression test.".to_string();
+        db.insert_chunk(&actionable).unwrap();
+
+        let scope = SourceScope::All.resolve(&[first, later]);
+        let outcome = local_retrieval_outcome(
+            "How should I improve this?",
+            &db,
+            None,
+            None,
+            false,
+            &scope,
+            4,
+            "trace-actionable-later".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.mode, RetrievalMode::Bm25Only);
+        assert_eq!(outcome.results[0].source_id, "zzz-actionable");
+        assert!(outcome.results[0]
+            .content
+            .contains("Actionable improvement plan"));
     }
 
     #[test]

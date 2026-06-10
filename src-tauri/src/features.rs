@@ -28,6 +28,8 @@ pub const SEMANTIC_MEMORY_AUTO_PROJECT: &str = "semantic_memory_auto_project";
 pub const SEMANTIC_MEMORY_STRICT_TESTING: &str = "semantic_memory_strict_testing";
 pub const SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS: &str =
     "semantic_memory_turbo_quant_require_fresh_artifacts";
+pub const SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED: &str =
+    "semantic_memory_provekv_pool_candidates_enabled";
 pub const FASTEMBED_DOWNLOAD_CONSENT: &str = "fastembed_download_consent";
 // Settings profiles expose use_gloss_local_profile and enable_semantic_memory_profile flows.
 

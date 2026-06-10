@@ -869,6 +869,10 @@ pub async fn set_memory_backend_profile(
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
                         "true",
                     ),
+                    (
+                        features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED,
+                        "false",
+                    ),
                 ])?;
             }
             MemoryProfile::SemanticMemorySafe => {
@@ -889,6 +893,10 @@ pub async fn set_memory_backend_profile(
                     (
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
                         "true",
+                    ),
+                    (
+                        features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED,
+                        "false",
                     ),
                 ])?;
             }
@@ -911,6 +919,10 @@ pub async fn set_memory_backend_profile(
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
                         "true",
                     ),
+                    (
+                        features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED,
+                        "false",
+                    ),
                 ])?;
             }
             MemoryProfile::SemanticMemoryTurboQuantSafe => {
@@ -932,6 +944,10 @@ pub async fn set_memory_backend_profile(
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
                         "true",
                     ),
+                    (
+                        features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED,
+                        "false",
+                    ),
                 ])?;
             }
             MemoryProfile::SemanticMemoryTurboQuantStrict => {
@@ -952,6 +968,10 @@ pub async fn set_memory_backend_profile(
                     (
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
                         "true",
+                    ),
+                    (
+                        features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED,
+                        "false",
                     ),
                 ])?;
             }

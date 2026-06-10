@@ -345,7 +345,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       {/* Messages */}
       <div className="gloss-chat-scroll flex-1 space-y-4 overflow-y-auto px-5 py-4">
         {messages.length === 0 && !isStreaming && (
-          <div className="mx-auto mt-12 max-w-[680px] text-center">
+          <div className="mt-12 w-full text-center">
             <MessageSquare className="mx-auto mb-3 h-10 w-10 text-text-muted" />
             <p className="gloss-serif mb-4 text-xl text-text">
               Ask a question about your sources
@@ -376,7 +376,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           return (
             <div
               key={msg.id}
-              className={`mx-auto flex max-w-[900px] ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+              className={`flex w-full ${msg.role === "user" ? "justify-end" : "justify-start"}`}
             >
               <div
                 className={`max-w-[82%] px-3 py-2 text-sm ${
@@ -486,7 +486,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         })}
 
         {isStreaming && streamingContent && (
-          <div className="mx-auto flex max-w-[900px] justify-start">
+          <div className="flex w-full justify-start">
             <div className="gloss-assistant-bubble max-w-[82%] px-3 py-2 text-sm text-text">
               <div className="prose prose-invert prose-sm max-w-none">
                 <ReactMarkdown>{streamingContent}</ReactMarkdown>
@@ -496,7 +496,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         )}
 
         {!isStreaming && streamingError && streamingContent && (
-          <div className="mx-auto flex max-w-[900px] justify-start">
+          <div className="flex w-full justify-start">
             <div className="gloss-assistant-bubble max-w-[82%] border border-warning/30 px-3 py-2 text-sm text-text">
               <div className="prose prose-invert prose-sm max-w-none">
                 <ReactMarkdown>{streamingContent}</ReactMarkdown>
@@ -506,7 +506,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         )}
 
         {isStreaming && !streamingContent && (
-          <div className="mx-auto flex max-w-[900px] justify-start">
+          <div className="flex w-full justify-start">
             <div className="gloss-assistant-bubble flex items-center gap-2 px-3 py-2 text-sm text-text-secondary">
               <Loader2 className="w-4 h-4 text-text-muted animate-spin" />
               <span>{streamingStatusLabel}</span>
@@ -515,7 +515,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         )}
 
         {isStreaming && streamingContent && streamingStatus && streamingStatus.phase !== "streaming" && (
-          <div className="mx-auto flex max-w-[900px] justify-start">
+          <div className="flex w-full justify-start">
             <div className="rounded border border-border bg-bg-secondary px-2 py-1 text-xs text-text-muted">
               {streamingStatusLabel}
             </div>
@@ -523,7 +523,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         )}
 
         {streamingStatus && streamingStatus.truncated && (
-          <div className="mx-auto flex max-w-[900px] justify-start">
+          <div className="flex w-full justify-start">
             <div className="flex items-start gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-400">
               <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
               <span>Context budgeted: prompt exceeded model window and was truncated to fit.</span>
@@ -532,7 +532,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         )}
 
         {streamingError && (
-          <div className="mx-auto flex max-w-[900px] justify-start">
+          <div className="flex w-full justify-start">
             <div className="flex max-w-[82%] items-start gap-2 rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
               <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
               <span>{streamingError}</span>
@@ -545,7 +545,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
 
       {/* Input */}
       <div className="gloss-input-dock px-5 py-3">
-        <div className="gloss-input-shell mx-auto flex max-w-[900px] items-center gap-2 p-2">
+        <div className="gloss-input-shell flex w-full items-center gap-2 p-2">
           <input
             type="text"
             value={input}

@@ -41,7 +41,12 @@ pub fn chunk_text(text: &str, source_id: &str) -> Vec<ChunkData> {
 
 /// Split text into chunks, using the source title for code-aware splitting.
 /// `target_tokens` overrides the default target chunk size.
-pub fn chunk_text_with_title(text: &str, source_id: &str, source_title: &str, target_tokens: Option<usize>) -> Vec<ChunkData> {
+pub fn chunk_text_with_title(
+    text: &str,
+    source_id: &str,
+    source_title: &str,
+    target_tokens: Option<usize>,
+) -> Vec<ChunkData> {
     if text.is_empty() {
         return Vec::new();
     }

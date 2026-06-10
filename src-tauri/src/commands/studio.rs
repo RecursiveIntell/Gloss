@@ -136,9 +136,7 @@ pub async fn generate_studio_output(
             match result {
                 Ok(prose) => (Some(prose), "source_grounded_refined_v1".to_string()),
                 Err(e) => {
-                    tracing::warn!(
-                        "Studio LLM refinement failed, falling back: {e}"
-                    );
+                    tracing::warn!("Studio LLM refinement failed, falling back: {e}");
                     (None, artifact.prompt_used.clone())
                 }
             }
@@ -320,24 +318,27 @@ async fn refine_studio_artifact(
         let model = app_db
             .get_setting("default_model")?
             .unwrap_or_else(|| "qwen3.5:4b".to_string());
-        let config =
-            crate::providers::provider_config_from_db(&app_db, &state.secret_store, {
-                let selected = app_db
-                    .get_setting("default_provider")?
-                    .and_then(|p| crate::providers::ProviderType::from_str(p.trim()));
-                selected.unwrap_or(crate::providers::ProviderType::Ollama)
-            })?;
+        let config = crate::providers::provider_config_from_db(&app_db, &state.secret_store, {
+            let selected = app_db
+                .get_setting("default_provider")?
+                .and_then(|p| crate::providers::ProviderType::from_str(p.trim()));
+            selected.unwrap_or(crate::providers::ProviderType::Ollama)
+        })?;
         drop(app_db);
         drop(registry);
         (config, model)
     };
 
-    let _llm_permit = state.llm_gate.acquire().await.map_err(|e| {
-        GlossError::Other(format!("Failed to acquire LLM gate: {e}"))
-    })?;
-    let _gpu_permit = state.gpu_gate.acquire().await.map_err(|e| {
-        GlossError::Other(format!("Failed to acquire GPU gate: {e}"))
-    })?;
+    let _llm_permit = state
+        .llm_gate
+        .acquire()
+        .await
+        .map_err(|e| GlossError::Other(format!("Failed to acquire LLM gate: {e}")))?;
+    let _gpu_permit = state
+        .gpu_gate
+        .acquire()
+        .await
+        .map_err(|e| GlossError::Other(format!("Failed to acquire GPU gate: {e}")))?;
 
     let provider = build_provider(&config)?;
     let output_type_label = artifact.output_type.clone();

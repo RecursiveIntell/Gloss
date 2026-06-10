@@ -1156,11 +1156,21 @@ impl NotebookDb {
         if !self.table_exists("semantic_memory_projection_status")? {
             return Ok(SemanticMemoryProjectionSummary {
                 notebook_id: notebook_id.to_string(),
-                total_sources: 0, chunk_bearing_sources: 0, zero_chunk_sources: 0,
-                projected_sources: 0, failed_sources: 0, skipped_no_chunks: 0,
-                stale_sources: 0, partial_sources: 0, projecting_sources: 0,
-                healthy_links: 0, degraded_links: 0, missing_links: 0,
-                total_chunks: 0, projected_chunks: 0, projection_required: false,
+                total_sources: 0,
+                chunk_bearing_sources: 0,
+                zero_chunk_sources: 0,
+                projected_sources: 0,
+                failed_sources: 0,
+                skipped_no_chunks: 0,
+                stale_sources: 0,
+                partial_sources: 0,
+                projecting_sources: 0,
+                healthy_links: 0,
+                degraded_links: 0,
+                missing_links: 0,
+                total_chunks: 0,
+                projected_chunks: 0,
+                projection_required: false,
             });
         }
         let placeholders = (0..scoped_ids.len())
@@ -1354,54 +1364,49 @@ impl NotebookDb {
         }
         let scoped_ids = scope.source_ids();
 
-        let mut sql = String::from(
-            "SELECT c.id, c.source_id, c.chunk_index, c.content, c.token_count,
+        let per_source_limit = limit as i64;
+        let per_source_sql = "SELECT c.id, c.source_id, c.chunk_index, c.content, c.token_count,
                     c.start_offset, c.end_offset, c.metadata, c.embedding_id,
                     c.embedding_model, chunks_fts.rank
              FROM chunks_fts
              JOIN chunks c ON c.rowid = chunks_fts.rowid
-             WHERE chunks_fts MATCH ?1",
-        );
-        let placeholders = (0..scoped_ids.len())
-            .map(|idx| format!("?{}", idx + 3))
-            .collect::<Vec<_>>()
-            .join(", ");
-        sql.push_str(" AND c.source_id IN (");
-        sql.push_str(&placeholders);
-        sql.push(')');
-        sql.push_str(
-            " ORDER BY chunks_fts.rank ASC, c.source_id ASC, c.chunk_index ASC, c.id ASC LIMIT ?2",
-        );
-
-        let limit_i64 = limit as i64;
-        let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&query, &limit_i64];
-        for source_id in scoped_ids {
-            params.push(source_id);
-        }
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-            Ok((
-                Chunk {
-                    id: row.get(0)?,
-                    source_id: row.get(1)?,
-                    chunk_index: row.get(2)?,
-                    content: row.get(3)?,
-                    token_count: row.get(4)?,
-                    start_offset: row.get(5)?,
-                    end_offset: row.get(6)?,
-                    metadata: row.get(7)?,
-                    embedding_id: row.get(8)?,
-                    embedding_model: row.get(9)?,
-                },
-                row.get::<_, f64>(10)?,
-            ))
-        })?;
-
+             WHERE chunks_fts MATCH ?1 AND c.source_id = ?2
+             ORDER BY chunks_fts.rank ASC, c.chunk_index ASC, c.id ASC LIMIT ?3";
+        let mut stmt = self.conn.prepare(per_source_sql)?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
+        for source_id in scoped_ids {
+            let rows = stmt.query_map(
+                rusqlite::params![query, source_id, per_source_limit],
+                |row| {
+                    Ok((
+                        Chunk {
+                            id: row.get(0)?,
+                            source_id: row.get(1)?,
+                            chunk_index: row.get(2)?,
+                            content: row.get(3)?,
+                            token_count: row.get(4)?,
+                            start_offset: row.get(5)?,
+                            end_offset: row.get(6)?,
+                            metadata: row.get(7)?,
+                            embedding_id: row.get(8)?,
+                            embedding_model: row.get(9)?,
+                        },
+                        row.get::<_, f64>(10)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                results.push(row?);
+            }
         }
+        results.sort_by(|(a_chunk, a_score), (b_chunk, b_score)| {
+            a_score
+                .partial_cmp(b_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a_chunk.source_id.cmp(&b_chunk.source_id))
+                .then_with(|| a_chunk.chunk_index.cmp(&b_chunk.chunk_index))
+                .then_with(|| a_chunk.id.cmp(&b_chunk.id))
+        });
         Ok(results)
     }
 

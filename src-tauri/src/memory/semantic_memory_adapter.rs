@@ -160,6 +160,7 @@ pub struct SemanticMemoryRuntimeConfig {
     pub fastembed_download_consent: bool,
     pub turbo_quant_enabled: bool,
     pub turbo_quant_require_fresh_artifacts: bool,
+    pub provekv_pool_enabled: bool,
 }
 
 impl Default for SemanticMemoryRuntimeConfig {
@@ -172,6 +173,7 @@ impl Default for SemanticMemoryRuntimeConfig {
             fastembed_download_consent: false,
             turbo_quant_enabled: false,
             turbo_quant_require_fresh_artifacts: true,
+            provekv_pool_enabled: false,
         }
     }
 }
@@ -184,6 +186,7 @@ pub fn runtime_config_from_settings(
     fastembed_download_consent: bool,
     turbo_quant_enabled: bool,
     turbo_quant_require_fresh_artifacts: bool,
+    provekv_pool_enabled: bool,
 ) -> SemanticMemoryRuntimeConfig {
     let defaults = SemanticMemoryRuntimeConfig::default();
     let provider = EmbeddingProviderKind::from_setting(embedding_provider);
@@ -206,6 +209,7 @@ pub fn runtime_config_from_settings(
         fastembed_download_consent,
         turbo_quant_enabled,
         turbo_quant_require_fresh_artifacts,
+        provekv_pool_enabled,
     }
 }
 
@@ -274,7 +278,11 @@ fn open_store(
     }
     #[cfg(feature = "semantic-memory-turbo-quant")]
     {
-        if runtime_config.is_some_and(|config| config.turbo_quant_enabled) {
+        if runtime_config.is_some_and(|config| config.provekv_pool_enabled) {
+            config.search.derived_vector_backend =
+                semantic_memory::DerivedVectorBackendPolicy::ProveKvPoolCandidateOnly;
+            config.search.turbo_quant_require_exact_rerank = true;
+        } else if runtime_config.is_some_and(|config| config.turbo_quant_enabled) {
             config.search.derived_vector_backend =
                 semantic_memory::DerivedVectorBackendPolicy::TurboQuantCandidateOnly;
             config.search.turbo_quant_require_exact_rerank = true;
@@ -1346,7 +1354,8 @@ mod tests {
 
     #[test]
     fn runtime_config_defaults_turbo_quant_off() {
-        let config = runtime_config_from_settings(None, None, None, None, false, false, true);
+        let config =
+            runtime_config_from_settings(None, None, None, None, false, false, true, false);
         assert_eq!(config.embedding_provider, EmbeddingProviderKind::FastEmbed);
         assert_eq!(
             config.embedding_ollama_url,
@@ -1358,6 +1367,14 @@ mod tests {
             DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS
         );
         assert!(!config.fastembed_download_consent);
+        assert!(!config.turbo_quant_enabled);
+        assert!(!config.provekv_pool_enabled);
+    }
+
+    #[test]
+    fn runtime_config_carries_explicit_provekv_pool_consent() {
+        let config = runtime_config_from_settings(None, None, None, None, false, false, true, true);
+        assert!(config.provekv_pool_enabled);
         assert!(!config.turbo_quant_enabled);
     }
 
@@ -1371,6 +1388,7 @@ mod tests {
             false,
             true,
             true,
+            false,
         );
         assert_eq!(config.embedding_ollama_url, "http://localhost:11435");
         assert_eq!(config.embedding_model, "embed-model");
@@ -1389,6 +1407,7 @@ mod tests {
             true,
             false,
             true,
+            false,
         );
         assert_eq!(config.embedding_provider, EmbeddingProviderKind::FastEmbed);
         assert_eq!(config.embedding_model, FASTEMBED_MODEL_NAME);
@@ -1492,6 +1511,7 @@ mod tests {
             fastembed_download_consent: false,
             turbo_quant_enabled: false,
             turbo_quant_require_fresh_artifacts: true,
+            provekv_pool_enabled: false,
         };
         validate_embedding_model_role(&runtime_config)?;
         let projection_receipt = reindex_source_with_options(

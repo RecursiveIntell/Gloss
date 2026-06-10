@@ -91,7 +91,10 @@ try_tauri_bundler() {
 manual_appimage() {
     local tmp_appdir
     tmp_appdir=$(mktemp -d /tmp/gloss-appdir.XXXXXX)
-    trap 'rm -rf "$tmp_appdir"' EXIT
+    # `trap` references the global $tmp_appdir — promote to a script-level
+    # variable so the EXIT handler can still see it after this function returns.
+    TMP_APPDIR="$tmp_appdir"
+    trap 'rm -rf "${TMP_APPDIR:-}"' EXIT
 
     log "Creating AppDir at $tmp_appdir..."
 

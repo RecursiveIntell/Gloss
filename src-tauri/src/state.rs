@@ -180,6 +180,10 @@ pub struct AppState {
     pub query_embed_cache_model: Mutex<Option<String>>,
     /// Per-notebook HNSW vector indices keyed by notebook ID
     pub hnsw_indices: Mutex<HashMap<String, HnswIndex>>,
+    /// Cached dims per notebook HNSW index, used by ensure_hnsw_index
+    /// to detect dim mismatches when the embedding model changes (C5-FIX).
+    /// We need this because HnswIndex doesn't expose its dims publicly.
+    pub hnsw_index_dims: Mutex<HashMap<String, usize>>,
     /// Whether summary generation is manually paused by the user
     pub summary_paused: AtomicBool,
     /// Number of sources currently being ingested (extract/chunk/embed).
@@ -401,6 +405,7 @@ impl AppState {
             query_embed_cache: Mutex::new(QueryEmbedCache::default()),
             query_embed_cache_model: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
+            hnsw_index_dims: Mutex::new(HashMap::new()),
             summary_paused: AtomicBool::new(summary_starts_paused),
             ingestion_active: Arc::new(AtomicU32::new(0)),
             llm_gate: Semaphore::new(1),
@@ -525,14 +530,45 @@ impl AppState {
     /// second contains_key guard to prevent the race where two threads both
     /// create a usearch Index and one is immediately dropped (corrupts C++ heap).
     pub fn ensure_hnsw_index(&self, notebook_id: &str) -> Result<(), GlossError> {
-        // Quick check — avoids unnecessary work if index already loaded
+        // C5-FIX: determine the expected embedding dim from the active
+        // embedder so that switching the embedding model (e.g. from
+        // all-minilm@384 to bge-large@1024) causes the cached HNSW index
+        // to be dropped and re-created from the new chunks.
+        let embedder_dim: Option<usize> = {
+            let guard = self
+                .embedder
+                .read()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            guard.as_ref().map(|e| e.dims())
+        };
+        // Quick check — avoids unnecessary work if index already loaded.
+        // If the dim is known and the cached index dim differs, drop it.
         {
-            let indices = self
+            let mut indices = self
                 .hnsw_indices
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
+            let mut dims = self
+                .hnsw_index_dims
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
             if indices.contains_key(notebook_id) {
-                return Ok(());
+                if let Some(dim) = embedder_dim {
+                    let cached = dims.get(notebook_id).copied();
+                    if cached != Some(dim) {
+                        tracing::warn!(
+                            notebook_id,
+                            cached_dims = ?cached,
+                            embedder_dims = dim,
+                            "HNSW dim mismatch; dropping cached index"
+                        );
+                        indices.remove(notebook_id);
+                        dims.remove(notebook_id);
+                    }
+                }
+                if indices.contains_key(notebook_id) {
+                    return Ok(());
+                }
             }
         }
         // hnsw_indices released here — safe to gather notebook metadata without
@@ -564,20 +600,29 @@ impl AppState {
         }
 
         let index_path = nb_dir.join("embeddings").join("chunks.usearch");
+        // Use the embedder's dim if known, else default to 384.
+        let dim = embedder_dim.unwrap_or(384);
         let index = if index_path.exists() {
             tracing::debug!(
                 notebook_id,
                 ?max_embedding_id,
+                dim,
                 "Loading existing HNSW index"
             );
-            HnswIndex::load_with_hwm(&index_path, max_embedding_id.unwrap_or(0), 384)?
+            HnswIndex::load_with_hwm(&index_path, max_embedding_id.unwrap_or(0), dim)?
         } else {
             std::fs::create_dir_all(nb_dir.join("embeddings"))?;
-            tracing::debug!(notebook_id, "Creating new HNSW index");
-            HnswIndex::new(384)?
+            tracing::debug!(notebook_id, dim, "Creating new HNSW index");
+            HnswIndex::new(dim)?
         };
 
         indices.insert(notebook_id.to_string(), index);
+        // Track the dim so future ensure_hnsw_index calls can detect mismatches.
+        let mut dims = self
+            .hnsw_index_dims
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        dims.insert(notebook_id.to_string(), dim);
         Ok(())
     }
 

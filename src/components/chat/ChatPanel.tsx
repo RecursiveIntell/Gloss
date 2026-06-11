@@ -155,23 +155,21 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     });
   };
 
-  const selectedSources = sources.filter((source) => selectedSourceIds.has(source.id));
-  const invalidSelectedCount = Array.from(selectedSourceIds).filter(
-    (id) => !sources.some((source) => source.id === id)
-  ).length;
-  const sourceLifecycleStatus = (source: (typeof sources)[number]) =>
-    source.processing_state?.lifecycle_status ?? source.status;
-  const sourceDenseStatus = (source: (typeof sources)[number]) =>
-    source.processing_state?.dense_index_status ?? "missing";
-  const sourceProjectionStatus = (source: (typeof sources)[number]) =>
-    source.processing_state?.semantic_projection_status ?? "disabled";
-  const unreadySelectedCount = selectedSources.filter((source) => sourceLifecycleStatus(source) !== "ready").length;
-  const unindexedSelectedCount = selectedSources.filter((source) =>
-    ["missing", "failed", "stale"].includes(sourceDenseStatus(source))
-  ).length;
-  const projectionProblemCount = selectedSources.filter((source) =>
-    ["failed", "partial", "degraded", "stale", "not_projected"].includes(sourceProjectionStatus(source))
-  ).length;
+  // D10 — memoize the derived counts. These run .filter() over `sources`
+  // on every render; if sources is large, that's a hot path. Keyed on
+  // sources + selectedSourceIds which are the only inputs.
+  const { invalidSelectedCount, unreadySelectedCount, unindexedSelectedCount, projectionProblemCount } = useMemo(() => {
+    const sel = sources.filter((s) => selectedSourceIds.has(s.id));
+    const lifecycle = (s: (typeof sources)[number]) => s.processing_state?.lifecycle_status ?? s.status;
+    const dense = (s: (typeof sources)[number]) => s.processing_state?.dense_index_status ?? "missing";
+    const proj = (s: (typeof sources)[number]) => s.processing_state?.semantic_projection_status ?? "disabled";
+    return {
+      invalidSelectedCount: Array.from(selectedSourceIds).filter((id) => !sources.some((s) => s.id === id)).length,
+      unreadySelectedCount: sel.filter((s) => lifecycle(s) !== "ready").length,
+      unindexedSelectedCount: sel.filter((s) => ["missing", "failed", "stale"].includes(dense(s))).length,
+      projectionProblemCount: sel.filter((s) => ["failed", "partial", "degraded", "stale", "not_projected"].includes(proj(s))).length,
+    };
+  }, [sources, selectedSourceIds]);
   const streamingStatusLabel = streamingStatus
     ? [
         streamingStatus.message,

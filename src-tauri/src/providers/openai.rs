@@ -122,7 +122,15 @@ impl LlmProvider for OpenAIProvider {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            // F3: bound the error body to ~1KB so a hostile / misconfigured
+            // server can't fill the logs with megabytes of HTML or stack
+            // traces. Use bytes (cheap) instead of text (allocates).
+            let text = {
+                match resp.bytes().await {
+                    Ok(b) => String::from_utf8_lossy(&b[..b.len().min(1024)]).to_string(),
+                    Err(_) => String::new(),
+                }
+            };
             return Err(provider_http_error("openai", status, &text));
         }
 

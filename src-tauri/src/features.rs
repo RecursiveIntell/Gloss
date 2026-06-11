@@ -213,8 +213,8 @@ pub fn feature_definitions() -> &'static [FeatureDefinition] {
             label: "Flashcard Widget",
             section: "Studio",
             description: "Interactive card-flip study widget for studio flashcard outputs.",
-            default_enabled: false,
-            stable: false,
+            default_enabled: true,
+            stable: true,
             requires_experimental: false,
             build_feature: None,
         },
@@ -223,8 +223,8 @@ pub fn feature_definitions() -> &'static [FeatureDefinition] {
             label: "Quiz Widget",
             section: "Studio",
             description: "Interactive multiple-choice quiz with scoring and explanations.",
-            default_enabled: false,
-            stable: false,
+            default_enabled: true,
+            stable: true,
             requires_experimental: false,
             build_feature: None,
         },
@@ -233,19 +233,35 @@ pub fn feature_definitions() -> &'static [FeatureDefinition] {
             label: "Mind Map Graph",
             section: "Studio",
             description: "Interactive d3-force mind map visualization for studio graph outputs.",
-            default_enabled: false,
-            stable: false,
+            default_enabled: true,
+            stable: true,
             requires_experimental: false,
             build_feature: None,
         },
     ]
 }
 
+/// Marker for the one-time re-seed of the Studio widget flags: earlier builds
+/// seeded them to false while the widgets could not render real data, so a
+/// stored "false" predating this marker reflects the old default, not a user
+/// choice.
+const STUDIO_WIDGET_FLAGS_RESEEDED: &str = "studio_widget_flags_reseeded_v2";
+
 pub fn ensure_default_feature_settings(app_db: &AppDb) -> Result<(), GlossError> {
     for definition in feature_definitions() {
         if app_db.get_setting(definition.id)?.is_none() {
             app_db.set_setting(definition.id, bool_to_setting(definition.default_enabled))?;
         }
+    }
+    if app_db.get_setting(STUDIO_WIDGET_FLAGS_RESEEDED)?.is_none() {
+        for id in [
+            FEATURE_FLASHCARD_WIDGET_ENABLED,
+            FEATURE_QUIZ_WIDGET_ENABLED,
+            FEATURE_MIND_MAP_WIDGET_ENABLED,
+        ] {
+            app_db.set_setting(id, bool_to_setting(true))?;
+        }
+        app_db.set_setting(STUDIO_WIDGET_FLAGS_RESEEDED, "true")?;
     }
     Ok(())
 }
@@ -321,6 +337,25 @@ pub fn apply_setting_update_side_effects(
 ) -> Result<(), GlossError> {
     if key == EXPERIMENTAL_FEATURES_ENABLED && !setting_value_is_enabled(value) {
         reset_experimental_runtime_settings(app_db)?;
+    }
+    // C4 — When the embedding model identity changes, the cached query
+    // embeddings (in state.query_embed_cache) and the HNSW index (in
+    // state.hnsw_indices) are stale. The query cache is auto-flushed by
+    // AppState::ensure_embedder on next call; the HNSW index is checked by
+    // dimension in ensure_hnsw_index. Here we just log so the user
+    // notices that changing the model triggers a re-index.
+    if key == "semantic_memory_embedding_model" {
+        let prior = app_db
+            .get_setting("semantic_memory_embedding_model")
+            .ok()
+            .flatten();
+        if prior.as_deref() != Some(value) {
+            tracing::warn!(
+                prior = ?prior,
+                new = %value,
+                "embedding model changed; HNSW index will be re-created on next chat"
+            );
+        }
     }
     Ok(())
 }

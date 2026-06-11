@@ -4641,6 +4641,7 @@ mod tests {
             query_embed_cache: Mutex::new(crate::state::QueryEmbedCache::default()),
             query_embed_cache_model: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
+            hnsw_index_dims: Mutex::new(HashMap::new()),
             summary_paused: AtomicBool::new(true),
             ingestion_active: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             llm_gate: tokio::sync::Semaphore::new(1),

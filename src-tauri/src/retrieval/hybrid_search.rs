@@ -17,14 +17,48 @@ pub struct SearchResult {
 }
 
 /// Compute dynamic top-K based on notebook source count.
+///
+/// Sized so that, combined with per-source diversity selection, every scoped
+/// source with a relevant candidate can contribute at least one passage while
+/// staying inside the chat context budget (~32K chars).
 pub fn compute_top_k(source_count: usize) -> usize {
     match source_count {
-        0..=5 => 4,
-        6..=20 => 6,
-        21..=50 => 8,
-        51..=100 => 10,
-        _ => 12,
+        0..=5 => 8,
+        6..=20 => 12,
+        21..=50 => 16,
+        51..=100 => 20,
+        _ => 24,
     }
+}
+
+fn dense_scope_overfetch_limit(top_k: usize, coverage: &RetrievalCoverage) -> usize {
+    let base = (top_k * 5).max(20);
+    let source_scaled = base.saturating_mul(coverage.selected_sources.max(1));
+    coverage
+        .embedded_chunks
+        .min(source_scaled.max(base))
+        .max(base.min(coverage.embedded_chunks.max(1)))
+}
+
+#[cfg(test)]
+fn collect_scoped_dense_chunks_from_ranked_labels(
+    ranked_labels: &[(i64, f32)],
+    nb_db: &NotebookDb,
+    scope: &ResolvedSourceScope,
+    top_k: usize,
+) -> Vec<(Chunk, usize)> {
+    let mut dense_chunks = Vec::new();
+    for (rank, (label, _distance)) in ranked_labels.iter().enumerate() {
+        if let Ok(chunk) = nb_db.get_chunk_by_embedding_id(*label) {
+            if scope_allows_chunk(scope, &chunk) {
+                dense_chunks.push((chunk, rank));
+                if dense_chunks.len() >= top_k {
+                    break;
+                }
+            }
+        }
+    }
+    dense_chunks
 }
 
 fn scope_allows_chunk(scope: &ResolvedSourceScope, chunk: &Chunk) -> bool {
@@ -37,6 +71,36 @@ pub fn local_retrieval_outcome(
     nb_db: &NotebookDb,
     embedder: Option<&EmbeddingService>,
     index: Option<&HnswIndex>,
+    native_indexing_enabled: bool,
+    scope: &ResolvedSourceScope,
+    top_k: usize,
+    trace_ref: String,
+) -> Result<RetrievalOutcome, GlossError> {
+    local_retrieval_outcome_with_query(
+        query,
+        nb_db,
+        embedder,
+        index,
+        None,
+        native_indexing_enabled,
+        scope,
+        top_k,
+        trace_ref,
+    )
+}
+
+/// Variant of `local_retrieval_outcome` that accepts a precomputed query
+/// embedding (e.g. from the LRU cache in `AppState::get_or_embed_query`).
+/// When `query_embedding` is `Some`, the dense path uses it directly and
+/// skips the `embed_one` call. When `None`, the function falls back to
+/// calling `embedder.embed_one(query)` as before.
+#[allow(clippy::too_many_arguments)]
+pub fn local_retrieval_outcome_with_query(
+    query: &str,
+    nb_db: &NotebookDb,
+    embedder: Option<&EmbeddingService>,
+    index: Option<&HnswIndex>,
+    query_embedding: Option<&[f32]>,
     native_indexing_enabled: bool,
     scope: &ResolvedSourceScope,
     top_k: usize,
@@ -114,8 +178,15 @@ pub fn local_retrieval_outcome(
             (Some(embedder), Some(index)) => {
                 dense_attempted = true;
                 dense_available = true;
-                let query_embedding = embedder.embed_one(query)?;
-                let hnsw_results = index.search(&query_embedding, k_per_source)?;
+                // Prefer the precomputed (cached) embedding if provided;
+                // fall back to embed_one if not. This is the B4 win:
+                // repeated identical queries no longer re-hit the embedder.
+                let query_embedding_vec: Vec<f32> = match query_embedding {
+                    Some(v) => v.to_vec(),
+                    None => embedder.embed_one(query)?,
+                };
+                let dense_limit = dense_scope_overfetch_limit(top_k, &coverage);
+                let hnsw_results = index.search(&query_embedding_vec, dense_limit)?;
                 for (rank, (label, _distance)) in hnsw_results.iter().enumerate() {
                     if let Ok(chunk) = nb_db.get_chunk_by_embedding_id(*label as i64) {
                         if scope_allows_chunk(scope, &chunk) {
@@ -132,7 +203,39 @@ pub fn local_retrieval_outcome(
     }
     let dense_elapsed = dense_started.elapsed().as_millis();
 
-    let fused = rrf_fuse(query, &dense_chunks, &bm25_chunks, top_k);
+    // Fuse into an overfetched candidate pool, optionally rerank with the
+    // cross-encoder, then apply per-source diversity so a single verbose
+    // source cannot crowd every other relevant source out of the context.
+    let candidate_pool = top_k.saturating_mul(3);
+    let mut fused = rrf_fuse(query, &dense_chunks, &bm25_chunks, candidate_pool);
+    if let Some(embedder) = embedder {
+        if embedder.has_reranker() && !fused.is_empty() {
+            let documents: Vec<String> = fused
+                .iter()
+                .map(|result| result.chunk.content.clone())
+                .collect();
+            match embedder.rerank(query, &documents, documents.len()) {
+                Ok(reranked) => {
+                    let mut out = Vec::with_capacity(fused.len());
+                    for (orig_idx, score) in reranked {
+                        if let Some(candidate) = fused.get(orig_idx) {
+                            out.push(SearchResult {
+                                chunk: candidate.chunk.clone(),
+                                score: score as f64,
+                            });
+                        }
+                    }
+                    if !out.is_empty() {
+                        fused = out;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("Cross-encoder rerank failed (keeping RRF order): {err}");
+                }
+            }
+        }
+    }
+    let fused = select_with_source_diversity(fused, top_k);
     let mode = match (!dense_chunks.is_empty(), !bm25_chunks.is_empty()) {
         (true, true) => RetrievalMode::HybridRrf,
         (true, false) => RetrievalMode::DenseOnly,
@@ -241,16 +344,43 @@ fn rrf_fuse(
             chunk,
         })
         .collect::<Vec<_>>();
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.chunk.source_id.cmp(&b.chunk.source_id))
-            .then_with(|| a.chunk.chunk_index.cmp(&b.chunk.chunk_index))
-            .then_with(|| a.chunk.id.cmp(&b.chunk.id))
-    });
+    results.sort_by(compare_results_desc);
     results.truncate(top_k);
     results
+}
+
+fn compare_results_desc(a: &SearchResult, b: &SearchResult) -> std::cmp::Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.chunk.source_id.cmp(&b.chunk.source_id))
+        .then_with(|| a.chunk.chunk_index.cmp(&b.chunk.chunk_index))
+        .then_with(|| a.chunk.id.cmp(&b.chunk.id))
+}
+
+/// Select the final top-K from a score-ordered candidate pool while
+/// guaranteeing per-source representation: the best chunk of each distinct
+/// source is admitted first (in score order), remaining slots are filled with
+/// the best leftover candidates, and the final set is re-sorted by score.
+fn select_with_source_diversity(candidates: Vec<SearchResult>, top_k: usize) -> Vec<SearchResult> {
+    if candidates.len() <= top_k {
+        return candidates;
+    }
+    let mut first_per_source = Vec::new();
+    let mut deferred = Vec::new();
+    let mut seen_sources = std::collections::HashSet::new();
+    for candidate in candidates {
+        if seen_sources.insert(candidate.chunk.source_id.clone()) {
+            first_per_source.push(candidate);
+        } else {
+            deferred.push(candidate);
+        }
+    }
+    first_per_source.truncate(top_k);
+    let remaining = top_k - first_per_source.len();
+    first_per_source.extend(deferred.into_iter().take(remaining));
+    first_per_source.sort_by(compare_results_desc);
+    first_per_source
 }
 
 pub(crate) fn local_intent_rerank_boost(query: &str, content: &str) -> f64 {
@@ -821,6 +951,90 @@ mod tests {
         assert!(outcome.results[0]
             .content
             .contains("Actionable improvement plan"));
+    }
+
+    #[test]
+    fn dense_scope_overfetch_scales_by_selected_sources_to_avoid_global_crowding() {
+        let coverage = RetrievalCoverage {
+            selected_sources: 3,
+            total_chunks: 90,
+            fts_indexed_chunks: 0,
+            embedded_chunks: 90,
+            missing_embeddings: 0,
+            semantic_links_total: 0,
+            semantic_links_healthy: 0,
+            semantic_links_degraded: 0,
+            dense_coverage_ratio: 1.0,
+        };
+
+        assert_eq!(dense_scope_overfetch_limit(4, &coverage), 60);
+    }
+
+    #[test]
+    fn scoped_dense_collection_recovers_selected_hit_after_out_of_scope_prefix() {
+        let dir = tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let first = source("aaa-first");
+        let selected = source("selected-answer");
+        db.insert_source(&first).unwrap();
+        db.insert_source(&selected).unwrap();
+
+        let mut ranked = Vec::new();
+        for idx in 0..20 {
+            let mut record = chunk(&format!("first-{idx}"), "aaa-first");
+            record.embedding_id = Some(idx + 1);
+            db.insert_chunk(&record).unwrap();
+            ranked.push((idx + 1, 0.01));
+        }
+        let mut answer = chunk("selected-answer-chunk", "selected-answer");
+        answer.embedding_id = Some(21);
+        answer.content = "Actionable selected dense answer".to_string();
+        db.insert_chunk(&answer).unwrap();
+        ranked.push((21, 0.02));
+
+        let scope =
+            SourceScope::Explicit(vec!["selected-answer".to_string()]).resolve(&[first, selected]);
+        let collected = collect_scoped_dense_chunks_from_ranked_labels(&ranked, &db, &scope, 4);
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].0.source_id, "selected-answer");
+    }
+
+    #[test]
+    fn source_diversity_guarantees_each_source_a_slot_before_filling_by_score() {
+        let mut candidates = Vec::new();
+        // Source A dominates the score-ordered pool with 5 chunks…
+        for idx in 0..5 {
+            candidates.push(SearchResult {
+                chunk: {
+                    let mut record = chunk(&format!("a{idx}"), "source-a");
+                    record.chunk_index = idx;
+                    record
+                },
+                score: 1.0 - idx as f64 * 0.01,
+            });
+        }
+        // …while sources B and C each have one weaker but relevant chunk.
+        candidates.push(SearchResult {
+            chunk: chunk("b0", "source-b"),
+            score: 0.5,
+        });
+        candidates.push(SearchResult {
+            chunk: chunk("c0", "source-c"),
+            score: 0.4,
+        });
+
+        let selected = select_with_source_diversity(candidates, 4);
+        let sources = selected
+            .iter()
+            .map(|result| result.chunk.source_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), 4);
+        assert!(sources.contains(&"source-b"), "{sources:?}");
+        assert!(sources.contains(&"source-c"), "{sources:?}");
+        // Order remains score-descending after diversity selection.
+        assert_eq!(selected[0].chunk.source_id, "source-a");
+        assert!(selected.windows(2).all(|w| w[0].score >= w[1].score));
     }
 
     #[test]

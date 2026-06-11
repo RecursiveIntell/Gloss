@@ -3046,8 +3046,11 @@ pub async fn add_source_folder(
                 }
             }
 
-            // Brief pause between sources to let GPU memory settle
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // (Removed: 50ms "let GPU memory settle" sleep — that was a
+            //  periodic-reset band-aid around in-process FastEmbed. With
+            //  the v3 migration defaulting to Ollama, the embedder is
+            //  out-of-process and there is nothing to settle. Real
+            //  backpressure is provided by the queue / GPU gate.)
         }
         let ingestion_ms = ingestion_started.elapsed().as_millis();
 
@@ -4632,6 +4635,8 @@ mod tests {
             model_registry: Mutex::new(model_registry),
             data_dir,
             embedder: Mutex::new(None),
+            query_embed_cache: Mutex::new(crate::state::QueryEmbedCache::default()),
+            query_embed_cache_model: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
             summary_paused: AtomicBool::new(true),
             ingestion_active: Arc::new(std::sync::atomic::AtomicU32::new(0)),

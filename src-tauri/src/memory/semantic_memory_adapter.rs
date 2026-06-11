@@ -23,15 +23,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const BACKEND_VERSION: &str = "semantic-memory 0.5.0";
-const DEFAULT_EMBEDDING_PROVIDER: EmbeddingProviderKind = EmbeddingProviderKind::FastEmbed;
+// User-forbidden: in-process FastEmbed crashes Gloss on batch imports.
+// Default and migrations now route everything to Ollama (out-of-process).
+// The FastEmbed variant is kept for tests that explicitly construct it
+// under the `fastembed-backend` feature flag, but it is never the default.
+const DEFAULT_EMBEDDING_PROVIDER: EmbeddingProviderKind = EmbeddingProviderKind::Ollama;
 const FASTEMBED_MODEL_NAME: &str = "fastembed:NomicEmbedTextV15";
 const FASTEMBED_DIMENSIONS: usize = 768;
 const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL: &str = "http://localhost:11434";
 const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL: &str = "nomic-embed-text";
 const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS: u64 = 10;
-const SEMANTIC_MEMORY_PROJECTION_MAX_CHUNKS_PER_BATCH: usize = 4;
-const SEMANTIC_MEMORY_PROJECTION_MAX_CHARS_PER_BATCH: usize = 8_000;
-const SEMANTIC_MEMORY_PROJECTION_MAX_TOKENS_PER_BATCH: usize = 2_000;
+// Projection batch cap. all-minilm (and similar 384-dim embedders) handle
+// 32 chunks/batch comfortably. The previous cap of 4 was 8x too conservative
+// and made a 5000-chunk import take 4+ minutes of pure network roundtrips
+// (1250 sequential POSTs). The 32-chunk cap brings that down to ~160 POSTs.
+const SEMANTIC_MEMORY_PROJECTION_MAX_CHUNKS_PER_BATCH: usize = 32;
+const SEMANTIC_MEMORY_PROJECTION_MAX_CHARS_PER_BATCH: usize = 32_000;
+const SEMANTIC_MEMORY_PROJECTION_MAX_TOKENS_PER_BATCH: usize = 8_000;
 const SEMANTIC_MEMORY_PROJECTION_MAX_SUBCHUNK_CHARS: usize = 7_200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -178,6 +186,7 @@ impl Default for SemanticMemoryRuntimeConfig {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn runtime_config_from_settings(
     embedding_provider: Option<String>,
     embedding_ollama_url: Option<String>,
@@ -404,6 +413,18 @@ fn mark_source_links_status(
         rusqlite::params![status, error, now, notebook_id, source_id],
     )?;
     Ok(())
+}
+
+fn semantic_preview_overfetch_limit(
+    request_limit: usize,
+    resolved_scope: &ResolvedSourceScope,
+) -> usize {
+    let limit = request_limit.max(1);
+    let source_count = resolved_scope.source_ids().len().max(1);
+    limit
+        .saturating_mul(4)
+        .saturating_mul(source_count)
+        .max(limit)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1201,11 +1222,7 @@ pub async fn search_preview(
 
     let namespaces = [notebook_id];
     let source_types = [SearchSourceType::Chunks];
-    let overfetch_limit = request
-        .limit
-        .max(1)
-        .saturating_mul(4)
-        .max(request.limit.max(1));
+    let overfetch_limit = semantic_preview_overfetch_limit(request.limit, &resolved_scope);
     let response = store
         .search_with_context(
             &request.query,
@@ -1356,12 +1373,18 @@ mod tests {
     fn runtime_config_defaults_turbo_quant_off() {
         let config =
             runtime_config_from_settings(None, None, None, None, false, false, true, false);
-        assert_eq!(config.embedding_provider, EmbeddingProviderKind::FastEmbed);
+        // v3 default: Ollama (out-of-process, crash-isolated). The previous
+        // default of FastEmbed was removed because in-process ONNX was
+        // killing Gloss on batch imports (per hostile audit A1).
+        assert_eq!(config.embedding_provider, EmbeddingProviderKind::Ollama);
         assert_eq!(
             config.embedding_ollama_url,
             DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL
         );
-        assert_eq!(config.embedding_model, FASTEMBED_MODEL_NAME);
+        assert_eq!(
+            config.embedding_model,
+            DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL
+        );
         assert_eq!(
             config.embedding_timeout_secs,
             DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS
@@ -1398,9 +1421,11 @@ mod tests {
     }
 
     #[test]
-    fn embedding_provider_defaults_to_fastembed_and_overrides_legacy_model_setting() {
+    fn embedding_provider_explicit_ollama_overrides_legacy_model_setting() {
+        // v3: explicit "ollama" provider should win. The previous test name
+        // referenced FastEmbed as the default; that default is now Ollama.
         let config = runtime_config_from_settings(
-            Some("fastembed".to_string()),
+            Some("ollama".to_string()),
             Some("http://localhost:11435".to_string()),
             Some("nomic-embed-text".to_string()),
             Some("12".to_string()),
@@ -1409,10 +1434,21 @@ mod tests {
             true,
             false,
         );
-        assert_eq!(config.embedding_provider, EmbeddingProviderKind::FastEmbed);
-        assert_eq!(config.embedding_model, FASTEMBED_MODEL_NAME);
+        assert_eq!(config.embedding_provider, EmbeddingProviderKind::Ollama);
+        assert_eq!(config.embedding_model, "nomic-embed-text");
         assert_eq!(config.embedding_timeout_secs, 12);
+        // The fastembed download consent flag is no longer wired to the
+        // default path, but should still be parsed when the caller supplies
+        // it (it is only relevant if a user later switches the provider).
         assert!(config.fastembed_download_consent);
+    }
+
+    #[test]
+    fn semantic_preview_overfetch_scales_by_resolved_scope_sources() {
+        let sources = vec![test_source("s1"), test_source("s2"), test_source("s3")];
+        let scope = SourceScope::All.resolve(&sources);
+
+        assert_eq!(semantic_preview_overfetch_limit(4, &scope), 48);
     }
 
     #[tokio::test]

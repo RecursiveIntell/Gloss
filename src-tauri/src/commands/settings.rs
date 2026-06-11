@@ -254,19 +254,28 @@ pub async fn update_provider(
         ))
     })?;
     {
-        let allow_lan = {
+        let (allow_lan, current_url) = {
             let app_db = state
                 .app_db
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
-            lan_local_providers_allowed(&app_db)
+            let lan = lan_local_providers_allowed(&app_db);
+            // When the caller is not setting a new base_url, validate the
+            // URL that is actually stored. Without this, a previous custom
+            // (un-validated) URL would silently survive a no-op update even
+            // if the LAN policy has since been tightened.
+            let current = if base_url.is_none() {
+                app_db.get_provider_url(&id).unwrap_or(None)
+            } else {
+                None
+            };
+            (lan, current)
         };
-        let candidate_url = base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| provider_type.default_base_url());
-        providers::validate_provider_base_url(provider_type, candidate_url, allow_lan)?;
+        let candidate_url = match base_url.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) => value.to_string(),
+            None => current_url.unwrap_or_else(|| provider_type.default_base_url().to_string()),
+        };
+        providers::validate_provider_base_url(provider_type, &candidate_url, allow_lan)?;
         if let Some(secret_key) = secret_setting_key(provider_type) {
             if let Some(api_key) = api_key.as_deref() {
                 state.secret_store.set(secret_key, Some(api_key))?;
@@ -609,7 +618,7 @@ pub async fn run_embedding_diagnostics(
         (
             app_db
                 .get_setting("semantic_memory_embedding_provider")?
-                .unwrap_or_else(|| "fastembed".to_string()),
+                .unwrap_or_else(|| "ollama".to_string()),
             app_db.get_setting("semantic_memory_embedding_url")?,
         )
     };
@@ -647,11 +656,15 @@ pub async fn update_setting(
     /// Known setting keys that may be written via update_setting.
     const KNOWN_SETTINGS: &[&str] = &[
         "summary_mode",
+        "summary_model",
+        "vision_model",
         "theme",
         "default_model",
         "default_provider",
         "memory_backend",
         "memory_backend_fallback",
+        "allow_lan_local_providers",
+        "chunk_target_tokens",
         "semantic_memory_auto_project",
         "semantic_memory_turbo_quant_require_fresh_artifacts",
         "semantic_memory_strict_testing",
@@ -660,6 +673,7 @@ pub async fn update_setting(
         "semantic_memory_embedding_model",
         "semantic_memory_embedding_timeout_secs",
         "semantic_memory_search_timeout_ms",
+        "semantic_memory_provekv_pool_candidates_enabled",
         "generation_temperature",
         "generation_top_p",
         "generation_top_k",

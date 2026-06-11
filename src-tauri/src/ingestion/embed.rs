@@ -49,7 +49,7 @@ impl HnswIndex {
     }
 
     pub fn load_with_hwm(path: &Path, hwm: i64, dims: usize) -> Result<Self, GlossError> {
-        let mut index = Self::new(dims)?;
+        let index = Self::new(dims)?;
         if path.exists() {
             index
                 .index
@@ -82,11 +82,7 @@ impl HnswIndex {
             .index
             .search(query, count)
             .map_err(|e| GlossError::Embedding(format!("HNSW search failed: {e}")))?;
-        Ok(results
-            .keys
-            .into_iter()
-            .zip(results.distances.into_iter())
-            .collect())
+        Ok(results.keys.into_iter().zip(results.distances).collect())
     }
 
     pub fn save(&self, path: &Path) -> Result<(), GlossError> {
@@ -96,6 +92,7 @@ impl HnswIndex {
             .map_err(|e| GlossError::Embedding(format!("HNSW save failed: {e}")))
     }
 
+    #[allow(dead_code)]
     pub fn size(&self) -> usize {
         self.index.size()
     }
@@ -104,7 +101,7 @@ impl HnswIndex {
 /// Embedding backend: FastEmbed (in-process ONNX, CPU-only, may crash) or
 /// Ollama (separate process via HTTP, crash-isolated).
 pub enum EmbeddingBackend {
-    FastEmbed(TextEmbedding),
+    FastEmbed(Box<TextEmbedding>),
     Ollama {
         client: reqwest::blocking::Client,
         url: String,
@@ -116,13 +113,14 @@ pub enum EmbeddingBackend {
 /// Gloss when the Ollama backend is active.
 pub struct EmbeddingService {
     backend: EmbeddingBackend,
-    #[allow(dead_code)]
     reranker: Option<TextRerank>,
+    #[allow(dead_code)]
     dims: usize,
 }
 
 impl EmbeddingService {
     /// FastEmbed path — kept for backward compatibility / offline fallback.
+    #[allow(dead_code)]
     pub fn new(cache_dir: &Path) -> Result<Self, GlossError> {
         Self::new_with_download_policy(cache_dir, false, true)
     }
@@ -141,17 +139,40 @@ impl EmbeddingService {
         )
         .map_err(|e| GlossError::Embedding(format!("FastEmbed init failed: {e}")))?;
 
+        // Non-fatal: fall back to RRF-only fusion if the reranker fails to load.
+        let reranker = match TextRerank::try_new(
+            RerankInitOptions::new(RerankerModel::BGERerankerBase)
+                .with_cache_dir(cache_dir.into())
+                .with_show_download_progress(true),
+        ) {
+            Ok(r) => {
+                tracing::info!("Reranker (BGERerankerBase) loaded");
+                Some(r)
+            }
+            Err(e) => {
+                tracing::warn!("Reranker failed to load (falling back to RRF-only): {e}");
+                None
+            }
+        };
+
         Ok(Self {
-            backend: EmbeddingBackend::FastEmbed(model),
-            reranker: None,
+            backend: EmbeddingBackend::FastEmbed(Box::new(model)),
+            reranker,
             dims: 384,
         })
     }
 
     /// Ollama path — crash-isolated, preferred.
-    pub fn new_ollama(url: &str, model: &str) -> Result<Self, GlossError> {
+    ///
+    /// `timeout_secs` distinguishes the chat hot path (~8s — embed must return
+    /// fast or we degrade to BM25) from the ingestion batch path (60s — a cold
+    /// all-minilm model load can take 10-15s on the first call). The user
+    /// sees a toast on chat-path timeout, not a 60-second frozen UI.
+    pub fn new_ollama(url: &str, model: &str, timeout_secs: u64) -> Result<Self, GlossError> {
+        let timeout = std::time::Duration::from_secs(timeout_secs.clamp(2, 300));
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(timeout)
+            .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .map_err(|e| GlossError::Embedding(format!("HTTP client build failed: {e}")))?;
 
@@ -164,6 +185,12 @@ impl EmbeddingService {
             reranker: None,
             dims: 384,
         })
+    }
+
+    /// Backwards-compatible constructor (defaults to 60s timeout, suitable
+    /// for batch imports). Prefer `new_ollama` with an explicit budget.
+    pub fn new_ollama_default(url: &str, model: &str) -> Result<Self, GlossError> {
+        Self::new_ollama(url, model, 60)
     }
 
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, GlossError> {
@@ -238,6 +265,7 @@ impl EmbeddingService {
         }
     }
 
+    #[allow(dead_code)]
     pub fn dims(&self) -> usize {
         self.dims
     }

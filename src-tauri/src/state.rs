@@ -21,6 +21,125 @@ use tokio::sync::Semaphore;
 /// through bounded single-source work and the GPU gate so fallback/degradation
 /// is visible instead of silently skipping dense vectors.
 pub const NATIVE_SEMANTIC_INDEXING_ENABLED: bool = true;
+/// LRU cache of (query_text, model_id) -> embedding vector. Bounded.
+/// Backing store: HashMap of text -> (Vec<f32>, generation). On insert,
+/// the oldest generation is evicted. This is O(1) amortized and bounded
+/// to `MAX_ENTRIES` (~384KB at 256 entries * 384 dims * 4 bytes).
+#[derive(Debug)]
+pub struct QueryEmbedCache {
+    entries: HashMap<String, (Vec<f32>, u64)>,
+    generation: u64,
+    max_entries: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl Default for QueryEmbedCache {
+    fn default() -> Self {
+        Self::new(256)
+    }
+}
+
+impl QueryEmbedCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            generation: 0,
+            max_entries: max_entries.max(1),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    pub fn get(&mut self, key: &str) -> Option<Vec<f32>> {
+        match self.entries.get(key) {
+            Some((vec, _gen)) => {
+                self.hits += 1;
+                Some(vec.clone())
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    pub fn insert(&mut self, key: String, vec: Vec<f32>) {
+        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
+            // Evict all entries from the oldest generation. A new generation
+            // is bumped; everything before it is stale. This is the simplest
+            // bounded-LRU that doesn't require a linked list.
+            self.generation += 1;
+            let keep = self.generation;
+            self.entries.retain(|_, (_, gen)| *gen == keep);
+            // If we still somehow overflowed (all entries were fresh), keep
+            // half to be safe.
+            if self.entries.len() >= self.max_entries {
+                let drop = self.entries.len() - self.max_entries / 2;
+                let keys: Vec<String> = self.entries.keys().take(drop).cloned().collect();
+                for k in keys {
+                    self.entries.remove(&k);
+                }
+            }
+        }
+        let gen = self.generation;
+        self.entries.insert(key, (vec, gen));
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.generation = 0;
+    }
+
+    pub fn stats(&self) -> (u64, u64, usize) {
+        (self.hits, self.misses, self.entries.len())
+    }
+}
+
+#[cfg(test)]
+mod query_embed_cache_tests {
+    use super::*;
+
+    #[test]
+    fn lru_evicts_oldest_generation() {
+        let mut c = QueryEmbedCache::new(2);
+        c.insert("a".into(), vec![1.0]);
+        c.insert("b".into(), vec![2.0]);
+        assert_eq!(c.entries.len(), 2);
+        // Force eviction
+        c.insert("c".into(), vec![3.0]);
+        assert!(c.entries.len() <= 2);
+        // At least one of the originals should be gone
+        let has_a = c.entries.contains_key("a");
+        let has_b = c.entries.contains_key("b");
+        assert!(
+            !has_a || !has_b,
+            "expected at least one original to be evicted"
+        );
+    }
+
+    #[test]
+    fn hits_and_misses_count() {
+        let mut c = QueryEmbedCache::new(4);
+        c.insert("x".into(), vec![0.5]);
+        assert!(c.get("x").is_some());
+        assert!(c.get("x").is_some());
+        assert!(c.get("missing").is_none());
+        let (hits, misses, _) = c.stats();
+        assert_eq!(hits, 2);
+        assert_eq!(misses, 1);
+    }
+
+    #[test]
+    fn clear_resets_state() {
+        let mut c = QueryEmbedCache::new(4);
+        c.insert("k".into(), vec![0.1]);
+        c.clear();
+        assert!(c.get("k").is_none());
+        assert_eq!(c.entries.len(), 0);
+    }
+}
+
 pub const SUMMARY_MODE_AUTO: &str = "auto";
 pub const SUMMARY_MODE_MANUAL: &str = "manual";
 
@@ -48,6 +167,17 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// Embedding model (lazy-initialized on first use)
     pub embedder: Mutex<Option<EmbeddingService>>,
+    /// LRU cache of (query_text, model_id) → embedding vector. The hostile
+    /// audit identified that the user query is re-embedded on EVERY chat
+    /// turn (80-400ms per turn) even when identical to the previous turn
+    /// ("yes", "explain more", retry of a failed message). Bounded to 256
+    /// entries to bound memory at ~256 * 384 * 4 = 384KB. Invalidate on
+    /// embedding model change by clearing the cache (see reset below).
+    pub query_embed_cache: Mutex<QueryEmbedCache>,
+    /// Cached model identity that the query_embed_cache was built against.
+    /// When this changes (e.g. user switches `semantic_memory_embedding_model`),
+    /// the cache is flushed in `ensure_embedder`.
+    pub query_embed_cache_model: Mutex<Option<String>>,
     /// Per-notebook HNSW vector indices keyed by notebook ID
     pub hnsw_indices: Mutex<HashMap<String, HnswIndex>>,
     /// Whether summary generation is manually paused by the user
@@ -268,6 +398,8 @@ impl AppState {
             model_registry: Mutex::new(model_registry),
             data_dir,
             embedder: Mutex::new(None),
+            query_embed_cache: Mutex::new(QueryEmbedCache::default()),
+            query_embed_cache_model: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
             summary_paused: AtomicBool::new(summary_starts_paused),
             ingestion_active: Arc::new(AtomicU32::new(0)),
@@ -300,7 +432,7 @@ impl AppState {
             return Ok(());
         }
 
-        let (provider, url, model) = {
+        let (provider, url, model, timeout_secs) = {
             let app_db = self
                 .app_db
                 .lock()
@@ -314,12 +446,19 @@ impl AppState {
             let model = app_db
                 .get_setting("semantic_memory_embedding_model")?
                 .unwrap_or_else(|| "all-minilm".to_string());
-            (provider, url, model)
+            // Default 12s — covers cold-load on first call (~10-15s) but
+            // breaks fast on a dead Ollama server. Users can lower to 8s
+            // for chat-only workloads or raise to 60s for batch imports.
+            let timeout_secs = app_db
+                .get_setting("semantic_memory_embedding_timeout_secs")?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(12);
+            (provider, url, model, timeout_secs)
         };
 
         let service = if provider.trim().eq_ignore_ascii_case("ollama") {
-            tracing::info!(url = %url, model = %model, "Initializing Ollama embedding backend");
-            EmbeddingService::new_ollama(&url, &model)?
+            tracing::info!(url = %url, model = %model, timeout_secs, "Initializing Ollama embedding backend");
+            EmbeddingService::new_ollama(&url, &model, timeout_secs)?
         } else {
             tracing::info!("Initializing FastEmbed embedding backend (CPU ONNX)");
             if let Some(handle) = app_handle {
@@ -359,6 +498,24 @@ impl AppState {
 
         tracing::info!("Embedding backend ready");
         *embedder = Some(service);
+
+        // Now that we know the real model identity, flush the query-embed
+        // cache if it was built against a different model. This is the
+        // only place the cache is invalidated on model change.
+        {
+            let mut cache_model = self
+                .query_embed_cache_model
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            let cache_key = format!("{provider}:{model}");
+            if cache_model.as_deref() != Some(cache_key.as_str()) {
+                if let Ok(mut cache) = self.query_embed_cache.lock() {
+                    cache.clear();
+                }
+                *cache_model = Some(cache_key.clone());
+                tracing::info!(model = %cache_key, "Flushed query-embed cache on model change");
+            }
+        }
         Ok(())
     }
 
@@ -647,6 +804,43 @@ impl AppState {
         pool.write(f)
     }
 
+    /// Get a cached embedding for the query, or embed it fresh and store it.
+    /// This is the LRU cache wrapper used by the chat hot path to avoid
+    /// re-embedding identical follow-up questions ("yes", "explain more",
+    /// retry of a failed message) on every chat turn.
+    ///
+    /// Returns the embedding vector; the caller is responsible for the HNSW
+    /// search and chunk lookup. On embed error, returns the error unchanged
+    /// (the caller decides whether to silently degrade to BM25 or surface
+    /// a toast).
+    pub fn get_or_embed_query(&self, query: &str) -> Result<Vec<f32>, GlossError> {
+        // Cache lookup
+        {
+            let mut cache = self
+                .query_embed_cache
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            if let Some(vec) = cache.get(query) {
+                return Ok(vec);
+            }
+        }
+
+        // Cache miss: embed fresh
+        let embedding = {
+            let embedder_guard = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
+            let embedder = embedder_guard
+                .as_ref()
+                .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
+            embedder.embed_one(query)?
+        };
+
+        // Store
+        if let Ok(mut cache) = self.query_embed_cache.lock() {
+            cache.insert(query.to_string(), embedding.clone());
+        }
+        Ok(embedding)
+    }
+
     /// Build a truthful local retrieval outcome. BM25/FTS5 always remains the
     /// stable baseline; native dense retrieval contributes only when available.
     pub fn local_retrieval_outcome(
@@ -659,17 +853,34 @@ impl AppState {
     ) -> Result<RetrievalOutcome, GlossError> {
         let db_path = self.notebook_db_path(notebook_id)?;
         let nb_db = NotebookDb::connect(&db_path)?;
-        let embedder_guard = self.embedder.try_lock().ok();
-        let embedder = embedder_guard.as_ref().and_then(|guard| guard.as_ref());
-        let indices_guard = self.hnsw_indices.try_lock().ok();
-        let index = indices_guard
-            .as_ref()
-            .and_then(|indices| indices.get(notebook_id));
-        hybrid_search::local_retrieval_outcome(
+        // Blocking lock (with poison recovery) instead of try_lock: contention
+        // here (e.g. ingestion embedding in another thread) must wait, not
+        // silently degrade dense retrieval to BM25-only for this query.
+        let embedder_guard = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
+        let embedder = embedder_guard.as_ref();
+        let indices_guard = self.hnsw_indices.lock().unwrap_or_else(|e| e.into_inner());
+        let index = indices_guard.get(notebook_id);
+        // Pre-compute the query embedding through the LRU cache so that
+        // repeated identical queries ("yes", "explain more", a regenerated
+        // message) don't re-hit Ollama / FastEmbed. The cache miss path
+        // (which actually calls embed_one) is what gets the timeout / error
+        // surfaced to the user. (See hostile audit B4.)
+        let cached_query_embedding = match embedder {
+            Some(_emb) => match self.get_or_embed_query(query) {
+                Ok(vec) => Some(vec),
+                Err(e) => {
+                    tracing::warn!(error = %e, "query embedding failed; dense retrieval will be skipped");
+                    None
+                }
+            },
+            None => None,
+        };
+        hybrid_search::local_retrieval_outcome_with_query(
             query,
             &nb_db,
             embedder,
             index,
+            cached_query_embedding.as_deref(),
             NATIVE_SEMANTIC_INDEXING_ENABLED,
             scope,
             top_k,

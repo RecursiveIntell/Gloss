@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-const APP_SCHEMA_VERSION: i32 = 2;
+const APP_SCHEMA_VERSION: i32 = 3;
 const NOTEBOOK_SCHEMA_VERSION: i32 = 6;
 
 /// Apply pragmas for performance and correctness.
@@ -93,7 +93,7 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_auto_project', 'true');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_strict_testing', 'false');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_provider', 'fastembed');
+             -- v1/v2 default; v3 migration above flips this on upgrade.
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_url', 'http://localhost:11434');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_model', 'bge-m3');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_timeout_secs', '10');
@@ -129,6 +129,40 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
         if !table_has_column(conn, "models", "last_error")? {
             conn.execute("ALTER TABLE models ADD COLUMN last_error TEXT", [])?;
         }
+        set_schema_version(conn, 2)?;
+    }
+
+    // v3: Stop shipping FastEmbed as the default. In-process ONNX has caused
+    // crashes during batch imports (per hostile audit / user memory: "ONNX
+    // heap corruption kills Gloss during batch imports" + "user forbids
+    // band-aids — only out-of-process embedding acceptable"). We flip any
+    // existing user that still has 'fastembed' selected to 'ollama' on first
+    // run of this migration, and change the new-install default to 'ollama'
+    // so fresh installs never touch the dangerous path.
+    if version < 3 {
+        let flipped = conn.execute(
+            "UPDATE settings
+                SET value = 'ollama'
+              WHERE key = 'semantic_memory_embedding_provider'
+                AND lower(value) = 'fastembed'",
+            [],
+        )?;
+        if flipped > 0 {
+            eprintln!(
+                "[gloss] migration v3: flipped {} setting(s) from \
+                 'fastembed' to 'ollama' for crash-isolated embeddings. \
+                 Use Settings → Embedding to change.",
+                flipped
+            );
+        }
+        // The new-install default below replaces the v1/v2 INSERT for the
+        // embedding provider key. Existing users with a different value are
+        // untouched.
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) \
+             VALUES ('semantic_memory_embedding_provider', 'ollama')",
+            [],
+        )?;
         set_schema_version(conn, APP_SCHEMA_VERSION)?;
     }
 

@@ -106,9 +106,42 @@ export function App() {
     const isMac = isMacLikePlatform();
     const handleGlobalKeyDown = (event: KeyboardEvent) => {
       if (!isHotkeyAllowed(event)) return;
-      if (event.key.toLowerCase() === "k" && ((isMac && event.metaKey) || (!isMac && event.ctrlKey))) {
+      const mod = (isMac && event.metaKey) || (!isMac && event.ctrlKey);
+      if (!mod) return;
+      const key = event.key.toLowerCase();
+      // Cmd/Ctrl+K — command palette
+      if (key === "k" && !event.shiftKey) {
         event.preventDefault();
         toggleCommandPaletteOpen();
+        return;
+      }
+      // D7 — Cmd/Ctrl+N or Cmd/Ctrl+T — new chat conversation
+      if ((key === "n" || key === "t") && !event.shiftKey) {
+        event.preventDefault();
+        const notebookId = useNotebookStore.getState().activeNotebookId;
+        if (notebookId) {
+          useChatStore.getState().createConversation(notebookId).catch((e) => {
+            // surfaced via toast
+            useToastStore.getState().addToast({
+              type: "error",
+              title: "New chat failed",
+              message: `Failed to create conversation: ${String(e)}`,
+              duration: 6000,
+            });
+          });
+        }
+        return;
+      }
+      // D7 — Cmd/Ctrl+, — open settings dialog
+      if (key === ",") {
+        event.preventDefault();
+        setShowSettings((s) => !s);
+        return;
+      }
+      // D7 — Cmd/Ctrl+Shift+T — toggle theme
+      if (key === "t" && event.shiftKey) {
+        event.preventDefault();
+        useUiStore.getState().toggleTheme();
         return;
       }
     };

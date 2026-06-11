@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import { useSettingsStore } from "../../../stores/settingsStore";
 import { useToastStore } from "../../../stores/toastStore";
@@ -95,6 +95,58 @@ function providerUrlClass(rawUrl: string | undefined): string {
   } catch {
     return "invalid";
   }
+}
+
+/**
+ * Debounce wrapper around `updateSetting` for text/number inputs that fire
+ * onChange per keystroke. Without this, typing "http://localhost:11434"
+ * would issue 21 IPC calls.
+ *
+ * Returns a tuple: [localValue, onChange, syncLocal]. The local value mirrors
+ * `settings[key]` so the input stays controlled even while the debounce
+ * timer is pending. `syncLocal` updates the local value WITHOUT scheduling a
+ * write — use it when syncing from the canonical settings store, otherwise
+ * every settings load would echo a redundant (or default-clobbering) write
+ * back to the backend.
+ */
+function useDebouncedSetting(
+  key: string,
+  updateSetting: (key: string, value: string) => Promise<void>,
+  delayMs: number = 400
+): [string, (value: string) => void, (value: string) => void] {
+  const [localValue, setLocalValue] = useState("");
+  const lastEmittedRef = useRef<string | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+  const onChange = (value: string) => {
+    setLocalValue(value);
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => {
+      lastEmittedRef.current = value;
+      timerRef.current = null;
+      // Fire-and-forget: the store now handles rollback on failure.
+      updateSetting(key, value).catch(() => {
+        // Already toasted inside the store; do nothing extra.
+      });
+    }, delayMs);
+  };
+  const syncLocal = (value: string) => {
+    // The store optimistically echoes our own debounced write back through
+    // settings[key]; ignore it so keystrokes typed in that window survive.
+    if (value === lastEmittedRef.current) return;
+    setLocalValue(value);
+    // A genuinely external canonical value arrived — drop any pending write
+    // so a stale keystroke cannot overwrite it.
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+  return [localValue, onChange, syncLocal];
 }
 
 function SettingsSection({
@@ -325,6 +377,38 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const [runningChatSmoke, setRunningChatSmoke] = useState(false);
   const [lastTrace, setLastTrace] = useState<ChatAttemptTraceV1 | null>(null);
 
+  // Debounce the 5 text/number inputs that previously fired updateSetting on
+  // every keystroke (H-4 from the hostile audit). Typing "http://localhost"
+  // used to issue 17+ IPC calls; now it issues 1.
+  const [embeddingUrl, setEmbeddingUrl, syncEmbeddingUrl] = useDebouncedSetting("semantic_memory_embedding_url", updateSetting);
+  const [embeddingModel, setEmbeddingModel, syncEmbeddingModel] = useDebouncedSetting("semantic_memory_embedding_model", updateSetting);
+  const [embeddingTimeout, setEmbeddingTimeout, syncEmbeddingTimeout] = useDebouncedSetting("semantic_memory_embedding_timeout_secs", updateSetting);
+  const [searchTimeout, setSearchTimeout, syncSearchTimeout] = useDebouncedSetting("semantic_memory_search_timeout_ms", updateSetting);
+  const [chunkTargetTokens, setChunkTargetTokens, syncChunkTargetTokens] = useDebouncedSetting("chunk_target_tokens", updateSetting);
+  // Sync local debounced state from settings whenever the canonical value
+  // changes (e.g. on dialog open or external update). Uses the sync-only
+  // setter so syncing never schedules a write back to the backend.
+  useEffect(() => {
+    syncEmbeddingUrl(settings["semantic_memory_embedding_url"] || "http://localhost:11434");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings["semantic_memory_embedding_url"]]);
+  useEffect(() => {
+    syncEmbeddingModel(settings["semantic_memory_embedding_model"] || "bge-m3");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings["semantic_memory_embedding_model"]]);
+  useEffect(() => {
+    syncEmbeddingTimeout(settings["semantic_memory_embedding_timeout_secs"] || "10");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings["semantic_memory_embedding_timeout_secs"]]);
+  useEffect(() => {
+    syncSearchTimeout(settings["semantic_memory_search_timeout_ms"] || "8000");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings["semantic_memory_search_timeout_ms"]]);
+  useEffect(() => {
+    syncChunkTargetTokens(settings["chunk_target_tokens"] || "1100");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings["chunk_target_tokens"]]);
+
   useEffect(() => {
     if (open) {
       loadSettings();
@@ -382,8 +466,11 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       enabledProviderIds.has(model.provider_id)
   );
   const visionModels = summaryModels.filter(isVisionCapableModel);
-  const activeModelRow = models.find((model) => model.id === activeModel);
-  const activeProviderId = activeModelRow?.provider_id ?? settings["default_provider"] ?? "ollama";
+  const configuredProviderId = settings["default_provider"] ?? "ollama";
+  const activeModelRow = models.find(
+    (model) => model.id === activeModel && model.provider_id === configuredProviderId
+  ) ?? models.find((model) => model.id === activeModel);
+  const activeProviderId = activeModelRow?.provider_id ?? configuredProviderId;
 
   useEffect(() => {
     if (!open || models.length === 0) return;
@@ -418,11 +505,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     await loadSettings();
   };
 
-  const handleSelectModel = async (modelId: string) => {
+  const handleSelectModel = async (providerId: string, modelId: string) => {
     setActiveModel(modelId);
     await updateSetting("default_model", modelId);
-    const providerId = models.find((model) => model.id === modelId)?.provider_id;
-    if (providerId) await updateSetting("default_provider", providerId);
+    await updateSetting("default_provider", providerId);
   };
 
   const handleSelectMemoryBackend = async (backendId: string) => {
@@ -791,16 +877,16 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                     {groupModels.map((model) => (
                       <button
                         key={`${model.provider_id}:${model.id}`}
-                        onClick={() => handleSelectModel(model.id)}
+                        onClick={() => handleSelectModel(model.provider_id, model.id)}
                         className={`flex w-full items-center gap-3 rounded border px-3 py-2 text-left ${
-                          activeModel === model.id
+                          activeModel === model.id && activeProviderId === model.provider_id
                             ? "border-accent/30 bg-accent/10"
                             : "border-transparent hover:bg-bg-tertiary"
                         }`}
                       >
                         <div
                           className={`h-3 w-3 shrink-0 rounded-full border-2 ${
-                            activeModel === model.id ? "border-accent bg-accent" : "border-text-muted"
+                            activeModel === model.id && activeProviderId === model.provider_id ? "border-accent bg-accent" : "border-text-muted"
                           }`}
                         />
                         <p className="min-w-0 flex-1 truncate text-xs text-text">{model.display_name}</p>
@@ -1171,13 +1257,13 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
             <div className="grid gap-2 sm:grid-cols-2">
               <div className="relative">
                 <input
-                  value={settings["semantic_memory_embedding_url"] || "http://localhost:11434"}
-                  onChange={(e) => updateSetting("semantic_memory_embedding_url", e.target.value)}
+                  value={embeddingUrl}
+                  onChange={(e) => setEmbeddingUrl(e.target.value)}
                   className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none w-full"
                   aria-label="Embedding URL"
                 />
                 {(() => {
-                  const urlClass = providerUrlClass(settings["semantic_memory_embedding_url"]);
+                  const urlClass = providerUrlClass(embeddingUrl);
                   if (urlClass === "lan" || urlClass === "remote" || urlClass === "cloud_https") {
                     return (
                       <p className="text-xs text-yellow-400 mt-1">
@@ -1189,24 +1275,24 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 })()}
               </div>
               <input
-                value={settings["semantic_memory_embedding_model"] || "bge-m3"}
-                onChange={(e) => updateSetting("semantic_memory_embedding_model", e.target.value)}
+                value={embeddingModel}
+                onChange={(e) => setEmbeddingModel(e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
                 aria-label="Embedding model"
               />
               <input
                 type="number"
                 min="1"
-                value={settings["semantic_memory_embedding_timeout_secs"] || "10"}
-                onChange={(e) => updateSetting("semantic_memory_embedding_timeout_secs", e.target.value)}
+                value={embeddingTimeout}
+                onChange={(e) => setEmbeddingTimeout(e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
                 aria-label="Embedding timeout seconds"
               />
               <input
                 type="number"
                 min="1"
-                value={settings["semantic_memory_search_timeout_ms"] || "8000"}
-                onChange={(e) => updateSetting("semantic_memory_search_timeout_ms", e.target.value)}
+                value={searchTimeout}
+                onChange={(e) => setSearchTimeout(e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
                 aria-label="Search timeout milliseconds"
               />
@@ -1214,8 +1300,8 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 type="number"
                 min="100"
                 max="3000"
-                value={settings["chunk_target_tokens"] || "1100"}
-                onChange={(e) => updateSetting("chunk_target_tokens", e.target.value)}
+                value={chunkTargetTokens}
+                onChange={(e) => setChunkTargetTokens(e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
                 aria-label="Chunk target tokens"
               />

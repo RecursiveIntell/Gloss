@@ -26,6 +26,13 @@ interface ChatStore {
   streamingError: string | null;
   streamingStatus: ChatStatusPayload | null;
   pendingEvidence: Record<string, ChatEvidencePayload>;
+  /**
+   * Set of assistant message ids that the store will accept chat:token /
+   * chat:evidence / chat:done for. This guards against the token race where
+   * the backend re-assigns a different messageId than the frontend asked for:
+   * the frontend stores BOTH ids so tokens arriving for either are accepted.
+   */
+  pendingMessageIds: Record<string, true>;
   suggestedQuestions: string[];
   style: string;
   customGoal: string;
@@ -62,6 +69,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   streamingError: null,
   streamingStatus: null,
   pendingEvidence: {},
+  pendingMessageIds: {},
   suggestedQuestions: [],
   style: 'default',
   customGoal: '',
@@ -129,6 +137,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   sendMessage: async (notebookId, query, sourceScope, model) => {
+    let userMsg: Message | null = null;
+    let addedUserMessage = false;
     try {
       let { activeConversationId } = get();
       if (!activeConversationId) {
@@ -140,7 +150,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       // Add user message to local state immediately only after a conversation exists.
       // If first-conversation creation fails, the prompt remains recoverable in the input
       // owner and the store exposes a real error instead of throwing out of band.
-      const userMsg: Message = {
+      userMsg = {
         id: crypto.randomUUID(),
         conversation_id: activeConversationId,
         role: 'user',
@@ -148,7 +158,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         created_at: new Date().toISOString(),
       };
       set((state) => ({
-        messages: [...state.messages, userMsg],
+        messages: [...state.messages, userMsg!],
         isStreaming: true,
         streamingContent: '',
         streamingNotebookId: notebookId,
@@ -164,6 +174,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           truncated: false,
         },
       }));
+      addedUserMessage = true;
 
       const { style, customGoal, responseLength } = get();
       const messageId = await api.sendMessage(
@@ -178,25 +189,63 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         responseLength !== 'default' ? responseLength : undefined,
       );
       if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+        // The user switched notebooks while sendMessage was in flight. The
+        // optimistically added user message is for the prior notebook's
+        // conversation and should be removed so the new notebook's message
+        // list is not polluted.
+        set((state) => ({
+          messages: userMsg
+            ? state.messages.filter((m) => m.id !== userMsg!.id)
+            : state.messages,
+          isStreaming: false,
+          streamingContent: '',
+          streamingNotebookId: null,
+          streamingMessageId: null,
+          streamingStatus: null,
+        }));
         return;
       }
       if (get().activeConversationId !== activeConversationId) {
+        set((state) => ({
+          messages: userMsg
+            ? state.messages.filter((m) => m.id !== userMsg!.id)
+            : state.messages,
+          isStreaming: false,
+          streamingContent: '',
+          streamingNotebookId: null,
+          streamingMessageId: null,
+          streamingStatus: null,
+        }));
         return;
       }
+      // Accept tokens for EITHER the frontend-assigned id (the common case) or
+      // the backend-reassigned id (in case the backend ever returns a different
+      // one). We track the accepted set in assistantMessageIds so the first
+      // chunk that arrives after a re-assignment is not silently dropped.
       if (messageId !== assistantMessageId) {
-        set({ streamingMessageId: messageId });
+        set({ streamingMessageId: messageId, pendingMessageIds: { ...get().pendingMessageIds, [messageId]: true } });
+        // Don't roll back the user message — the send succeeded; the backend
+        // chose a different assistant id and we will accept tokens for either.
+      } else {
+        set({ pendingMessageIds: { ...get().pendingMessageIds, [messageId]: true } });
       }
     } catch (e) {
       const message = errorMessage(e);
       console.warn('Failed to send message:', e);
-      set({
+      // Roll back the optimistically added user message so the chat does not
+      // show a prompt that was never persisted. Reload will fetch authoritative
+      // history.
+      set((state) => ({
+        messages: addedUserMessage && userMsg
+          ? state.messages.filter((m) => m.id !== userMsg!.id)
+          : state.messages,
         streamingError: message,
         isStreaming: false,
         streamingContent: '',
         streamingNotebookId: null,
         streamingMessageId: null,
         streamingStatus: null,
-      });
+      }));
     }
   },
 
@@ -209,6 +258,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       set((state) => ({
         pendingEvidence: Object.fromEntries(
           Object.entries(state.pendingEvidence).filter(([id]) => id !== streamingMessageId)
+        ),
+        pendingMessageIds: Object.fromEntries(
+          Object.entries(state.pendingMessageIds).filter(([id]) => id !== streamingMessageId)
         ),
         isStreaming: false,
         streamingContent,
@@ -223,8 +275,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   attachAssistantEvidence: (notebookId, _conversationId, messageId, payload) => {
-    const { streamingNotebookId } = get();
+    const { streamingNotebookId, pendingMessageIds } = get();
     if (streamingNotebookId && streamingNotebookId !== notebookId) return;
+    if (!pendingMessageIds[messageId]) return;
     set((state) => ({
       pendingEvidence: { ...state.pendingEvidence, [messageId]: payload },
       messages: state.messages.map((message) =>
@@ -238,10 +291,24 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       isStreaming,
       streamingNotebookId,
       streamingMessageId,
+      pendingMessageIds,
     } = get();
     if (!isStreaming) return;
     if (streamingNotebookId !== notebookId) return;
-    if (!streamingMessageId || streamingMessageId !== messageId) return;
+    // Accept tokens for the currently-bound streamingMessageId OR any other
+    // id we previously registered (covers the case where the backend returned
+    // a different messageId from the one the frontend asked for, and tokens
+    // were in flight before the streamingMessageId swap completed).
+    const accepted =
+      (streamingMessageId && streamingMessageId === messageId) ||
+      pendingMessageIds[messageId];
+    if (!accepted) return;
+    // If the messageId isn't the currently-bound one but is in the pending
+    // set, promote it to streamingMessageId so subsequent token/evidence/done
+    // events line up with a single id.
+    if (streamingMessageId !== messageId) {
+      set({ streamingMessageId: messageId });
+    }
     set((state) => ({
       streamingContent: state.streamingContent + token,
     }));
@@ -252,12 +319,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       isStreaming,
       streamingMessageId,
       streamingNotebookId,
+      pendingMessageIds,
     } = get();
     // Terminal event: MUST be processed even after a notebook switch so the
     // frontend exits streaming state. But an old notebook's assistant text must
     // not be appended into the newly active notebook message list.
     if (!isStreaming) return;
-    if (!streamingMessageId || streamingMessageId !== messageId) return;
+    const accepted =
+      (streamingMessageId && streamingMessageId === messageId) ||
+      pendingMessageIds[messageId];
+    if (!accepted) return;
     const activeNotebookId = localStorage.getItem(ACTIVE_NB_KEY);
     const shouldAppendToVisibleMessages =
       streamingNotebookId === notebookId && (!activeNotebookId || activeNotebookId === notebookId);
@@ -272,6 +343,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         streamingStatus: null,
         pendingEvidence: Object.fromEntries(
           Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
+        ),
+        pendingMessageIds: Object.fromEntries(
+          Object.entries(state.pendingMessageIds).filter(([id]) => id !== messageId)
         ),
       }));
       return;
@@ -290,6 +364,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       pendingEvidence: Object.fromEntries(
         Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
       ),
+      pendingMessageIds: Object.fromEntries(
+        Object.entries(state.pendingMessageIds).filter(([id]) => id !== messageId)
+      ),
       isStreaming: false,
       streamingContent: '',
       streamingNotebookId: null,
@@ -303,12 +380,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const {
       isStreaming,
       streamingMessageId,
+      pendingMessageIds,
     } = get();
     // Terminal event: MUST be processed regardless of notebookId — the
     // frontend must always exit streaming state on error. Match on messageId
     // to ensure we close the correct stream.
     if (!isStreaming) return;
-    if (!streamingMessageId || streamingMessageId !== messageId) return;
+    const accepted =
+      (streamingMessageId && streamingMessageId === messageId) ||
+      pendingMessageIds[messageId];
+    if (!accepted) return;
     set((state) => ({
       streamingError: error,
       isStreaming: false,
@@ -318,6 +399,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       pendingEvidence: Object.fromEntries(
         Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
       ),
+      pendingMessageIds: Object.fromEntries(
+        Object.entries(state.pendingMessageIds).filter(([id]) => id !== messageId)
+      ),
       streamingStatus: null,
     }));
   },
@@ -326,12 +410,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const {
       isStreaming,
       streamingMessageId,
+      pendingMessageIds,
     } = get();
     // Terminal event: MUST be processed regardless of notebookId — the
     // frontend must always exit streaming state on cancellation. Match on
     // messageId to ensure we close the correct stream.
     if (!isStreaming) return;
-    if (!streamingMessageId || streamingMessageId !== messageId) return;
+    const accepted =
+      (streamingMessageId && streamingMessageId === messageId) ||
+      pendingMessageIds[messageId];
+    if (!accepted) return;
     set((state) => ({
       streamingError: reason,
       isStreaming: false,
@@ -340,6 +428,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       streamingMessageId: null,
       pendingEvidence: Object.fromEntries(
         Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
+      ),
+      pendingMessageIds: Object.fromEntries(
+        Object.entries(state.pendingMessageIds).filter(([id]) => id !== messageId)
       ),
       streamingStatus: null,
     }));
@@ -350,10 +441,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       isStreaming,
       streamingNotebookId,
       streamingMessageId,
+      pendingMessageIds,
     } = get();
     if (!isStreaming) return;
     if (streamingNotebookId !== payload.notebook_id) return;
-    if (!streamingMessageId || streamingMessageId !== payload.message_id) return;
+    const accepted =
+      (streamingMessageId && streamingMessageId === payload.message_id) ||
+      pendingMessageIds[payload.message_id];
+    if (!accepted) return;
     set({ streamingStatus: payload });
   },
 
@@ -370,6 +465,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       streamingError: current.isStreaming ? current.streamingError : null,
       streamingStatus: current.isStreaming ? current.streamingStatus : null,
       pendingEvidence: current.isStreaming ? current.pendingEvidence : {},
+      pendingMessageIds: current.isStreaming ? current.pendingMessageIds : {},
       suggestedQuestions: [],
     });
   },

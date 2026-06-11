@@ -78,11 +78,33 @@ describe('sourceStore', () => {
     expect(state.sourceListError).toBe('Something broke');
   });
 
-  it('setting sourceListStatus to loaded (ready) is reflected in state', () => {
-    useSourceStore.setState({ sourceListStatus: 'ready', sourceListError: null });
+  it('preserves all-source retrieval when source list is partial but has source information', () => {
+    useSourceStore.setState({
+      sources: [
+        {
+          id: 'src-loaded',
+          source_type: 'file',
+          title: 'Loaded source',
+          status: 'ready',
+          selected: true,
+          created_at: '2026-06-10T00:00:00Z',
+          updated_at: '2026-06-10T00:00:00Z',
+        },
+      ],
+      selectedSourceIds: new Set(['src-loaded']),
+      sourceScopeMode: 'all',
+      sourceListStatus: 'partial',
+      stats: {
+        source_count: 2,
+        ready_count: 1,
+        error_count: 0,
+        missing_summaries: 0,
+        chunk_count: 1,
+        sources_with_chunks: 1,
+        total_words: 3,
+      },
+    });
 
-    const state = useSourceStore.getState();
-    expect(state.sourceListStatus).toBe('ready');
-    expect(state.sourceListError).toBeNull();
+    expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'all' });
   });
 });

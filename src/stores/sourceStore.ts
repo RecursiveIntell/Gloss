@@ -39,9 +39,6 @@ function buildSourceScope(
     return { kind: 'none' };
   }
   if (sourceScopeMode === 'all') {
-    if (stats?.source_count && stats.source_count !== sources.length) {
-      return { kind: 'none' };
-    }
     return { kind: 'all' };
   }
   const validIds = new Set(sources.map((source) => source.id));

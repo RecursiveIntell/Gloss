@@ -1,8 +1,15 @@
 import { create } from 'zustand';
 import type { Note } from '../lib/types';
 import * as api from '../lib/tauri';
+import { useToastStore } from './toastStore';
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
+
+function errMsg(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  return 'Unknown error';
+}
 
 interface NoteStore {
   notes: Note[];
@@ -38,28 +45,83 @@ export const useNoteStore = create<NoteStore>((set, get) => ({
   },
 
   createNote: async (notebookId, title, content) => {
-    await api.createNote(notebookId, title, content);
-    await get().loadNotes(notebookId);
+    try {
+      await api.createNote(notebookId, title, content);
+      await get().loadNotes(notebookId);
+    } catch (e) {
+      console.warn('Failed to create note:', e);
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Create note failed',
+        message: errMsg(e),
+        duration: 0,
+      });
+      throw e;
+    }
   },
 
   saveResponse: async (notebookId, messageId) => {
-    await api.saveResponseAsNote(notebookId, messageId);
-    await get().loadNotes(notebookId);
+    try {
+      await api.saveResponseAsNote(notebookId, messageId);
+      await get().loadNotes(notebookId);
+    } catch (e) {
+      console.warn('Failed to save response as note:', e);
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Save as note failed',
+        message: errMsg(e),
+        duration: 0,
+      });
+      throw e;
+    }
   },
 
   updateNote: async (notebookId, noteId, title, content) => {
-    await api.updateNote(notebookId, noteId, title, content);
-    await get().loadNotes(notebookId);
+    try {
+      await api.updateNote(notebookId, noteId, title, content);
+      await get().loadNotes(notebookId);
+    } catch (e) {
+      console.warn('Failed to update note:', e);
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Update note failed',
+        message: errMsg(e),
+        duration: 0,
+      });
+      throw e;
+    }
   },
 
   togglePin: async (notebookId, noteId) => {
-    await api.togglePin(notebookId, noteId);
-    await get().loadNotes(notebookId);
+    try {
+      await api.togglePin(notebookId, noteId);
+      await get().loadNotes(notebookId);
+    } catch (e) {
+      console.warn('Failed to toggle pin:', e);
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Pin toggle failed',
+        message: errMsg(e),
+        duration: 0,
+      });
+      throw e;
+    }
   },
 
   deleteNote: async (notebookId, noteId) => {
-    await api.deleteNote(notebookId, noteId);
-    await get().loadNotes(notebookId);
+    try {
+      await api.deleteNote(notebookId, noteId);
+      await get().loadNotes(notebookId);
+    } catch (e) {
+      console.warn('Failed to delete note:', e);
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Delete note failed',
+        message: errMsg(e),
+        duration: 0,
+      });
+      throw e;
+    }
   },
 
   resetForNotebookSwitch: () => {

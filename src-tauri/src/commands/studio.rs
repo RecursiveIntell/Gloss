@@ -3,9 +3,11 @@ use crate::error::GlossError;
 use crate::providers::{build_provider, ChatMessage, ChatRequest};
 use crate::redaction::redact_path;
 use crate::state::AppState;
-use crate::studio::{build_snippets, generate_artifact, StudioOutputKind};
+use crate::studio::{
+    build_snippets, generate_artifact, validate_artifact, StudioCitation, StudioOutputKind,
+};
 use futures::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -77,7 +79,9 @@ pub async fn generate_studio_output(
         .clamp(1, MAX_STUDIO_ITEMS);
     let should_refine = refine.unwrap_or(true);
 
-    state.with_notebook_db_write(&notebook_id, |db| {
+    // Phase 1 (read): build the deterministic artifact and collect full source
+    // texts. No write lock is held during the (potentially long) LLM phase.
+    let (mut artifact, full_texts, citation_pool) = state.with_notebook_db(&notebook_id, |db| {
         let mut sources = db.list_sources()?;
         let mut chunks_by_source = Vec::new();
         for source in &mut sources {
@@ -91,23 +95,14 @@ pub async fn generate_studio_output(
         let requested = source_ids.as_deref();
         let (scope, snippets) =
             build_snippets(&sources, &chunks_by_source, requested, max_items, max_items)?;
+        let citation_pool = snippets
+            .iter()
+            .map(|snippet| snippet.citation())
+            .collect::<Vec<_>>();
         let artifact = generate_artifact(kind, title, scope, &snippets)?;
-        let raw_content = serde_json::to_string_pretty(&artifact)?;
-        let config = serde_json::to_string(&json!({
-            "schema": "StudioOutputConfigV1",
-            "deterministic": true,
-            "source_bound": true,
-            "schema_validated": artifact.validation.schema_validated,
-            "all_items_source_cited": artifact.validation.all_items_source_cited,
-            "max_items": max_items,
-            "receipt_id": artifact.receipt_id,
-        }))?;
-        let source_ids_json = serde_json::to_string(&artifact.source_scope.effective_source_ids)?;
-        let now = chrono::Utc::now().to_rfc3339();
 
-        // Collect full source texts for LLM refinement.
-        // list_sources() excludes content_text (heavy field), so we must call
-        // get_source() for each effective source to get the actual text.
+        // list_sources() excludes content_text (heavy field), so we must
+        // call get_source() for each effective source to get the text.
         let mut full_texts: Vec<(String, String)> = Vec::new();
         for sid in &artifact.source_scope.effective_source_ids {
             if let Ok(full_source) = db.get_source(sid) {
@@ -119,48 +114,96 @@ pub async fn generate_studio_output(
                 }
             }
         }
+        Ok((artifact, full_texts, citation_pool))
+    })?;
 
-        // Optional LLM refinement pass — now uses full source content
-        let (prose_content, prompt_used) = if should_refine {
-            let artifact_clone = artifact.clone();
-            let nb = notebook_id.clone();
-            let result = tokio::task::block_in_place(|| {
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(refine_studio_artifact(
-                    &artifact_clone,
-                    &full_texts,
-                    &state,
-                    &nb,
-                ))
-            });
-            match result {
+    // Phase 2 (no DB lock): LLM generation. Widget kinds (flashcards, quiz,
+    // mind map) get structured JSON content the interactive widgets can
+    // render; prose kinds get refined markdown. Both fall back to the
+    // deterministic template artifact on failure.
+    let (prose_content, prompt_used) = if should_refine && !full_texts.is_empty() {
+        if is_widget_kind(kind) {
+            match generate_structured_widget_content(
+                kind,
+                &artifact,
+                &full_texts,
+                &citation_pool,
+                max_items,
+                &state,
+            )
+            .await
+            {
+                Ok(content) => {
+                    artifact.content = content;
+                    artifact.prompt_used = "llm_structured_source_grounded_v1".to_string();
+                    artifact.validation = validate_artifact(&artifact);
+                    if !artifact.validation.schema_validated {
+                        tracing::warn!(
+                            errors = ?artifact.validation.errors,
+                            "Structured Studio content failed validation; this should not happen \
+                             after citation injection"
+                        );
+                    }
+                    (None, artifact.prompt_used.clone())
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Studio structured generation failed, using deterministic template: {e}"
+                    );
+                    (None, artifact.prompt_used.clone())
+                }
+            }
+        } else {
+            match refine_studio_artifact(&artifact, &full_texts, &state).await {
                 Ok(prose) => (Some(prose), "source_grounded_refined_v1".to_string()),
                 Err(e) => {
                     tracing::warn!("Studio LLM refinement failed, falling back: {e}");
                     (None, artifact.prompt_used.clone())
                 }
             }
-        } else {
-            (None, artifact.prompt_used.clone())
-        };
+        }
+    } else {
+        (None, artifact.prompt_used.clone())
+    };
 
-        let output = StudioOutput {
-            id: artifact.receipt_id.clone(),
-            output_type: artifact.output_type.clone(),
-            title: Some(artifact.title.clone()),
-            prompt_used,
-            raw_content: Some(raw_content),
-            prose_content,
-            config: Some(config),
-            source_ids: Some(source_ids_json),
-            file_path: None,
-            status: "ready".to_string(),
-            error_message: None,
-            created_at: now,
-        };
-        db.insert_studio_output(&output)?;
-        studio_output_view(output)
-    })
+    let raw_content = serde_json::to_string_pretty(&artifact)?;
+    let config = serde_json::to_string(&json!({
+        "schema": "StudioOutputConfigV1",
+        "deterministic": artifact.validation.deterministic,
+        "source_bound": true,
+        "schema_validated": artifact.validation.schema_validated,
+        "all_items_source_cited": artifact.validation.all_items_source_cited,
+        "max_items": max_items,
+        "receipt_id": artifact.receipt_id,
+    }))?;
+    let source_ids_json = serde_json::to_string(&artifact.source_scope.effective_source_ids)?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let output = StudioOutput {
+        id: artifact.receipt_id.clone(),
+        output_type: artifact.output_type.clone(),
+        title: Some(artifact.title.clone()),
+        prompt_used,
+        raw_content: Some(raw_content),
+        prose_content,
+        config: Some(config),
+        source_ids: Some(source_ids_json),
+        file_path: None,
+        status: "ready".to_string(),
+        error_message: None,
+        created_at: now,
+    };
+
+    // Phase 3 (short write): persist the finished output.
+    state.with_notebook_db_write(&notebook_id, |db| db.insert_studio_output(&output))?;
+    studio_output_view(output)
+}
+
+fn is_widget_kind(kind: StudioOutputKind) -> bool {
+    matches!(
+        kind,
+        StudioOutputKind::Flashcards | StudioOutputKind::Quiz | StudioOutputKind::MindMap
+    )
 }
 
 #[tauri::command]
@@ -295,22 +338,15 @@ fn truncate_to_char_boundary(text: &str, max_chars: usize) -> String {
     format!("{truncated}\n[...truncated]")
 }
 
-/// Convert source-grounded data into natural-language prose via the LLM.
-///
-/// Now receives FULL source texts (not just 360-char snippets) and uses
-/// type-specific system prompts so each Studio output button produces
-/// genuinely differentiated content.
-async fn refine_studio_artifact(
-    artifact: &crate::studio::StudioArtifact,
-    full_texts: &[(String, String)], // (title, text)
+/// Run a single non-streaming Studio LLM call behind the LLM/GPU gates.
+async fn run_studio_llm(
     state: &AppState,
-    _notebook_id: &str,
+    system_prompt: String,
+    user_prompt: String,
+    temperature: f32,
+    purpose: &str,
 ) -> Result<String, GlossError> {
     let (config, model) = {
-        let registry = state
-            .model_registry
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
         let app_db = state
             .app_db
             .lock()
@@ -324,8 +360,6 @@ async fn refine_studio_artifact(
                 .and_then(|p| crate::providers::ProviderType::from_str(p.trim()));
             selected.unwrap_or(crate::providers::ProviderType::Ollama)
         })?;
-        drop(app_db);
-        drop(registry);
         (config, model)
     };
 
@@ -341,25 +375,8 @@ async fn refine_studio_artifact(
         .map_err(|e| GlossError::Other(format!("Failed to acquire GPU gate: {e}")))?;
 
     let provider = build_provider(&config)?;
-    let output_type_label = artifact.output_type.clone();
-    let title = &artifact.title;
-
-    // Build source material block from full texts
-    let source_material = full_texts
-        .iter()
-        .map(|(src_title, text)| format!("# {src_title}\n\n{text}"))
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
-
-    let (system_prompt, user_prompt) = studio_prompt_for_kind(
-        &artifact.output_type,
-        title,
-        &output_type_label,
-        &source_material,
-    );
-
     let request = ChatRequest {
-        model: model.clone(),
+        model,
         system_prompt: Some(system_prompt),
         messages: vec![ChatMessage {
             role: "user".to_string(),
@@ -367,7 +384,7 @@ async fn refine_studio_artifact(
             images: None,
         }],
         max_tokens: 4096,
-        temperature: 0.3,
+        temperature,
         top_p: None,
         top_k: None,
         min_p: None,
@@ -383,15 +400,288 @@ async fn refine_studio_artifact(
         let token = token_result?;
         response.push_str(&token.token);
     }
-
-    let elapsed = start.elapsed();
     tracing::info!(
-        "Studio LLM refinement ({output_type_label}) completed in {}ms, output: {} chars",
-        elapsed.as_millis(),
+        "Studio LLM call ({purpose}) completed in {}ms, output: {} chars",
+        start.elapsed().as_millis(),
         response.trim().len()
     );
-
     Ok(response.trim().to_string())
+}
+
+fn studio_source_material(full_texts: &[(String, String)]) -> String {
+    full_texts
+        .iter()
+        .map(|(src_title, text)| format!("# {src_title}\n\n{text}"))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n")
+}
+
+/// Convert source-grounded data into natural-language prose via the LLM.
+///
+/// Receives FULL source texts (not just 360-char snippets) and uses
+/// type-specific system prompts so each Studio output button produces
+/// genuinely differentiated content.
+async fn refine_studio_artifact(
+    artifact: &crate::studio::StudioArtifact,
+    full_texts: &[(String, String)], // (title, text)
+    state: &AppState,
+) -> Result<String, GlossError> {
+    let source_material = studio_source_material(full_texts);
+    let (system_prompt, user_prompt) = studio_prompt_for_kind(
+        &artifact.output_type,
+        &artifact.title,
+        &artifact.output_type,
+        &source_material,
+    );
+    run_studio_llm(
+        state,
+        system_prompt,
+        user_prompt,
+        0.3,
+        &artifact.output_type,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Structured widget generation (flashcards / quiz / mind map)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct LlmFlashcards {
+    cards: Vec<LlmFlashcard>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmFlashcard {
+    front: String,
+    back: String,
+    #[serde(default)]
+    difficulty: Option<String>,
+    #[serde(default)]
+    source_title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmQuiz {
+    questions: Vec<LlmQuizItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmQuizItem {
+    question: String,
+    choices: Vec<String>,
+    answer_index: usize,
+    #[serde(default)]
+    explanation: Option<String>,
+    #[serde(default)]
+    source_title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmMindMap {
+    nodes: Vec<LlmMindMapNode>,
+    #[serde(default)]
+    edges: Vec<LlmMindMapEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmMindMapNode {
+    id: String,
+    label: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    source_title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmMindMapEdge {
+    from: String,
+    to: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// Find the citation whose source title matches the LLM-reported title;
+/// fall back to the first citation so every item stays source-anchored.
+fn citation_for_title<'a>(
+    pool: &'a [StudioCitation],
+    source_title: Option<&str>,
+) -> Option<&'a StudioCitation> {
+    let by_title = source_title.and_then(|wanted| {
+        pool.iter()
+            .find(|citation| citation.source_title.eq_ignore_ascii_case(wanted.trim()))
+    });
+    by_title.or_else(|| pool.first())
+}
+
+fn citations_json(citation: Option<&StudioCitation>) -> serde_json::Value {
+    match citation {
+        Some(citation) => json!([citation]),
+        None => json!([]),
+    }
+}
+
+/// Generate real, LLM-authored structured content for the interactive Studio
+/// widgets, with per-item citations injected from the source scope.
+async fn generate_structured_widget_content(
+    kind: StudioOutputKind,
+    artifact: &crate::studio::StudioArtifact,
+    full_texts: &[(String, String)],
+    citation_pool: &[StudioCitation],
+    max_items: usize,
+    state: &AppState,
+) -> Result<serde_json::Value, GlossError> {
+    let source_material = studio_source_material(full_texts);
+    let title = &artifact.title;
+    let structured_err = |message: String| GlossError::Studio {
+        output_type: kind.as_str().to_string(),
+        message,
+    };
+
+    match kind {
+        StudioOutputKind::Flashcards => {
+            let system = "You create study flashcards from source material. Respond with ONLY a \
+                          valid JSON object — no markdown fences, no commentary."
+                .to_string();
+            let user = format!(
+                "Create up to {max_items} study flashcards from the sources below.\n\
+                 Each card must test one self-contained fact or concept from the sources.\n\
+                 Respond with JSON exactly in this shape:\n\
+                 {{\"cards\":[{{\"front\":\"question or prompt\",\"back\":\"answer\",\
+                 \"difficulty\":\"easy|medium|hard\",\
+                 \"source_title\":\"exact title of the supporting source\"}}]}}\n\n\
+                 Title: {title}\n\n## Sources\n\n{source_material}"
+            );
+            let response =
+                run_studio_llm(state, system, user, 0.2, "flashcards_structured").await?;
+            let parsed: LlmFlashcards = llm_pipeline::parsing::parse_as(&response)
+                .map_err(|e| structured_err(format!("flashcards JSON parse failed: {e}")))?;
+            let cards = parsed
+                .cards
+                .into_iter()
+                .filter(|card| !card.front.trim().is_empty() && !card.back.trim().is_empty())
+                .take(max_items)
+                .map(|card| {
+                    let citation = citation_for_title(citation_pool, card.source_title.as_deref());
+                    json!({
+                        "front": card.front.trim(),
+                        "back": card.back.trim(),
+                        "difficulty": card.difficulty,
+                        "citations": citations_json(citation),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if cards.is_empty() {
+                return Err(structured_err("LLM produced no usable flashcards".into()));
+            }
+            Ok(json!({ "cards": cards }))
+        }
+        StudioOutputKind::Quiz => {
+            let system = "You design multiple-choice quizzes from source material. Respond with \
+                          ONLY a valid JSON object — no markdown fences, no commentary."
+                .to_string();
+            let user = format!(
+                "Write up to {max_items} multiple-choice questions testing understanding of the \
+                 sources below. Each question needs exactly 4 plausible choices with one correct \
+                 answer, and a short explanation grounded in the sources.\n\
+                 Respond with JSON exactly in this shape:\n\
+                 {{\"questions\":[{{\"question\":\"...\",\"choices\":[\"a\",\"b\",\"c\",\"d\"],\
+                 \"answer_index\":0,\"explanation\":\"why the answer is correct\",\
+                 \"source_title\":\"exact title of the supporting source\"}}]}}\n\n\
+                 Title: {title}\n\n## Sources\n\n{source_material}"
+            );
+            let response = run_studio_llm(state, system, user, 0.2, "quiz_structured").await?;
+            let parsed: LlmQuiz = llm_pipeline::parsing::parse_as(&response)
+                .map_err(|e| structured_err(format!("quiz JSON parse failed: {e}")))?;
+            let questions = parsed
+                .questions
+                .into_iter()
+                .filter(|item| {
+                    !item.question.trim().is_empty()
+                        && item.choices.len() >= 2
+                        && item.answer_index < item.choices.len()
+                })
+                .take(max_items)
+                .map(|item| {
+                    let citation = citation_for_title(citation_pool, item.source_title.as_deref());
+                    json!({
+                        "question": item.question.trim(),
+                        "choices": item.choices,
+                        "answer_index": item.answer_index,
+                        "explanation": item.explanation,
+                        "citations": citations_json(citation),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if questions.is_empty() {
+                return Err(structured_err(
+                    "LLM produced no usable quiz questions".into(),
+                ));
+            }
+            Ok(json!({ "questions": questions }))
+        }
+        StudioOutputKind::MindMap => {
+            let system = "You extract concept graphs from source material for mind map \
+                          visualization. Respond with ONLY a valid JSON object — no markdown \
+                          fences, no commentary."
+                .to_string();
+            let user = format!(
+                "Extract the key concepts from the sources below and map their relationships as \
+                 a graph with up to {max_items} concept nodes plus one central topic node. Use \
+                 short labels and connect every node to the graph.\n\
+                 Respond with JSON exactly in this shape:\n\
+                 {{\"nodes\":[{{\"id\":\"n1\",\"label\":\"concept\",\"summary\":\"one sentence\",\
+                 \"source_title\":\"exact title of the supporting source\"}}],\
+                 \"edges\":[{{\"from\":\"n1\",\"to\":\"n2\",\"label\":\"relationship\"}}]}}\n\n\
+                 Title: {title}\n\n## Sources\n\n{source_material}"
+            );
+            let response = run_studio_llm(state, system, user, 0.2, "mind_map_structured").await?;
+            let parsed: LlmMindMap = llm_pipeline::parsing::parse_as(&response)
+                .map_err(|e| structured_err(format!("mind map JSON parse failed: {e}")))?;
+            let node_ids = parsed
+                .nodes
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let nodes = parsed
+                .nodes
+                .iter()
+                .filter(|node| !node.label.trim().is_empty())
+                .map(|node| {
+                    let citation = citation_for_title(citation_pool, node.source_title.as_deref());
+                    json!({
+                        "id": node.id,
+                        "label": node.label.trim(),
+                        "summary": node.summary,
+                        "citations": citations_json(citation),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let edges = parsed
+                .edges
+                .iter()
+                .filter(|edge| node_ids.contains(&edge.from) && node_ids.contains(&edge.to))
+                .map(|edge| {
+                    json!({
+                        "from": edge.from,
+                        "to": edge.to,
+                        "label": edge.label,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if nodes.is_empty() {
+                return Err(structured_err(
+                    "LLM produced no usable mind map nodes".into(),
+                ));
+            }
+            Ok(json!({ "nodes": nodes, "edges": edges }))
+        }
+        _ => Err(structured_err(
+            "structured generation only supports widget output kinds".into(),
+        )),
+    }
 }
 
 /// Build type-specific prompts so each Studio button produces differentiated output.

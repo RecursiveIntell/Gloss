@@ -76,6 +76,10 @@ fn scope_allows_chunk(scope: &ResolvedSourceScope, chunk: &Chunk) -> bool {
     scope.allows(&chunk.source_id)
 }
 
+/// Convenience wrapper for tests: same signature as
+/// `local_retrieval_outcome_with_query` minus the precomputed query
+/// embedding, which lets tests assert on the auto-embed path.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn local_retrieval_outcome(
     query: &str,

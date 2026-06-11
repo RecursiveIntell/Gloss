@@ -91,6 +91,7 @@ impl QueryEmbedCache {
         self.generation = 0;
     }
 
+    #[cfg(test)]
     pub fn stats(&self) -> (u64, u64, usize) {
         (self.hits, self.misses, self.entries.len())
     }

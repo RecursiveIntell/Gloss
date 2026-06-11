@@ -28,7 +28,10 @@ def validate() -> list[str]:
     if run_id != REQUIRED_RUN_ID:
         errors.append(f"current run is {run_id!r}, expected {REQUIRED_RUN_ID}")
 
-    pack_manifest = ROOT / "PACK_MANIFEST.json"
+    pack_manifest = ROOT / "docs" / "PACK_MANIFEST.json"
+    if not pack_manifest.exists():
+        # Fall back to repo root for older layouts.
+        pack_manifest = ROOT / "PACK_MANIFEST.json"
     try:
         manifest = json.loads(read(pack_manifest) or "{}")
     except Exception as exc:

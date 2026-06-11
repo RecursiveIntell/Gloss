@@ -187,12 +187,6 @@ impl EmbeddingService {
         })
     }
 
-    /// Backwards-compatible constructor (defaults to 60s timeout, suitable
-    /// for batch imports). Prefer `new_ollama` with an explicit budget.
-    pub fn new_ollama_default(url: &str, model: &str) -> Result<Self, GlossError> {
-        Self::new_ollama(url, model, 60)
-    }
-
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, GlossError> {
         match &self.backend {
             EmbeddingBackend::FastEmbed(model) => {

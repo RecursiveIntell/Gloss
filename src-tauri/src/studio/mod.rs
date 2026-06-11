@@ -74,7 +74,7 @@ pub struct StudioSnippet {
 }
 
 impl StudioSnippet {
-    fn citation(&self) -> StudioCitation {
+    pub fn citation(&self) -> StudioCitation {
         StudioCitation {
             source_id: self.source_id.clone(),
             source_title: self.source_title.clone(),
@@ -499,8 +499,11 @@ pub fn validate_artifact(artifact: &StudioArtifact) -> StudioValidation {
 fn content_items_have_citations(content: &Value) -> bool {
     let arrays = match content.as_object() {
         Some(map) => map
-            .values()
-            .filter_map(Value::as_array)
+            .iter()
+            // Mind-map "edges" are relations between already-cited nodes,
+            // not claims of their own — they carry no citations.
+            .filter(|(key, _)| key.as_str() != "edges")
+            .filter_map(|(_, value)| value.as_array())
             .filter(|items| items.iter().all(Value::is_object))
             .collect::<Vec<_>>(),
         None => return false,
@@ -610,7 +613,7 @@ mod tests {
     fn explicit_studio_scope_skips_not_ready_sources_instead_of_failing() {
         // Two sources: one ready, one still processing.  Explicitly requesting both
         // should succeed using the ready one rather than erroring out.
-        let mut ready_src = source("s1", "Ready", true);
+        let ready_src = source("s1", "Ready", true);
         let mut processing_src = source("s2", "Processing", true);
         processing_src.status = "processing".to_string();
 

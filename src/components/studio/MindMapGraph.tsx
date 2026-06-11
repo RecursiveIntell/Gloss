@@ -38,7 +38,7 @@ interface GraphLink extends SimulationLinkDatum<GraphNode> {
   label?: string;
 }
 
-function parseMindMap(raw: string | undefined): MindMapData | null {
+export function parseMindMap(raw: string | undefined): MindMapData | null {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
@@ -47,14 +47,44 @@ function parseMindMap(raw: string | undefined): MindMapData | null {
     }
     if (parsed && typeof parsed === "object" && parsed.content) {
       const c = parsed.content;
-      if (c && Array.isArray(c.nodes) && Array.isArray(c.edges)) {
-        return c as MindMapData;
+      if (c && Array.isArray(c.nodes)) {
+        return { nodes: c.nodes, edges: Array.isArray(c.edges) ? c.edges : [] } as MindMapData;
       }
+      // Deterministic template fallback: {center, branches: [{label, children}]}
+      const fromBranches = branchesToGraph(parsed.title, c);
+      if (fromBranches) return fromBranches;
     }
     return null;
   } catch {
     return null;
   }
+}
+
+function branchesToGraph(
+  title: unknown,
+  content: { center?: unknown; branches?: unknown }
+): MindMapData | null {
+  if (!Array.isArray(content.branches)) return null;
+  const centerLabel =
+    typeof content.center === "string"
+      ? content.center
+      : typeof title === "string"
+        ? title
+        : "Mind map";
+  const nodes: MindMapNode[] = [{ id: "center", label: centerLabel }];
+  const edges: MindMapEdge[] = [];
+  content.branches.forEach((branch, branchIndex) => {
+    if (branch == null || typeof branch !== "object") return;
+    const b = branch as Record<string, unknown>;
+    if (typeof b.label !== "string" || b.label.length === 0) return;
+    const branchId = `branch-${branchIndex}`;
+    const children = Array.isArray(b.children)
+      ? (b.children as unknown[]).filter((c): c is string => typeof c === "string")
+      : [];
+    nodes.push({ id: branchId, label: b.label, summary: children[0] });
+    edges.push({ from: "center", to: branchId });
+  });
+  return nodes.length > 1 ? { nodes, edges } : null;
 }
 
 const NODE_W = 140;

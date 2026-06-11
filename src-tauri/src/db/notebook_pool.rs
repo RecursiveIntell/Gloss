@@ -99,10 +99,10 @@ impl NotebookDbPool {
         F: FnOnce(&NotebookDb) -> Result<T, GlossError>,
     {
         info!("[notebook-pool] read acquire for {:?}", self.db_path);
-        let conn = self.take_read_conn()?;
+        let (conn, is_one_shot) = self.take_read_conn()?;
         let db = NotebookDb::from_conn_ref(&conn);
         let result = f(db);
-        self.return_read_conn(conn);
+        self.return_read_conn(conn, is_one_shot);
         info!("[notebook-pool] read release for {:?}", self.db_path);
         result
     }
@@ -132,7 +132,12 @@ impl NotebookDbPool {
     // -- internal helpers ---------------------------------------------------
 
     /// Take a read connection from the pool (or open a new one).
-    fn take_read_conn(&self) -> Result<Connection, GlossError> {
+    ///
+    /// Returns a tuple `(Connection, is_one_shot)`. When `is_one_shot` is
+    /// `true`, the connection was opened past the `max_read_conns` budget
+    /// and must be DROPPED (not cached) by `return_read_conn` to avoid
+    /// growing the pool beyond the configured cap.
+    fn take_read_conn(&self) -> Result<(Connection, bool), GlossError> {
         {
             let mut pool = self
                 .read_conns
@@ -143,7 +148,7 @@ impl NotebookDbPool {
                     "[notebook-pool] reusing cached read conn for {:?}",
                     self.db_path
                 );
-                return Ok(conn);
+                return Ok((conn, false));
             }
         }
         // No cached connection available — try to open a new one.
@@ -158,39 +163,38 @@ impl NotebookDbPool {
                 "[notebook-pool] opened new read conn #{} for {:?}",
                 count, self.db_path
             );
-            Ok(conn)
+            Ok((conn, false))
         } else {
             // Over budget — open a one-shot connection that will be dropped
-            // when returned (we won't cache it).
+            // when returned. We deliberately do NOT increment read_conn_count
+            // so the budget check stays accurate.
             warn!(
                 "[notebook-pool] read pool at capacity ({max}), opening one-shot conn for {:?}",
                 self.db_path,
                 max = self.max_read_conns
             );
-            self.open_read_conn()
+            self.open_read_conn().map(|c| (c, true))
         }
     }
 
     /// Return a read connection to the pool.
-    fn return_read_conn(&self, conn: Connection) {
-        let count = self
-            .read_conn_count
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // If we're over the cached limit, just drop the connection.
-        if *count > self.max_read_conns {
-            // One-shot connection — drop it and decrement nothing.
-            // Actually, one-shot conns don't increment read_conn_count, so
-            // we can just drop the connection. But to be safe, let's check
-            // the pool size:
-            let mut pool = self.read_conns.lock().unwrap_or_else(|e| e.into_inner());
-            if pool.len() < self.max_read_conns {
-                pool.push(conn);
-            }
-            // else: drop (conn goes out of scope and closes)
+    ///
+    /// One-shot connections (past the budget) are NOT cached: they are dropped
+    /// here so the pool stays bounded.
+    fn return_read_conn(&self, conn: Connection, is_one_shot: bool) {
+        if is_one_shot {
+            // Drop the connection — don't touch the cached pool. The
+            // Connection's Drop impl closes the SQLite handle.
             return;
         }
         let mut pool = self.read_conns.lock().unwrap_or_else(|e| e.into_inner());
+        // Defensive: even for cached returns, don't let the pool grow past
+        // the configured cap. (This should not happen given take_read_conn's
+        // budget check, but it protects against any other path that calls
+        // this function.)
+        if pool.len() >= self.max_read_conns {
+            return;
+        }
         pool.push(conn);
     }
 
@@ -314,5 +318,41 @@ impl NotebookDbPools {
     pub fn contains(&self, notebook_id: &str) -> bool {
         let pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
         pools.contains_key(notebook_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// B-1 regression: opening more than `max_read_conns` concurrent read
+    /// closures must NOT cause the cached pool to grow past the cap. Each
+    /// over-budget connection should be opened and dropped, leaving the
+    /// pool at exactly `max_read_conns` entries.
+    #[test]
+    fn read_pool_does_not_grow_past_max_read_conns_under_burst() {
+        let dir = tempdir().unwrap();
+        let pool =
+            Arc::new(NotebookDbPool::with_max_read_conns(&dir.path().join("nb.db"), 2).unwrap());
+        // Issue 10 concurrent reads, way past the cap of 2. Each one must
+        // succeed (using a one-shot conn) and the pool must stay bounded.
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let pool = Arc::clone(&pool);
+            handles.push(std::thread::spawn(move || {
+                pool.read(|_db| Ok::<_, GlossError>(i)).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let cached = pool.read_conns.lock().unwrap();
+        assert!(
+            cached.len() <= 2,
+            "read pool grew past cap: {} entries (max=2)",
+            cached.len()
+        );
     }
 }

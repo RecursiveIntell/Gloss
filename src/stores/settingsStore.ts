@@ -90,11 +90,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   updateSetting: async (key, value) => {
-    try {
-      await api.updateSetting(key, value);
-    } catch (err) {
-      console.warn("Failed to update setting:", key, err);
-    }
+    // Snapshot the prior value so we can roll back on failure.
+    const prior = get().settings[key];
+    const priorConfigured = get().settings[`${key}_configured`];
+    // Optimistic local commit so the UI is responsive while the IPC is in
+    // flight. On failure we restore the prior value below.
     set((state) => {
       const nextSettings = { ...state.settings };
       if (key === 'openai_api_key' || key === 'anthropic_api_key') {
@@ -105,20 +105,73 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       }
       return { settings: nextSettings };
     });
+    try {
+      await api.updateSetting(key, value);
+    } catch (err) {
+      console.warn("Failed to update setting:", key, err);
+      // Restore the prior value so the UI does not show a phantom setting
+      // that was never persisted. Reload will overwrite with the authoritative
+      // value on next load.
+      set((state) => {
+        const nextSettings = { ...state.settings };
+        if (prior === undefined) {
+          delete nextSettings[key];
+        } else {
+          nextSettings[key] = prior;
+        }
+        if (key === 'openai_api_key' || key === 'anthropic_api_key') {
+          if (priorConfigured === undefined) {
+            delete nextSettings[`${key}_configured`];
+          } else {
+            nextSettings[`${key}_configured`] = priorConfigured;
+          }
+        }
+        return { settings: nextSettings };
+      });
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Setting not saved',
+        message: `${key}: ${err instanceof Error ? err.message : String(err)}`,
+        duration: 5000,
+      });
+      throw err;
+    }
     if (key === 'memory_backend') {
       await get().loadFeatureFlags();
     }
   },
 
   updateFeatureFlag: async (id, enabled) => {
-    const featureFlags = await api.updateFeatureFlag(id, enabled);
-    set({ featureFlags });
-    await get().loadSettings();
+    try {
+      const featureFlags = await api.updateFeatureFlag(id, enabled);
+      set({ featureFlags });
+      await get().loadSettings();
+    } catch (err) {
+      console.warn("Failed to update feature flag:", id, err);
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Feature flag not saved',
+        message: `${id}: ${err instanceof Error ? err.message : String(err)}`,
+        duration: 5000,
+      });
+      throw err;
+    }
   },
 
   updateProvider: async (id, enabled, baseUrl, apiKey) => {
-    await api.updateProvider(id, enabled, baseUrl, apiKey);
-    await get().loadProviders();
+    try {
+      await api.updateProvider(id, enabled, baseUrl, apiKey);
+      await get().loadProviders();
+    } catch (err) {
+      console.warn("Failed to update provider:", id, err);
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Provider not saved',
+        message: `${id}: ${err instanceof Error ? err.message : String(err)}`,
+        duration: 5000,
+      });
+      throw err;
+    }
   },
 
   setActiveModel: (model) => set({ activeModel: model }),

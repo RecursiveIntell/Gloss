@@ -27,12 +27,16 @@ def read(repo: Path, rel: str) -> str:
 def _(repo: Path):
     text = read(repo, "src/App.tsx")
     failures = []
+    import re as _re
     for event in ["onChatToken", "onChatStatus", "onChatError", "onChatEvidence"]:
-        idx = text.find(f"const unlisten = {event}")
-        if idx == -1:
+        # Real shape is `unlisteners.push(onChatToken((payload) => { ... }))`
+        # inside the listen-all call. Match the call-site (not the import)
+        # via `event((payload` so we know we are looking at the handler.
+        m = _re.search(rf"{_re.escape(event)}\s*\(\s*\(payload", text)
+        if not m:
             failures.append(f"missing {event}")
             continue
-        block = text[idx : idx + 900]
+        block = text[m.start() : m.start() + 900]
         filter_idx = block.find("activeNotebookId")
         store_idx = block.find("useChatStore.getState()")
         if filter_idx != -1 and (store_idx == -1 or filter_idx < store_idx):

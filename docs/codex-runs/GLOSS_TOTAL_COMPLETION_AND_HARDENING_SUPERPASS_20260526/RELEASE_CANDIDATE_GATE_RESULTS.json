@@ -418,7 +418,7 @@
   ],
   "public_claim_ready": true,
   "reason_release_ready_false": "",
-  "recorded_utc": "2026-06-10T19:26:11.045883+00:00",
+  "recorded_utc": "2026-06-11T18:47:02.765524+00:00",
   "release_candidate_gate_passed": true,
   "release_ready": true,
   "run_id": "GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526",

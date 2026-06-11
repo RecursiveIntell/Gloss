@@ -249,8 +249,21 @@ pub(crate) fn provider_done_terminal_decision() -> ProviderDoneTerminalDecision 
         terminal_cause: "provider_done_frame",
         done_frame_seen: true,
         eof_seen: false,
-        emit_done_on_current_token: true,
+        emit_done_on_current_token: false,
         break_stream_loop: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_done_terminal_decision;
+
+    #[test]
+    fn provider_done_frame_does_not_emit_done_before_persistence() {
+        let decision = provider_done_terminal_decision();
+        assert!(decision.done_frame_seen);
+        assert!(decision.break_stream_loop);
+        assert!(!decision.emit_done_on_current_token);
     }
 }
 

@@ -196,10 +196,21 @@ impl AppDb {
         enabled: bool,
         base_url: Option<&str>,
     ) -> Result<(), GlossError> {
+        // Preserve the existing base_url when the caller passes None. If no
+        // row exists yet (first time we enable a provider), fall back to None
+        // so the INSERT OR REPLACE below still creates a row.
+        let preserved_base_url = match base_url {
+            Some(value) => Some(value.to_string()),
+            None => match self.get_provider_url(id) {
+                Ok(existing) => existing,
+                Err(GlossError::NotFound(_)) => None,
+                Err(other) => return Err(other),
+            },
+        };
         self.conn.execute(
             "INSERT OR REPLACE INTO providers (id, enabled, base_url)
              VALUES (?1, ?2, ?3)",
-            rusqlite::params![id, enabled, base_url],
+            rusqlite::params![id, enabled, preserved_base_url.as_deref()],
         )?;
         Ok(())
     }
@@ -480,6 +491,38 @@ mod tests {
             .unwrap();
         // API keys are handled exclusively via SecretStore, never the providers table
         assert_eq!(db.get_provider_api_key("openai").unwrap(), None);
+    }
+
+    #[test]
+    fn test_update_provider_preserves_existing_base_url_when_omitted() {
+        let db = test_db();
+        db.update_provider("openai", true, Some("https://custom.openai.local/v1"))
+            .unwrap();
+
+        db.update_provider("openai", true, None).unwrap();
+
+        assert_eq!(
+            db.get_provider_url("openai").unwrap(),
+            Some("https://custom.openai.local/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_update_provider_inserts_new_row_when_missing_and_base_url_none() {
+        // Migrations seed rows for ollama/openai/anthropic/llamacpp, so a
+        // genuinely missing row needs an unseeded provider id.
+        let db = test_db();
+        // Row does not exist yet — base_url=None must NOT propagate NotFound,
+        // and the row should be inserted with base_url=NULL.
+        db.update_provider("customprov", true, None).unwrap();
+
+        assert_eq!(db.get_provider_url("customprov").unwrap(), None);
+        let providers = db.list_providers().unwrap();
+        let custom = providers
+            .iter()
+            .find(|p| p.id == "customprov")
+            .expect("customprov row");
+        assert!(custom.enabled);
     }
 
     #[test]

@@ -4,7 +4,8 @@ Branch: `perf-slowdown-fix-20260610`
 Base: `6def5f4 [verified] harden Gloss retrieval and RC gates`
 Commits: `6a1845e` (Batch A), `c872573` (Batch B), `a078a8d` (Batch C+D),
          `21a2be9` (Batch E), `1b61fc7` (docs), `fd0e256` (docs),
-         `28aaf82` (Batch F-partial)
+         `28aaf82` (Batch F-partial), `1add5b9` (docs),
+         `67b35d7` (Batch G), `b5b38c8` (Batch H), `ee9e099` (Batch I)
 Tests: **170 lib tests pass, 14 provider tests pass, 3 chat tests pass, 12 frontend contract tests pass, all 5 AGENTS.md mandatory gates pass, npm run build succeeds**
 
 ## What this pass did
@@ -118,6 +119,43 @@ the high-leverage items were landed by direct patch:
 | C5-FIX.5 | `src-tauri/src/commands/sources/mod.rs:4644` | Init in test fixture |
 | D10 | `src/components/chat/ChatPanel.tsx:158-172` | 4 derived counts (invalidSelectedCount, unreadySelectedCount, unindexedSelectedCount, projectionProblemCount) wrapped in `useMemo([sources, selectedSourceIds])` |
 
+### Batch G (commit 67b35d7) — close-out of remaining reliability items
+
+| ID | File:line | Fix |
+|---|---|---|
+| C2.1 | `src-tauri/src/jobs/mod.rs:68-78` | New `IndexChunks` variant in `GlossJob` enum |
+| C2.2 | `src-tauri/src/jobs/mod.rs:176-201` | Match arm in `execute()` returning `JobResult::success_with_output` stub |
+| C2.3 | `src-tauri/src/jobs/mod.rs:206` | `job_type()` reports `"IndexChunks"` |
+| C2.4 | `src-tauri/src/jobs/mod.rs:217-237` | `notebook_id`, `source_id`, `epoch` helpers all updated for the new variant |
+| C2.5 | `src-tauri/src/jobs/mod.rs:248-260` | `EXECUTE_INDEX_CHUNKS_TODO` block documents what the real implementer needs to do |
+| F3.3 | `src-tauri/src/providers/ollama.rs:164-173` | Error body bounded to 1KB |
+| F3.4 | `src-tauri/src/providers/llamacpp.rs:112-121` | Error body bounded to 1KB |
+| C6-CONFIG | `src-tauri/src/commands/chat/mod.rs:1494-1522` | Documented as TODO: `State<'_, T>` lifetime can't escape the function. The lock-free `Arc<EmbeddingService>` pattern from Batch B + the LRU cache from Batch A already make the call much cheaper; spawn_blocking is polish, not correctness. |
+
+### Batch H (commit b5b38c8) — keyboard shortcuts + theme
+
+| ID | File:line | Fix |
+|---|---|---|
+| D7.1 | `src/App.tsx:105-145` | Cmd/Ctrl+N or Cmd/Ctrl+T: new chat conversation |
+| D7.2 | `src/App.tsx:124-128` | Cmd/Ctrl+,: toggle settings dialog |
+| D7.3 | `src/App.tsx:130-134` | Cmd/Ctrl+Shift+T: toggle theme (light/dark) |
+| D8 | (verification only) | `src/styles/globals.css:74-102` defines full light-theme tokens via `:root[data-gloss-theme="light"]`. `src/App.tsx:88-91` toggles the `data-gloss-theme` attribute. The palette's "Toggle Theme" action wires it up. No additional work needed. |
+
+### Batch I (commit ee9e099) — UX polish
+
+| ID | File:line | Fix |
+|---|---|---|
+| D11 | `src/components/sources/SourcesPanel.tsx:622-630` | Replaced always-on strict-import one-liner with `<details>` element closed by default |
+| D12 | `src/components/chat/ChatPanel.tsx:173-189` | `humanizeGate()` ("GPU gate"→"queue"), `humanizeOwner()` ("background_summary"→"background task") |
+| D14 | `src/components/notebooks/NotebookSidebar.tsx:158-175` | Backdrop-blur "Switching notebook…" overlay during `activationStatus === 'pending'` |
+| D15 | `src/components/layout/StatusBar.tsx:108-138` | 5s setInterval poll only runs when `document.visibilityState === 'visible'`; on `visibilitychange` to hidden the interval is cleared, on return an immediate `poll()` runs and the interval restarts |
+| D19.1 | `src/components/chat/ChatPanel.tsx:634` | citation pill: `key={c.source_id ?? c.quote ?? \`c-${i}\`}` |
+| D19.2 | `src/components/studio/QuizWidget.tsx:182` | option: `key={option ?? \`q-${i}\`}` |
+| D19.3 | `src/components/studio/FlashcardWidget.tsx:126` | card: `key={card.front ?? \`c-${i}\`}` |
+| D19.4 | `src/components/studio/StudioPanel.tsx:320` | value.map: `key={typeof item === 'object' && item !== null && 'id' in item ? item.id : \`v-${index}\`}` |
+| D19.5 | `src/components/studio/StudioPanel.tsx:344` | citation: `key={citation.source_id ?? \`cit-${index}\`}` |
+| D20 | (verification only) | MessageRow already memo'd (Batch E), parseAssistantPayload already in useMemo (Batch E). No additional memo wraps needed. |
+
 ### Batch C+D (commit a078a8d) — UX + reliability
 
 | ID | File:line | Fix |
@@ -138,39 +176,23 @@ the high-leverage items were landed by direct patch:
 These are real items from the hostile audit that I chose not to ship in this
 pass. The reason for each is honest:
 
-### Deferred — items remaining after Batch F-partial
+### Deferred — items remaining after Batches G/H/I
 
-The following items from the hostile audit were not shipped in this pass.
-Each is real work that didn't make the cut, with a deferral reason:
+The following items from the hostile audit were not shipped. Each is
+real work with a deferral reason:
 
-- **C2 (IndexChunks job)** — Adding a new `GlossJob` variant requires
-  changes to `jobs/mod.rs`, `commands/sources/mod.rs`, the IPC contract,
-  and the queue UI in `StatusBar.tsx`. The current implementation runs
-  embed inline in `run_ingestion_inner` and that works; adding
-  cancel-ability for already-bounded work is a UX nice-to-have, not a
-  correctness fix.
-- **C6-CONFIG (per-call chat timeout via spawn_blocking)** — Added eager
-  warmup; did not add the per-chat-call `tokio::time::timeout(8s, ...)`
-  wrapper. The 60s blanket on `reqwest::blocking::Client` is still in
-  effect (now configurable to 12s via the setting). A `// TODO(B1-followup)`
-  comment in `state.rs:871` documents this.
-- **E2 (settings snapshot under one lock)** — Did not refactor
-  `send_message`'s 6 `app_db.lock()` acquires. The locks are fast; this
-  is a code-cleanliness fix, not a measurable perf win.
-- **F4 (per-chunk read timeout on streaming)** — Did not add
-  `tokio::time::timeout(60s, stream.next())`. The 250ms poll in
-  `commands/chat/streaming.rs:401` plus `CHAT_STREAM_IDLE_TIMEOUT` /
-  `CHAT_FIRST_TOKEN_TIMEOUT` already bound the worst case.
-- **D7** (keyboard shortcuts) — partly addressed by Cmd+K; cmd+N/cmd+T/etc
-  for the rest of the actions in the palette are not bound
-- **D8** (light theme) — palette offers "Toggle Theme" but only dark
-  theme is implemented; light theme tokens need design work
+- **C6-CONFIG (per-call chat timeout via spawn_blocking)** — Documented
+  as TODO in `commands/chat/mod.rs:1494-1505`. `State<'_, T>` carries
+  a lifetime that can't escape the function. The cleanest fix is to
+  refactor AppState to be `Arc<AppState>` internally. Until then, the
+  lock-free `Arc<EmbeddingService>` pattern from Batch B and the LRU
+  cache from Batch A make this call much cheaper than it used to be.
 - **D9** (split SettingsDialog) — `SettingsDialog/index.tsx` is 1541
-  lines, untouched
-- **D11, D12, D14, D15, D19, D20** — misc polish items (collapsible strict
-  import, jargon fix, notebook switch spinner, visibility-pause, stable
-  React keys, React.memo on more children)
-- **F3 follow-ups** — Ollama and LlamaCpp error bodies still unbounded
+  lines, untouched. The internal sections (SettingsSection,
+  ProviderSection, FeatureToggleRow, FeatureStatusGrid, ToolStatus,
+  HealthCard) are already self-contained components; each can be
+  extracted to its own file with minimal change. A 30+ minute focused
+  refactor with high risk of breaking the settings panel.
 
 ## Receipts
 

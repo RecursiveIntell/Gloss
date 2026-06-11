@@ -71,6 +71,48 @@ body {
   text-rendering: geometricPrecision;
 }
 
+:root[data-gloss-theme="light"] {
+  --void: #f7f5ff;
+  --ink-0: #f7f5ff;
+  --ink-1: #ebe5ff;
+  --ink-2: #ded2ff;
+  --ink-3: #cdb8ff;
+  --ink-4: #bda2f2;
+  --hairline: #d8c9ff;
+  --hairline-2: #bca4e8;
+  --hairline-3: #a58ecf;
+  --text: #1f1a2e;
+  --text-2: #3a3051;
+  --text-3: #61567a;
+  --text-4: #887fa0;
+  --text-faint: #b8b0ca;
+  --wisteria: #8a52ff;
+  --wisteria-soft: #b47eff;
+  --wisteria-deep: #6234b6;
+  --wisteria-glow: rgba(138, 82, 255, 0.15);
+  --wisteria-glow-strong: rgba(138, 82, 255, 0.3);
+  --sakura: #e84ca0;
+  --sakura-soft: #ff8ecf;
+  --sakura-deep: #bd2b77;
+  --sakura-glow: rgba(232, 76, 160, 0.18);
+  --ok: #18b173;
+  --warn: #d38a00;
+  --bad: #f03e57;
+  --info: #1f87d9;
+  --color-bg: #f7f5ff;
+  --color-bg-secondary: #ebe5ff;
+  --color-bg-tertiary: #ded2ff;
+  --color-border: #cfbaff;
+  --color-text: #1f1a2e;
+  --color-text-secondary: #3a3051;
+  --color-text-muted: #635986;
+  --color-accent: #7f46ff;
+  --color-accent-hover: #9d63ff;
+  --color-success: #18b173;
+  --color-warning: #d38a00;
+  --color-error: #f03e57;
+}
+
 #root {
   height: 100vh;
   width: 100vw;
@@ -105,6 +147,76 @@ select option {
     radial-gradient(ellipse at 75% 85%, rgba(255, 95, 178, 0.045) 0%, transparent 38%),
     var(--ink-0);
   color: var(--text);
+}
+
+.gloss-command-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 2.25rem 0.75rem;
+  background: rgba(2, 0, 12, 0.58);
+  backdrop-filter: blur(2px);
+}
+
+.gloss-command-dialog {
+  width: min(760px, calc(100vw - 1.5rem));
+}
+
+.gloss-command-root {
+  border: 1px solid var(--hairline-2);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-tertiary);
+  box-shadow: 0 24px 56px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+}
+
+.gloss-command-search-row {
+  border-bottom: 1px solid var(--hairline-2);
+  background: var(--ink-1);
+}
+
+.gloss-command-input {
+  width: 100%;
+  border: none;
+  outline: none;
+  padding: 0.6rem 0.75rem;
+  background: transparent;
+  color: var(--text);
+}
+
+.gloss-command-list {
+  max-height: min(380px, calc(100vh - 220px));
+  overflow: auto;
+}
+
+.gloss-command-list [cmdk-group-heading] {
+  padding: 0.45rem 0.75rem;
+  background: var(--ink-2);
+  color: var(--text-2);
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+
+.gloss-command-list [cmdk-item] {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.58rem 0.72rem;
+  border-radius: 0;
+  color: var(--text);
+}
+
+.gloss-command-label {
+  flex: 1;
+}
+
+.gloss-command-meta {
+  font-size: 11px;
+  color: var(--text-4);
 }
 
 .gloss-serif {

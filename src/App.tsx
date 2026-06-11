@@ -1,28 +1,73 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { NotebookSidebar } from "./components/notebooks/NotebookSidebar";
 import { PanelLayout } from "./components/layout/PanelLayout";
 import { StatusBar } from "./components/layout/StatusBar";
 import { ToastContainer } from "./components/layout/ToastContainer";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { CommandPalette } from "./components/CommandPalette";
+import { EmptyStateOnboarding } from "./components/EmptyStateOnboarding";
+import { SettingsDialog } from "./components/settings/SettingsDialog";
 import { useNotebookStore } from "./stores/notebookStore";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useToastStore } from "./stores/toastStore";
-import { onChatToken, onChatStatus, onChatError, onChatCancelled, onChatEvidence, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
+import { useUiStore } from "./stores/uiStore";
 import { useSourceStore } from "./stores/sourceStore";
+import * as api from "./lib/tauri";
+import { onChatToken, onChatStatus, onChatError, onChatCancelled, onChatEvidence, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
 import { BookOpen, Database, Search, Sparkles } from "lucide-react";
 
+const SAMPLE_NOTEBOOK_SOURCES = [
+  {
+    title: "Welcome to Gloss",
+    text: "Gloss is a local-first notebook for chat, sources, and notes. Start by asking questions about your files and watching references stay grounded in imported sources.",
+  },
+  {
+    title: "Get started with sources",
+    text: "Drop notes, PDFs, markdown, or URLs in Sources. Then switch source scope in chat (All / Selected) to compare context-heavy and focused answers.",
+  },
+  {
+    title: "Try notes and studio",
+    text: "Use Notes to pin useful answers and Studio to generate structured outputs. This project keeps everything tied to your current notebook by default.",
+  },
+] as const;
+
+function isNotebookStoreAvailable(target: EventTarget | null): target is HTMLElement {
+  return target instanceof HTMLElement;
+}
+
+function isHotkeyAllowed(event: KeyboardEvent): boolean {
+  if (!isNotebookStoreAvailable(event.target)) return false;
+  const editableTag = new Set(["INPUT", "TEXTAREA", "SELECT"]).has(event.target.tagName);
+  if (editableTag || event.target.isContentEditable) return false;
+  if (event.defaultPrevented) return false;
+  if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) {
+    // continue
+  }
+  return true;
+}
+
+function isMacLikePlatform(): boolean {
+  return /Mac|iPad|iPhone|iPod/.test(navigator.platform);
+}
+
 export function App() {
-  const { notebooks, activeNotebookId, loadNotebooks } = useNotebookStore();
+  const { notebooks, activeNotebookId, loadNotebooks, setActive, createNotebook } = useNotebookStore();
+  const { createConversation } = useChatStore();
   const { activeModel, models, settings, loadSettings, loadProviders, loadModels, loadFeatureFlags } = useSettingsStore();
   const stats = useSourceStore((s) => s.stats);
+  const addToast = useToastStore((s) => s.addToast);
+  const { commandPaletteOpen, setCommandPaletteOpen, toggleCommandPaletteOpen, toggleTheme } = useUiStore();
+  const [showSettings, setShowSettings] = useState(false);
   const activeNotebook = notebooks.find((notebook) => notebook.id === activeNotebookId) ?? null;
   const activeProvider =
     settings["default_provider"] ||
     models.find((model) => model.id === activeModel)?.provider_id ||
     null;
 
-  // --- Batching/debouncing refs ---
+  const activeTheme = useUiStore((state) => state.theme);
+
   const pendingStatusRef = useRef<Map<string, { status: string; errorMessage?: string }>>(new Map());
   const statusFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const statsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -32,11 +77,17 @@ export function App() {
   const jobCompletedDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    if (typeof document !== "undefined") {
+      document.documentElement.setAttribute("data-gloss-theme", activeTheme);
+    }
+  }, [activeTheme]);
+
+  useEffect(() => {
     loadNotebooks().then(() => {
       // Sync persisted activeNotebookId to backend on startup
       const nbId = useNotebookStore.getState().activeNotebookId;
       if (nbId) {
-        const exists = useNotebookStore.getState().notebooks.some(n => n.id === nbId);
+        const exists = useNotebookStore.getState().notebooks.some((n) => n.id === nbId);
         if (exists) {
           void useNotebookStore.getState().setActive(nbId);
         } else {
@@ -50,6 +101,21 @@ export function App() {
     loadModels();
     loadFeatureFlags();
   }, []);
+
+  useEffect(() => {
+    const isMac = isMacLikePlatform();
+    const handleGlobalKeyDown = (event: KeyboardEvent) => {
+      if (!isHotkeyAllowed(event)) return;
+      if (event.key.toLowerCase() === "k" && ((isMac && event.metaKey) || (!isMac && event.ctrlKey))) {
+        event.preventDefault();
+        toggleCommandPaletteOpen();
+        return;
+      }
+    };
+
+    window.addEventListener("keydown", handleGlobalKeyDown);
+    return () => window.removeEventListener("keydown", handleGlobalKeyDown);
+  }, [toggleCommandPaletteOpen]);
 
   // Listen for all Tauri events — consolidated cleanup
   useEffect(() => {
@@ -259,6 +325,163 @@ export function App() {
     };
   }, []);
 
+  const handleCreateEmptyNotebook = async () => {
+    try {
+      await createNotebook("New Notebook");
+    } catch (error) {
+      addToast({
+        type: "error",
+        title: "Failed to create notebook",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 6000,
+      });
+    }
+  };
+
+  const handleCreateSampleNotebook = async () => {
+    try {
+      const notebookId = await createNotebook("Sample Notebook");
+      await Promise.all(
+        SAMPLE_NOTEBOOK_SOURCES.map((snippet) =>
+          api.addSourcePaste(notebookId, snippet.title, snippet.text)
+        )
+      );
+      await useSourceStore.getState().loadSources(notebookId);
+      await useSourceStore.getState().loadStats(notebookId);
+      addToast({
+        type: "success",
+        title: "Sample notebook ready",
+        message: "Created Sample Notebook with starter sources.",
+        duration: 5000,
+      });
+    } catch (error) {
+      addToast({
+        type: "error",
+        title: "Sample notebook creation failed",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 6000,
+      });
+    }
+  };
+
+  const handleImportSource = async () => {
+    if (!activeNotebookId) {
+      addToast({
+        type: "warning",
+        title: "Select a notebook first",
+        message: "Create or open a notebook before importing files.",
+        duration: 5000,
+      });
+      return;
+    }
+
+    const selected = await open({
+      title: "Import source files",
+      multiple: true,
+      directory: false,
+    });
+
+    if (!selected) return;
+
+    const files = Array.isArray(selected) ? selected : [selected];
+    try {
+      await api.addSourceFiles(activeNotebookId, files);
+      await useSourceStore.getState().loadSources(activeNotebookId);
+      await useSourceStore.getState().loadStats(activeNotebookId);
+      addToast({
+        type: "success",
+        title: "Files queued for import",
+        message: `Added ${files.length} file${files.length === 1 ? "" : "s"} to Sources.`,
+        duration: 5000,
+      });
+    } catch (error) {
+      addToast({
+        type: "error",
+        title: "Import failed",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 6000,
+      });
+    }
+  };
+
+  const handleOpenSettings = () => {
+    setCommandPaletteOpen(false);
+    setShowSettings(true);
+  };
+
+  const handleNewChat = async () => {
+    if (!activeNotebookId) {
+      addToast({
+        type: "warning",
+        title: "Select a notebook first",
+        message: "Create or open a notebook to start chatting.",
+        duration: 5000,
+      });
+      return;
+    }
+
+    try {
+      await createConversation(activeNotebookId);
+    } catch (error) {
+      addToast({
+        type: "error",
+        title: "Failed to start chat",
+        message: error instanceof Error ? error.message : String(error),
+        duration: 6000,
+      });
+    }
+  };
+
+  const handleViewSources = () => {
+    const sourceButton =
+      document.querySelector<HTMLButtonElement>(
+        'button[title="Open sources"], button[title="Close sources"]'
+      );
+    if (!sourceButton) {
+      addToast({
+        type: "info",
+        title: "Sources panel unavailable",
+        message: "Open a notebook to access Sources.",
+        duration: 4000,
+      });
+      return;
+    }
+    if (sourceButton.title === "Open sources") {
+      sourceButton.click();
+    }
+  };
+
+  const handleViewNotes = () => {
+    const notesButton =
+      document.querySelector<HTMLButtonElement>(
+        'button[title="Open notes"], button[title="Close notes"]'
+      );
+    if (!notesButton) {
+      addToast({
+        type: "info",
+        title: "Notes panel unavailable",
+        message: "Open a notebook to access Notes.",
+        duration: 4000,
+      });
+      return;
+    }
+    if (notesButton.title === "Open notes") {
+      notesButton.click();
+    }
+  };
+
+  const handleViewStudio = () => {
+    handleViewNotes();
+    window.setTimeout(() => {
+      const studioTab = Array.from(document.querySelectorAll("button")).find(
+        (button) => button.textContent?.trim() === "Studio"
+      );
+      if (studioTab) {
+        studioTab.click();
+      }
+    }, 0);
+  };
+
   return (
     <ErrorBoundary>
     <div className="gloss-root flex h-screen flex-col bg-bg">
@@ -268,24 +491,38 @@ export function App() {
         activeProvider={activeProvider}
         sourceCount={stats?.source_count ?? activeNotebook?.source_count ?? 0}
         chunkCount={stats?.chunk_count ?? 0}
+        onOpenCommandPalette={() => setCommandPaletteOpen(true)}
       />
       <div className="flex flex-1 overflow-hidden">
         <NotebookSidebar />
         {activeNotebookId ? (
           <PanelLayout key={activeNotebookId} notebookId={activeNotebookId} />
         ) : (
-          <div className="flex-1 flex items-center justify-center text-text-muted">
-            <div className="text-center">
-              <h2 className="text-2xl font-semibold mb-2">Welcome to Gloss</h2>
-              <p className="text-text-secondary">
-                Create or select a notebook to get started
-              </p>
-            </div>
-          </div>
+          <EmptyStateOnboarding
+            onCreateEmptyNotebook={handleCreateEmptyNotebook}
+            onTrySampleNotebook={handleCreateSampleNotebook}
+            onImportFiles={handleImportSource}
+          />
         )}
       </div>
       <StatusBar />
       <ToastContainer />
+      <CommandPalette
+        open={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        notebooks={notebooks}
+        activeNotebookId={activeNotebookId}
+        onNewChat={handleNewChat}
+        onNewNotebook={handleCreateEmptyNotebook}
+        onSwitchNotebook={setActive}
+        onOpenSettings={handleOpenSettings}
+        onToggleTheme={toggleTheme}
+        onImportSource={handleImportSource}
+        onViewSources={handleViewSources}
+        onViewNotes={handleViewNotes}
+        onViewStudio={handleViewStudio}
+      />
+      <SettingsDialog open={showSettings} onClose={() => setShowSettings(false)} />
     </div>
     </ErrorBoundary>
   );
@@ -297,12 +534,14 @@ function GlossTopBar({
   activeProvider,
   sourceCount,
   chunkCount,
+  onOpenCommandPalette,
 }: {
   activeNotebookName: string | null;
   activeModel: string;
   activeProvider: string | null;
   sourceCount: number;
   chunkCount: number;
+  onOpenCommandPalette: () => void;
 }) {
   return (
     <div className="gloss-topbar flex shrink-0 items-center gap-3 px-3 text-xs text-text-muted">
@@ -324,9 +563,14 @@ function GlossTopBar({
       <div className="hidden h-7 max-w-[520px] flex-1 items-center gap-2 rounded border border-border bg-bg-secondary px-3 text-text-muted md:flex">
         <Search className="h-3.5 w-3.5" />
         <span className="truncate">Search across notebook</span>
-        <span className="gloss-mono ml-auto rounded border border-border px-1.5 py-0.5 text-[10px] text-text-muted">
+        <button
+          type="button"
+          onClick={onOpenCommandPalette}
+          className="gloss-mono ml-auto rounded border border-border px-1.5 py-0.5 text-[10px] text-text-muted hover:border-accent/50 hover:text-text"
+          title="Open command palette"
+        >
           Cmd K
-        </span>
+        </button>
       </div>
 
       <span className="flex-1" />

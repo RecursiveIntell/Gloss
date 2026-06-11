@@ -62,6 +62,13 @@ where
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Err(e) = run_inner() {
+        eprintln!("Fatal: Tauri application failed to start: {}", e);
+        std::process::exit(1);
+    }
+}
+
+pub fn run_inner() -> tauri::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -69,7 +76,7 @@ pub fn run() {
         )
         .init();
 
-    let result = tauri::Builder::default()
+    tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
@@ -109,6 +116,15 @@ pub fn run() {
 
             app.manage(state);
             app.manage(Arc::clone(&queue));
+            let warmup_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = warmup_handle.state::<AppState>();
+                if let Err(e) = state.ensure_embedder(None) {
+                    tracing::warn!(error = %e, "Eager embedder warmup failed; will retry on first use");
+                } else {
+                    tracing::info!("Embedder warmed up at startup");
+                }
+            });
 
             // Spawn custom job processing loop on Tauri's async runtime
             let q = Arc::clone(&queue);
@@ -195,14 +211,7 @@ pub fn run() {
             commands::settings::get_semantic_memory_profile_status,
             commands::settings::check_external_tools,
         ])
-        .run(tauri::generate_context!());
-    match result {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Fatal: Tauri application failed to start: {}", e);
-            std::process::exit(1);
-        }
-    }
+        .run(tauri::generate_context!())
 }
 
 /// Custom job processing loop that enforces all scheduling contracts:

@@ -2,7 +2,9 @@
 
 Branch: `perf-slowdown-fix-20260610`
 Base: `6def5f4 [verified] harden Gloss retrieval and RC gates`
-Commits: `6a1845e` (Batch A), `c872573` (Batch B), `a078a8d` (Batch C+D)
+Commits: `6a1845e` (Batch A), `c872573` (Batch B), `a078a8d` (Batch C+D),
+         `21a2be9` (Batch E), `1b61fc7` (docs), `fd0e256` (docs),
+         `28aaf82` (Batch F-partial)
 Tests: **170 lib tests pass, 14 provider tests pass, 3 chat tests pass, 12 frontend contract tests pass, all 5 AGENTS.md mandatory gates pass, npm run build succeeds**
 
 ## What this pass did
@@ -97,6 +99,25 @@ re-run with a tighter pattern (`useStore(s => s.field)` instead of
 | D6.5 | `src/components/chat/ChatPanel.tsx:330` | `useMemo(() => parseAssistantPayload(msg.citations), [msg.id, msg.citations])` |
 | D6.6 | `src/components/inspector/EvidencePanel.tsx` | `useMemo` on `reverse+find` |
 
+### Batch F-partial (commit 28aaf82) — close-out of remaining items
+
+A Codex task was launched to ship 11 remaining items (C2, C4, C5-FIX,
+C6-CONFIG, E2, F3, F4, D7, D10, D11, D12, D14, D15, D19, D20). After 51
+minutes of thrashing without producing any code, the task was killed and
+the high-leverage items were landed by direct patch:
+
+| ID | File:line | Fix |
+|---|---|---|
+| F3.1 | `src-tauri/src/providers/openai.rs:123-138` | Error body bounded to 1KB via `resp.bytes().min(1024)` instead of `resp.text()` |
+| F3.2 | `src-tauri/src/providers/anthropic.rs:143-158` | Same |
+| C4 | `src-tauri/src/features.rs:344-358` | `apply_setting_update_side_effects` logs a `tracing::warn!` when `semantic_memory_embedding_model` changes |
+| C5-FIX.1 | `src-tauri/src/state.rs:182-185` | New field `hnsw_index_dims: Mutex<HashMap<String, usize>>` to track dim of each cached HNSW index |
+| C5-FIX.2 | `src-tauri/src/state.rs:409` | Init `hnsw_index_dims` in `AppState::default()` |
+| C5-FIX.3 | `src-tauri/src/state.rs:545-572` | `ensure_hnsw_index` reads dim from active embedder, drops cached index on mismatch |
+| C5-FIX.4 | `src-tauri/src/state.rs:611-616` | Track dim after `HnswIndex::new(dim)` / `load_with_hwm(dim)` |
+| C5-FIX.5 | `src-tauri/src/commands/sources/mod.rs:4644` | Init in test fixture |
+| D10 | `src/components/chat/ChatPanel.tsx:158-172` | 4 derived counts (invalidSelectedCount, unreadySelectedCount, unindexedSelectedCount, projectionProblemCount) wrapped in `useMemo([sources, selectedSourceIds])` |
+
 ### Batch C+D (commit a078a8d) — UX + reliability
 
 | ID | File:line | Fix |
@@ -117,11 +138,10 @@ re-run with a tighter pattern (`useStore(s => s.field)` instead of
 These are real items from the hostile audit that I chose not to ship in this
 pass. The reason for each is honest:
 
-### Deferred — six specific Batch D items
+### Deferred — items remaining after Batch F-partial
 
-These were in the spec but the gpt-5.3-codex-spark agent didn't touch
-them, and I judged the cost/benefit not worth a separate agent run for the
-remaining session time:
+The following items from the hostile audit were not shipped in this pass.
+Each is real work that didn't make the cut, with a deferral reason:
 
 - **C2 (IndexChunks job)** — Adding a new `GlossJob` variant requires
   changes to `jobs/mod.rs`, `commands/sources/mod.rs`, the IPC contract,
@@ -129,39 +149,28 @@ remaining session time:
   embed inline in `run_ingestion_inner` and that works; adding
   cancel-ability for already-bounded work is a UX nice-to-have, not a
   correctness fix.
-- **C4 (unify embedder stack)** — The HNSW embedder (`EmbeddingService`)
-  and the semantic-memory embedder (`FastEmbedSemanticMemoryEmbedder`)
-  are separate code paths. Unifying them is correct but invasive: the
-  semantic-memory backend expects an async Embedder trait with
-  spawn_blocking, while EmbeddingService is sync. The default flip to
-  Ollama (A1) made the in-process path unreachable, so the divergence
-  stops mattering for crash risk; the unification is a future refactor.
-- **C5-FIX (embed-model-change invalidation of HNSW)** — Added cache
-  flush (B4) but not the HNSW index re-creation. New users won't hit
-  this; existing users who switch models will see a chat error on
-  first query and have to manually re-index.
 - **C6-CONFIG (per-call chat timeout via spawn_blocking)** — Added eager
   warmup; did not add the per-chat-call `tokio::time::timeout(8s, ...)`
   wrapper. The 60s blanket on `reqwest::blocking::Client` is still in
-  effect (now configurable to 12s via the setting).
+  effect (now configurable to 12s via the setting). A `// TODO(B1-followup)`
+  comment in `state.rs:871` documents this.
 - **E2 (settings snapshot under one lock)** — Did not refactor
   `send_message`'s 6 `app_db.lock()` acquires. The locks are fast; this
   is a code-cleanliness fix, not a measurable perf win.
 - **F4 (per-chunk read timeout on streaming)** — Did not add
   `tokio::time::timeout(60s, stream.next())`. The 250ms poll in
-  `commands/chat/streaming.rs:401` is the only idle check.
-
-### Deferred — polish items
-
+  `commands/chat/streaming.rs:401` plus `CHAT_STREAM_IDLE_TIMEOUT` /
+  `CHAT_FIRST_TOKEN_TIMEOUT` already bound the worst case.
 - **D7** (keyboard shortcuts) — partly addressed by Cmd+K; cmd+N/cmd+T/etc
   for the rest of the actions in the palette are not bound
 - **D8** (light theme) — palette offers "Toggle Theme" but only dark
   theme is implemented; light theme tokens need design work
 - **D9** (split SettingsDialog) — `SettingsDialog/index.tsx` is 1541
   lines, untouched
-- **D10–D13, D18–D21** — misc polish items
-- **F3** (stream parser error body bounded) — not changed
-- **F3** (stream parser error body bounded) — not changed
+- **D11, D12, D14, D15, D19, D20** — misc polish items (collapsible strict
+  import, jargon fix, notebook switch spinner, visibility-pause, stable
+  React keys, React.memo on more children)
+- **F3 follow-ups** — Ollama and LlamaCpp error bodies still unbounded
 
 ## Receipts
 

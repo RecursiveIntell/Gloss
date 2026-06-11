@@ -65,6 +65,20 @@ pub enum GlossJob {
         #[serde(default = "default_chunk_target_tokens")]
         chunk_target_tokens: usize,
     },
+    /// C2 — Background re-embed / re-index job for a source's chunks. Replaces
+    /// the inline embed-during-ingestion path with a queueable, cancellable,
+    /// progress-reporting job. The match arm below is a stub that returns
+    /// Ok(JobResult::noop()) for now; the actual chunk-by-chunk embed work
+    /// is the next step (see EXECUTE_INDEX_CHUNKS_TODO in jobs/mod.rs).
+    IndexChunks {
+        #[serde(default)]
+        epoch: u64,
+        notebook_id: String,
+        source_id: String,
+        data_dir: String,
+        ollama_url: String,
+        model: String,
+    },
 }
 
 fn default_chunk_target_tokens() -> usize {
@@ -156,6 +170,33 @@ impl JobHandler for GlossJob {
                 )
                 .await
             }
+            // C2 stub: the IndexChunks job currently no-ops. The actual
+            // chunk-by-chunk re-embed is the next step (see
+            // EXECUTE_INDEX_CHUNKS_TODO below). Until then, callers can
+            // enqueue an IndexChunks job to claim the slot in the queue
+            // and exercise the variant in tests.
+            GlossJob::IndexChunks {
+                epoch: _,
+                notebook_id,
+                source_id,
+                data_dir: _,
+                ollama_url: _,
+                model: _,
+            } => {
+                tracing::info!(
+                    notebook_id,
+                    source_id,
+                    "IndexChunks job: stub (no-op). Re-embed work is the next step."
+                );
+                Ok(tauri_queue::JobResult::success_with_output(
+                    serde_json::to_string(&serde_json::json!({
+                        "status": "stub",
+                        "notebook_id": notebook_id,
+                        "source_id": source_id,
+                    }))
+                    .unwrap_or_default(),
+                ))
+            }
         }
     }
 
@@ -165,6 +206,7 @@ impl JobHandler for GlossJob {
             GlossJob::DescribeImage { .. } => "DescribeImage",
             GlossJob::DescribeVideo { .. } => "DescribeVideo",
             GlossJob::ExtractAudioMetadata { .. } => "ExtractAudioMetadata",
+            GlossJob::IndexChunks { .. } => "IndexChunks",
         }
     }
 }
@@ -175,7 +217,8 @@ impl GlossJob {
             GlossJob::SummarizeSource { notebook_id, .. }
             | GlossJob::DescribeImage { notebook_id, .. }
             | GlossJob::DescribeVideo { notebook_id, .. }
-            | GlossJob::ExtractAudioMetadata { notebook_id, .. } => notebook_id,
+            | GlossJob::ExtractAudioMetadata { notebook_id, .. }
+            | GlossJob::IndexChunks { notebook_id, .. } => notebook_id,
         }
     }
 
@@ -184,7 +227,8 @@ impl GlossJob {
             GlossJob::SummarizeSource { source_id, .. }
             | GlossJob::DescribeImage { source_id, .. }
             | GlossJob::DescribeVideo { source_id, .. }
-            | GlossJob::ExtractAudioMetadata { source_id, .. } => source_id,
+            | GlossJob::ExtractAudioMetadata { source_id, .. }
+            | GlossJob::IndexChunks { source_id, .. } => source_id,
         }
     }
 
@@ -193,10 +237,23 @@ impl GlossJob {
             GlossJob::SummarizeSource { epoch, .. }
             | GlossJob::DescribeImage { epoch, .. }
             | GlossJob::DescribeVideo { epoch, .. }
-            | GlossJob::ExtractAudioMetadata { epoch, .. } => *epoch,
+            | GlossJob::ExtractAudioMetadata { epoch, .. }
+            | GlossJob::IndexChunks { epoch, .. } => *epoch,
         }
     }
 }
+
+// EXECUTE_INDEX_CHUNKS_TODO
+// The C2 IndexChunks job's execute() function needs to:
+//   1. Open the notebook DB
+//   2. Look up chunks for source_id that don't yet have an embedding
+//   3. Embed them in batches of MAX_CHUNKS_PER_BATCH via the active embedder
+//   4. Write embeddings + update chunk_index
+//   5. Emit progress events to the frontend via ctx.events.emit(...)
+//   6. Respect ctx.cancellation_token() between batches
+//   7. Return Ok(JobResult::completed(...)) with the receipt
+// For now the stub above just no-ops; the routing and tests for the variant
+// are in place. The actual embed loop is a follow-up that lives in this file.
 
 pub(crate) fn cancel_jobs_matching<F>(queue: &Arc<QueueManager>, mut should_cancel: F) -> u32
 where

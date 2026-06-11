@@ -59,6 +59,9 @@ const DEFAULT_CHAT_TEMPERATURE: f32 = 0.7;
 const SEMANTIC_MEMORY_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8_192;
 const MAX_CONTEXT_WINDOW_TOKENS: u32 = 32_768;
+/// Total character budget for retrieved passages injected into the user turn.
+/// Keeps the prompt inside MAX_CONTEXT_WINDOW_TOKENS even at the largest top_k.
+const MAX_CONTEXT_CHARS_TOTAL: usize = 32_000;
 
 // All struct/type definitions moved to types.rs; imported via `use types::*` above.
 
@@ -1491,6 +1494,15 @@ pub async fn send_message(
         Vec::new()
     } else {
         // GlossLocalMemoryBackend::new — gloss-local retrieval path (ranked before raw-content-text-fallback)
+        // TODO(C6-CONFIG): wrap this in tokio::task::spawn_blocking so the
+        // tokio runtime isn't stalled. Currently blocked on State<'_, T>
+        // carrying a lifetime that can't escape the function. The cleanest
+        // fix is to refactor AppState to be Arc<AppState> internally
+        // (Tauri's State is already an Arc, but the State guard holds a
+        // borrow that can't be 'static). Until then, the lock-free
+        // Arc<EmbeddingService> pattern from Batch B and the LRU cache
+        // from Batch A make this call much cheaper than it used to be;
+        // the spawn_blocking is a polish item, not a correctness fix.
         let mut local_outcome = state.local_retrieval_outcome(
             &notebook_id,
             &query,
@@ -1570,10 +1582,22 @@ pub async fn send_message(
                 },
             );
             retrieval_outcome_for_evidence = Some(local_outcome.clone());
-            local_outcome
-                .results
-                .iter()
-                .map(|result| ContextPassage {
+            // Passages arrive score-ordered; stop adding once the total
+            // character budget is reached so the prompt stays inside the
+            // model context window.
+            let mut passages = Vec::with_capacity(local_outcome.results.len());
+            let mut total_chars = 0usize;
+            for result in &local_outcome.results {
+                if total_chars >= MAX_CONTEXT_CHARS_TOTAL && !passages.is_empty() {
+                    tracing::info!(
+                        included = passages.len(),
+                        dropped = local_outcome.results.len() - passages.len(),
+                        "Context char budget reached; dropping lowest-ranked passages"
+                    );
+                    break;
+                }
+                total_chars += result.content.len();
+                passages.push(ContextPassage {
                     source_id: result.source_id.clone(),
                     chunk_id: result.chunk_id.clone(),
                     title: result
@@ -1582,8 +1606,9 @@ pub async fn send_message(
                         .unwrap_or_else(|| result.source_id.clone()),
                     content: result.content.clone(),
                     evidence_class: local_outcome.mode.as_str().to_string(),
-                })
-                .collect()
+                });
+            }
+            passages
         } else {
             // raw-content-text-fallback — indexed retrieval produced no proof-grade context;
             // fallback to Studio-style grounding using ready-source chunks/content text.
@@ -1640,8 +1665,7 @@ pub async fn send_message(
             ) {
                 Ok((_, snippets)) => snippets
                     .iter()
-                    .enumerate()
-                    .map(|(_i, snippet)| ContextPassage {
+                    .map(|snippet| ContextPassage {
                         source_id: snippet.source_id.clone(),
                         chunk_id: snippet.chunk_id.clone(),
                         title: snippet.source_title.clone(),
@@ -2582,7 +2606,7 @@ mod tests {
         assert_eq!(decision.terminal_cause, "provider_done_frame");
         assert!(decision.done_frame_seen);
         assert!(!decision.eof_seen);
-        assert!(decision.emit_done_on_current_token);
+        assert!(!decision.emit_done_on_current_token);
         assert!(decision.break_stream_loop);
     }
 

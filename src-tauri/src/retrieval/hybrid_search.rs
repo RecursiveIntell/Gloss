@@ -21,6 +21,15 @@ pub struct SearchResult {
 /// Sized so that, combined with per-source diversity selection, every scoped
 /// source with a relevant candidate can contribute at least one passage while
 /// staying inside the chat context budget (~32K chars).
+///
+/// `DENSE_HARD_OVERFETCH_CAP_MULTIPLIER` (16) caps the dense HNSW overfetch
+/// regardless of source count. Without this cap, with 100 sources and
+/// top_k=24, the formula `top_k * 5 * sources` = 12,000 would walk the
+/// entire HNSW index and do a single-row SQL per neighbor. 16x is generous
+/// for chat latency while still preserving per-source diversity. (See
+/// hostile audit B3.)
+const DENSE_HARD_OVERFETCH_CAP_MULTIPLIER: usize = 16;
+
 pub fn compute_top_k(source_count: usize) -> usize {
     match source_count {
         0..=5 => 8,
@@ -33,11 +42,13 @@ pub fn compute_top_k(source_count: usize) -> usize {
 
 fn dense_scope_overfetch_limit(top_k: usize, coverage: &RetrievalCoverage) -> usize {
     let base = (top_k * 5).max(20);
+    let hard_cap = top_k.saturating_mul(DENSE_HARD_OVERFETCH_CAP_MULTIPLIER);
     let source_scaled = base.saturating_mul(coverage.selected_sources.max(1));
-    coverage
+    let computed_limit = coverage
         .embedded_chunks
         .min(source_scaled.max(base))
-        .max(base.min(coverage.embedded_chunks.max(1)))
+        .max(base.min(coverage.embedded_chunks.max(1)));
+    computed_limit.min(hard_cap)
 }
 
 #[cfg(test)]
@@ -133,7 +144,12 @@ pub fn local_retrieval_outcome_with_query(
         bm25_reason = Some(RetrievalReasonCode::Bm25QuerySanitizedEmpty);
         fallback_chain.push(RetrievalReasonCode::Bm25QuerySanitizedEmpty);
     } else {
-        match nb_db.fts_search_chunks_in_sources(&fts_query, scope, k_per_source) {
+        let scoped_source_ids: Vec<&str> = scope.source_ids().iter().map(String::as_str).collect();
+        match nb_db.fts_search_chunks_in_sources_batched(
+            &fts_query,
+            &scoped_source_ids,
+            k_per_source,
+        ) {
             Ok(results) => {
                 bm25_chunks = results
                     .into_iter()
@@ -968,6 +984,26 @@ mod tests {
         };
 
         assert_eq!(dense_scope_overfetch_limit(4, &coverage), 60);
+    }
+
+    #[test]
+    fn dense_scope_overfetch_limit_is_capped_by_source_count() {
+        let coverage = RetrievalCoverage {
+            selected_sources: 100,
+            total_chunks: 20_000,
+            fts_indexed_chunks: 0,
+            embedded_chunks: 10_000,
+            missing_embeddings: 0,
+            semantic_links_total: 0,
+            semantic_links_healthy: 0,
+            semantic_links_degraded: 0,
+            dense_coverage_ratio: 1.0,
+        };
+
+        // Without the cap, the formula would give top_k*5*sources = 12000.
+        // With the new cap of DENSE_HARD_OVERFETCH_CAP_MULTIPLIER=16, the
+        // result is min(12000, 24*16) = 384. (See hostile audit B3.)
+        assert_eq!(dense_scope_overfetch_limit(24, &coverage), 384);
     }
 
     #[test]

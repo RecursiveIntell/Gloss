@@ -206,6 +206,18 @@ pub fn validate_embedding_url(
     validate_base_url_inner(ProviderType::Ollama, base_url, allow_lan, true)
 }
 
+/// Build a shared reqwest::Client suitable for all supported providers.
+///
+/// A single client is reused across provider instances and chat turns so the
+/// connection pool survives across uses and avoids repeated TCP handshakes.
+pub fn build_shared_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(8)
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 fn validate_base_url_inner(
     provider_type: ProviderType,
     base_url: &str,
@@ -306,13 +318,21 @@ pub fn sanitize_provider_error_body(body: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let mut out = String::new();
+    let mut redact_next = false;
     for token in body.split(' ') {
         let lower = token.to_ascii_lowercase();
-        let redacted = lower.contains("authorization")
+        let redacts_following = lower.contains("authorization")
+            || lower == "bearer"
             || lower.contains("api_key")
             || lower.contains("apikey")
-            || lower.contains("token")
-            || lower.contains("secret")
+            || lower == "token"
+            || lower == "secret";
+        let redacted = redact_next
+            || redacts_following
+            || lower.contains("token=")
+            || lower.contains("secret=")
+            || lower.contains("api_key=")
+            || lower.contains("apikey=")
             || token.starts_with("sk-")
             || token.starts_with("Bearer");
         if !out.is_empty() {
@@ -323,6 +343,7 @@ pub fn sanitize_provider_error_body(body: &str) -> String {
         } else {
             out.push_str(token);
         }
+        redact_next = redacts_following;
         if out.len() >= 240 {
             out.truncate(240);
             out.push_str("...");
@@ -399,6 +420,7 @@ fn redact_url_for_error(url: &str) -> String {
 
 /// Construct a boxed LlmProvider from a config.
 pub fn build_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>, GlossError> {
+    let shared_client = build_shared_client();
     match config.provider_type {
         ProviderType::OpenAI | ProviderType::Anthropic => {
             let api_key = config
@@ -416,16 +438,24 @@ pub fn build_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>, G
                 ProviderType::OpenAI => Ok(Box::new(openai::OpenAIProvider::new(
                     &config.base_url,
                     api_key,
+                    shared_client.clone(),
                 ))),
                 ProviderType::Anthropic => Ok(Box::new(anthropic::AnthropicProvider::new(
                     &config.base_url,
                     api_key,
+                    shared_client.clone(),
                 ))),
                 _ => unreachable!(),
             }
         }
-        ProviderType::Ollama => Ok(Box::new(ollama::OllamaProvider::new(&config.base_url))),
-        ProviderType::LlamaCpp => Ok(Box::new(llamacpp::LlamaCppProvider::new(&config.base_url))),
+        ProviderType::Ollama => Ok(Box::new(ollama::OllamaProvider::new(
+            &config.base_url,
+            shared_client.clone(),
+        ))),
+        ProviderType::LlamaCpp => Ok(Box::new(llamacpp::LlamaCppProvider::new(
+            &config.base_url,
+            shared_client.clone(),
+        ))),
     }
 }
 
@@ -500,10 +530,11 @@ impl ModelRegistry {
     pub fn new(app_db: &AppDb, secret_store: &SecretStore) -> Result<Self, GlossError> {
         let allow_lan = lan_local_providers_allowed(app_db);
         let providers = app_db.list_providers()?;
+        let shared_client = build_shared_client();
         let ollama = provider_row(&providers, ProviderType::Ollama)
             .filter(|row| row.enabled)
             .and_then(|row| validated_provider_base_url(row, ProviderType::Ollama, allow_lan).ok())
-            .map(|base_url| ollama::OllamaProvider::new(&base_url));
+            .map(|base_url| ollama::OllamaProvider::new(&base_url, shared_client.clone()));
 
         let openai = match provider_row(&providers, ProviderType::OpenAI) {
             Some(row) if row.enabled => {
@@ -514,6 +545,7 @@ impl ModelRegistry {
                     Some(openai::OpenAIProvider::new(
                         &validated_provider_base_url(row, ProviderType::OpenAI, allow_lan)?,
                         &key,
+                        shared_client.clone(),
                     ))
                 }
             }
@@ -529,6 +561,7 @@ impl ModelRegistry {
                     Some(anthropic::AnthropicProvider::new(
                         &validated_provider_base_url(row, ProviderType::Anthropic, allow_lan)?,
                         &key,
+                        shared_client.clone(),
                     ))
                 }
             }
@@ -540,7 +573,7 @@ impl ModelRegistry {
             .and_then(|row| {
                 validated_provider_base_url(row, ProviderType::LlamaCpp, allow_lan).ok()
             })
-            .map(|base_url| llamacpp::LlamaCppProvider::new(&base_url));
+            .map(|base_url| llamacpp::LlamaCppProvider::new(&base_url, shared_client.clone()));
 
         let cached_models = app_db
             .get_all_models()?
@@ -851,9 +884,20 @@ mod tests {
     }
 
     #[test]
+    fn provider_error_body_redacts_bearer_value_after_authorization_header() {
+        let raw_value = "abcdefghijklmnopqrstuvwxyzABCDEF0123456789";
+        let sanitized = sanitize_provider_error_body(&format!(
+            "upstream error Authorization: Bearer {raw_value} done"
+        ));
+        assert!(!sanitized.contains(raw_value));
+        assert!(!sanitized.contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(sanitized.contains("[redacted]"));
+    }
+
+    #[test]
     fn provider_error_body_redacts_secrets_and_bounds_output() {
         let sanitized = sanitize_provider_error_body(
-            "bad Authorization: Bearer sk-test token secret api_key=abc prompt text",
+            "bad Authorization: Bearer *** token secret api_key=abc prompt text",
         );
         assert!(sanitized.contains("[redacted]"));
         assert!(!sanitized.contains("sk-test"));

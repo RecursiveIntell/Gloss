@@ -12,14 +12,10 @@ pub struct LlamaCppProvider {
 }
 
 impl LlamaCppProvider {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, client: reqwest::Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client,
         }
     }
 }

@@ -14,15 +14,11 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(base_url: &str, api_key: &str) -> Self {
+    pub fn new(base_url: &str, api_key: &str, client: reqwest::Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client,
         }
     }
 }
@@ -154,17 +150,27 @@ impl LlmProvider for AnthropicProvider {
             let byte_stream = resp.bytes_stream();
 
             let stream = stream::unfold(
-                (byte_stream, String::new()),
+                (byte_stream, Vec::<u8>::new()),
                 |(mut byte_stream, mut buffer)| async move {
                     loop {
                         match byte_stream.next().await {
                             Some(Ok(bytes)) => {
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                buffer.extend_from_slice(&bytes);
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
-
-                                while let Some(newline_pos) = buffer.find('\n') {
-                                    let line = buffer[..newline_pos].trim().to_string();
-                                    buffer = buffer[newline_pos + 1..].to_string();
+                                // Process complete SSE lines
+                                while let Some(newline_pos) =
+                                    buffer.iter().position(|&b| b == b'\n')
+                                {
+                                    let owned: String =
+                                        match std::str::from_utf8(&buffer[..newline_pos]) {
+                                            Ok(s) => s.trim().to_string(),
+                                            Err(_) => {
+                                                buffer.drain(..=newline_pos);
+                                                continue;
+                                            }
+                                        };
+                                    buffer.drain(..=newline_pos);
+                                    let line = owned.as_str();
 
                                     if line.is_empty() || line.starts_with(':') {
                                         continue;

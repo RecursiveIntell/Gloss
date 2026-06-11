@@ -577,13 +577,22 @@ pub async fn run_embedding_diagnostics(
     let cache_dir = state.data_dir.join("models");
     let native_fastembed = match state.ensure_embedder(None) {
         Ok(()) => {
-            let embed_result = state
-                .embedder
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?
-                .as_ref()
-                .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))
-                .and_then(|embedder| embedder.embed_one("Gloss embedding diagnostics"));
+            let embed_result: Result<Vec<f32>, GlossError> = {
+                let embedder_arc = {
+                    let guard = state
+                        .embedder
+                        .read()
+                        .map_err(|e| GlossError::Other(e.to_string()))?;
+                    guard
+                        .as_ref()
+                        .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))
+                        .map(|arc| arc.clone())
+                };
+                match embedder_arc {
+                    Ok(arc) => arc.embed_one("Gloss embedding diagnostics"),
+                    Err(e) => Err(e),
+                }
+            };
             match embed_result {
                 Ok(vector) => NativeFastEmbedDiagnostics {
                     init_ok: true,

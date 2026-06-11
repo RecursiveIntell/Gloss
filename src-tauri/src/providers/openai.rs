@@ -14,15 +14,11 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
-    pub fn new(base_url: &str, api_key: &str) -> Self {
+    pub fn new(base_url: &str, api_key: &str, client: reqwest::Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client,
         }
     }
 }
@@ -134,18 +130,31 @@ impl LlmProvider for OpenAIProvider {
             let byte_stream = resp.bytes_stream();
 
             let stream = stream::unfold(
-                (byte_stream, String::new()),
+                (byte_stream, Vec::<u8>::new()),
                 |(mut byte_stream, mut buffer)| async move {
                     loop {
                         match byte_stream.next().await {
                             Some(Ok(bytes)) => {
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                buffer.extend_from_slice(&bytes);
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
 
                                 // Process complete SSE lines
-                                while let Some(newline_pos) = buffer.find('\n') {
-                                    let line = buffer[..newline_pos].trim().to_string();
-                                    buffer = buffer[newline_pos + 1..].to_string();
+                                while let Some(newline_pos) =
+                                    buffer.iter().position(|&b| b == b'\n')
+                                {
+                                    // Copy the line out of the buffer first
+                                    // so we can drain the consumed bytes
+                                    // without holding an immutable borrow.
+                                    let owned: String =
+                                        match std::str::from_utf8(&buffer[..newline_pos]) {
+                                            Ok(s) => s.trim().to_string(),
+                                            Err(_) => {
+                                                buffer.drain(..=newline_pos);
+                                                continue;
+                                            }
+                                        };
+                                    buffer.drain(..=newline_pos);
+                                    let line = owned.as_str();
 
                                     if line.is_empty() || line.starts_with(':') {
                                         continue;
@@ -245,5 +254,19 @@ impl LlmProvider for OpenAIProvider {
 
     fn provider_type(&self) -> ProviderType {
         ProviderType::OpenAI
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenAIProvider;
+    use crate::providers::build_shared_client;
+
+    #[test]
+    fn shared_client_pool_reuses_connections() {
+        let client = build_shared_client();
+        let p1 = OpenAIProvider::new("http://x", "k", client.clone());
+        let p2 = OpenAIProvider::new("http://x", "k", client.clone());
+        let _ = (p1, p2);
     }
 }

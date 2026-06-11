@@ -4,6 +4,7 @@ use crate::memory::types::RetrievalCoverage;
 use crate::retrieval::source_scope::ResolvedSourceScope;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Per-notebook database handle (notebook.db).
@@ -68,6 +69,8 @@ pub struct Chunk {
     pub embedding_id: Option<i64>,
     pub embedding_model: Option<String>,
 }
+
+pub type ChunkSearchHit = (Chunk, f64);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
@@ -511,6 +514,73 @@ impl NotebookDb {
             })
     }
 
+    /// Batch fetch sources. Returns a map keyed by source id. Sources that are
+    /// missing from the DB are simply absent from the map (caller handles miss).
+    pub fn get_sources(&self, source_ids: &[&str]) -> Result<HashMap<String, Source>, GlossError> {
+        if source_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders: Vec<String> = (0..source_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT sources.id, sources.source_type, sources.title, sources.original_filename,
+                    sources.file_hash, sources.url, sources.file_path,
+                    sources.content_text, sources.word_count, sources.metadata,
+                    sources.summary, sources.summary_model,
+                    sources.status, sources.error_message, sources.selected,
+                    sources.created_at, sources.updated_at,
+                    COALESCE(ps.source_id, sources.id),
+                    COALESCE(ps.lifecycle_status, sources.status),
+                    COALESCE(ps.summary_status, CASE WHEN sources.summary IS NULL OR trim(sources.summary) = '' THEN 'missing' ELSE 'ready' END),
+                    COALESCE(ps.fts_index_status, 'missing'),
+                    COALESCE(ps.dense_index_status, 'missing'),
+                    COALESCE(ps.semantic_projection_status, 'disabled'),
+                    ps.last_summary_receipt_id,
+                    ps.last_dense_index_receipt_id,
+                    ps.last_projection_receipt_id,
+                    COALESCE(ps.last_error, sources.error_message),
+                    COALESCE(ps.updated_at, sources.updated_at)
+             FROM sources
+             LEFT JOIN source_processing_state ps ON ps.source_id = sources.id
+             WHERE sources.id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = source_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(Source {
+                id: row.get(0)?,
+                source_type: row.get(1)?,
+                title: row.get(2)?,
+                original_filename: row.get(3)?,
+                file_hash: row.get(4)?,
+                url: row.get(5)?,
+                file_path: row.get(6)?,
+                content_text: row.get(7)?,
+                word_count: row.get(8)?,
+                metadata: row.get(9)?,
+                summary: row.get(10)?,
+                summary_model: row.get(11)?,
+                status: row.get(12)?,
+                error_message: row.get(13)?,
+                selected: row.get(14)?,
+                created_at: row.get(15)?,
+                updated_at: row.get(16)?,
+                processing_state: Some(source_processing_state_from_row(row, 17)?),
+            })
+        })?;
+        let mut sources = HashMap::new();
+        for row in rows {
+            let source = row?;
+            sources.insert(source.id.clone(), source);
+        }
+        Ok(sources)
+    }
+
     /// Delete a source and its chunks (cascade).
     pub fn delete_source(&self, source_id: &str) -> Result<(), GlossError> {
         self.conn
@@ -712,6 +782,58 @@ impl NotebookDb {
             chunks.push(row?);
         }
         Ok(chunks)
+    }
+
+    /// Batch fetch chunks for multiple sources. Returns a map keyed by source id to
+    /// `Vec<Chunk>`, with empty vectors when a source has no chunks.
+    pub fn get_chunks_for_sources(
+        &self,
+        source_ids: &[&str],
+    ) -> Result<HashMap<String, Vec<Chunk>>, GlossError> {
+        let mut chunks_by_source: HashMap<String, Vec<Chunk>> = source_ids
+            .iter()
+            .map(|source_id| (source_id.to_string(), Vec::new()))
+            .collect();
+        if source_ids.is_empty() {
+            return Ok(chunks_by_source);
+        }
+
+        let placeholders: Vec<String> = (0..source_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT id, source_id, chunk_index, content, token_count, start_offset, end_offset,
+                    metadata, embedding_id, embedding_model
+             FROM chunks WHERE source_id IN ({}) ORDER BY source_id, chunk_index",
+            placeholders.join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = source_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(Chunk {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                chunk_index: row.get(2)?,
+                content: row.get(3)?,
+                token_count: row.get(4)?,
+                start_offset: row.get(5)?,
+                end_offset: row.get(6)?,
+                metadata: row.get(7)?,
+                embedding_id: row.get(8)?,
+                embedding_model: row.get(9)?,
+            })
+        })?;
+        for row in rows {
+            let chunk = row?;
+            chunks_by_source
+                .entry(chunk.source_id.clone())
+                .or_default()
+                .push(chunk);
+        }
+        Ok(chunks_by_source)
     }
 
     /// Get a chunk by ID.
@@ -1336,6 +1458,53 @@ impl NotebookDb {
             })
     }
 
+    /// Batch fetch chunks by embedding IDs. Returns a map keyed by embedding ID.
+    pub fn get_chunks_by_embedding_ids(
+        &self,
+        embedding_ids: &[i64],
+    ) -> Result<HashMap<i64, Chunk>, GlossError> {
+        if embedding_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders: Vec<String> = (0..embedding_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT id, source_id, chunk_index, content, token_count, start_offset, end_offset,
+                    metadata, embedding_id, embedding_model
+             FROM chunks WHERE embedding_id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = embedding_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(8)?,
+                Chunk {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    chunk_index: row.get(2)?,
+                    content: row.get(3)?,
+                    token_count: row.get(4)?,
+                    start_offset: row.get(5)?,
+                    end_offset: row.get(6)?,
+                    metadata: row.get(7)?,
+                    embedding_id: row.get(8)?,
+                    embedding_model: row.get(9)?,
+                },
+            ))
+        })?;
+        let mut chunks = HashMap::new();
+        for row in rows {
+            let (embedding_id, chunk) = row?;
+            chunks.insert(embedding_id, chunk);
+        }
+        Ok(chunks)
+    }
+
     /// FTS5 search for chunks.
     pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<(i64, f64)>, GlossError> {
         let mut stmt = self.conn.prepare(
@@ -1358,46 +1527,73 @@ impl NotebookDb {
         query: &str,
         scope: &ResolvedSourceScope,
         limit: usize,
-    ) -> Result<Vec<(Chunk, f64)>, GlossError> {
+    ) -> Result<Vec<ChunkSearchHit>, GlossError> {
         if limit == 0 || scope.is_none() || scope.source_ids().is_empty() {
             return Ok(Vec::new());
         }
-        let scoped_ids = scope.source_ids();
+        let source_ids: Vec<&str> = scope.source_ids().iter().map(String::as_str).collect();
+        self.fts_search_chunks_in_sources_batched(query, &source_ids, limit)
+    }
 
-        let per_source_limit = limit as i64;
-        let per_source_sql = "SELECT c.id, c.source_id, c.chunk_index, c.content, c.token_count,
+    pub fn fts_search_chunks_in_sources_batched(
+        &self,
+        query: &str,
+        source_ids: &[&str],
+        limit: usize,
+    ) -> Result<Vec<ChunkSearchHit>, GlossError> {
+        if limit == 0 || source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let capped_ids: Vec<&str> = source_ids.iter().copied().take(256).collect();
+        if capped_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: Vec<String> = (0..capped_ids.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect();
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(capped_ids.len() + 2);
+        params.push(&query);
+        for source_id in &capped_ids {
+            params.push(source_id);
+        }
+        let limit = limit as i64;
+        let limit_placeholder = capped_ids.len() + 2;
+        let sql = format!(
+            "SELECT c.id, c.source_id, c.chunk_index, c.content, c.token_count,
                     c.start_offset, c.end_offset, c.metadata, c.embedding_id,
                     c.embedding_model, chunks_fts.rank
              FROM chunks_fts
              JOIN chunks c ON c.rowid = chunks_fts.rowid
-             WHERE chunks_fts MATCH ?1 AND c.source_id = ?2
-             ORDER BY chunks_fts.rank ASC, c.chunk_index ASC, c.id ASC LIMIT ?3";
-        let mut stmt = self.conn.prepare(per_source_sql)?;
-        let mut results = Vec::new();
-        for source_id in scoped_ids {
-            let rows = stmt.query_map(
-                rusqlite::params![query, source_id, per_source_limit],
-                |row| {
-                    Ok((
-                        Chunk {
-                            id: row.get(0)?,
-                            source_id: row.get(1)?,
-                            chunk_index: row.get(2)?,
-                            content: row.get(3)?,
-                            token_count: row.get(4)?,
-                            start_offset: row.get(5)?,
-                            end_offset: row.get(6)?,
-                            metadata: row.get(7)?,
-                            embedding_id: row.get(8)?,
-                            embedding_model: row.get(9)?,
-                        },
-                        row.get::<_, f64>(10)?,
-                    ))
+             WHERE chunks_fts MATCH ?1 AND c.source_id IN ({})
+             ORDER BY chunks_fts.rank ASC
+             LIMIT ?{}",
+            placeholders.join(", "),
+            limit_placeholder
+        );
+        params.push(&limit);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                Chunk {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    chunk_index: row.get(2)?,
+                    content: row.get(3)?,
+                    token_count: row.get(4)?,
+                    start_offset: row.get(5)?,
+                    end_offset: row.get(6)?,
+                    metadata: row.get(7)?,
+                    embedding_id: row.get(8)?,
+                    embedding_model: row.get(9)?,
                 },
-            )?;
-            for row in rows {
-                results.push(row?);
-            }
+                row.get::<_, f64>(10)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
         }
         results.sort_by(|(a_chunk, a_score), (b_chunk, b_score)| {
             a_score
@@ -2060,6 +2256,160 @@ mod tests {
         db.set_selected_sources(&["s2".to_string()]).unwrap();
         let selected = db.get_selected_source_ids().unwrap();
         assert_eq!(selected, vec!["s2".to_string()]);
+    }
+
+    #[test]
+    fn get_sources_batched_with_multiple_ids() {
+        let db = test_db();
+        for id in ["s1", "s2", "s3"] {
+            db.insert_source(&Source {
+                id: id.to_string(),
+                source_type: "text".to_string(),
+                title: format!("Source {id}"),
+                original_filename: None,
+                file_hash: None,
+                url: None,
+                file_path: None,
+                content_text: None,
+                word_count: Some(0),
+                metadata: None,
+                summary: None,
+                summary_model: None,
+                status: "ready".to_string(),
+                error_message: None,
+                selected: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+                processing_state: None,
+            })
+            .unwrap();
+        }
+
+        let source_ids = ["s1", "s3"];
+        let sources = db.get_sources(&source_ids).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert!(sources.contains_key("s1"));
+        assert!(sources.contains_key("s3"));
+        assert!(!sources.contains_key("s2"));
+    }
+
+    #[test]
+    fn get_chunks_by_embedding_ids_batched_with_multiple_ids() {
+        let db = test_db();
+        db.insert_source(&Source {
+            id: "s1".to_string(),
+            source_type: "text".to_string(),
+            title: "Source".to_string(),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: None,
+            word_count: Some(0),
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: "ready".to_string(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            processing_state: None,
+        })
+        .unwrap();
+
+        db.insert_chunk(&Chunk {
+            id: "c1".to_string(),
+            source_id: "s1".to_string(),
+            chunk_index: 0,
+            content: "first".to_string(),
+            token_count: None,
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: Some(11),
+            embedding_model: None,
+        })
+        .unwrap();
+        db.insert_chunk(&Chunk {
+            id: "c2".to_string(),
+            source_id: "s1".to_string(),
+            chunk_index: 1,
+            content: "second".to_string(),
+            token_count: None,
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: Some(22),
+            embedding_model: None,
+        })
+        .unwrap();
+
+        let chunks = db.get_chunks_by_embedding_ids(&[11, 22]).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.get(&11).map(|chunk| chunk.id.as_str()), Some("c1"));
+        assert_eq!(chunks.get(&22).map(|chunk| chunk.id.as_str()), Some("c2"));
+    }
+
+    #[test]
+    fn get_chunks_for_sources_batched_with_empty_and_populated_sources() {
+        let db = test_db();
+        for id in ["s1", "s2", "s3"] {
+            db.insert_source(&Source {
+                id: id.to_string(),
+                source_type: "text".to_string(),
+                title: format!("Source {id}"),
+                original_filename: None,
+                file_hash: None,
+                url: None,
+                file_path: None,
+                content_text: None,
+                word_count: Some(0),
+                metadata: None,
+                summary: None,
+                summary_model: None,
+                status: "ready".to_string(),
+                error_message: None,
+                selected: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+                processing_state: None,
+            })
+            .unwrap();
+        }
+
+        db.insert_chunk(&Chunk {
+            id: "c1".to_string(),
+            source_id: "s1".to_string(),
+            chunk_index: 0,
+            content: "first".to_string(),
+            token_count: None,
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: None,
+            embedding_model: None,
+        })
+        .unwrap();
+        db.insert_chunk(&Chunk {
+            id: "c2".to_string(),
+            source_id: "s1".to_string(),
+            chunk_index: 1,
+            content: "second".to_string(),
+            token_count: None,
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: None,
+            embedding_model: None,
+        })
+        .unwrap();
+
+        let chunks_by_source = db.get_chunks_for_sources(&["s1", "s2", "s3"]).unwrap();
+        assert_eq!(chunks_by_source.len(), 3);
+        assert_eq!(chunks_by_source["s1"].len(), 2);
+        assert_eq!(chunks_by_source["s2"].len(), 0);
+        assert_eq!(chunks_by_source["s3"].len(), 0);
     }
 
     #[test]

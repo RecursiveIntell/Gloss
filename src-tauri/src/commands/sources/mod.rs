@@ -551,13 +551,16 @@ fn run_ingestion_inner(
 
             let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
             let embeddings = {
-                let embedder = state
-                    .embedder
-                    .lock()
-                    .map_err(|e| GlossError::Other(e.to_string()))?;
-                let embedder = embedder
-                    .as_ref()
-                    .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
+                let embedder = {
+                    let embedder = state
+                        .embedder
+                        .read()
+                        .map_err(|e| GlossError::Other(e.to_string()))?;
+                    let embedder = embedder
+                        .as_ref()
+                        .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
+                    embedder.clone()
+                };
                 embedder.embed_batch(&chunk_texts)?
             };
 
@@ -4634,7 +4637,7 @@ mod tests {
             notebook_pools: crate::db::notebook_pool::NotebookDbPools::new(&data_dir),
             model_registry: Mutex::new(model_registry),
             data_dir,
-            embedder: Mutex::new(None),
+            embedder: std::sync::RwLock::new(None),
             query_embed_cache: Mutex::new(crate::state::QueryEmbedCache::default()),
             query_embed_cache_model: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),

@@ -913,7 +913,7 @@ async fn execute_summarize(
     }
 
     // Create provider and generate summary
-    let provider = OllamaProvider::new(ollama_url);
+    let provider = OllamaProvider::new(ollama_url, crate::providers::build_shared_client());
 
     tracing::info!(source_id, source_title, model, "Generating summary");
 
@@ -989,6 +989,7 @@ async fn execute_summarize(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_describe_image(
     ctx: &JobContext,
     notebook_id: &str,
@@ -1075,7 +1076,7 @@ async fn execute_describe_image(
     );
 
     // Call vision model
-    let provider = OllamaProvider::new(ollama_url);
+    let provider = OllamaProvider::new(ollama_url, crate::providers::build_shared_client());
     let description_future =
         crate::ingestion::vision::describe_image(&image_base64, source_title, &provider, model);
     tokio::pin!(description_future);
@@ -1192,6 +1193,7 @@ async fn execute_describe_image(
 /// Maximum number of frames to extract from a video.
 const MAX_VIDEO_FRAMES: usize = 10;
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_describe_video(
     ctx: &JobContext,
     notebook_id: &str,
@@ -1406,7 +1408,7 @@ async fn execute_describe_video(
     );
 
     // Describe each frame
-    let provider = OllamaProvider::new(ollama_url);
+    let provider = OllamaProvider::new(ollama_url, crate::providers::build_shared_client());
     let mut frame_descriptions = Vec::new();
     let mut video_batch_receipt = crate::commands::chat::receipts::BatchReceiptV1::new(
         "video_frame_description",

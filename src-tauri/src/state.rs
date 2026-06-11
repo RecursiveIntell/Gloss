@@ -166,7 +166,7 @@ pub struct AppState {
     /// Application data directory
     pub data_dir: PathBuf,
     /// Embedding model (lazy-initialized on first use)
-    pub embedder: Mutex<Option<EmbeddingService>>,
+    pub embedder: std::sync::RwLock<Option<Arc<EmbeddingService>>>,
     /// LRU cache of (query_text, model_id) → embedding vector. The hostile
     /// audit identified that the user query is re-embedded on EVERY chat
     /// turn (80-400ms per turn) even when identical to the previous turn
@@ -397,7 +397,7 @@ impl AppState {
             notebook_pools: NotebookDbPools::new(&data_dir),
             model_registry: Mutex::new(model_registry),
             data_dir,
-            embedder: Mutex::new(None),
+            embedder: std::sync::RwLock::new(None),
             query_embed_cache: Mutex::new(QueryEmbedCache::default()),
             query_embed_cache_model: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
@@ -423,10 +423,7 @@ impl AppState {
     /// (crash-isolated, preferred); anything else falls back to in-process
     /// FastEmbed (CPU ONNX, kept for offline fallback).
     pub fn ensure_embedder(&self, app_handle: Option<&tauri::AppHandle>) -> Result<(), GlossError> {
-        let mut embedder = self
-            .embedder
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let mut embedder = self.embedder.write().unwrap_or_else(|e| e.into_inner());
 
         if embedder.is_some() {
             return Ok(());
@@ -497,7 +494,7 @@ impl AppState {
         }
 
         tracing::info!("Embedding backend ready");
-        *embedder = Some(service);
+        *embedder = Some(Arc::new(service));
 
         // Now that we know the real model identity, flush the query-embed
         // cache if it was built against a different model. This is the
@@ -827,11 +824,14 @@ impl AppState {
 
         // Cache miss: embed fresh
         let embedding = {
-            let embedder_guard = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
-            let embedder = embedder_guard
-                .as_ref()
-                .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
-            embedder.embed_one(query)?
+            let embedder_arc: Arc<EmbeddingService> = {
+                let guard = self.embedder.read().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .as_ref()
+                    .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?
+                    .clone()
+            };
+            embedder_arc.embed_one(query)?
         };
 
         // Store
@@ -851,41 +851,42 @@ impl AppState {
         top_k: usize,
         trace_ref: String,
     ) -> Result<RetrievalOutcome, GlossError> {
-        let db_path = self.notebook_db_path(notebook_id)?;
-        let nb_db = NotebookDb::connect(&db_path)?;
-        // Blocking lock (with poison recovery) instead of try_lock: contention
-        // here (e.g. ingestion embedding in another thread) must wait, not
-        // silently degrade dense retrieval to BM25-only for this query.
-        let embedder_guard = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
-        let embedder = embedder_guard.as_ref();
-        let indices_guard = self.hnsw_indices.lock().unwrap_or_else(|e| e.into_inner());
-        let index = indices_guard.get(notebook_id);
-        // Pre-compute the query embedding through the LRU cache so that
-        // repeated identical queries ("yes", "explain more", a regenerated
-        // message) don't re-hit Ollama / FastEmbed. The cache miss path
-        // (which actually calls embed_one) is what gets the timeout / error
-        // surfaced to the user. (See hostile audit B4.)
-        let cached_query_embedding = match embedder {
-            Some(_emb) => match self.get_or_embed_query(query) {
-                Ok(vec) => Some(vec),
-                Err(e) => {
-                    tracing::warn!(error = %e, "query embedding failed; dense retrieval will be skipped");
-                    None
-                }
-            },
-            None => None,
-        };
-        hybrid_search::local_retrieval_outcome_with_query(
-            query,
-            &nb_db,
-            embedder,
-            index,
-            cached_query_embedding.as_deref(),
-            NATIVE_SEMANTIC_INDEXING_ENABLED,
-            scope,
-            top_k,
-            trace_ref,
-        )
+        self.with_notebook_db(notebook_id, |nb_db| {
+            // TODO(B1-followup): move this blocking call to spawn_blocking in the
+            // commands/chat caller once we validate perf gains.
+            let embedder = {
+                let embedder_guard = self.embedder.read().unwrap_or_else(|e| e.into_inner());
+                embedder_guard.clone()
+            };
+            let indices_guard = self.hnsw_indices.lock().unwrap_or_else(|e| e.into_inner());
+            let index = indices_guard.get(notebook_id);
+            // Pre-compute the query embedding through the LRU cache so that
+            // repeated identical queries ("yes", "explain more", a regenerated
+            // message) don't re-hit Ollama / FastEmbed. The cache miss path
+            // (which actually calls embed_one) is what gets the timeout / error
+            // surfaced to the user. (See hostile audit B4.)
+            let cached_query_embedding = match embedder.as_deref() {
+                Some(_emb) => match self.get_or_embed_query(query) {
+                    Ok(vec) => Some(vec),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "query embedding failed; dense retrieval will be skipped");
+                        None
+                    }
+                },
+                None => None,
+            };
+            hybrid_search::local_retrieval_outcome_with_query(
+                query,
+                nb_db,
+                embedder.as_deref(),
+                index,
+                cached_query_embedding.as_deref(),
+                NATIVE_SEMANTIC_INDEXING_ENABLED,
+                scope,
+                top_k,
+                trace_ref,
+            )
+        })
     }
 }
 

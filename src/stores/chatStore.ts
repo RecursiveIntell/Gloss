@@ -2,8 +2,7 @@ import { create } from 'zustand';
 import type { ChatEvidencePayload, ChatStatusPayload, Conversation, Message, SourceScope } from '../lib/types';
 import * as api from '../lib/tauri';
 import { useToastStore } from './toastStore';
-
-const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
+import { useNotebookStore } from './notebookStore';
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -78,7 +77,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   loadConversations: async (notebookId) => {
     try {
       const conversations = await api.listConversations(notebookId);
-      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      if (useNotebookStore.getState().activeNotebookId !== notebookId) {
         return;
       }
       set({ conversations });
@@ -91,7 +90,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   createConversation: async (notebookId) => {
     const id = await api.createConversation(notebookId);
     await get().loadConversations(notebookId);
-    if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+    if (useNotebookStore.getState().activeNotebookId !== notebookId) {
       return id;
     }
     set({ activeConversationId: id, messages: [] });
@@ -123,7 +122,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set({ activeConversationId: conversationId });
     try {
       const messages = await api.loadMessages(notebookId, conversationId);
-      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      if (useNotebookStore.getState().activeNotebookId !== notebookId) {
         return;
       }
       if (get().activeConversationId !== conversationId) {
@@ -188,7 +187,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         customGoal || undefined,
         responseLength !== 'default' ? responseLength : undefined,
       );
-      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      if (useNotebookStore.getState().activeNotebookId !== notebookId) {
         // The user switched notebooks while sendMessage was in flight. The
         // optimistically added user message is for the prior notebook's
         // conversation and should be removed so the new notebook's message
@@ -329,7 +328,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       (streamingMessageId && streamingMessageId === messageId) ||
       pendingMessageIds[messageId];
     if (!accepted) return;
-    const activeNotebookId = localStorage.getItem(ACTIVE_NB_KEY);
+    const activeNotebookId = useNotebookStore.getState().activeNotebookId;
     const shouldAppendToVisibleMessages =
       streamingNotebookId === notebookId && (!activeNotebookId || activeNotebookId === notebookId);
     const finalContent = get().streamingContent;
@@ -473,12 +472,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   loadSuggestedQuestions: async (notebookId) => {
     try {
       const questions = await api.getSuggestedQuestions(notebookId);
-      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      if (useNotebookStore.getState().activeNotebookId !== notebookId) {
         return;
       }
       set({ suggestedQuestions: questions });
     } catch {
-      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      if (useNotebookStore.getState().activeNotebookId !== notebookId) {
         return;
       }
       set({ suggestedQuestions: [] });

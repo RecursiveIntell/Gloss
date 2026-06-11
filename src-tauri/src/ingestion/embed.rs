@@ -103,7 +103,7 @@ impl HnswIndex {
 pub enum EmbeddingBackend {
     FastEmbed(Box<TextEmbedding>),
     Ollama {
-        client: reqwest::blocking::Client,
+        client: reqwest::Client,
         url: String,
         model: String,
     },
@@ -168,13 +168,50 @@ impl EmbeddingService {
     /// fast or we degrade to BM25) from the ingestion batch path (60s — a cold
     /// all-minilm model load can take 10-15s on the first call). The user
     /// sees a toast on chat-path timeout, not a 60-second frozen UI.
+    ///
+    /// Sync, but the underlying `reqwest::Client` is the async flavor rather
+    /// than the blocking one. The previous code used `reqwest::blocking::Client`,
+    /// whose `ClientBuilder::build()` lazily spins up an internal blocking-pool
+    /// runtime. Constructing that from inside a `tauri::async_runtime::spawn`
+    /// task panicked at `tokio::runtime::blocking::shutdown` ("Cannot drop a
+    /// runtime in a context where blocking is not allowed"). The async
+    /// `reqwest::Client` has no such blocking pool, so this constructor is
+    /// safe to call from any context.
     pub fn new_ollama(url: &str, model: &str, timeout_secs: u64) -> Result<Self, GlossError> {
         let timeout = std::time::Duration::from_secs(timeout_secs.clamp(2, 300));
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(timeout)
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .map_err(|e| GlossError::Embedding(format!("HTTP client build failed: {e}")))?;
+
+        // The embedding dim is model-specific (bge-m3=1024, all-minilm=384,
+        // nomic-embed=768, etc.). Hardcoding 384 here caused the HNSW index to
+        // be created with the wrong dim when the user picked a non-384 model,
+        // which made every subsequent retrieval corrupt the C++ heap or
+        // silently return no results. We probe ollama for the actual dim
+        // before constructing the service so the HNSW matches.
+        //
+        // We try two paths in order:
+        //   1. POST /api/embed with a single token and read the response
+        //      vector's length. This is authoritative.
+        //   2. POST /api/show and look for `bert.embedding_length` in
+        //      `model_info`. Less reliable (older ollama builds, custom
+        //      models), but a useful fallback.
+        // If both fail, we default to 384 and log a warning. The first
+        // retrieval that produces a vector of a different length will trip a
+        // dim-mismatch panic from usearch, which is loud and fixable — much
+        // better than silently searching a 384-dim HNSW with a 1024-dim vector.
+        let dims = probe_ollama_dims(&client, url, model).unwrap_or_else(|| {
+            tracing::warn!(
+                model = %model,
+                url = %url,
+                "Could not probe embedding dim from ollama; defaulting to 384. \
+                 HNSW dim may not match the model's actual dim. \
+                 First embed call will surface the mismatch as a usearch error."
+            );
+            384
+        });
 
         Ok(Self {
             backend: EmbeddingBackend::Ollama {
@@ -183,7 +220,7 @@ impl EmbeddingService {
                 model: model.to_string(),
             },
             reranker: None,
-            dims: 384,
+            dims,
         })
     }
 
@@ -200,26 +237,71 @@ impl EmbeddingService {
                     "model": model,
                     "input": texts,
                 });
-                let response = client
+                // The async `reqwest::Client` requires a tokio runtime to
+                // drive `.send()`. The previous code used `reqwest::blocking
+                // ::Client`, whose `ClientBuilder::build()` lazily spins up an
+                // internal blocking-pool runtime; that panicked at
+                // `tokio::runtime::blocking::shutdown` when the constructor
+                // was called from inside a `tauri::async_runtime::spawn` task.
+                // We bridge to the async client from this sync method by
+                // either borrowing the existing tokio runtime (if we are on a
+                // runtime thread) or running a fresh, single-threaded runtime
+                // for the duration of the call. This keeps the public API sync
+                // while avoiding the blocking-pool-panic root cause.
+                let post = client
                     .post(format!("{}/api/embed", url))
-                    .json(&body)
-                    .send()
-                    .map_err(|e| {
-                        GlossError::Embedding(format!("Ollama embed request failed: {e}"))
-                    })?;
+                    .json(&body);
+                let send_fut = post.send();
+                let response = match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => tokio::task::block_in_place(|| handle.block_on(send_fut)),
+                    Err(_) => {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| {
+                                GlossError::Embedding(format!("runtime build failed: {e}"))
+                            })?;
+                        runtime.block_on(send_fut)
+                    }
+                }
+                .map_err(|e| GlossError::Embedding(format!("Ollama embed request failed: {e}")))?;
 
                 if !response.status().is_success() {
                     let status = response.status();
-                    let body_text = response
-                        .text()
-                        .unwrap_or_else(|_| "<could not read body>".to_string());
+                    let text_fut = response.text();
+                    let body_text = match tokio::runtime::Handle::try_current() {
+                        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(text_fut)),
+                        Err(_) => {
+                            let runtime = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(|e| {
+                                    GlossError::Embedding(format!("runtime build failed: {e}"))
+                                })?;
+                            runtime.block_on(text_fut)
+                        }
+                    }
+                    .unwrap_or_else(|_| "<could not read body>".to_string());
                     return Err(GlossError::Embedding(format!(
                         "Ollama embed returned HTTP {}: {}",
                         status, body_text
                     )));
                 }
 
-                let parsed: serde_json::Value = response.json().map_err(|e| {
+                let json_fut = response.json();
+                let parsed: serde_json::Value = match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => tokio::task::block_in_place(|| handle.block_on(json_fut)),
+                    Err(_) => {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| {
+                                GlossError::Embedding(format!("runtime build failed: {e}"))
+                            })?;
+                        runtime.block_on(json_fut)
+                    }
+                }
+                .map_err(|e| {
                     GlossError::Embedding(format!("Ollama embed JSON parse failed: {e}"))
                 })?;
 
@@ -303,6 +385,54 @@ impl EmbeddingService {
             )),
         }
     }
+}
+
+/// Probe ollama for the embedding dim of the given model. Returns `None` if
+/// the probe fails for any reason (network, parse, model not found). Caller
+/// decides the fallback.
+///
+/// This is used during `EmbeddingService::new_ollama` so the HNSW index dim
+/// matches the model. The probe runs a single-token embed through the same
+/// async bridge as a normal embed call.
+fn probe_ollama_dims(client: &reqwest::Client, url: &str, model: &str) -> Option<usize> {
+    let url = url.trim_end_matches('/');
+    let body = serde_json::json!({ "model": model, "input": "dim-probe" });
+    let send_fut = client
+        .post(format!("{}/api/embed", url))
+        .json(&body)
+        .send();
+    let response = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(send_fut)),
+        Err(_) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(send_fut)
+        }
+    }
+    .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let json_fut = response.json::<serde_json::Value>();
+    let parsed = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(json_fut)),
+        Err(_) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(json_fut)
+        }
+    }
+    .ok()?;
+    parsed
+        .get("embeddings")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
 }
 
 #[cfg(test)]

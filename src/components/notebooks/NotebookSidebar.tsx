@@ -6,21 +6,21 @@ import { SettingsDialog } from "../settings/SettingsDialog";
 import * as api from "../../lib/tauri";
 import { useToastStore } from "../../stores/toastStore";
 
+type NotebookStoreState = ReturnType<typeof useNotebookStore.getState>;
+
 function portableDefaultName(name: string): string {
   const safe = name.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
   return `${safe || "notebook"}.glosspkg.tar.gz`;
 }
 
 export function NotebookSidebar() {
-  const {
-    notebooks,
-    activeNotebookId,
-    setActive,
-    createNotebook,
-    renameNotebook,
-    deleteNotebook,
-    loadNotebooks,
-  } = useNotebookStore();
+  const notebooks = useNotebookStore((s: NotebookStoreState) => s.notebooks);
+  const activeNotebookId = useNotebookStore((s: NotebookStoreState) => s.activeNotebookId);
+  const setActive = useNotebookStore((s: NotebookStoreState) => s.setActive);
+  const createNotebook = useNotebookStore((s: NotebookStoreState) => s.createNotebook);
+  const renameNotebook = useNotebookStore((s: NotebookStoreState) => s.renameNotebook);
+  const deleteNotebook = useNotebookStore((s: NotebookStoreState) => s.deleteNotebook);
+  const loadNotebooks = useNotebookStore((s: NotebookStoreState) => s.loadNotebooks);
   const addToast = useToastStore((s) => s.addToast);
   const [newName, setNewName] = useState("");
   const [showCreate, setShowCreate] = useState(false);

@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import type { ChatEvidenceDisclosure, CitationAnchorV1, CitationFilterReasonV1 } from "../../lib/types";
 import { AlertTriangle, CheckCircle, ShieldAlert } from "lucide-react";
@@ -13,9 +14,13 @@ export function EvidencePanel() {
   const streamingContent = useChatStore((s) => s.streamingContent);
 
   // Find the latest assistant message with evidence
-  const lastAssistantWithEvidence = [...messages]
-    .reverse()
-    .find((m) => m.role === "assistant" && m.citations?.evidence);
+  const lastAssistantWithEvidence = useMemo(
+    () =>
+      [...messages]
+        .reverse()
+        .find((m) => m.role === "assistant" && m.citations?.evidence),
+    [messages]
+  );
 
   const evidence: ChatEvidenceDisclosure | undefined =
     lastAssistantWithEvidence?.citations?.evidence;

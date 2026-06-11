@@ -1,8 +1,9 @@
-import { useState, useRef, useEffect } from "react";
+import { memo, useContext, useState, useEffect, useMemo, createContext } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useNoteStore } from "../../stores/noteStore";
+import { Virtuoso } from "react-virtuoso";
 import { SourceViewerModal } from "../sources/SourceViewerModal";
 import {
   Send,
@@ -30,31 +31,36 @@ interface ChatPanelProps {
   notebookId: string;
 }
 
+type ChatStoreState = ReturnType<typeof useChatStore.getState>;
+type SettingsStoreState = ReturnType<typeof useSettingsStore.getState>;
+
 export function ChatPanel({ notebookId }: ChatPanelProps) {
-  const {
-    conversations,
-    activeConversationId,
-    messages,
-    isStreaming,
-    streamingContent,
-    streamingError,
-    streamingStatus,
-    sendMessage,
-    stopStreaming,
-    createConversation,
-    deleteConversation,
-    setActiveConversation,
-    loadMessages,
-    suggestedQuestions,
-    style,
-    customGoal,
-    responseLength,
-    setStyle,
-    setCustomGoal,
-    setResponseLength,
-  } = useChatStore();
+  const conversations = useChatStore((s: ChatStoreState) => s.conversations);
+  const activeConversationId = useChatStore((s: ChatStoreState) => s.activeConversationId);
+  const messages = useChatStore((s: ChatStoreState) => s.messages);
+  const isStreaming = useChatStore((s: ChatStoreState) => s.isStreaming);
+  const streamingContent = useChatStore((s: ChatStoreState) => s.streamingContent);
+  const streamingError = useChatStore((s: ChatStoreState) => s.streamingError);
+  const streamingStatus = useChatStore((s: ChatStoreState) => s.streamingStatus);
+  const sendMessage = useChatStore((s: ChatStoreState) => s.sendMessage);
+  const stopStreaming = useChatStore((s: ChatStoreState) => s.stopStreaming);
+  const createConversation = useChatStore((s: ChatStoreState) => s.createConversation);
+  const deleteConversation = useChatStore((s: ChatStoreState) => s.deleteConversation);
+  const setActiveConversation = useChatStore((s: ChatStoreState) => s.setActiveConversation);
+  const loadMessages = useChatStore((s: ChatStoreState) => s.loadMessages);
+  const suggestedQuestions = useChatStore((s: ChatStoreState) => s.suggestedQuestions);
+  const style = useChatStore((s: ChatStoreState) => s.style);
+  const customGoal = useChatStore((s: ChatStoreState) => s.customGoal);
+  const responseLength = useChatStore((s: ChatStoreState) => s.responseLength);
+  const setStyle = useChatStore((s: ChatStoreState) => s.setStyle);
+  const setCustomGoal = useChatStore((s: ChatStoreState) => s.setCustomGoal);
+  const setResponseLength = useChatStore((s: ChatStoreState) => s.setResponseLength);
   const saveResponse = useNoteStore((s) => s.saveResponse);
-  const { activeModel, models, settings, refreshModels, loading: modelsLoading } = useSettingsStore();
+  const activeModel = useSettingsStore((s: SettingsStoreState) => s.activeModel);
+  const models = useSettingsStore((s: SettingsStoreState) => s.models);
+  const settings = useSettingsStore((s: SettingsStoreState) => s.settings);
+  const refreshModels = useSettingsStore((s: SettingsStoreState) => s.refreshModels);
+  const modelsLoading = useSettingsStore((s: SettingsStoreState) => s.loading);
   const getSourceScope = useSourceStore((s) => s.getSourceScope);
   const sources = useSourceStore((s) => s.sources);
   const selectedSourceIds = useSourceStore((s) => s.selectedSourceIds);
@@ -69,15 +75,15 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
   const [editingUserMessageId, setEditingUserMessageId] = useState<string | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const lastScrollRef = useRef(0);
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
 
   useEffect(() => {
-    const now = Date.now();
-    if (now - lastScrollRef.current < 100) return;
-    lastScrollRef.current = now;
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, streamingContent]);
+    if (isStreaming) {
+      setStreamingMessageId("streaming");
+    } else {
+      setStreamingMessageId(null);
+    }
+  }, [isStreaming]);
 
   const handleSend = async () => {
     if (!input.trim() || isStreaming) return;
@@ -118,8 +124,9 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     }
   };
 
-  const handleRegenerate = async (messageIndex: number) => {
+  const handleRegenerate = async (messageId: string) => {
     if (isStreaming) return;
+    const messageIndex = messages.findIndex((m: Message) => m.id === messageId);
     const priorUser = [...messages]
       .slice(0, messageIndex)
       .reverse()
@@ -367,143 +374,49 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           </div>
         )}
 
-        {messages.map((msg, messageIndex) => {
-          const parsedPayload = parseAssistantPayload(msg.citations);
-          const parsedCitations = parsedPayload.citations;
-          const evidence = parsedPayload.evidence;
-          const evidenceOpen = expandedEvidence.has(msg.id);
-
-          return (
-            <div
-              key={msg.id}
-              className={`flex w-full ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-            >
-              <div
-                className={`max-w-[82%] px-3 py-2 text-sm ${
-                  msg.role === "user"
-                    ? "gloss-user-bubble text-white"
-                    : "gloss-assistant-bubble text-text"
-                }`}
-              >
-                {msg.role === "assistant" ? (
-                  <>
-                    <div className="mb-2 flex items-center gap-2 text-[11px] text-text-muted">
-                      <span className="gloss-serif text-sm text-text-secondary">Gloss</span>
-                      <span>·</span>
-                      <span className="gloss-mono">{activeModel}</span>
-                    </div>
-                    <div className="prose prose-invert prose-sm max-w-none">
-                      <ReactMarkdown>{msg.content}</ReactMarkdown>
-                    </div>
-                    <div className="gloss-mono mt-2 flex flex-wrap items-center gap-1.5 text-[10px] uppercase tracking-[0.03em]">
-                      <button
-                        onClick={() => void handleCopy(msg.content)}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text"
-                        title="Copy markdown"
-                      >
-                        <Copy className="w-2.5 h-2.5" />
-                        Copy
-                      </button>
-                      <button
-                        onClick={() => void handleRegenerate(messageIndex)}
-                        disabled={isStreaming}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text disabled:opacity-60"
-                        title="Regenerate"
-                      >
-                        <RotateCcw className="w-2.5 h-2.5" />
-                        Regenerate
-                      </button>
-                      <button
-                        onClick={() => handleSaveResponse(msg.id)}
-                        disabled={savingMessageId === msg.id}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text disabled:opacity-60"
-                      >
-                        <BookmarkPlus className="w-2.5 h-2.5" />
-                        {savingMessageId === msg.id ? "Saving..." : "Save to notes"}
-                      </button>
-                      <button
-                        onClick={() => toggleEvidence(msg.id)}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text"
-                        title="Evidence"
-                        aria-expanded={evidenceOpen}
-                        aria-controls={`evidence-${msg.id}`}
-                      >
-                        {evidenceOpen ? (
-                          <ChevronDown className="w-2.5 h-2.5" />
-                        ) : (
-                          <ChevronRight className="w-2.5 h-2.5" />
-                        )}
-                        Evidence
-                      </button>
-                    </div>
-                    {evidenceOpen && (
-                      <EvidenceDrawer id={`evidence-${msg.id}`} evidence={evidence} />
-                    )}
-                    {parsedCitations.length > 0 && (
-                      <div className="mt-2 flex flex-wrap gap-1.5 border-t border-border/40 pt-2">
-                        {parsedCitations.map((c, i) => (
-                          <button
-                            key={i}
-                            title={c.quote || c.source_title}
-                            onClick={() => setActiveCitation(c)}
-                            className="inline-flex items-center gap-1 rounded border border-accent/25 bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent transition-colors hover:bg-accent/25"
-                          >
-                            <BookMarked className="w-2.5 h-2.5" />
-                            [{i + 1}] {c.source_title}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <div>
-                    <p>{msg.content}</p>
-                    <div className="mt-1 flex justify-end">
-                      <button
-                        onClick={handleContinue}
-                        disabled={isStreaming}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-white/80 hover:bg-white/10 disabled:opacity-60"
-                        title="Continue generation"
-                      >
-                        <RotateCcw className="w-2.5 h-2.5" />
-                        Continue
-                      </button>
-                      <button
-                        onClick={() => handleEditUserMessage(msg)}
-                        disabled={isStreaming}
-                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-white/80 hover:bg-white/10 disabled:opacity-60"
-                        title="Edit and rerun"
-                      >
-                        <FileEdit className="w-2.5 h-2.5" />
-                        Edit
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          );
-        })}
-
-        {isStreaming && streamingContent && (
-          <div className="flex w-full justify-start">
-            <div className="gloss-assistant-bubble max-w-[82%] px-3 py-2 text-sm text-text">
-              <div className="prose prose-invert prose-sm max-w-none">
-                <ReactMarkdown>{streamingContent}</ReactMarkdown>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {!isStreaming && streamingError && streamingContent && (
-          <div className="flex w-full justify-start">
-            <div className="gloss-assistant-bubble max-w-[82%] border border-warning/30 px-3 py-2 text-sm text-text">
-              <div className="prose prose-invert prose-sm max-w-none">
-                <ReactMarkdown>{streamingContent}</ReactMarkdown>
-              </div>
-            </div>
-          </div>
-        )}
+        <MessageRowContext.Provider
+          value={useMemo(
+            () => ({
+              activeModel,
+              isStreaming,
+              savingMessageId,
+              expandedEvidence,
+              onCopy: handleCopy,
+              onRegenerate: handleRegenerate,
+              onSaveResponse: handleSaveResponse,
+              onEditUserMessage: handleEditUserMessage,
+              onContinue: handleContinue,
+              onToggleEvidence: toggleEvidence,
+              onSetActiveCitation: setActiveCitation,
+            }),
+            [
+              activeModel,
+              isStreaming,
+              savingMessageId,
+              expandedEvidence,
+              handleCopy,
+              handleRegenerate,
+              handleSaveResponse,
+              handleEditUserMessage,
+              handleContinue,
+              toggleEvidence,
+              setActiveCitation,
+            ]
+          )}
+        >
+          <Virtuoso
+            data={messages}
+            followOutput="auto"
+            initialTopMostItemIndex={Math.max(messages.length - 1, 0)}
+            itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} />}
+            components={{
+              Footer: () => {
+                if (!streamingMessageId || !streamingContent) return null;
+                return <StreamingMessage content={streamingContent} />;
+              },
+            }}
+          />
+        </MessageRowContext.Provider>
 
         {isStreaming && !streamingContent && (
           <div className="flex w-full justify-start">
@@ -540,7 +453,6 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           </div>
         )}
 
-        <div ref={messagesEndRef} />
       </div>
 
       {/* Input */}
@@ -599,6 +511,171 @@ function parseAssistantPayload(raw: unknown): ChatEvidencePayload {
     return { citations: [], evidence: nullEvidence() };
   }
   return { citations: [], evidence: nullEvidence() };
+}
+
+type MessageRowContextValue = {
+  activeModel: string;
+  isStreaming: boolean;
+  savingMessageId: string | null;
+  expandedEvidence: Set<string>;
+  onCopy: (content: string) => void;
+  onRegenerate: (messageId: string) => Promise<void>;
+  onSaveResponse: (messageId: string) => Promise<void>;
+  onEditUserMessage: (message: Message) => void;
+  onContinue: () => Promise<void>;
+  onToggleEvidence: (messageId: string) => void;
+  onSetActiveCitation: (citation: Citation) => void;
+};
+
+const MessageRowContext = createContext<MessageRowContextValue | null>(null);
+
+const useMessageRowContext = () => {
+  const context = useContext(MessageRowContext);
+  if (!context) {
+    throw new Error("MessageRowContext missing");
+  }
+  return context;
+};
+
+const MessageRow = memo(function MessageRow({
+  msg,
+}: {
+  msg: Message;
+}) {
+  const {
+    activeModel,
+    isStreaming,
+    savingMessageId,
+    expandedEvidence,
+    onCopy,
+    onRegenerate,
+    onSaveResponse,
+    onEditUserMessage,
+    onContinue,
+    onToggleEvidence,
+    onSetActiveCitation,
+  } = useMessageRowContext();
+
+  const parsedPayload = useMemo(() => parseAssistantPayload(msg.citations), [msg.id, msg.citations]);
+  const parsedCitations = parsedPayload.citations;
+  const evidence = parsedPayload.evidence;
+  const evidenceOpen = expandedEvidence.has(msg.id);
+
+  return (
+    <div className={`flex w-full ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+      <div
+        className={`max-w-[82%] px-3 py-2 text-sm ${
+          msg.role === "user"
+            ? "gloss-user-bubble text-white"
+            : "gloss-assistant-bubble text-text"
+        }`}
+      >
+        {msg.role === "assistant" ? (
+          <>
+            <div className="mb-2 flex items-center gap-2 text-[11px] text-text-muted">
+              <span className="gloss-serif text-sm text-text-secondary">Gloss</span>
+              <span>·</span>
+              <span className="gloss-mono">{activeModel}</span>
+            </div>
+            <div className="prose prose-invert prose-sm max-w-none">
+              <ReactMarkdown>{msg.content}</ReactMarkdown>
+            </div>
+            <div className="gloss-mono mt-2 flex flex-wrap items-center gap-1.5 text-[10px] uppercase tracking-[0.03em]">
+              <button
+                onClick={() => void onCopy(msg.content)}
+                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text"
+                title="Copy markdown"
+              >
+                <Copy className="w-2.5 h-2.5" />
+                Copy
+              </button>
+              <button
+                onClick={() => void onRegenerate(msg.id)}
+                disabled={isStreaming}
+                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text disabled:opacity-60"
+                title="Regenerate"
+              >
+                <RotateCcw className="w-2.5 h-2.5" />
+                Regenerate
+              </button>
+              <button
+                onClick={() => void onSaveResponse(msg.id)}
+                disabled={savingMessageId === msg.id}
+                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text disabled:opacity-60"
+              >
+                <BookmarkPlus className="w-2.5 h-2.5" />
+                {savingMessageId === msg.id ? "Saving..." : "Save to notes"}
+              </button>
+              <button
+                onClick={() => onToggleEvidence(msg.id)}
+                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text"
+                title="Evidence"
+                aria-expanded={evidenceOpen}
+                aria-controls={`evidence-${msg.id}`}
+              >
+                {evidenceOpen ? (
+                  <ChevronDown className="w-2.5 h-2.5" />
+                ) : (
+                  <ChevronRight className="w-2.5 h-2.5" />
+                )}
+                Evidence
+              </button>
+            </div>
+            {evidenceOpen && <EvidenceDrawer id={`evidence-${msg.id}`} evidence={evidence} />}
+            {parsedCitations.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1.5 border-t border-border/40 pt-2">
+                {parsedCitations.map((c, i) => (
+                  <button
+                    key={i}
+                    title={c.quote || c.source_title}
+                    onClick={() => onSetActiveCitation(c)}
+                    className="inline-flex items-center gap-1 rounded border border-accent/25 bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent transition-colors hover:bg-accent/25"
+                  >
+                    <BookMarked className="w-2.5 h-2.5" />
+                    [{i + 1}] {c.source_title}
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
+        ) : (
+          <div>
+            <p>{msg.content}</p>
+            <div className="mt-1 flex justify-end">
+              <button
+                onClick={onContinue}
+                disabled={isStreaming}
+                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-white/80 hover:bg-white/10 disabled:opacity-60"
+                title="Continue generation"
+              >
+                <RotateCcw className="w-2.5 h-2.5" />
+                Continue
+              </button>
+              <button
+                onClick={() => onEditUserMessage(msg)}
+                disabled={isStreaming}
+                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-white/80 hover:bg-white/10 disabled:opacity-60"
+                title="Edit and rerun"
+              >
+                <FileEdit className="w-2.5 h-2.5" />
+                Edit
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
+function StreamingMessage({ content }: { content: string }) {
+  return (
+    <div className="flex w-full justify-start">
+      <div className="gloss-assistant-bubble max-w-[82%] px-3 py-2 text-sm text-text">
+        <pre className="m-0 whitespace-pre-wrap break-words font-mono text-xs leading-relaxed">{content}</pre>
+      </div>
+    </div>
+  );
 }
 
 function nullEvidence(citationCount = 0): ChatEvidenceDisclosure {

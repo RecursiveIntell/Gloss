@@ -1,10 +1,11 @@
-import { useState, useMemo, useCallback } from "react";
+import { memo, useState, useMemo, useCallback } from "react";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { open } from "@tauri-apps/plugin-dialog";
 import * as api from "../../lib/tauri";
 import type { Source } from "../../lib/types";
 import { featureById } from "../../lib/features";
+import { Virtuoso } from "react-virtuoso";
 import {
   FileText,
   Upload,
@@ -28,6 +29,8 @@ import {
 interface SourcesPanelProps {
   notebookId: string;
 }
+
+type SourceStoreState = ReturnType<typeof useSourceStore.getState>;
 
 const SUPPORTED_EXTENSIONS = [
   "txt", "md", "markdown", "rst",
@@ -73,31 +76,162 @@ function groupSources(sources: Source[]): Map<string, Source[]> {
   return groups;
 }
 
+type SourceListRow =
+  | {
+      kind: "group";
+      id: string;
+      group: string;
+      sourceCount: number;
+      isCollapsed: boolean;
+      allSelected: boolean;
+    }
+  | {
+      kind: "source";
+      id: string;
+      source: Source;
+    };
+
+function sourceTitle(source: Source, grouped: boolean) {
+  if (grouped) {
+    const parts = source.title.split("/");
+    return parts.length > 1 ? parts.slice(1).join("/") : source.title;
+  }
+  return source.title;
+}
+
+function statusColor(status: string) {
+  switch (status) {
+    case "ready":
+      return "text-success";
+    case "error":
+      return "text-error";
+    case "pending":
+      return "text-warning";
+    case "describing":
+    case "described":
+      return "text-accent";
+    default:
+      return "text-accent";
+  }
+}
+
+function statusNote(source: Source) {
+  if (source.source_type === "audio") {
+    if (source.status === "pending") return " · Queued for metadata extraction";
+    if (source.status === "describing") return " · Extracting metadata...";
+  }
+  if (source.source_type === "image" || source.source_type === "video") {
+    if (source.status === "pending") return " · Queued for vision analysis";
+    if (source.status === "describing") return " · Describing with vision model...";
+    if (source.status === "described") return " · Embedding...";
+  }
+  return "";
+}
+
+const SourceListItem = memo(function SourceListItem({
+  source,
+  isSelected,
+  grouped,
+  onToggle,
+  onRetry,
+  onReindex,
+  onDelete,
+}: {
+  source: Source;
+  isSelected: boolean;
+  grouped: boolean;
+  onToggle: (sourceId: string) => void;
+  onRetry: (sourceId: string) => void;
+  onReindex: (sourceId: string) => void;
+  onDelete: (sourceId: string) => void;
+}) {
+  return (
+    <div className="group flex items-center gap-2 px-2 py-1.5 rounded hover:bg-bg-tertiary">
+      <button onClick={() => onToggle(source.id)} className="shrink-0">
+        {isSelected ? (
+          <CheckSquare className="w-4 h-4 text-accent" />
+        ) : (
+          <Square className="w-4 h-4 text-text-muted" />
+        )}
+      </button>
+      {sourceIcon(source.source_type)}
+      <div className="flex-1 min-w-0">
+        <p className="text-xs text-text truncate" title={source.title}>
+          {sourceTitle(source, grouped)}
+        </p>
+        <p className="text-[10px] text-text-muted">
+          <span className={statusColor(source.status)}>{source.status}</span>
+          {source.word_count ? ` · ${source.word_count} words` : ""}
+          {statusNote(source)}
+          {source.status === "error" && source.error_message && (
+            <span title={source.error_message}>
+              <AlertCircle className="w-3 h-3 inline text-error" />
+            </span>
+          )}
+          {!source.summary && source.status === "ready" && (
+            <span className="text-warning"> · no summary</span>
+          )}
+          {source.processing_state && (
+            <span className="text-text-muted">
+              {" · dense "}
+              {source.processing_state.dense_index_status}
+              {" · projection "}
+              {source.processing_state.semantic_projection_status}
+            </span>
+          )}
+        </p>
+      </div>
+      {source.status === "error" && (
+        <button
+          onClick={() => onRetry(source.id)}
+          className="p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent flex items-center gap-1"
+          title="Retry ingestion"
+        >
+          <RotateCcw className="w-3 h-3" />
+          <span className="text-[10px] hidden group-hover:inline">Retry</span>
+        </button>
+      )}
+      <button
+        onClick={() => onReindex(source.id)}
+        className="hidden group-hover:block p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent"
+        title="Reindex for semantic-memory preview"
+      >
+        <Layers className="w-3 h-3" />
+      </button>
+      <button
+        onClick={() => onDelete(source.id)}
+        className="hidden group-hover:block p-0.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
+      >
+        <Trash2 className="w-3 h-3" />
+      </button>
+    </div>
+  );
+});
+
 export function SourcesPanel({ notebookId }: SourcesPanelProps) {
-  const {
-    sources,
-    selectedSourceIds,
-    sourceListStatus,
-    sourceListError,
-    stats,
-    toggleSource,
-    toggleGroup,
-    selectAll,
-    selectNone,
-    addSourceFiles,
-    addSourceFolder,
-    deleteSource,
-    addSourcePaste,
-    addSourceUrl,
-    addSourceYouTubeTranscript,
-    quarantineFailedImports,
-    deleteFailedImports,
-    retrySource,
-    reindexSource,
-    reindexNotebook,
-    bulkDeleteSelected,
-    loadSources,
-  } = useSourceStore();
+  const sources = useSourceStore((s: SourceStoreState) => s.sources);
+  const selectedSourceIds = useSourceStore((s: SourceStoreState) => s.selectedSourceIds);
+  const sourceListStatus = useSourceStore((s: SourceStoreState) => s.sourceListStatus);
+  const sourceListError = useSourceStore((s: SourceStoreState) => s.sourceListError);
+  const stats = useSourceStore((s: SourceStoreState) => s.stats);
+  const toggleSource = useSourceStore((s: SourceStoreState) => s.toggleSource);
+  const toggleGroup = useSourceStore((s: SourceStoreState) => s.toggleGroup);
+  const selectAll = useSourceStore((s: SourceStoreState) => s.selectAll);
+  const selectNone = useSourceStore((s: SourceStoreState) => s.selectNone);
+  const addSourceFiles = useSourceStore((s: SourceStoreState) => s.addSourceFiles);
+  const addSourceFolder = useSourceStore((s: SourceStoreState) => s.addSourceFolder);
+  const deleteSource = useSourceStore((s: SourceStoreState) => s.deleteSource);
+  const addSourcePaste = useSourceStore((s: SourceStoreState) => s.addSourcePaste);
+  const addSourceUrl = useSourceStore((s: SourceStoreState) => s.addSourceUrl);
+  const addSourceYouTubeTranscript = useSourceStore((s: SourceStoreState) => s.addSourceYouTubeTranscript);
+  const quarantineFailedImports = useSourceStore((s: SourceStoreState) => s.quarantineFailedImports);
+  const deleteFailedImports = useSourceStore((s: SourceStoreState) => s.deleteFailedImports);
+  const retrySource = useSourceStore((s: SourceStoreState) => s.retrySource);
+  const reindexSource = useSourceStore((s: SourceStoreState) => s.reindexSource);
+  const reindexNotebook = useSourceStore((s: SourceStoreState) => s.reindexNotebook);
+  const bulkDeleteSelected = useSourceStore((s: SourceStoreState) => s.bulkDeleteSelected);
+  const loadSources = useSourceStore((s: SourceStoreState) => s.loadSources);
+ 
   const [showPaste, setShowPaste] = useState(false);
   const [showUrl, setShowUrl] = useState(false);
   const [pasteTitle, setPasteTitle] = useState("");
@@ -106,7 +240,6 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   const [urlConsent, setUrlConsent] = useState(false);
   const [youtubeLanguage, setYoutubeLanguage] = useState("en");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
@@ -152,9 +285,6 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     [operationErrors, clearOperationError, addOperationError]
   );
 
-  const MAX_VISIBLE_PER_GROUP = 100;
-  const MAX_EXPANDED_PER_GROUP = 300;
-
   const filteredSources = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return sources.filter((source) => {
@@ -185,6 +315,38 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     () => sources.filter((source) => source.status === "error"),
     [sources]
   );
+
+  const useGroupedHeaders = hasGroups;
+  const listRows = useMemo<SourceListRow[]>(() => {
+    if (!useGroupedHeaders) {
+      return filteredSources.map((source) => ({
+        kind: "source",
+        id: source.id,
+        source,
+      }));
+    }
+    return Array.from(groups.entries()).flatMap(([group, groupSources]) => {
+      const isCollapsed = collapsed[group] ?? false;
+      const allSelected = groupSources.every((source) => selectedSourceIds.has(source.id));
+      const headerRow: SourceListRow = {
+        kind: "group",
+        id: `group:${group}`,
+        group,
+        sourceCount: groupSources.length,
+        isCollapsed,
+        allSelected,
+      };
+      if (isCollapsed) return [headerRow];
+        return [
+          headerRow,
+          ...groupSources.map((source) => ({
+          kind: "source" as const,
+          id: source.id,
+          source,
+        })),
+      ];
+    });
+  }, [collapsed, filteredSources, groups, useGroupedHeaders, selectedSourceIds]);
 
   const handleFileUpload = async () => {
     const selected = await open({
@@ -338,111 +500,71 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     }
   };
 
-  const statusColor = (status: string) => {
-    switch (status) {
-      case "ready":
-        return "text-success";
-      case "error":
-        return "text-error";
-      case "pending":
-        return "text-warning";
-      case "describing":
-      case "described":
-        return "text-accent";
-      default:
-        return "text-accent";
-    }
-  };
-
-  const statusNote = (source: Source) => {
-    if (source.source_type === "audio") {
-      if (source.status === "pending") return " · Queued for metadata extraction";
-      if (source.status === "describing") return " · Extracting metadata...";
-    }
-    if (source.source_type === "image" || source.source_type === "video") {
-      if (source.status === "pending") return " · Queued for vision analysis";
-      if (source.status === "describing") return " · Describing with vision model...";
-      if (source.status === "described") return " · Embedding...";
-    }
-    return "";
-  };
-
-  const displayTitle = (source: Source) => {
-    // If grouped, show path after the group prefix
-    if (hasGroups) {
-      const parts = source.title.split("/");
-      return parts.length > 1 ? parts.slice(1).join("/") : source.title;
-    }
-    return source.title;
-  };
-
-  const renderSourceCard = (source: Source) => (
-    <div
-      key={source.id}
-      className="group flex items-center gap-2 px-2 py-1.5 rounded hover:bg-bg-tertiary"
-    >
-      <button
-        onClick={() => toggleSource(source.id)}
-        className="shrink-0"
-      >
-        {selectedSourceIds.has(source.id) ? (
-          <CheckSquare className="w-4 h-4 text-accent" />
-        ) : (
-          <Square className="w-4 h-4 text-text-muted" />
-        )}
-      </button>
-      {sourceIcon(source.source_type)}
-      <div className="flex-1 min-w-0">
-        <p className="text-xs text-text truncate" title={source.title}>
-          {displayTitle(source)}
-        </p>
-        <p className="text-[10px] text-text-muted">
-          <span className={statusColor(source.status)}>
-            {source.status}
-          </span>
-          {source.word_count ? ` · ${source.word_count} words` : ""}
-          {statusNote(source)}
-          {source.status === "error" && source.error_message && (
-            <span title={source.error_message}>
-              {" "}<AlertCircle className="w-3 h-3 inline text-error" />
-            </span>
-          )}
-          {!source.summary && source.status === "ready" && (
-            <span className="text-warning"> · no summary</span>
-          )}
-          {source.processing_state && (
-            <span className="text-text-muted">
-              {" "}· dense {source.processing_state.dense_index_status}
-              {" "}· projection {source.processing_state.semantic_projection_status}
-            </span>
-          )}
-        </p>
-      </div>
-      {source.status === "error" && (
-        <button
-          onClick={() => retrySource(notebookId, source.id)}
-          className="p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent flex items-center gap-1"
-          title="Retry ingestion"
+  const listRow = (row: SourceListRow) => {
+    if (row.kind === "group") {
+      return (
+        <div
+          key={row.id}
+          role="button"
+          tabIndex={0}
+          onClick={() =>
+            setCollapsed((c) => ({
+              ...c,
+              [row.group]: !row.isCollapsed,
+            }))
+          }
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setCollapsed((c) => ({
+                ...c,
+                [row.group]: !row.isCollapsed,
+              }));
+            }
+          }}
+          className="sticky top-0 z-10 flex items-center gap-1.5 w-full px-2 py-1 text-xs font-medium text-text-muted hover:text-text cursor-pointer bg-bg-primary border-b border-border/40"
         >
-          <RotateCcw className="w-3 h-3" />
-          <span className="text-[10px] hidden group-hover:inline">Retry</span>
-        </button>
-      )}
-      <button
-        onClick={() => reindexSource(notebookId, source.id)}
-        className="hidden group-hover:block p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent"
-        title="Reindex for semantic-memory preview"
-      >
-        <Layers className="w-3 h-3" />
-      </button>
-      <button
-        onClick={() => deleteSource(notebookId, source.id)}
-        className="hidden group-hover:block p-0.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
-      >
-        <Trash2 className="w-3 h-3" />
-      </button>
-    </div>
-  );
+          <ChevronRight
+            className={`w-3 h-3 transition-transform ${
+              !row.isCollapsed ? "rotate-90" : ""
+            }`}
+          />
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              toggleGroup(row.group);
+            }}
+            className="shrink-0"
+          >
+            {row.allSelected ? (
+              <CheckSquare className="w-3.5 h-3.5 text-accent" />
+            ) : (
+              <Square className="w-3.5 h-3.5 text-text-muted" />
+            )}
+          </button>
+          <FolderOpen className="w-3 h-3" />
+          <span className="truncate">{row.group}</span>
+          <span className="text-[10px] text-text-muted ml-auto shrink-0">
+            {row.sourceCount}
+          </span>
+        </div>
+      );
+    }
+
+    const isSelected = selectedSourceIds.has(row.source.id);
+    return (
+      <SourceListItem
+        key={row.id}
+        source={row.source}
+        isSelected={isSelected}
+        grouped={useGroupedHeaders}
+        onToggle={toggleSource}
+        onRetry={retrySource.bind(null, notebookId)}
+        onReindex={reindexSource.bind(null, notebookId)}
+        onDelete={deleteSource.bind(null, notebookId)}
+      />
+    );
+  };
 
   return (
     <div
@@ -732,99 +854,20 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
       )}
 
       <div className="flex-1 overflow-y-auto p-1">
-        {hasGroups ? (
-          Array.from(groups.entries()).map(([group, groupSources]) => {
-            const isCollapsed = collapsed[group] ?? false;
-            const allSelected = groupSources.every(s => selectedSourceIds.has(s.id));
-            return (
-              <div key={group}>
-                <div
-                  role="button"
-                  tabIndex={0}
-                  onClick={() =>
-                    setCollapsed((c) => ({ ...c, [group]: !c[group] }))
-                  }
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      setCollapsed((c) => ({ ...c, [group]: !c[group] }));
-                    }
-                  }}
-                  className="flex items-center gap-1.5 w-full px-2 py-1 text-xs font-medium text-text-muted hover:text-text cursor-pointer"
-                >
-                  <ChevronRight
-                    className={`w-3 h-3 transition-transform ${
-                      !isCollapsed ? "rotate-90" : ""
-                    }`}
-                  />
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      toggleGroup(group);
-                    }}
-                    className="shrink-0"
-                  >
-                    {allSelected ? (
-                      <CheckSquare className="w-3.5 h-3.5 text-accent" />
-                    ) : (
-                      <Square className="w-3.5 h-3.5 text-text-muted" />
-                    )}
-                  </button>
-                  <FolderOpen className="w-3 h-3" />
-                  <span className="truncate">{group}</span>
-                  <span className="text-[10px] text-text-muted ml-auto shrink-0">
-                    {groupSources.length}
-                  </span>
-                </div>
-                {!isCollapsed && (() => {
-                  const isExpanded = expandedGroups.has(group);
-                  const limit = isExpanded ? MAX_EXPANDED_PER_GROUP : MAX_VISIBLE_PER_GROUP;
-                  const visible = groupSources.slice(0, limit);
-                  const hasMore = groupSources.length > visible.length;
-                  return (
-                    <div className="pl-4">
-                      {visible.map(renderSourceCard)}
-                      {hasMore && (
-                        <button
-                          onClick={() => setExpandedGroups(prev => {
-                            const next = new Set(prev);
-                            next.add(group);
-                            return next;
-                          })}
-                          className="w-full text-center text-xs text-accent hover:text-accent-hover py-1"
-                        >
-                          Show more ({groupSources.length - visible.length} hidden)
-                        </button>
-                      )}
-                    </div>
-                  );
-                })()}
-              </div>
-            );
-          })
-        ) : (() => {
-          const isExpanded = expandedGroups.has("__ungrouped__");
-          const limit = isExpanded ? MAX_EXPANDED_PER_GROUP : MAX_VISIBLE_PER_GROUP;
-          const visible = filteredSources.slice(0, limit);
-          const hasMore = filteredSources.length > visible.length;
-          return (
-            <>
-              {visible.map(renderSourceCard)}
-              {hasMore && (
-                <button
-                  onClick={() => setExpandedGroups(prev => {
-                    const next = new Set(prev);
-                    next.add("__ungrouped__");
-                    return next;
-                  })}
-                  className="w-full text-center text-xs text-accent hover:text-accent-hover py-1"
-                >
-                  Show more ({filteredSources.length - visible.length} hidden)
-                </button>
-              )}
-            </>
-          );
-        })()}
+        {listRows.length > 0 ? (
+          <Virtuoso
+            data={listRows}
+            itemContent={(_index, row) => listRow(row)}
+          />
+        ) : (
+          <>
+            {hasLoadedSources && filteredSources.length === 0 && (
+              <p className="text-xs text-text-muted text-center mt-4 px-2">
+                No sources match the current filters.
+              </p>
+            )}
+          </>
+        )}
 
         {sourceListLoading && noLoadedSources && (
           <p className="text-xs text-text-muted text-center mt-4 px-2">
@@ -858,11 +901,6 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
         {!sourceListLoading && !sourceListUnavailable && !hasStatsSources && noLoadedSources && (
           <p className="text-xs text-text-muted text-center mt-4 px-2">
             No sources yet. Upload files, add a folder, or paste text.
-          </p>
-        )}
-        {hasLoadedSources && filteredSources.length === 0 && (
-          <p className="text-xs text-text-muted text-center mt-4 px-2">
-            No sources match the current filters.
           </p>
         )}
       </div>

@@ -78,6 +78,25 @@ human review and conflict resolution.
 | B11.2 | `src-tauri/src/providers/anthropic.rs:150-200` | Same byte-buffer refactor |
 | Test | `src-tauri/src/providers/openai.rs:259-275` | `shared_client_pool_reuses_connections` |
 
+### Bonus Batch E (commit 21a2be9) — React perf via individual selectors
+
+The React-perf Codex task that initially produced 41 TypeScript errors was
+re-run with a tighter pattern (`useStore(s => s.field)` instead of
+`useStore(useShallow(s => ({})))`) and produced a clean diff that ships:
+
+| ID | File:line | Fix |
+|---|---|---|
+| B6.1 | `src/components/chat/ChatPanel.tsx:75-95` | `Virtuoso` for message list with `streamingContent` rendered via `Footer` slot |
+| B6.2 | `src/components/chat/ChatPanel.tsx:35-40` | `useContext` + `createContext` for the streaming state (avoids prop drilling) |
+| B6.3 | `src/components/sources/SourcesPanel.tsx:233-260` | Per-group source list wrapped in `Virtuoso` |
+| D6.1 | `src/components/chat/ChatPanel.tsx:40-65` | 20 individual `useChatStore(s => s.field)` calls |
+| D6.2 | `src/components/chat/ChatPanel.tsx:66-71` | 5 individual `useSettingsStore(s => s.field)` calls |
+| D6.3 | `src/components/sources/SourcesPanel.tsx`, `NotebookSidebar.tsx` | Same pattern applied |
+| B5 | `src/components/chat/ChatPanel.tsx` (Footer) | Streaming message rendered as plain text via Footer; ReactMarkdown only on finalized messages |
+| D6.4 | `src/components/chat/ChatPanel.tsx:325` | `const MessageRow = memo(...)` |
+| D6.5 | `src/components/chat/ChatPanel.tsx:330` | `useMemo(() => parseAssistantPayload(msg.citations), [msg.id, msg.citations])` |
+| D6.6 | `src/components/inspector/EvidencePanel.tsx` | `useMemo` on `reverse+find` |
+
 ### Batch C+D (commit a078a8d) — UX + reliability
 
 | ID | File:line | Fix |
@@ -97,31 +116,6 @@ human review and conflict resolution.
 
 These are real items from the hostile audit that I chose not to ship in this
 pass. The reason for each is honest:
-
-### Deferred — TS errors in agent's selector refactor
-
-The React-perf agent (gpt-5.3-codex-spark) was given a spec to use
-`useShallow` Zustand selectors in `ChatPanel.tsx`, `SourcesPanel.tsx`,
-`NotebookSidebar.tsx`, and `EvidencePanel.tsx`. The agent's diff introduced
-41 TypeScript errors:
-
-- `useChatStore(useShallow(...))` returned `unknown` because of how the
-  generic inference landed in the v5 zustand types
-- The agent removed the `useNoteStore` import on line 5 of ChatPanel.tsx,
-  breaking all the `saveResponse` calls
-- The agent removed the `Virtuoso` import, undoing its own work
-- `SourcesPanel.tsx` had implicit-any errors and unused `index` warnings
-
-I reverted the agent's changes on those 4 files to HEAD and re-ran the
-build. The build is now green. **The performance wins from those changes
-(B6 react-virtuoso, D6 useShallow selectors, B5 plain-while-streaming)
-are deferred** because the agent's diff didn't compile and I didn't have
-time to fix all 41 errors plus redesign the new component shape.
-
-Re-applying these safely is a focused 30-60 minute follow-up that should
-use a single Codex task with a tighter spec ("match the EXISTING selector
-pattern in `src/components/layout/StatusBar.tsx:21-34`, do not introduce
-new patterns").
 
 ### Deferred — six specific Batch D items
 
@@ -159,7 +153,6 @@ remaining session time:
 
 ### Deferred — polish items
 
-- **D6** (selectors in 3 big components) — see above
 - **D7** (keyboard shortcuts) — partly addressed by Cmd+K; cmd+N/cmd+T/etc
   for the rest of the actions in the palette are not bound
 - **D8** (light theme) — palette offers "Toggle Theme" but only dark
@@ -167,6 +160,7 @@ remaining session time:
 - **D9** (split SettingsDialog) — `SettingsDialog/index.tsx` is 1541
   lines, untouched
 - **D10–D13, D18–D21** — misc polish items
+- **F3** (stream parser error body bounded) — not changed
 - **F3** (stream parser error body bounded) — not changed
 
 ## Receipts

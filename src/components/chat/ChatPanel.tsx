@@ -170,11 +170,18 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       projectionProblemCount: sel.filter((s) => ["failed", "partial", "degraded", "stale", "not_projected"].includes(proj(s))).length,
     };
   }, [sources, selectedSourceIds]);
+  // D12 — replace internal jargon with user-readable labels.
+  // "GPU gate" -> "queue" and "background_summary" -> "background task".
+  // Map is intentionally narrow; unknown values pass through unchanged.
+  const humanizeGate = (raw: string) =>
+    raw === "GPU gate" ? "queue" : raw === "LLM gate" ? "model queue" : raw;
+  const humanizeOwner = (raw: string) =>
+    raw === "background_summary" ? "background task" : raw;
   const streamingStatusLabel = streamingStatus
     ? [
         streamingStatus.message,
-        streamingStatus.gate ? `Gate: ${streamingStatus.gate}` : null,
-        streamingStatus.owner ? `Owner: ${streamingStatus.owner}` : null,
+        streamingStatus.gate ? `Gate: ${humanizeGate(streamingStatus.gate)}` : null,
+        streamingStatus.owner ? `Owner: ${humanizeOwner(streamingStatus.owner)}` : null,
         streamingStatus.owner_detail ? `Detail: ${streamingStatus.owner_detail}` : null,
       ]
         .filter(Boolean)
@@ -624,7 +631,7 @@ const MessageRow = memo(function MessageRow({
               <div className="mt-2 flex flex-wrap gap-1.5 border-t border-border/40 pt-2">
                 {parsedCitations.map((c, i) => (
                   <button
-                    key={i}
+                      key={c.source_id ?? c.quote ?? `c-${i}`}
                     title={c.quote || c.source_title}
                     onClick={() => onSetActiveCitation(c)}
                     className="inline-flex items-center gap-1 rounded border border-accent/25 bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent transition-colors hover:bg-accent/25"

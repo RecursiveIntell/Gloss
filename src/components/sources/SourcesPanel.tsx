@@ -619,12 +619,15 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             </button>
           )}
         </div>
-        <div className="mt-2 flex items-start gap-1.5 rounded border border-border bg-bg-tertiary px-2 py-1 text-[10px] leading-snug text-text-muted">
-          <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
-          <span>
-            Strict import: text, markdown, code, paste, local PDF/DOCX/DOC/XLSX/XLS/PPTX/PPT/EPUB extraction, URL text fetch, YouTube transcript fetch, audio metadata, and cached Whisper audio transcription are supported; CSV, HTML, image, video, and legacy Office CLI extraction are degraded.
+        <details className="mt-2 rounded border border-border bg-bg-tertiary px-2 py-1 text-[10px] leading-snug text-text-muted">
+          <summary className="flex cursor-pointer items-start gap-1.5">
+            <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+            <span>Strict import — what's supported</span>
+          </summary>
+          <span className="ml-5 mt-1 block">
+            text, markdown, code, paste, local PDF/DOCX/DOC/XLSX/XLS/PPTX/PPT/EPUB extraction, URL text fetch, YouTube transcript fetch, audio metadata, and cached Whisper audio transcription are supported; CSV, HTML, image, video, and legacy Office CLI extraction are degraded.
           </span>
-        </div>
+        </details>
 
         {hasLoadedSources && (
           <div className="mt-2 flex flex-wrap gap-2 text-xs text-text-muted">

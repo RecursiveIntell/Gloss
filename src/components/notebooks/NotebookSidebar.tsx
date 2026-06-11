@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useNotebookStore } from "../../stores/notebookStore";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { BookOpen, Plus, Trash2, Settings, Pencil, Save, X, Download, Upload } from "lucide-react";
+import { BookOpen, Plus, Trash2, Settings, Pencil, Save, X, Download, Upload, Loader2 } from "lucide-react";
 import { SettingsDialog } from "../settings/SettingsDialog";
 import * as api from "../../lib/tauri";
 import { useToastStore } from "../../stores/toastStore";
@@ -21,6 +21,7 @@ export function NotebookSidebar() {
   const renameNotebook = useNotebookStore((s: NotebookStoreState) => s.renameNotebook);
   const deleteNotebook = useNotebookStore((s: NotebookStoreState) => s.deleteNotebook);
   const loadNotebooks = useNotebookStore((s: NotebookStoreState) => s.loadNotebooks);
+  const activationStatus = useNotebookStore((s: NotebookStoreState) => s.activationStatus);
   const addToast = useToastStore((s) => s.addToast);
   const [newName, setNewName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
@@ -155,7 +156,22 @@ export function NotebookSidebar() {
         </div>
       )}
 
-      <div className="flex-1 overflow-y-auto p-1.5">
+      <div className="relative flex-1 overflow-y-auto p-1.5">
+        {/* D14 — "Switching notebook..." overlay during activation. The
+            activationStatus flag is set to 'pending' in setActive() and
+            cleared to 'confirmed' once the backend confirms. While pending,
+            a backdrop-blur overlay prevents misclicks and shows a spinner. */}
+        {activationStatus === "pending" && (
+          <div
+            className="pointer-events-auto absolute inset-0 z-10 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+            data-testid="notebook-switch-overlay"
+          >
+            <div className="flex items-center gap-2 rounded border border-border bg-bg-secondary px-3 py-2 text-xs text-text">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <span>Switching notebook…</span>
+            </div>
+          </div>
+        )}
         {notebooks.map((nb) => (
           <div
             key={nb.id}

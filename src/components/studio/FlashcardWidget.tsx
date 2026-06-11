@@ -10,15 +10,37 @@ interface FlashcardItem {
 
 type CardState = "known" | "review";
 
-function parseCards(raw: string | undefined): FlashcardItem[] {
+export function parseCards(raw: string | undefined): FlashcardItem[] {
   if (!raw) return [];
   try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed as FlashcardItem[];
-    if (parsed && typeof parsed === "object" && Array.isArray(parsed.content)) {
-      return parsed.content as FlashcardItem[];
-    }
-    return [];
+    const parsed = JSON.parse(raw) as Record<string, unknown> | unknown[];
+    // Accepted shapes: bare array, {content: [...]}, StudioArtifact
+    // {content: {cards: [...]}}, or {cards: [...]}.
+    const content = !Array.isArray(parsed) ? parsed?.content : undefined;
+    const items = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(content)
+        ? content
+        : Array.isArray((content as Record<string, unknown> | undefined)?.cards)
+          ? ((content as Record<string, unknown>).cards as unknown[])
+          : Array.isArray((parsed as Record<string, unknown>)?.cards)
+            ? ((parsed as Record<string, unknown>).cards as unknown[])
+            : [];
+    return items
+      .filter((item): item is Record<string, unknown> => item != null && typeof item === "object")
+      .map((item) => {
+        const citations = Array.isArray(item.citations) ? (item.citations as unknown[]) : [];
+        const citation =
+          (item.citation as FlashcardItem["citation"]) ??
+          (citations[0] as FlashcardItem["citation"]);
+        return {
+          front: typeof item.front === "string" ? item.front : "",
+          back: typeof item.back === "string" ? item.back : "",
+          difficulty: typeof item.difficulty === "string" ? item.difficulty : undefined,
+          citation,
+        };
+      })
+      .filter((card) => card.front.length > 0 && card.back.length > 0);
   } catch {
     return [];
   }
@@ -101,7 +123,7 @@ export function FlashcardWidget({ output }: { output: StudioOutput }) {
             <p className="text-xs font-medium text-text-muted">Cards to review:</p>
             {needReview.map((card, i) => (
               <div
-                key={i}
+                key={card.front ?? `c-${i}`}
                 className="rounded border border-border bg-bg-secondary px-3 py-2 text-xs text-text-secondary"
               >
                 <span className="font-medium text-text">{card.front}</span>

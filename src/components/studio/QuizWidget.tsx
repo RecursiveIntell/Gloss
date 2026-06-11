@@ -5,21 +5,61 @@ interface QuizItem {
   question: string;
   options: string[];
   correct_index: number;
-  explanation: string;
+  explanation?: string;
   citation?: { source_title?: string; section?: string; [key: string]: unknown };
 }
 
 type AnswerState = "unanswered" | "correct" | "incorrect";
 
-function parseQuiz(raw: string | undefined): QuizItem[] {
+export function parseQuiz(raw: string | undefined): QuizItem[] {
   if (!raw) return [];
   try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed as QuizItem[];
-    if (parsed && typeof parsed === "object" && Array.isArray(parsed.content)) {
-      return parsed.content as QuizItem[];
-    }
-    return [];
+    const parsed = JSON.parse(raw) as Record<string, unknown> | unknown[];
+    // Accepted shapes: bare array, {content: [...]}, StudioArtifact
+    // {content: {questions: [...]}}, or {questions: [...]}. Items may use
+    // options/correct_index (legacy) or choices/answer_index (backend).
+    const content = !Array.isArray(parsed) ? parsed?.content : undefined;
+    const items = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(content)
+        ? content
+        : Array.isArray((content as Record<string, unknown> | undefined)?.questions)
+          ? ((content as Record<string, unknown>).questions as unknown[])
+          : Array.isArray((parsed as Record<string, unknown>)?.questions)
+            ? ((parsed as Record<string, unknown>).questions as unknown[])
+            : [];
+    return items
+      .filter((item): item is Record<string, unknown> => item != null && typeof item === "object")
+      .map((item) => {
+        const options = Array.isArray(item.options)
+          ? (item.options as unknown[])
+          : Array.isArray(item.choices)
+            ? (item.choices as unknown[])
+            : [];
+        const rawIndex =
+          typeof item.correct_index === "number"
+            ? item.correct_index
+            : typeof item.answer_index === "number"
+              ? item.answer_index
+              : -1;
+        const citations = Array.isArray(item.citations) ? (item.citations as unknown[]) : [];
+        const citation =
+          (item.citation as QuizItem["citation"]) ?? (citations[0] as QuizItem["citation"]);
+        return {
+          question: typeof item.question === "string" ? item.question : "",
+          options: options.filter((option): option is string => typeof option === "string"),
+          correct_index: rawIndex,
+          explanation: typeof item.explanation === "string" ? item.explanation : undefined,
+          citation,
+        };
+      })
+      .filter(
+        (item) =>
+          item.question.length > 0 &&
+          item.options.length >= 2 &&
+          item.correct_index >= 0 &&
+          item.correct_index < item.options.length
+      );
   } catch {
     return [];
   }
@@ -139,7 +179,7 @@ export function QuizWidget({ output }: { output: StudioOutput }) {
 
           return (
             <button
-              key={i}
+              key={option ?? `q-${i}`}
               type="button"
               disabled={isAnswered}
               onClick={() => handleAnswer(i)}
@@ -161,10 +201,12 @@ export function QuizWidget({ output }: { output: StudioOutput }) {
       </div>
 
       {/* Explanation */}
-      {answerState !== "unanswered" && (
+      {answerState !== "unanswered" && (q.explanation || q.citation?.source_title) && (
         <div className="rounded-lg border border-border bg-bg-secondary p-3">
           <p className="text-xs font-medium text-text">Explanation</p>
-          <p className="mt-1 text-xs leading-relaxed text-text-secondary">{q.explanation}</p>
+          {q.explanation && (
+            <p className="mt-1 text-xs leading-relaxed text-text-secondary">{q.explanation}</p>
+          )}
           {q.citation?.source_title && (
             <p className="mt-2 text-[10px] text-text-muted">
               Source: {q.citation.source_title}

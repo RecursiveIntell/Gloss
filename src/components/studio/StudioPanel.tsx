@@ -20,9 +20,9 @@ import { useToastStore } from "../../stores/toastStore";
 import type { StudioOutput } from "../../lib/types";
 import { featureById } from "../../lib/features";
 import ReactMarkdown from "react-markdown";
-import { FlashcardWidget } from "./FlashcardWidget";
-import { QuizWidget } from "./QuizWidget";
-import { MindMapGraph } from "./MindMapGraph";
+import { FlashcardWidget, parseCards } from "./FlashcardWidget";
+import { QuizWidget, parseQuiz } from "./QuizWidget";
+import { MindMapGraph, parseMindMap } from "./MindMapGraph";
 
 interface StudioPanelProps {
   notebookId: string;
@@ -219,21 +219,31 @@ function StudioOutputBody({ output }: { output: StudioOutput }) {
   const quizActive = featureById(featureFlags, "feature_quiz_widget_enabled")?.active === true;
   const mindMapActive = featureById(featureFlags, "feature_mind_map_widget_enabled")?.active === true;
 
-  if (output.output_type === "flashcards" && flashcardActive) {
+  // Widgets render only when their data actually parses; otherwise fall
+  // through to prose/generic rendering instead of an empty widget state.
+  if (
+    output.output_type === "flashcards" &&
+    flashcardActive &&
+    parseCards(output.raw_content).length > 0
+  ) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto">
         <FlashcardWidget output={output} />
       </div>
     );
   }
-  if (output.output_type === "quiz" && quizActive) {
+  if (output.output_type === "quiz" && quizActive && parseQuiz(output.raw_content).length > 0) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto">
         <QuizWidget output={output} />
       </div>
     );
   }
-  if (output.output_type === "mind_map" && mindMapActive) {
+  if (
+    output.output_type === "mind_map" &&
+    mindMapActive &&
+    (parseMindMap(output.raw_content)?.nodes.length ?? 0) > 0
+  ) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto">
         <MindMapGraph output={output} />
@@ -307,7 +317,7 @@ function renderValue(value: unknown): ReactNode {
     return (
       <div className="space-y-2">
         {value.map((item, index) => (
-          <div key={index} className="border-b border-border pb-2 last:border-0">
+          <div key={typeof item === 'object' && item !== null && 'id' in item ? item.id : `v-${index}`} className="border-b border-border pb-2 last:border-0">
             {renderValue(item)}
           </div>
         ))}
@@ -331,7 +341,7 @@ function renderValue(value: unknown): ReactNode {
         {Array.isArray(obj.citations) && obj.citations.length > 0 && (
           <div className="flex flex-wrap gap-1">
             {obj.citations.map((citation: ArtifactCitation, index: number) => (
-              <span key={index} className="rounded border border-border bg-bg-secondary px-1.5 py-0.5 text-[10px] text-text-muted">
+              <span key={citation.source_id ?? `cit-${index}`} className="rounded border border-border bg-bg-secondary px-1.5 py-0.5 text-[10px] text-text-muted">
                 {citation.source_title ?? citation.source_id}
               </span>
             ))}

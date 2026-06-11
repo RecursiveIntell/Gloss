@@ -105,9 +105,36 @@ export function StatusBar() {
         setProfileStatus(null);
       }
     };
+    // D15 — skip polling when the tab is hidden. The 5s poll still fires
+    // when the tab is visible, but when the user switches away, polling
+    // stops and resumes on visibilitychange. This avoids burning CPU
+    // and IPC calls on a tab the user isn't looking at.
+    let interval: ReturnType<typeof setInterval> | null = null;
+    const startPoll = () => {
+      if (interval !== null) return;
+      interval = setInterval(poll, 5000);
+    };
+    const stopPoll = () => {
+      if (interval !== null) {
+        clearInterval(interval);
+        interval = null;
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        poll(); // immediate refresh on return
+        startPoll();
+      } else {
+        stopPoll();
+      }
+    };
     poll();
-    const interval = setInterval(poll, 5000);
-    return () => clearInterval(interval);
+    if (document.visibilityState === "visible") startPoll();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stopPoll();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [activeNotebookId]);
 
   const handleTogglePause = useCallback(async () => {

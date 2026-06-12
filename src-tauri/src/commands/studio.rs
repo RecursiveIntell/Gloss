@@ -394,7 +394,35 @@ async fn run_studio_llm(
     };
 
     let start = Instant::now();
-    let mut stream = provider.chat(request).await?;
+    // Hard timeout: on slow CPU ollama + large system prompts, the first
+    // byte can take many minutes (or never arrive). Without this guard the
+    // Studio Generate button just spins forever. On timeout, the caller falls
+    // through to the deterministic template artifact (see Err(e) branch in
+    // generate_studio_output), which is built locally and returns in <1s.
+    const STUDIO_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    tracing::info!(
+        "Studio LLM call ({purpose}) starting, timeout={}s",
+        STUDIO_LLM_TIMEOUT.as_secs()
+    );
+    let stream_result = tokio::time::timeout(
+        STUDIO_LLM_TIMEOUT,
+        provider.chat(request),
+    )
+    .await;
+    let mut stream = match stream_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e),
+        Err(_elapsed) => {
+            tracing::warn!(
+                "Studio LLM call ({purpose}) timed out after {}s; caller will fall back to template",
+                STUDIO_LLM_TIMEOUT.as_secs()
+            );
+            return Err(GlossError::Other(format!(
+                "Studio LLM call timed out after {}s",
+                STUDIO_LLM_TIMEOUT.as_secs()
+            )));
+        }
+    };
     let mut response = String::new();
     while let Some(token_result) = stream.next().await {
         let token = token_result?;

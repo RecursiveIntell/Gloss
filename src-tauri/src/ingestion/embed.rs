@@ -248,9 +248,7 @@ impl EmbeddingService {
                 // runtime thread) or running a fresh, single-threaded runtime
                 // for the duration of the call. This keeps the public API sync
                 // while avoiding the blocking-pool-panic root cause.
-                let post = client
-                    .post(format!("{}/api/embed", url))
-                    .json(&body);
+                let post = client.post(format!("{}/api/embed", url)).json(&body);
                 let send_fut = post.send();
                 let response = match tokio::runtime::Handle::try_current() {
                     Ok(handle) => tokio::task::block_in_place(|| handle.block_on(send_fut)),
@@ -397,10 +395,7 @@ impl EmbeddingService {
 fn probe_ollama_dims(client: &reqwest::Client, url: &str, model: &str) -> Option<usize> {
     let url = url.trim_end_matches('/');
     let body = serde_json::json!({ "model": model, "input": "dim-probe" });
-    let send_fut = client
-        .post(format!("{}/api/embed", url))
-        .json(&body)
-        .send();
+    let send_fut = client.post(format!("{}/api/embed", url)).json(&body).send();
     let response = match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(send_fut)),
         Err(_) => {

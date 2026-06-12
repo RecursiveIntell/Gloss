@@ -404,11 +404,7 @@ async fn run_studio_llm(
         "Studio LLM call ({purpose}) starting, timeout={}s",
         STUDIO_LLM_TIMEOUT.as_secs()
     );
-    let stream_result = tokio::time::timeout(
-        STUDIO_LLM_TIMEOUT,
-        provider.chat(request),
-    )
-    .await;
+    let stream_result = tokio::time::timeout(STUDIO_LLM_TIMEOUT, provider.chat(request)).await;
     let mut stream = match stream_result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),

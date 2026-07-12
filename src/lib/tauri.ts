@@ -20,15 +20,12 @@ import type {
   IndexSourceReceipt,
   SemanticMemoryBackfillReceipt,
   SemanticMemoryProfileStatus,
-  RetrievalDiagnostics,
-  VectorArtifactStatus,
   RetrievalProbeReceipt,
   ChatAttemptTraceV1,
-  RetrievalCoverage,
+  ChatStreamEventV1,
   EmbeddingDiagnosticsReceipt,
   ExternalToolAvailabilityReceipt,
   FailedImportQuarantineReceipt,
-  ImportCapability,
   DbDoctorReceipt,
   NotebookExportReceipt,
   NotebookImportReceipt,
@@ -47,13 +44,6 @@ export async function runDatabaseDoctor(repair: boolean): Promise<DbDoctorReceip
   return invoke("run_database_doctor", { repair });
 }
 
-export async function exportNotebook(
-  notebookId: string,
-  packageDir: string
-): Promise<NotebookExportReceipt> {
-  return invoke("export_notebook", { notebookId, packageDir });
-}
-
 export async function exportNotebookArchive(
   notebookId: string,
   archivePath: string
@@ -61,23 +51,10 @@ export async function exportNotebookArchive(
   return invoke("export_notebook_archive", { notebookId, archivePath });
 }
 
-export async function validateNotebookImportPackage(
-  packageDir: string
-): Promise<NotebookPortableManifest> {
-  return invoke("validate_notebook_import_package", { packageDir });
-}
-
 export async function validateNotebookImportArchive(
   archivePath: string
 ): Promise<NotebookPortableManifest> {
   return invoke("validate_notebook_import_archive", { archivePath });
-}
-
-export async function importNotebook(
-  packageDir: string,
-  nameOverride?: string
-): Promise<NotebookImportReceipt> {
-  return invoke("import_notebook", { packageDir, nameOverride });
 }
 
 export async function importNotebookArchive(
@@ -200,10 +177,6 @@ export async function getSourceContent(
   return invoke("get_source_content", { notebookId, sourceId });
 }
 
-export async function getImportCapabilityMatrix(): Promise<ImportCapability[]> {
-  return invoke("get_import_capability_matrix");
-}
-
 export async function retrySourceIngestion(
   notebookId: string,
   sourceId: string
@@ -215,27 +188,6 @@ export async function getNotebookStats(
   notebookId: string
 ): Promise<NotebookStats> {
   return invoke("get_notebook_stats", { notebookId });
-}
-
-export async function diagnoseRetrievalCoverage(
-  notebookId: string,
-  sourceScope?: SourceScope
-): Promise<RetrievalCoverage> {
-  return invoke("diagnose_retrieval_coverage", { notebookId, sourceScope });
-}
-
-export async function diagnoseRetrievalQuery(
-  notebookId: string,
-  query: string,
-  sourceScope: SourceScope,
-  limit?: number
-): Promise<RetrievalDiagnostics> {
-  return invoke("diagnose_retrieval_query", {
-    notebookId,
-    query,
-    sourceScope,
-    limit,
-  });
 }
 
 export async function runRetrievalProbe(
@@ -263,7 +215,8 @@ export async function generateStudioOutput(
   outputType: string,
   sourceIds?: string[],
   title?: string,
-  maxItems?: number
+  maxItems?: number,
+  attemptId?: string
 ): Promise<StudioOutput> {
   return invoke("generate_studio_output", {
     notebookId,
@@ -271,7 +224,15 @@ export async function generateStudioOutput(
     sourceIds,
     title,
     maxItems,
+    attemptId,
   });
+}
+
+export async function cancelStudioGeneration(
+  notebookId: string,
+  attemptId?: string
+): Promise<boolean> {
+  return invoke("cancel_studio_generation", { notebookId, attemptId });
 }
 
 export async function exportStudioOutput(
@@ -307,6 +268,18 @@ export async function loadMessages(
   conversationId: string
 ): Promise<Message[]> {
   return invoke("load_messages", { notebookId, conversationId });
+}
+
+export async function getChatEventsSince(
+  notebookId: string,
+  conversationId: string,
+  afterSeq?: number | null
+): Promise<ChatStreamEventV1[]> {
+  return invoke("get_chat_events_since", {
+    notebookId,
+    conversationId,
+    afterSeq,
+  });
 }
 
 export async function sendMessage(
@@ -423,20 +396,6 @@ export async function testProvider(providerId: string): Promise<boolean> {
   return invoke("test_provider", { providerId });
 }
 
-export interface ProviderModelTestResult {
-  provider_healthy: boolean;
-  model_found: boolean;
-  model_available: boolean;
-  model_list_error: string | null;
-}
-
-export async function testProviderModel(
-  providerId: string,
-  modelId: string
-): Promise<ProviderModelTestResult> {
-  return invoke("test_provider_model", { providerId, modelId });
-}
-
 export async function refreshModels(
   providerId?: string
 ): Promise<ModelInfo[]> {
@@ -527,12 +486,6 @@ export async function semanticMemoryReindexSource(
   });
 }
 
-export async function semanticMemoryReindexNotebook(
-  notebookId: string
-): Promise<SemanticMemoryBackfillReceipt> {
-  return invoke("semantic_memory_reindex_notebook", { notebookId });
-}
-
 export async function semanticMemoryBackfillNotebook(
   notebookId: string
 ): Promise<SemanticMemoryBackfillReceipt> {
@@ -543,12 +496,6 @@ export async function semanticMemoryRebuildVectorArtifacts(
   notebookId: string
 ): Promise<Record<string, unknown> | null> {
   return invoke("semantic_memory_rebuild_vector_artifacts", { notebookId });
-}
-
-export async function semanticMemoryVectorArtifactStatus(
-  notebookId: string
-): Promise<VectorArtifactStatus> {
-  return invoke("semantic_memory_vector_artifact_status", { notebookId });
 }
 
 export async function getSemanticMemoryProfileStatus(

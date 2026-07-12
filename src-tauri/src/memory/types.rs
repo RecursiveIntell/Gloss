@@ -21,10 +21,26 @@ pub struct MemoryBackendStatus {
     pub last_retrieval_receipt_id: Option<String>,
     pub last_receipt_ref: Option<String>,
     pub fallback_reason: Option<String>,
+    pub fallback_reason_code: Option<RetrievalReasonCode>,
     pub degradation_markers: Vec<String>,
     pub backend_version_or_digest: Option<String>,
+    #[serde(default)]
+    pub embedding_index_metadata: Vec<EmbeddingIndexStatusView>,
     pub degraded: bool,
     pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingIndexStatusView {
+    pub index_id: String,
+    pub provider: String,
+    pub model: String,
+    pub model_digest: Option<String>,
+    pub dimensions: Option<usize>,
+    pub schema_version: i32,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub validated_at: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -33,6 +49,7 @@ pub struct RetrievalCapabilityDecisionV1 {
     pub requested_backend: String,
     pub effective_backend: String,
     pub decision_reason: Option<String>,
+    pub decision_reason_code: Option<RetrievalReasonCode>,
     pub build_feature_available: bool,
     pub runtime_enabled: bool,
     pub projection_ready: bool,
@@ -107,6 +124,7 @@ pub struct MemorySearchResponse {
     pub receipt_id: String,
     pub provenance: serde_json::Value,
     pub fallback_reason: Option<String>,
+    pub fallback_reason_code: Option<RetrievalReasonCode>,
     pub degradation_markers: Vec<String>,
     pub source_scope_preserved: bool,
     pub fallback_used: bool,
@@ -146,6 +164,8 @@ pub enum RetrievalReasonCode {
     DenseEngineUnavailable,
     EmbedderUnavailable,
     IndexMissing,
+    EmbeddingIndexMetadataUnknown,
+    EmbeddingIndexMetadataStale,
     NoEmbeddedChunks,
     PartialEmbeddingCoverage,
     ScopeHasMissingEmbeddings,
@@ -169,6 +189,8 @@ impl RetrievalReasonCode {
             Self::DenseEngineUnavailable => "dense_engine_unavailable",
             Self::EmbedderUnavailable => "embedder_unavailable",
             Self::IndexMissing => "index_missing",
+            Self::EmbeddingIndexMetadataUnknown => "embedding_index_metadata_unknown",
+            Self::EmbeddingIndexMetadataStale => "embedding_index_metadata_stale",
             Self::NoEmbeddedChunks => "no_embedded_chunks",
             Self::PartialEmbeddingCoverage => "partial_embedding_coverage",
             Self::ScopeHasMissingEmbeddings => "scope_has_missing_embeddings",

@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const LOCAL_EGRESS_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 const OPENAI_EGRESS_HOST: &str = "api.openai.com";
@@ -148,6 +150,145 @@ pub struct ChatToken {
     pub done: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LlmPhaseTimeouts {
+    pub provider_start: Duration,
+    pub first_token: Duration,
+    pub stream_idle: Duration,
+}
+
+impl Default for LlmPhaseTimeouts {
+    fn default() -> Self {
+        Self {
+            provider_start: Duration::from_secs(180),
+            first_token: Duration::from_secs(168),
+            stream_idle: Duration::from_secs(84),
+        }
+    }
+}
+
+/// Stable identity snapshot for one LLM-affecting operation. It deliberately
+/// travels with `LlmExecutionContext` rather than becoming another mutable
+/// runtime registry; the chat terminal emitter remains the sole terminal
+/// event guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // fields are part of the audit/receipt surface; not all are read in every build
+pub enum LlmOperationKind {
+    Chat,
+    Summary,
+    Vision,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // populated for receipt/audit serialization; not every build path reads each field
+pub struct LlmOperationContext {
+    pub kind: LlmOperationKind,
+    pub notebook_id: String,
+    pub conversation_id: Option<String>,
+    pub output_id: Option<String>,
+    pub source_id: Option<String>,
+    pub epoch: u64,
+    pub attempt_id: String,
+    pub provider_snapshot: String,
+    pub model_snapshot: String,
+    pub receipt_id: String,
+}
+
+impl LlmOperationContext {
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat(
+        notebook_id: impl Into<String>,
+        conversation_id: impl Into<String>,
+        output_id: impl Into<String>,
+        epoch: u64,
+        attempt_id: impl Into<String>,
+        provider_snapshot: impl Into<String>,
+        model_snapshot: impl Into<String>,
+        receipt_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: LlmOperationKind::Chat,
+            notebook_id: notebook_id.into(),
+            conversation_id: Some(conversation_id.into()),
+            output_id: Some(output_id.into()),
+            source_id: None,
+            epoch,
+            attempt_id: attempt_id.into(),
+            provider_snapshot: provider_snapshot.into(),
+            model_snapshot: model_snapshot.into(),
+            receipt_id: receipt_id.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmExecutionContext {
+    pub cancellation: CancellationToken,
+    pub timeouts: LlmPhaseTimeouts,
+    pub attempt_id: Option<String>,
+    pub operation: Option<LlmOperationContext>,
+}
+
+impl LlmExecutionContext {
+    pub fn new(cancellation: CancellationToken, timeouts: LlmPhaseTimeouts) -> Self {
+        Self {
+            cancellation,
+            timeouts,
+            attempt_id: None,
+            operation: None,
+        }
+    }
+
+    pub fn default_with_token(cancellation: CancellationToken) -> Self {
+        Self::new(cancellation, LlmPhaseTimeouts::default())
+    }
+
+    pub fn uncancellable() -> Self {
+        Self::default_with_token(CancellationToken::new())
+    }
+
+    pub fn with_attempt_id(mut self, attempt_id: impl Into<String>) -> Self {
+        self.attempt_id = Some(attempt_id.into());
+        self
+    }
+
+    pub fn with_operation(mut self, operation: LlmOperationContext) -> Self {
+        self.attempt_id = Some(operation.attempt_id.clone());
+        self.operation = Some(operation);
+        self
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    pub fn check_cancelled(&self, provider: &str, phase: &str) -> Result<(), GlossError> {
+        if self.is_cancelled() {
+            Err(provider_cancelled_error(
+                provider,
+                phase,
+                self.attempt_id.as_deref(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub fn provider_cancelled_error(
+    provider: &str,
+    phase: &str,
+    attempt_id: Option<&str>,
+) -> GlossError {
+    let attempt_detail = attempt_id
+        .map(|attempt_id| format!(" attempt_id={attempt_id}"))
+        .unwrap_or_default();
+    GlossError::Provider {
+        provider: provider.to_string(),
+        source: anyhow::anyhow!("provider request cancelled during {phase}{attempt_detail}"),
+    }
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// List available models from this provider.
@@ -157,6 +298,7 @@ pub trait LlmProvider: Send + Sync {
     async fn chat(
         &self,
         request: ChatRequest,
+        ctx: LlmExecutionContext,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatToken, GlossError>> + Send>>, GlossError>;
 
     /// Test connectivity.
@@ -212,6 +354,9 @@ pub fn validate_embedding_url(
 /// connection pool survives across uses and avoids repeated TCP handshakes.
 pub fn build_shared_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(90))
+        .timeout(std::time::Duration::from_secs(300))
         .pool_max_idle_per_host(8)
         .tcp_keepalive(std::time::Duration::from_secs(60))
         .build()
@@ -709,6 +854,325 @@ impl ModelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::{stream, StreamExt};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::time::{sleep, Duration};
+
+    #[derive(Clone)]
+    enum MockProviderMode {
+        NeverStarts,
+        SlowStart {
+            delay_ms: u64,
+        },
+        SlowFirstToken {
+            delay_ms: u64,
+        },
+        IdleAfterChunks {
+            chunks: Vec<&'static str>,
+            idle_ms: u64,
+        },
+        LateChunksAfterCancel,
+        IncompleteEof,
+        DoneNoContent,
+        Normal {
+            chunks: Vec<&'static str>,
+        },
+    }
+
+    struct HarnessMockProvider {
+        mode: MockProviderMode,
+        active_requests: Arc<AtomicUsize>,
+        cancellation_observed: Arc<AtomicBool>,
+    }
+
+    impl HarnessMockProvider {
+        fn new(mode: MockProviderMode) -> Self {
+            Self {
+                mode,
+                active_requests: Arc::new(AtomicUsize::new(0)),
+                cancellation_observed: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    struct MockStreamState {
+        mode: MockProviderMode,
+        step: usize,
+        ctx: LlmExecutionContext,
+        active_requests: Arc<AtomicUsize>,
+        cancellation_observed: Arc<AtomicBool>,
+    }
+
+    impl Drop for MockStreamState {
+        fn drop(&mut self) {
+            self.active_requests.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for HarnessMockProvider {
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, GlossError> {
+            Ok(Vec::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            ctx: LlmExecutionContext,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatToken, GlossError>> + Send>>,
+            GlossError,
+        > {
+            self.active_requests.fetch_add(1, Ordering::SeqCst);
+            match &self.mode {
+                MockProviderMode::NeverStarts => {
+                    ctx.cancellation.cancelled().await;
+                    self.cancellation_observed.store(true, Ordering::SeqCst);
+                    self.active_requests.fetch_sub(1, Ordering::SeqCst);
+                    Err(provider_cancelled_error(
+                        "ollama",
+                        "mock_never_starts",
+                        ctx.attempt_id.as_deref(),
+                    ))
+                }
+                MockProviderMode::SlowStart { delay_ms } => {
+                    tokio::select! {
+                        _ = ctx.cancellation.cancelled() => {
+                            self.cancellation_observed.store(true, Ordering::SeqCst);
+                            self.active_requests.fetch_sub(1, Ordering::SeqCst);
+                            Err(provider_cancelled_error("ollama", "mock_slow_start", ctx.attempt_id.as_deref()))
+                        }
+                        _ = sleep(Duration::from_millis(*delay_ms)) => {
+                            self.active_requests.fetch_sub(1, Ordering::SeqCst);
+                            Ok(Box::pin(stream::iter(vec![Ok(ChatToken { token: "started".into(), done: true })])))
+                        }
+                    }
+                }
+                _ => {
+                    let state = MockStreamState {
+                        mode: self.mode.clone(),
+                        step: 0,
+                        ctx,
+                        active_requests: Arc::clone(&self.active_requests),
+                        cancellation_observed: Arc::clone(&self.cancellation_observed),
+                    };
+                    let stream = stream::unfold(Some(state), |state| async move {
+                        let mut state = state?;
+                        if state.ctx.is_cancelled() {
+                            state.cancellation_observed.store(true, Ordering::SeqCst);
+                            return Some((
+                                Err(provider_cancelled_error(
+                                    "ollama",
+                                    "mock_stream_cancelled",
+                                    state.ctx.attempt_id.as_deref(),
+                                )),
+                                None,
+                            ));
+                        }
+                        let item = match &state.mode {
+                            MockProviderMode::SlowFirstToken { delay_ms } if state.step == 0 => {
+                                sleep(Duration::from_millis(*delay_ms)).await;
+                                Ok(ChatToken {
+                                    token: "slow-first".into(),
+                                    done: false,
+                                })
+                            }
+                            MockProviderMode::IdleAfterChunks { chunks, idle_ms } => {
+                                if let Some(chunk) = chunks.get(state.step) {
+                                    Ok(ChatToken {
+                                        token: (*chunk).to_string(),
+                                        done: false,
+                                    })
+                                } else {
+                                    sleep(Duration::from_millis(*idle_ms)).await;
+                                    Ok(ChatToken {
+                                        token: String::new(),
+                                        done: false,
+                                    })
+                                }
+                            }
+                            MockProviderMode::LateChunksAfterCancel => Ok(ChatToken {
+                                token: "before-cancel".into(),
+                                done: false,
+                            }),
+                            MockProviderMode::IncompleteEof => {
+                                if state.step == 0 {
+                                    Ok(ChatToken {
+                                        token: "partial".into(),
+                                        done: false,
+                                    })
+                                } else {
+                                    return None;
+                                }
+                            }
+                            MockProviderMode::DoneNoContent => Ok(ChatToken {
+                                token: String::new(),
+                                done: true,
+                            }),
+                            MockProviderMode::Normal { chunks } => {
+                                if let Some(chunk) = chunks.get(state.step) {
+                                    Ok(ChatToken {
+                                        token: (*chunk).to_string(),
+                                        done: false,
+                                    })
+                                } else {
+                                    Ok(ChatToken {
+                                        token: String::new(),
+                                        done: true,
+                                    })
+                                }
+                            }
+                            _ => Ok(ChatToken {
+                                token: String::new(),
+                                done: true,
+                            }),
+                        };
+                        state.step += 1;
+                        Some((item, Some(state)))
+                    });
+                    Ok(Box::pin(stream))
+                }
+            }
+        }
+
+        async fn health_check(&self) -> Result<bool, GlossError> {
+            Ok(true)
+        }
+
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::Ollama
+        }
+    }
+
+    fn mock_chat_request() -> ChatRequest {
+        ChatRequest {
+            model: "mock-model".to_string(),
+            system_prompt: None,
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                images: None,
+            }],
+            max_tokens: 32,
+            temperature: 0.0,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+            stream: true,
+            num_ctx: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_provider_never_starts_observes_cancellation_and_decrements_active() {
+        let provider = HarnessMockProvider::new(MockProviderMode::NeverStarts);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let ctx = LlmExecutionContext::default_with_token(cancellation.clone())
+            .with_attempt_id("attempt-never-starts");
+
+        let task = tokio::spawn({
+            let provider = HarnessMockProvider {
+                mode: provider.mode.clone(),
+                active_requests: Arc::clone(&provider.active_requests),
+                cancellation_observed: Arc::clone(&provider.cancellation_observed),
+            };
+            async move { provider.chat(mock_chat_request(), ctx).await }
+        });
+        while provider.active_requests.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(1)).await;
+        }
+        cancellation.cancel();
+        let error = match task.await.unwrap() {
+            Ok(_) => panic!("cancelled start must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("provider request cancelled"));
+        assert!(provider.cancellation_observed.load(Ordering::SeqCst));
+        assert_eq!(provider.active_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn mock_provider_exercises_stream_shapes() {
+        let cases = [
+            (
+                MockProviderMode::SlowStart { delay_ms: 1 },
+                vec!["started"],
+                true,
+            ),
+            (
+                MockProviderMode::SlowFirstToken { delay_ms: 1 },
+                vec!["slow-first", ""],
+                true,
+            ),
+            (
+                MockProviderMode::IdleAfterChunks {
+                    chunks: vec!["a", "b"],
+                    idle_ms: 1,
+                },
+                vec!["a", "b", ""],
+                false,
+            ),
+            (MockProviderMode::IncompleteEof, vec!["partial"], false),
+            (MockProviderMode::DoneNoContent, vec![""], true),
+            (
+                MockProviderMode::Normal {
+                    chunks: vec!["hello", " world"],
+                },
+                vec!["hello", " world", ""],
+                true,
+            ),
+        ];
+
+        for (mode, expected_tokens, expected_terminal_done) in cases {
+            let provider = HarnessMockProvider::new(mode);
+            let ctx = LlmExecutionContext::uncancellable();
+            let mut stream = provider.chat(mock_chat_request(), ctx).await.unwrap();
+            let mut tokens = Vec::new();
+            let mut done = false;
+            while let Some(item) = stream.next().await {
+                let token = item.unwrap();
+                done = token.done;
+                tokens.push(token.token);
+                if tokens.len() >= expected_tokens.len() {
+                    break;
+                }
+            }
+            drop(stream);
+
+            assert_eq!(tokens, expected_tokens);
+            assert_eq!(done, expected_terminal_done);
+            assert_eq!(provider.active_requests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_provider_late_chunks_after_cancel_surface_cancelled_error() {
+        let provider = HarnessMockProvider::new(MockProviderMode::LateChunksAfterCancel);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let ctx = LlmExecutionContext::default_with_token(cancellation.clone())
+            .with_attempt_id("attempt-late-cancel");
+        let mut stream = provider.chat(mock_chat_request(), ctx).await.unwrap();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.token, "before-cancel");
+
+        cancellation.cancel();
+        let late = stream
+            .next()
+            .await
+            .expect("mock should report attempted post-cancel chunk")
+            .expect_err("post-cancel provider yield must become cancellation");
+
+        assert!(late.to_string().contains("provider request cancelled"));
+        drop(stream);
+        assert!(provider.cancellation_observed.load(Ordering::SeqCst));
+        assert_eq!(provider.active_requests.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn network_scope_policy_allows_loopback_local_providers() {

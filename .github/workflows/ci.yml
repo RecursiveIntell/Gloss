@@ -26,6 +26,9 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
@@ -44,14 +47,8 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Frontend build
-        run: npm run build
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.8 --locked
 
-      - name: Rust format check
-        run: |
-          find src-tauri -path 'src-tauri/vendor' -prune -o -name '*.rs' -print0 \
-            | xargs -0 rustfmt --edition 2021 --check
-
-      - name: Rust tests
-        working-directory: src-tauri
-        run: cargo test
+      - name: Canonical release verification
+        run: npm run verify

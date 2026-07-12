@@ -48,6 +48,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const deleteConversation = useChatStore((s: ChatStoreState) => s.deleteConversation);
   const setActiveConversation = useChatStore((s: ChatStoreState) => s.setActiveConversation);
   const loadMessages = useChatStore((s: ChatStoreState) => s.loadMessages);
+  const rehydrateConversation = useChatStore((s: ChatStoreState) => s.rehydrateConversation);
+  const replayChatEvents = useChatStore((s: ChatStoreState) => s.replayChatEvents);
   const suggestedQuestions = useChatStore((s: ChatStoreState) => s.suggestedQuestions);
   const style = useChatStore((s: ChatStoreState) => s.style);
   const customGoal = useChatStore((s: ChatStoreState) => s.customGoal);
@@ -67,8 +69,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const sourceScopeMode = useSourceStore((s) => s.sourceScopeMode);
   const sourceListStatus = useSourceStore((s) => s.sourceListStatus);
   const sourceListError = useSourceStore((s) => s.sourceListError);
-  const setActiveModel = useSettingsStore((s) => s.setActiveModel);
-  const updateSetting = useSettingsStore((s) => s.updateSetting);
+  const selectModel = useSettingsStore((s) => s.selectModel);
 
   const [input, setInput] = useState("");
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
@@ -84,6 +85,17 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       setStreamingMessageId(null);
     }
   }, [isStreaming]);
+
+  useEffect(() => {
+    if (!activeConversationId) return;
+    void replayChatEvents(notebookId, activeConversationId)
+      .catch((error) => {
+        console.warn("Failed to replay chat events on conversation switch:", error);
+      })
+      .finally(() => {
+        void rehydrateConversation(notebookId, activeConversationId);
+      });
+  }, [notebookId, activeConversationId, replayChatEvents, rehydrateConversation]);
 
   const handleSend = async () => {
     if (!input.trim() || isStreaming) return;
@@ -177,9 +189,16 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     raw === "GPU gate" ? "queue" : raw === "LLM gate" ? "model queue" : raw;
   const humanizeOwner = (raw: string) =>
     raw === "background_summary" ? "background task" : raw;
+  const formatMs = (value: number) =>
+    value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${value}ms`;
   const streamingStatusLabel = streamingStatus
     ? [
         streamingStatus.message,
+        streamingStatus.provider ? `Provider: ${streamingStatus.provider}` : null,
+        streamingStatus.model ? `Model: ${streamingStatus.model}` : null,
+        streamingStatus.elapsed_ms > 0 ? `Elapsed: ${formatMs(streamingStatus.elapsed_ms)}` : null,
+        streamingStatus.timeout_ms ? `Timeout: ${formatMs(streamingStatus.timeout_ms)}` : null,
+        streamingStatus.reason_code ? `Reason: ${streamingStatus.reason_code}` : null,
         streamingStatus.gate ? `Gate: ${humanizeGate(streamingStatus.gate)}` : null,
         streamingStatus.owner ? `Owner: ${humanizeOwner(streamingStatus.owner)}` : null,
         streamingStatus.owner_detail ? `Detail: ${streamingStatus.owner_detail}` : null,
@@ -240,11 +259,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           onChange={(e) => {
             const [nextProvider, ...modelParts] = e.target.value.split("::");
             const nextModel = modelParts.join("::");
-            void updateSetting("default_model", nextModel);
-            if (nextProvider) {
-              void updateSetting("default_provider", nextProvider);
-            }
-            setActiveModel(nextModel);
+            if (nextProvider) void selectModel(nextProvider, nextModel).catch(() => undefined);
           }}
           className="min-w-0 max-w-[320px] rounded-full border border-border bg-bg-tertiary px-3 py-1 text-xs text-text focus:border-accent focus:outline-none"
         >
@@ -690,6 +705,7 @@ function nullEvidence(citationCount = 0): ChatEvidenceDisclosure {
     retrieval_mode: "unknown",
     fallback_used: false,
     fallback_reason: null,
+    fallback_reason_code: null,
     degradation_markers: [],
     source_scope_mode: "unknown",
     requested_source_ids: [],
@@ -726,6 +742,7 @@ function nullEvidence(citationCount = 0): ChatEvidenceDisclosure {
       requested_backend: "unknown",
       effective_backend: "unknown",
       decision_reason: null,
+      decision_reason_code: null,
       build_feature_available: false,
       runtime_enabled: false,
       projection_ready: false,
@@ -744,6 +761,7 @@ function nullEvidence(citationCount = 0): ChatEvidenceDisclosure {
         requested_backend: "unknown",
         effective_backend: "unknown",
         decision_reason: null,
+        decision_reason_code: null,
         build_feature_available: false,
         runtime_enabled: false,
         projection_ready: false,
@@ -755,6 +773,7 @@ function nullEvidence(citationCount = 0): ChatEvidenceDisclosure {
     decoding_settings_receipt: null,
     prompt_receipt: null,
     generation_receipt: null,
+    prompt_budget_receipt: null,
   };
 }
 
@@ -773,9 +792,9 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
       <div className="grid grid-cols-2 gap-x-3 gap-y-1">
         <EvidenceRow label="Backend requested" value={evidence.backend_requested} />
         <EvidenceRow label="Backend used" value={evidence.backend_used} />
-        <EvidenceRow label="Decision" value={evidence.retrieval_capability_decision.decision_reason || (evidence.retrieval_capability_decision.degraded ? "degraded" : "ready")} />
+        <EvidenceRow label="Decision" value={evidence.retrieval_capability_decision.decision_reason_code || evidence.retrieval_capability_decision.decision_reason || (evidence.retrieval_capability_decision.degraded ? "degraded" : "ready")} />
         <EvidenceRow label="Retrieval" value={evidence.retrieval_mode} />
-        <EvidenceRow label="Fallback" value={evidence.fallback_used ? evidence.fallback_reason || "yes" : "no"} />
+        <EvidenceRow label="Fallback" value={evidence.fallback_used ? evidence.fallback_reason_code || evidence.fallback_reason || "yes" : "no"} />
         <EvidenceRow label="Scope" value={`${evidence.source_scope_mode} (${evidence.effective_source_count} selected, ${evidence.excluded_source_count} excluded, ${evidence.invalid_source_count} invalid)`} />
         <EvidenceRow label="Invalid scope IDs" value={`${evidence.invalid_source_ids.length} recorded`} />
         <EvidenceRow label="Requested source IDs" value={`${evidence.requested_source_ids.length} recorded`} />
@@ -797,6 +816,12 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
         )}
         {evidence.generation_receipt && (
           <EvidenceRow label="Generation" value={evidence.generation_receipt.status} />
+        )}
+        {evidence.prompt_budget_receipt && (
+          <EvidenceRow
+            label="Prompt budget"
+            value={`${evidence.prompt_budget_receipt.estimated_prompt_tokens} est tokens, context budgeted: ${evidence.prompt_budget_receipt.context_budgeted ? "yes" : "no"}`}
+          />
         )}
         {evidence.candidate_backend && (
           <EvidenceRow label="Candidate backend" value={evidence.candidate_backend} />

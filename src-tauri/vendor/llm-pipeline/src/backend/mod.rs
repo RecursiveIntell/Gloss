@@ -38,6 +38,7 @@ use crate::PipelineError;
 use async_trait::async_trait;
 use reqwest::Client;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Type alias for the callback invoked before each transport retry.
 ///
@@ -69,6 +70,17 @@ pub struct LlmRequest {
 
     /// Whether to use the streaming endpoint.
     pub stream: bool,
+
+    /// Per-request timeout applied at the HTTP `RequestBuilder` level.
+    ///
+    /// When `Some`, each HTTP request to the LLM provider uses this timeout
+    /// instead of the client-level default. This allows mixed-latency payloads
+    /// (e.g., a 5 s classifier and a 120 s generator) to coexist on the same
+    /// `ExecCtx` without sharing a single baked-in timeout.
+    ///
+    /// Populated by [`LlmCall`](crate::llm_call::LlmCall) from its own
+    /// `timeout` field, falling back to [`PipelineLimits::request_timeout`](crate::limits::PipelineLimits::request_timeout).
+    pub request_timeout: Option<Duration>,
 }
 
 /// A single message in a chat conversation.
@@ -408,6 +420,7 @@ mod tests {
             messages: Vec::new(),
             config: LlmConfig::default(),
             stream: false,
+            request_timeout: None,
         };
 
         let result = with_backoff(

@@ -1,4 +1,7 @@
 use crate::db::app_db::{ModelRecord, Provider};
+use crate::db::notebook_db::{
+    EmbeddingIndexMetadataStatus, NATIVE_HNSW_INDEX_ID, SEMANTIC_MEMORY_INDEX_ID,
+};
 use crate::error::GlossError;
 use crate::features::{self, FeatureFlagStatus};
 use crate::memory::MemoryBackendStatus;
@@ -96,7 +99,8 @@ pub struct NativeFastEmbedDiagnostics {
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticMemoryProviderDiagnostics {
     pub provider: String,
-    pub dims: usize,
+    pub dims: Option<usize>,
+    pub dimensions: Option<usize>,
     pub model: String,
 }
 
@@ -118,6 +122,7 @@ pub struct EmbeddingDiagnosticsReceipt {
     pub native_fastembed: NativeFastEmbedDiagnostics,
     pub semantic_memory_provider: SemanticMemoryProviderDiagnostics,
     pub optional_ollama: OptionalOllamaEmbeddingDiagnostics,
+    pub projection_summary: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,6 +328,7 @@ pub struct ProviderModelTestResult {
     pub model_found: bool,
     pub model_available: bool,
     pub model_list_error: Option<String>,
+    pub model_list_count: usize,
 }
 
 #[tauri::command]
@@ -350,6 +356,7 @@ pub async fn test_provider_model(
                 model_found: false,
                 model_available: false,
                 model_list_error: Some(format!("health_check: {e}")),
+                model_list_count: 0,
             });
         }
     };
@@ -362,16 +369,19 @@ pub async fn test_provider_model(
                 model_found: false,
                 model_available: false,
                 model_list_error: Some(format!("list_models: {e}")),
+                model_list_count: 0,
             });
         }
     };
 
     let found = models.iter().find(|m| m.id == model_id);
+    let model_list_count = models.len();
     Ok(ProviderModelTestResult {
         provider_healthy,
         model_found: found.is_some(),
         model_available: found.is_some(), // list_models already filters unavailable
         model_list_error: None,
+        model_list_count,
     })
 }
 
@@ -575,51 +585,24 @@ pub async fn run_embedding_diagnostics(
     state: State<'_, AppState>,
 ) -> Result<EmbeddingDiagnosticsReceipt, GlossError> {
     let cache_dir = state.data_dir.join("models");
-    let native_fastembed = match state.ensure_embedder(None) {
-        Ok(()) => {
-            let embed_result: Result<Vec<f32>, GlossError> = {
-                let embedder_arc = {
-                    let guard = state
-                        .embedder
-                        .read()
-                        .map_err(|e| GlossError::Other(e.to_string()))?;
-                    guard
-                        .as_ref()
-                        .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))
-                        .map(|arc| arc.clone())
-                };
-                match embedder_arc {
-                    Ok(arc) => arc.embed_one("Gloss embedding diagnostics"),
-                    Err(e) => Err(e),
-                }
-            };
-            match embed_result {
-                Ok(vector) => NativeFastEmbedDiagnostics {
-                    init_ok: true,
-                    embed_one_ok: true,
-                    dims: Some(vector.len()),
-                    cache_dir: redact_path(&cache_dir),
-                    error: None,
-                },
-                Err(err) => NativeFastEmbedDiagnostics {
-                    init_ok: true,
-                    embed_one_ok: false,
-                    dims: None,
-                    cache_dir: redact_path(&cache_dir),
-                    error: Some(err.to_string()),
-                },
-            }
-        }
-        Err(err) => NativeFastEmbedDiagnostics {
-            init_ok: false,
-            embed_one_ok: false,
-            dims: None,
-            cache_dir: redact_path(&cache_dir),
-            error: Some(err.to_string()),
-        },
+    let native_fastembed = NativeFastEmbedDiagnostics {
+        init_ok: false,
+        embed_one_ok: false,
+        dims: None,
+        cache_dir: redact_path(&cache_dir),
+        error: Some("native embedder not initialized by semantic-memory diagnostics".to_string()),
     };
 
-    let (provider, ollama_url) = {
+    let (
+        provider,
+        ollama_url,
+        embedding_model,
+        embedding_timeout_secs,
+        fastembed_download_consent,
+        turbo_quant_enabled,
+        turbo_quant_require_fresh_artifacts,
+        provekv_pool_enabled,
+    ) = {
         let app_db = state
             .app_db
             .lock()
@@ -629,30 +612,57 @@ pub async fn run_embedding_diagnostics(
                 .get_setting("semantic_memory_embedding_provider")?
                 .unwrap_or_else(|| "ollama".to_string()),
             app_db.get_setting("semantic_memory_embedding_url")?,
+            app_db.get_setting("semantic_memory_embedding_model")?,
+            app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+            super::chat::setting_is_enabled(
+                app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
+            ),
+            features::turbo_quant_active(&app_db)?,
+            super::chat::setting_is_enabled(
+                app_db
+                    .get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
+            ),
+            super::chat::setting_is_enabled(
+                app_db.get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?,
+            ),
         )
     };
-    let provider = if provider.trim().eq_ignore_ascii_case("ollama") {
+    let runtime_config = crate::memory::semantic_memory_adapter::runtime_config_from_settings(
+        Some(provider.clone()),
+        ollama_url.clone(),
+        embedding_model,
+        embedding_timeout_secs,
+        fastembed_download_consent,
+        turbo_quant_enabled,
+        turbo_quant_require_fresh_artifacts,
+        provekv_pool_enabled,
+    );
+    let normalized_provider = if provider.trim().eq_ignore_ascii_case("ollama") {
         "ollama"
     } else {
         "fastembed"
+    };
+    let dimensions = if normalized_provider == "ollama" {
+        crate::memory::semantic_memory_adapter::probe_ollama_embedding_dimension(&runtime_config)
+            .ok()
+    } else {
+        Some(crate::memory::semantic_memory_adapter::FASTEMBED_DIMENSIONS)
     };
 
     Ok(EmbeddingDiagnosticsReceipt {
         native_fastembed,
         semantic_memory_provider: SemanticMemoryProviderDiagnostics {
-            provider: provider.to_string(),
-            dims: 768,
-            model: if provider == "fastembed" {
-                "fastembed:NomicEmbedTextV15".to_string()
-            } else {
-                "nomic-embed-text".to_string()
-            },
+            provider: normalized_provider.to_string(),
+            dims: dimensions,
+            dimensions,
+            model: runtime_config.embedding_model,
         },
         optional_ollama: OptionalOllamaEmbeddingDiagnostics {
-            configured: provider == "ollama",
-            url: ollama_url.filter(|url| provider == "ollama" && !url.trim().is_empty()),
+            configured: normalized_provider == "ollama",
+            url: ollama_url.filter(|url| normalized_provider == "ollama" && !url.trim().is_empty()),
             embed_ok: None,
         },
+        projection_summary: None,
     })
 }
 
@@ -738,13 +748,49 @@ pub async fn update_setting(
         return Ok(());
     }
 
-    let app_db = state
-        .app_db
-        .lock()
-        .map_err(|e| GlossError::Other(e.to_string()))?;
-    features::validate_setting_update(&app_db, &key, &value)?;
-    app_db.set_setting(&key, &value)?;
-    features::apply_setting_update_side_effects(&app_db, &key, &value)?;
+    let notebook_ids = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        features::validate_setting_update(&app_db, &key, &value)?;
+        let prior_value = app_db.get_setting(&key)?;
+        app_db.set_setting(&key, &value)?;
+        features::apply_setting_update_side_effects(&app_db, &key, &value)?;
+        if matches!(
+            key.as_str(),
+            "semantic_memory_embedding_provider"
+                | "semantic_memory_embedding_url"
+                | "semantic_memory_embedding_model"
+                | "semantic_memory_embedding_timeout_secs"
+        ) && prior_value.as_deref() != Some(value.as_str())
+        {
+            app_db
+                .list_notebooks()?
+                .into_iter()
+                .map(|notebook| notebook.id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
+    };
+    if !notebook_ids.is_empty() {
+        let reason = format!("embedding-index-stale: setting {key} changed");
+        for notebook_id in notebook_ids {
+            state.with_notebook_db_write(&notebook_id, |db| {
+                db.mark_embedding_index_status(
+                    NATIVE_HNSW_INDEX_ID,
+                    EmbeddingIndexMetadataStatus::Stale,
+                    Some(&reason),
+                )?;
+                db.mark_embedding_index_status(
+                    SEMANTIC_MEMORY_INDEX_ID,
+                    EmbeddingIndexMetadataStatus::Stale,
+                    Some(&reason),
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -846,13 +892,22 @@ pub async fn set_memory_backend_profile(
     }
 
     if blocked {
+        let semantic_memory_auto_project = {
+            let app_db = state
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            super::chat::setting_is_enabled(
+                app_db.get_setting(features::SEMANTIC_MEMORY_AUTO_PROJECT)?,
+            )
+        };
         let status = crate::commands::sources::memory_backend_status(notebook_id, state).await?;
         return Ok(MemoryBackendProfileReceipt {
             profile: normalized,
             requested_backend: status.backend_id.clone(),
             backend_used: status.backend_used.clone(),
             strict_mode: false,
-            semantic_memory_auto_project: true,
+            semantic_memory_auto_project,
             turbo_quant_requested: false,
             turbo_quant_active: false,
             blocked,

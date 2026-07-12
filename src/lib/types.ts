@@ -272,6 +272,7 @@ export interface ChatEvidenceDisclosure {
   retrieval_mode: string;
   fallback_used: boolean;
   fallback_reason?: string | null;
+  fallback_reason_code?: RetrievalReasonCode | null;
   degradation_markers: string[];
   source_scope_mode: string;
   requested_source_ids: string[];
@@ -316,6 +317,7 @@ export interface RetrievalCapabilityDecisionV1 {
   requested_backend: string;
   effective_backend: string;
   decision_reason?: string | null;
+  decision_reason_code?: RetrievalReasonCode | null;
   build_feature_available: boolean;
   runtime_enabled: boolean;
   projection_ready: boolean;
@@ -422,6 +424,7 @@ export interface ChatEvidenceEventPayload extends ChatEvidencePayload {
   notebook_id: string;
   conversation_id: string;
   message_id: string;
+  attempt_id?: string | null;
 }
 
 export interface Note {
@@ -438,12 +441,48 @@ export interface Note {
 
 export interface StudioOutputConfig {
   schema?: "StudioOutputConfigV1";
+  attempt_id?: string;
   deterministic?: boolean;
   source_bound?: boolean;
   schema_validated?: boolean;
   all_items_source_cited?: boolean;
   max_items?: number;
   receipt_id?: string;
+  source_readiness?: {
+    schema: "StudioSourceReadinessV1";
+    requested_source_ids: string[];
+    effective_source_ids: string[];
+    ready_source_count: number;
+    skipped_source_count: number;
+    skipped_sources: Array<{
+      source_id: string;
+      title: string;
+      status: string;
+      reason: string;
+    }>;
+  };
+  provider_runtime_receipt?: {
+    schema: "StudioProviderRuntimeReceiptV1";
+    attempt_id: string;
+    purpose: string;
+    phase: string;
+    provider: string;
+    model: string;
+    elapsed_ms: number;
+    provider_cancelled: boolean;
+    recorded_utc: string;
+  } | null;
+  fallback_receipt?: {
+    schema: "StudioFallbackReceiptV1";
+    receipt_id: string;
+    attempt_id: string;
+    reason: string;
+    reason_code: string;
+    provider_cancelled: boolean;
+    elapsed_ms: number;
+    detail: string;
+    recorded_utc: string;
+  } | null;
   mode?: string;
   model?: string;
   provider?: string;
@@ -537,6 +576,7 @@ export interface ChatTokenPayload {
   notebook_id: string;
   conversation_id: string;
   message_id: string;
+  attempt_id?: string | null;
   token: string;
   done: boolean;
 }
@@ -545,6 +585,7 @@ export interface ChatStatusPayload {
   notebook_id: string;
   conversation_id: string;
   message_id: string;
+  attempt_id?: string | null;
   phase: string;
   message: string;
   provider?: string | null;
@@ -552,11 +593,23 @@ export interface ChatStatusPayload {
   gate?: string | null;
   owner?: string | null;
   owner_detail?: string | null;
+  reason_code?: RetrievalReasonCode | null;
   elapsed_ms: number;
   timeout_ms?: number | null;
   truncated: boolean;
   error?: string | null;
   vector_artifact_receipt?: VectorArtifactReceipt | null;
+}
+
+export interface ChatStreamEventV1 {
+  seq: number;
+  attempt_id: string;
+  kind: "queued" | "status" | "token" | "evidence" | "done" | "error" | "cancelled" | string;
+  notebook_id: string;
+  conversation_id: string;
+  message_id: string;
+  payload: unknown;
+  recorded_at: string;
 }
 
 export interface ChatAttemptTraceEvent {
@@ -613,6 +666,8 @@ export type RetrievalReasonCode =
   | "dense_engine_unavailable"
   | "embedder_unavailable"
   | "index_missing"
+  | "embedding_index_metadata_unknown"
+  | "embedding_index_metadata_stale"
   | "no_embedded_chunks"
   | "partial_embedding_coverage"
   | "scope_has_missing_embeddings"
@@ -625,6 +680,7 @@ export type RetrievalReasonCode =
   | "bm25_no_matches"
   | "source_order_fallback"
   | "raw_content_fallback"
+  | "dense_no_query_matches"
   | "no_retrieval_context";
 
 export interface RetrievalEngineStatus {
@@ -701,6 +757,7 @@ export interface ChatErrorPayload {
   notebook_id: string;
   conversation_id: string;
   message_id: string;
+  attempt_id?: string | null;
   error: string;
 }
 
@@ -708,6 +765,7 @@ export interface ChatCancelledPayload {
   notebook_id: string;
   conversation_id: string;
   message_id: string;
+  attempt_id?: string | null;
   reason: string;
 }
 
@@ -797,10 +855,24 @@ export interface MemoryBackendStatus {
   last_retrieval_receipt_id?: string | null;
   last_receipt_ref?: string | null;
   fallback_reason?: string | null;
+  fallback_reason_code?: RetrievalReasonCode | null;
   degradation_markers: string[];
   backend_version_or_digest?: string | null;
+  embedding_index_metadata: EmbeddingIndexStatusView[];
   degraded: boolean;
   diagnostic?: string | null;
+}
+
+export interface EmbeddingIndexStatusView {
+  index_id: string;
+  provider: string;
+  model: string;
+  model_digest?: string | null;
+  dimensions?: number | null;
+  schema_version: number;
+  status: string;
+  status_reason?: string | null;
+  validated_at?: string | null;
 }
 
 export interface MemoryBackendProfileReceipt {

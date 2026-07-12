@@ -65,24 +65,48 @@ pub enum GlossJob {
         #[serde(default = "default_chunk_target_tokens")]
         chunk_target_tokens: usize,
     },
-    /// C2 — Background re-embed / re-index job for a source's chunks. Replaces
-    /// the inline embed-during-ingestion path with a queueable, cancellable,
-    /// progress-reporting job. The match arm below is a stub that returns
-    /// Ok(JobResult::noop()) for now; the actual chunk-by-chunk embed work
-    /// is the next step (see EXECUTE_INDEX_CHUNKS_TODO in jobs/mod.rs).
+    /// C2 — Background re-embed / re-index job for a source's chunks. Uses
+    /// local FastEmbed (Nomic v2 MoE) for embeddings - no Ollama needed.
     IndexChunks {
         #[serde(default)]
         epoch: u64,
         notebook_id: String,
         source_id: String,
         data_dir: String,
-        ollama_url: String,
-        model: String,
     },
 }
 
 fn default_chunk_target_tokens() -> usize {
     1100
+}
+
+/// Scheduling authority for a queue job. The summary worker must consult this
+/// policy instead of applying summary throttles to unrelated ingestion/media
+/// work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobResourcePolicy {
+    pub requires_active_notebook: bool,
+    pub respects_summary_pause: bool,
+    pub respects_chat_grace: bool,
+    pub requires_gpu_gate: bool,
+    pub requires_llm_gate: bool,
+}
+
+impl JobResourcePolicy {
+    const SUMMARY: Self = Self {
+        requires_active_notebook: true,
+        respects_summary_pause: true,
+        respects_chat_grace: true,
+        requires_gpu_gate: true,
+        requires_llm_gate: true,
+    };
+    const INGESTION: Self = Self {
+        requires_active_notebook: false,
+        respects_summary_pause: false,
+        respects_chat_grace: false,
+        requires_gpu_gate: false,
+        requires_llm_gate: false,
+    };
 }
 
 impl JobHandler for GlossJob {
@@ -170,33 +194,12 @@ impl JobHandler for GlossJob {
                 )
                 .await
             }
-            // C2 stub: the IndexChunks job currently no-ops. The actual
-            // chunk-by-chunk re-embed is the next step (see
-            // EXECUTE_INDEX_CHUNKS_TODO below). Until then, callers can
-            // enqueue an IndexChunks job to claim the slot in the queue
-            // and exercise the variant in tests.
             GlossJob::IndexChunks {
-                epoch: _,
+                epoch: _epoch,
                 notebook_id,
                 source_id,
-                data_dir: _,
-                ollama_url: _,
-                model: _,
-            } => {
-                tracing::info!(
-                    notebook_id,
-                    source_id,
-                    "IndexChunks job: stub (no-op). Re-embed work is the next step."
-                );
-                Ok(tauri_queue::JobResult::success_with_output(
-                    serde_json::to_string(&serde_json::json!({
-                        "status": "stub",
-                        "notebook_id": notebook_id,
-                        "source_id": source_id,
-                    }))
-                    .unwrap_or_default(),
-                ))
-            }
+                data_dir,
+            } => execute_index_chunks(ctx, notebook_id, source_id, data_dir).await,
         }
     }
 
@@ -212,6 +215,16 @@ impl JobHandler for GlossJob {
 }
 
 impl GlossJob {
+    pub fn resource_policy(&self) -> JobResourcePolicy {
+        match self {
+            GlossJob::SummarizeSource { .. } => JobResourcePolicy::SUMMARY,
+            GlossJob::DescribeImage { .. }
+            | GlossJob::DescribeVideo { .. }
+            | GlossJob::ExtractAudioMetadata { .. }
+            | GlossJob::IndexChunks { .. } => JobResourcePolicy::INGESTION,
+        }
+    }
+
     pub fn notebook_id(&self) -> &str {
         match self {
             GlossJob::SummarizeSource { notebook_id, .. }
@@ -243,17 +256,157 @@ impl GlossJob {
     }
 }
 
-// EXECUTE_INDEX_CHUNKS_TODO
-// The C2 IndexChunks job's execute() function needs to:
-//   1. Open the notebook DB
-//   2. Look up chunks for source_id that don't yet have an embedding
-//   3. Embed them in batches of MAX_CHUNKS_PER_BATCH via the active embedder
-//   4. Write embeddings + update chunk_index
-//   5. Emit progress events to the frontend via ctx.events.emit(...)
-//   6. Respect ctx.cancellation_token() between batches
-//   7. Return Ok(JobResult::completed(...)) with the receipt
-// For now the stub above just no-ops; the routing and tests for the variant
-// are in place. The actual embed loop is a follow-up that lives in this file.
+// EXECUTE_INDEX_CHUNKS_IMPLEMENTED
+// The IndexChunks job uses local FastEmbed (Nomic v2 MoE) for embeddings.
+// No Ollama needed - model is hardcoded to nomic-ai/nomic-embed-text-v1.5
+
+/// Maximum chunks to batch embed at a time (balances VRAM pressure vs round-trips).
+const MAX_CHUNKS_PER_BATCH: usize = 64;
+
+async fn execute_index_chunks(
+    ctx: &JobContext,
+    notebook_id: &str,
+    source_id: &str,
+    data_dir: &str,
+) -> Result<JobResult, QueueError> {
+    let nb_dir = PathBuf::from(data_dir).join("notebooks").join(notebook_id);
+    let db_path = nb_dir.join("notebook.db");
+
+    // If the notebook has been deleted, skip gracefully
+    if !db_path.exists() {
+        tracing::info!(
+            notebook_id,
+            source_id,
+            "Notebook deleted, skipping index chunks job"
+        );
+        return Ok(JobResult::success_with_output(
+            serde_json::json!({ "notebook_id": notebook_id, "source_id": source_id, "skipped": true })
+                .to_string(),
+        ));
+    }
+
+    // Open DB read-write for chunk updates
+    let db = NotebookDb::connect(&db_path).map_err(|e| QueueError::Execution(e.to_string()))?;
+
+    // Find chunks without embeddings for this source
+    let unindexed_chunks = db
+        .get_chunks_without_embedding(source_id)
+        .map_err(|e| QueueError::Execution(e.to_string()))?;
+
+    if unindexed_chunks.is_empty() {
+        tracing::debug!(source_id, "No chunks need indexing");
+        return Ok(JobResult::success_with_output(
+            serde_json::json!({
+                "notebook_id": notebook_id,
+                "source_id": source_id,
+                "chunks_embedded": 0,
+                "skipped": true
+            })
+            .to_string(),
+        ));
+    }
+
+    tracing::info!(
+        source_id,
+        chunks = unindexed_chunks.len(),
+        "Indexing chunks with FastEmbed (Nomic v2 MoE)"
+    );
+
+    // Create embedder via FastEmbed (standalone, no shared state needed)
+    // Model: nomic-ai/nomic-embed-text-v1.5 (768 dimensions)
+    let cache_dir = PathBuf::from(data_dir).join("models");
+    std::fs::create_dir_all(&cache_dir).ok();
+    let app_db_path = PathBuf::from(data_dir).join("gloss.db");
+    let download_consent = crate::db::app_db::AppDb::open(&app_db_path)
+        .and_then(|app_db| app_db.get_setting(crate::features::FASTEMBED_DOWNLOAD_CONSENT))
+        .map_err(|e| {
+            QueueError::Execution(format!("Failed to read embedding download consent: {e}"))
+        })
+        .map(|value| crate::commands::chat::setting_is_enabled(value))?;
+    let embedder = crate::ingestion::embed::EmbeddingService::new_with_download_policy(
+        &cache_dir,
+        false,
+        download_consent,
+    )
+    .map_err(|e| QueueError::Execution(format!("Failed to create embedder: {e}")))?;
+
+    let index_path = crate::ingestion::embed::native_dense_artifact_path(&nb_dir);
+    let dims = embedder.dims();
+
+    // Load or create HNSW index
+    let mut index = {
+        let max_id = db.max_embedding_id().unwrap_or(None).unwrap_or(0);
+        crate::ingestion::embed::HnswIndex::load_with_hwm(&index_path, max_id, dims)
+            .map_err(|e| QueueError::Execution(format!("Failed to load HNSW index: {e}")))?
+    };
+
+    let mut embedded_count = 0;
+
+    // Process in batches
+    for chunk_batch in unindexed_chunks.chunks(MAX_CHUNKS_PER_BATCH) {
+        if ctx.is_cancelled() {
+            // Save index on cancel so partial work persists
+            if let Err(e) = index.save_atomic_verified(
+                &index_path,
+                db.max_embedding_id().unwrap_or(None).unwrap_or(0),
+            ) {
+                tracing::warn!(error = %e, "failed to save HNSW index on cancel");
+            }
+            return Err(QueueError::Cancelled);
+        }
+
+        let texts: Vec<&str> = chunk_batch.iter().map(|c| c.content.as_str()).collect();
+        let embeddings = embedder
+            .embed_batch(&texts)
+            .map_err(|e| QueueError::Execution(format!("Embedding failed: {e}")))?;
+
+        // Add to HNSW and update DB
+        for (i, chunk) in chunk_batch.iter().enumerate() {
+            if let Some(embedding) = embeddings.get(i) {
+                let label = index
+                    .add(embedding)
+                    .map_err(|e| QueueError::Execution(format!("HNSW add failed: {e}")))?;
+                db.update_chunk_embedding(&chunk.id, label as i64, embedder.model_id())
+                    .map_err(|e| QueueError::Execution(e.to_string()))?;
+                embedded_count += 1;
+            }
+        }
+
+        // Save index after each batch
+        if let Err(e) = index.save_atomic_verified(
+            &index_path,
+            db.max_embedding_id().unwrap_or(None).unwrap_or(0),
+        ) {
+            tracing::warn!(error = %e, "failed to save HNSW index during batch");
+        }
+    }
+
+    // Update embedding index metadata
+    let metadata = crate::db::notebook_db::EmbeddingIndexMetadata::ready(
+        crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+        embedder.provider_id(),
+        embedder.model_id().to_string(),
+        embedder.model_digest(),
+        dims,
+    );
+    db.upsert_embedding_index_metadata(&metadata)
+        .map_err(|e| QueueError::Execution(e.to_string()))?;
+
+    tracing::info!(
+        source_id,
+        chunks_embedded = embedded_count,
+        "Index chunks job complete"
+    );
+
+    Ok(JobResult::success_with_output(
+        serde_json::json!({
+            "notebook_id": notebook_id,
+            "source_id": source_id,
+            "chunks_embedded": embedded_count
+        })
+        .to_string(),
+    ))
+}
 
 pub(crate) fn cancel_jobs_matching<F>(queue: &Arc<QueueManager>, mut should_cancel: F) -> u32
 where
@@ -301,9 +454,10 @@ pub(crate) fn cancel_jobs_not_matching_active_notebook(
 ) -> u32 {
     cancel_jobs_matching(queue, |job, _status| match active_notebook_id {
         Some(active_notebook_id) => {
-            job.notebook_id() != active_notebook_id || job.epoch() != active_epoch
+            job.resource_policy().requires_active_notebook
+                && (job.notebook_id() != active_notebook_id || job.epoch() != active_epoch)
         }
-        None => true,
+        None => job.resource_policy().requires_active_notebook,
     })
 }
 

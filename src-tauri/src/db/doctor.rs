@@ -287,9 +287,12 @@ fn count_orphan_semantic_memory_links(db: &NotebookDb) -> Result<usize, GlossErr
     let count: i64 = db.conn().query_row(
         "SELECT COUNT(*)
          FROM semantic_memory_links l
-         LEFT JOIN chunks c ON c.id = l.chunk_id
+         LEFT JOIN chunks c ON c.id = COALESCE(l.gloss_chunk_id, l.chunk_id)
          LEFT JOIN sources s ON s.id = l.source_id
-         WHERE c.id IS NULL OR s.id IS NULL",
+         WHERE c.id IS NULL
+            OR s.id IS NULL
+            OR (l.projection_unit_kind IS NOT NULL
+                AND l.projection_unit_id IS NULL)",
         [],
         |row| row.get(0),
     )?;
@@ -315,8 +318,9 @@ fn repair_orphan_rows(db: &NotebookDb) -> Result<usize, GlossError> {
     if table_exists(db, "semantic_memory_links")? {
         repaired += db.conn().execute(
             "DELETE FROM semantic_memory_links
-             WHERE chunk_id NOT IN (SELECT id FROM chunks)
-                OR source_id NOT IN (SELECT id FROM sources)",
+             WHERE COALESCE(gloss_chunk_id, chunk_id) NOT IN (SELECT id FROM chunks)
+                OR source_id NOT IN (SELECT id FROM sources)
+                OR (projection_unit_kind IS NOT NULL AND projection_unit_id IS NULL)",
             [],
         )?;
     }
@@ -438,7 +442,7 @@ fn insert_doctor_receipt(
 mod tests {
     use super::run_db_doctor;
     use crate::db::app_db::AppDb;
-    use crate::db::notebook_db::{NotebookDb, Source};
+    use crate::db::notebook_db::{Chunk, NotebookDb, SemanticMemoryProjectionStatusUpdate, Source};
     use tempfile::tempdir;
 
     fn text_source(id: &str) -> Source {
@@ -551,6 +555,112 @@ mod tests {
             .unwrap();
         assert!(report.receipt_id.is_some());
         assert!(report.supersedes_receipt_id.is_some());
+    }
+
+    #[test]
+    fn db_doctor_preserves_oversized_semantic_memory_projection_units() {
+        let dir = tempdir().unwrap();
+        let app_db = AppDb::open(&dir.path().join("gloss.db")).unwrap();
+        let notebook_dir = dir.path().join("notebooks").join("nb1");
+        std::fs::create_dir_all(notebook_dir.join("sources")).unwrap();
+        app_db
+            .create_notebook("nb1", "Doctor", &notebook_dir.to_string_lossy())
+            .unwrap();
+        app_db.update_source_count("nb1", 1).unwrap();
+
+        let notebook_db = NotebookDb::open(&notebook_dir.join("notebook.db")).unwrap();
+        notebook_db
+            .insert_source(&text_source("source-large"))
+            .unwrap();
+        notebook_db
+            .insert_chunk(&Chunk {
+                id: "chunk-parent".to_string(),
+                source_id: "source-large".to_string(),
+                chunk_index: 0,
+                content: "oversized semantic memory content ".repeat(400),
+                token_count: Some(1200),
+                start_offset: Some(0),
+                end_offset: Some(13_200),
+                metadata: None,
+                embedding_id: None,
+                embedding_model: None,
+            })
+            .unwrap();
+        for ordinal in 0..3 {
+            notebook_db
+                .conn()
+                .execute(
+                    "INSERT INTO semantic_memory_links (
+                        chunk_id, gloss_chunk_id, notebook_id, source_id, sm_document_id,
+                        sm_chunk_id, content_digest, backend_version, sync_status, synced_at,
+                        projection_unit_id, projection_unit_kind, projection_unit_ordinal
+                     )
+                     VALUES (?1, 'chunk-parent', 'nb1', 'source-large', 'doc-large',
+                        ?2, ?3, 'semantic-memory test', 'synced', datetime('now'),
+                        ?1, 'projection_unit_subchunk', ?4)",
+                    rusqlite::params![
+                        format!("chunk-parent::projection-{ordinal}"),
+                        format!("sm-subchunk-{ordinal}"),
+                        format!("digest-{ordinal}"),
+                        ordinal,
+                    ],
+                )
+                .unwrap();
+        }
+        notebook_db
+            .upsert_semantic_memory_projection_status(&SemanticMemoryProjectionStatusUpdate {
+                notebook_id: "nb1".to_string(),
+                source_id: "source-large".to_string(),
+                status: "synced".to_string(),
+                chunk_count: 1,
+                projected_chunk_count: 1,
+                healthy_link_count: 1,
+                degraded_link_count: 0,
+                last_receipt_id: Some("receipt-oversized".to_string()),
+                last_error: None,
+                artifact_generation_id: None,
+                vector_artifact_manifest_digest: None,
+            })
+            .unwrap();
+
+        let projection_unit_count: i64 = notebook_db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_memory_links
+                 WHERE gloss_chunk_id = 'chunk-parent'
+                   AND projection_unit_kind = 'projection_unit_subchunk'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(projection_unit_count, 3);
+        let status = notebook_db
+            .get_semantic_memory_projection_status("nb1", "source-large")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.chunk_count, 1);
+        assert_eq!(status.healthy_link_count, 1);
+
+        let check = run_db_doctor(&app_db, false).unwrap();
+        assert_eq!(check.repaired_orphan_rows, 0);
+        assert!(!check
+            .findings
+            .iter()
+            .any(|finding| finding.code == "orphan_semantic_memory_links"));
+
+        let repair = run_db_doctor(&app_db, true).unwrap();
+        assert_eq!(repair.repaired_orphan_rows, 0);
+        let remaining_projection_units: i64 = notebook_db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_memory_links
+                 WHERE gloss_chunk_id = 'chunk-parent'
+                   AND projection_unit_kind = 'projection_unit_subchunk'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_projection_units, 3);
     }
 
     #[test]

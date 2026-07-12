@@ -1,6 +1,6 @@
 #[cfg(feature = "semantic-memory-backend")]
 use crate::db::notebook_db::NotebookDb;
-use crate::db::notebook_db::{Chunk, Conversation, Message, Source};
+use crate::db::notebook_db::{ChatAttemptStatus, Chunk, Conversation, Message, Source};
 use crate::error::GlossError;
 use crate::features;
 use crate::jobs;
@@ -24,10 +24,9 @@ use futures::StreamExt;
 use serde::Serialize;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{Emitter, State};
+use tauri::{Manager, State};
 use tauri_queue::QueueManager;
 
 mod emit;
@@ -38,7 +37,7 @@ mod types;
 
 // Re-export helpers used by send_message / stream_chat_response and other
 // functions that remain in this file.
-use emit::{emit_chat_error, emit_chat_status, ChatTerminalEmitter};
+use emit::{emit_chat_error, emit_chat_evidence, emit_chat_status, ChatTerminalEmitter};
 use gates::acquire_gate_with_epoch;
 use receipts::{chat_attempt_trace_snapshot, new_chat_attempt_trace, record_chat_attempt_trace};
 
@@ -49,8 +48,10 @@ use streaming::{source_context_digest, stream_chat_response};
 
 #[allow(unused_imports)]
 pub use receipts::{ChatAttemptTraceEvent, ChatAttemptTraceV1};
+pub(crate) use types::ChatStreamEventV1;
 
 const CHAT_CANCELLED_NOTEBOOK_SWITCH: &str = "__chat_cancelled_notebook_switch__";
+const CHAT_CANCELLED_USER_REQUEST: &str = "__chat_cancelled_user_request__";
 const CHAT_PROVIDER_START_TIMEOUT: Duration = Duration::from_secs(180);
 const CHAT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(168);
 const CHAT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(84);
@@ -64,6 +65,54 @@ const MAX_CONTEXT_WINDOW_TOKENS: u32 = 32_768;
 const MAX_CONTEXT_CHARS_TOTAL: usize = 32_000;
 
 // All struct/type definitions moved to types.rs; imported via `use types::*` above.
+
+#[allow(clippy::too_many_arguments)]
+fn persist_chat_attempt_status(
+    state: &AppState,
+    notebook_id: &str,
+    conversation_id: &str,
+    attempt_id: &str,
+    assistant_message_id: &str,
+    user_message_id: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    status: &str,
+    phase: Option<&str>,
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+    response_digest: Option<&str>,
+    terminal: bool,
+) {
+    let attempt = ChatAttemptStatus {
+        attempt_id: attempt_id.to_string(),
+        notebook_id: notebook_id.to_string(),
+        conversation_id: conversation_id.to_string(),
+        assistant_message_id: assistant_message_id.to_string(),
+        user_message_id: user_message_id.map(str::to_string),
+        provider: provider.map(str::to_string),
+        model: model.map(str::to_string),
+        status: status.to_string(),
+        phase: phase.map(str::to_string),
+        error_code: error_code.map(str::to_string),
+        error_message: error_message.map(str::to_string),
+        request_digest: None,
+        response_digest: response_digest.map(str::to_string),
+        partial_policy: Some("full_response_or_terminal_error".to_string()),
+        terminal,
+    };
+    if let Err(err) =
+        state.with_notebook_db_write(notebook_id, |db| db.upsert_chat_attempt_status(&attempt))
+    {
+        tracing::warn!(
+            notebook_id,
+            conversation_id,
+            attempt_id,
+            assistant_message_id,
+            error = %err,
+            "failed to persist chat_attempts status"
+        );
+    }
+}
 
 pub(crate) fn provider_decoding_capability(
     provider_type: providers::ProviderType,
@@ -259,6 +308,62 @@ fn bounded_semantic_fallback_reason(reason: &str) -> &'static str {
     }
 }
 
+fn retrieval_reason_code_from_text(value: &str) -> Option<RetrievalReasonCode> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "search-timeout"
+        | "semantic_memory_timeout"
+        | "semantic-memory-preview-timeout-fallback" => {
+            Some(RetrievalReasonCode::SemanticMemoryTimeout)
+        }
+        "semantic-memory-not-compiled" | "semantic_memory_build_feature_missing" => {
+            Some(RetrievalReasonCode::SemanticMemoryBuildFeatureMissing)
+        }
+        "semantic-memory-flag-off"
+        | "semantic_memory_feature_disabled"
+        | "semantic-memory-feature-disabled-fallback" => {
+            Some(RetrievalReasonCode::SemanticMemoryFeatureDisabled)
+        }
+        "links-missing" | "projection-required" | "semantic_memory_links_missing" => {
+            Some(RetrievalReasonCode::SemanticMemoryLinksMissing)
+        }
+        "projection-failed" | "semantic_memory_links_degraded" => {
+            Some(RetrievalReasonCode::SemanticMemoryLinksDegraded)
+        }
+        "turbo-artifacts-stale" | "embedding_index_metadata_stale" => {
+            Some(RetrievalReasonCode::EmbeddingIndexMetadataStale)
+        }
+        "no-candidates" | "no_retrieval_context" | "semantic-memory-empty-context" => {
+            Some(RetrievalReasonCode::NoRetrievalContext)
+        }
+        "source-order-fallback" | "source_order_fallback" => {
+            Some(RetrievalReasonCode::SourceOrderFallback)
+        }
+        "raw-content-fallback" | "raw_content_fallback" => {
+            Some(RetrievalReasonCode::RawContentFallback)
+        }
+        "index_missing" => Some(RetrievalReasonCode::IndexMissing),
+        "bm25_no_matches" => Some(RetrievalReasonCode::Bm25NoMatches),
+        "bm25_query_sanitized_empty" => Some(RetrievalReasonCode::Bm25QuerySanitizedEmpty),
+        _ if (normalized.contains("metadata") || normalized.contains("embedding index"))
+            && normalized.contains("stale") =>
+        {
+            Some(RetrievalReasonCode::EmbeddingIndexMetadataStale)
+        }
+        _ if normalized.contains("timeout") => Some(RetrievalReasonCode::SemanticMemoryTimeout),
+        _ if normalized.contains("no mapped candidates") => {
+            Some(RetrievalReasonCode::NoRetrievalContext)
+        }
+        _ if normalized.contains("projection") && normalized.contains("required") => {
+            Some(RetrievalReasonCode::SemanticMemoryLinksMissing)
+        }
+        _ if normalized.contains("projection") || normalized.contains("link") => {
+            Some(RetrievalReasonCode::SemanticMemoryLinksDegraded)
+        }
+        _ => None,
+    }
+}
+
 fn load_cached_suggested_questions(
     notebook_id: &str,
     state: &AppState,
@@ -343,8 +448,15 @@ pub async fn delete_conversation(
 
 #[tauri::command]
 pub async fn stop_chat(notebook_id: String, state: State<'_, AppState>) -> Result<(), GlossError> {
-    if state.get_active_notebook_id().as_deref() == Some(notebook_id.as_str()) {
-        state.active_epoch.fetch_add(1, Ordering::SeqCst);
+    let cancelled = state.cancel_active_chats_for_notebook(&notebook_id);
+    if !cancelled.is_empty() {
+        tracing::info!(
+            notebook_id = %notebook_id,
+            attempts = cancelled.len(),
+            conversations = ?cancelled.iter().map(|attempt| attempt.conversation_id.as_str()).collect::<Vec<_>>(),
+            message_ids = ?cancelled.iter().map(|attempt| attempt.message_id.as_str()).collect::<Vec<_>>(),
+            "Cancelled active chat attempt(s) by request"
+        );
         state.bump_user_activity();
     }
     Ok(())
@@ -357,6 +469,16 @@ pub async fn load_messages(
     state: State<'_, AppState>,
 ) -> Result<Vec<Message>, GlossError> {
     state.with_notebook_db(&notebook_id, |db| db.load_messages(&conversation_id))
+}
+
+#[tauri::command]
+pub async fn get_chat_events_since(
+    notebook_id: String,
+    conversation_id: String,
+    after_seq: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ChatStreamEventV1>, GlossError> {
+    Ok(state.chat_events_since(&notebook_id, &conversation_id, after_seq))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -405,6 +527,7 @@ pub async fn send_message(
         trace_memory_fallback,
         Some(trace_source_scope_mode),
     )));
+    let attempt_id = chat_attempt_trace_snapshot(&attempt_trace).attempt_id;
     let trace_data_dir = state.data_dir.clone();
     record_chat_attempt_trace(
         &attempt_trace,
@@ -414,6 +537,93 @@ pub async fn send_message(
         Some("Chat request accepted by Tauri command"),
         None,
         |_| {},
+    );
+    // Register before *any* normal user-turn side effect. The lease clears the
+    // registration on every pre-stream error path; ownership transfers to the
+    // spawned stream task only after context construction succeeds.
+    let user_message_id = uuid::Uuid::new_v4().to_string();
+    let active_chat_attempt_lease = match state.lease_active_chat_attempt(
+        &notebook_id,
+        &conversation_id,
+        &attempt_id,
+        &user_message_id,
+    ) {
+        Ok(lease) => lease,
+        Err(existing) => {
+            let error = format!(
+                "Conversation already has an active chat attempt: {}",
+                existing.attempt_id
+            );
+            emit_chat_status(
+                &app_handle,
+                &notebook_id,
+                &conversation_id,
+                &message_id,
+                "single_flight_rejected",
+                "Conversation already has an active chat",
+                None,
+                Some(&model),
+                None,
+                None,
+                None,
+                Duration::ZERO,
+                None,
+                false,
+                Some(&error),
+            );
+            emit_chat_error(
+                &app_handle,
+                &notebook_id,
+                &conversation_id,
+                &message_id,
+                &error,
+            );
+            record_chat_attempt_trace(
+                &attempt_trace,
+                &trace_data_dir,
+                "single_flight_rejected",
+                Some(Duration::ZERO),
+                Some("Concurrent chat generation rejected before user-turn persistence"),
+                Some(&error),
+                |_| {},
+            );
+            persist_chat_attempt_status(
+                &state,
+                &notebook_id,
+                &conversation_id,
+                &attempt_id,
+                &message_id,
+                None,
+                None,
+                Some(&model),
+                "error",
+                Some("single_flight_rejected"),
+                Some("single_flight_rejected"),
+                Some(&error),
+                None,
+                true,
+            );
+            return Err(GlossError::Other(error));
+        }
+    };
+    // ChatAttemptStatus is the durable terminal ledger; the replay ring buffer
+    // is transport-only. Targeted cancellation is handled by the active
+    // attempt's CancellationToken once provider generation starts.
+    persist_chat_attempt_status(
+        &state,
+        &notebook_id,
+        &conversation_id,
+        &attempt_id,
+        &message_id,
+        None,
+        None,
+        Some(&model),
+        "queued",
+        Some("queued"),
+        None,
+        None,
+        None,
+        false,
     );
 
     if state.get_active_notebook_id().as_deref() != Some(notebook_id.as_str()) {
@@ -458,6 +668,22 @@ pub async fn send_message(
                 Some(&error),
                 |_| {},
             );
+            persist_chat_attempt_status(
+                &state,
+                &notebook_id,
+                &conversation_id,
+                &attempt_id,
+                &message_id,
+                None,
+                None,
+                Some(&model),
+                "error",
+                Some("active_notebook_error"),
+                Some("active_notebook_error"),
+                Some(&error),
+                None,
+                true,
+            );
             return Err(GlossError::Other(error));
         }
         state.set_active_notebook(Some(notebook_id.clone()), None);
@@ -485,7 +711,9 @@ pub async fn send_message(
     state.bump_chat_grace();
     state.bump_user_activity();
 
-    let cancelled = jobs::cancel_jobs_matching(&queue, |_job, status| status == "processing");
+    let cancelled = jobs::cancel_jobs_matching(&queue, |job, status| {
+        status == "processing" && job.notebook_id() == notebook_id
+    });
     if cancelled > 0 {
         tracing::info!(
             cancelled,
@@ -507,7 +735,7 @@ pub async fn send_message(
 
     // Store user message
     let user_msg = Message {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: user_message_id,
         conversation_id: conversation_id.clone(),
         role: "user".to_string(),
         content: query.clone(),
@@ -518,6 +746,22 @@ pub async fn send_message(
         created_at: String::new(),
     };
     state.with_notebook_db_write(&notebook_id, |db| db.insert_message(&user_msg))?;
+    persist_chat_attempt_status(
+        &state,
+        &notebook_id,
+        &conversation_id,
+        &attempt_id,
+        &message_id,
+        Some(&user_msg.id),
+        None,
+        Some(&model),
+        "running",
+        Some("user_message_persisted"),
+        None,
+        None,
+        None,
+        false,
+    );
     record_chat_attempt_trace(
         &attempt_trace,
         &trace_data_dir,
@@ -591,6 +835,22 @@ pub async fn send_message(
                 Some(&error),
                 |_| {},
             );
+            persist_chat_attempt_status(
+                &state,
+                &notebook_id,
+                &conversation_id,
+                &attempt_id,
+                &message_id,
+                Some(&user_msg.id),
+                None,
+                Some(&model),
+                "error",
+                Some("provider_config_error"),
+                Some("provider_config_error"),
+                Some(&error),
+                None,
+                true,
+            );
             return Err(err);
         }
     };
@@ -605,6 +865,22 @@ pub async fn send_message(
             trace.provider = provider_config.provider_type.as_str().to_string();
             trace.provider_base_url = Some(provider_config.base_url.clone());
         },
+    );
+    persist_chat_attempt_status(
+        &state,
+        &notebook_id,
+        &conversation_id,
+        &attempt_id,
+        &message_id,
+        Some(&user_msg.id),
+        Some(provider_config.provider_type.as_str()),
+        Some(&model),
+        "running",
+        Some("provider_config_resolved"),
+        None,
+        None,
+        None,
+        false,
     );
 
     // --- RAG context assembly ---
@@ -673,6 +949,60 @@ pub async fn send_message(
             selected_sources = resolved_scope.source_count(),
             "Skipping native dense search warmup because native indexing is disabled or scope is empty"
         );
+    }
+
+    if active_chat_attempt_lease.cancellation().is_cancelled() {
+        let error = "Chat cancelled during retrieval setup";
+        emit_chat_status(
+            &app_handle,
+            &notebook_id,
+            &conversation_id,
+            &message_id,
+            "cancelled",
+            error,
+            None,
+            Some(&model),
+            None,
+            None,
+            None,
+            Duration::ZERO,
+            None,
+            false,
+            Some(error),
+        );
+        emit_chat_error(
+            &app_handle,
+            &notebook_id,
+            &conversation_id,
+            &message_id,
+            error,
+        );
+        record_chat_attempt_trace(
+            &attempt_trace,
+            &trace_data_dir,
+            "cancelled",
+            Some(Duration::ZERO),
+            Some("Stop requested during retrieval setup"),
+            Some(error),
+            |_| {},
+        );
+        persist_chat_attempt_status(
+            &state,
+            &notebook_id,
+            &conversation_id,
+            &attempt_id,
+            &message_id,
+            Some(&user_msg.id),
+            None,
+            Some(&model),
+            "cancelled",
+            Some("cancelled_during_retrieval_setup"),
+            Some("cancelled"),
+            Some(error),
+            None,
+            true,
+        );
+        return Err(GlossError::Other(error.to_string()));
     }
 
     let source_count = resolved_scope.source_count();
@@ -825,6 +1155,10 @@ pub async fn send_message(
             let projection_summary = {
                 let nb_db = NotebookDb::connect(&db_path)?;
                 nb_db.semantic_memory_projection_summary(&notebook_id, &resolved_scope)?
+            };
+            let semantic_embedding_metadata = {
+                let nb_db = NotebookDb::connect(&db_path)?;
+                nb_db.embedding_index_metadata(crate::db::notebook_db::SEMANTIC_MEMORY_INDEX_ID)?
             };
             let scoped_links = links
                 .iter()
@@ -1012,6 +1346,7 @@ pub async fn send_message(
                         &all_sources,
                         preview_request,
                         Some(semantic_memory_runtime_config.clone()),
+                        semantic_embedding_metadata,
                     ),
                 )
                 .await;
@@ -1494,22 +1829,28 @@ pub async fn send_message(
         Vec::new()
     } else {
         // GlossLocalMemoryBackend::new — gloss-local retrieval path (ranked before raw-content-text-fallback)
-        // TODO(C6-CONFIG): wrap this in tokio::task::spawn_blocking so the
-        // tokio runtime isn't stalled. Currently blocked on State<'_, T>
-        // carrying a lifetime that can't escape the function. The cleanest
-        // fix is to refactor AppState to be Arc<AppState> internally
-        // (Tauri's State is already an Arc, but the State guard holds a
-        // borrow that can't be 'static). Until then, the lock-free
-        // Arc<EmbeddingService> pattern from Batch B and the LRU cache
-        // from Batch A make this call much cheaper than it used to be;
-        // the spawn_blocking is a polish item, not a correctness fix.
-        let mut local_outcome = state.local_retrieval_outcome(
-            &notebook_id,
-            &query,
-            &resolved_scope,
-            top_k,
-            retrieval_receipt_id.clone(),
-        )?;
+        let mut local_outcome = {
+            let app_handle = app_handle.clone();
+            let notebook_id = notebook_id.clone();
+            let query = query.clone();
+            let resolved_scope = resolved_scope.clone();
+            let retrieval_receipt_id = retrieval_receipt_id.clone();
+
+            tokio::task::spawn_blocking(move || {
+                let state = app_handle.state::<AppState>();
+                state.local_retrieval_outcome(
+                    &notebook_id,
+                    &query,
+                    &resolved_scope,
+                    top_k,
+                    retrieval_receipt_id,
+                )
+            })
+            .await
+            .map_err(|err| {
+                GlossError::Other(format!("local retrieval execution failed: {err}"))
+            })??
+        };
         if force_gloss_local_retrieval {
             local_outcome.degraded = true;
             if !local_outcome
@@ -1544,7 +1885,6 @@ pub async fn send_message(
             _ => MEMORY_BACKEND_GLOSS_LOCAL,
         }
         .to_string();
-
         if !local_outcome.results.is_empty() {
             let unique_source_ids: Vec<String> = local_outcome
                 .results
@@ -1556,7 +1896,7 @@ pub async fn send_message(
 
             let title_map: HashMap<String, String> =
                 state.with_notebook_db(&notebook_id, |db| {
-                    let mut map = HashMap::new();
+                    let mut map: HashMap<String, String> = HashMap::new();
                     for sid in &unique_source_ids {
                         if let Ok(source) = db.get_source(sid) {
                             map.insert(sid.clone(), source.title);
@@ -1744,6 +2084,24 @@ pub async fn send_message(
         .and_then(|value| value.as_str())
         .map(bounded_semantic_fallback_reason)
         .map(str::to_string);
+    let retrieval_fallback_reason_code = retrieval_outcome_for_evidence
+        .as_ref()
+        .and_then(|outcome| outcome.fallback_chain.first().cloned())
+        .or_else(|| {
+            retrieval_fallback_reason
+                .as_deref()
+                .and_then(retrieval_reason_code_from_text)
+        })
+        .or_else(|| {
+            semantic_memory_fallback_reason
+                .as_deref()
+                .and_then(retrieval_reason_code_from_text)
+        })
+        .or_else(|| {
+            retrieval_degradation_markers
+                .iter()
+                .find_map(|marker| retrieval_reason_code_from_text(marker))
+        });
     let source_scope_integrity = {
         let requested_ids_valid = invalid_source_ids.is_empty();
         let effective_ids_match_allowed_set = effective_source_ids
@@ -1782,6 +2140,7 @@ pub async fn send_message(
         requested_backend: retrieval_backend_requested.clone(),
         effective_backend: retrieval_backend_used.clone(),
         decision_reason: retrieval_fallback_reason.clone(),
+        decision_reason_code: retrieval_fallback_reason_code.clone(),
         build_feature_available: cfg!(feature = "semantic-memory-backend"),
         runtime_enabled: semantic_preview_gate_open,
         projection_ready: !retrieval_degradation_markers.iter().any(|marker| {
@@ -1828,6 +2187,7 @@ pub async fn send_message(
         retrieval_mode,
         fallback_used: retrieval_fallback_reason.is_some(),
         fallback_reason: retrieval_fallback_reason,
+        fallback_reason_code: retrieval_fallback_reason_code,
         degradation_markers: retrieval_degradation_markers,
         source_scope_mode: source_scope_mode.clone(),
         requested_source_ids: requested_source_ids.clone(),
@@ -1932,6 +2292,10 @@ pub async fn send_message(
     let spawned_style = effective_style.clone();
     let spawned_custom_goal = effective_custom_goal.clone();
     let spawned_response_length = effective_response_length.clone();
+    let spawned_attempt_id = attempt_id.clone();
+    let spawned_user_message_id = user_msg.id.clone();
+    let spawned_provider = provider_config.provider_type.as_str().to_string();
+    let spawned_operation_receipt_id = evidence_base.receipt_id.clone();
     emit_chat_status(
         &app_handle,
         &notebook_id,
@@ -1959,8 +2323,16 @@ pub async fn send_message(
         |_| {},
     );
 
+    let active_chat_attempt = active_chat_attempt_lease.activate();
+
     // Construct the provider outside any lock (provider_config was extracted above)
-    let provider = providers::build_provider(&provider_config)?;
+    let provider = match providers::build_provider(&provider_config) {
+        Ok(provider) => provider,
+        Err(err) => {
+            state.finish_active_chat_attempt(&notebook_id, &conversation_id, &attempt_id);
+            return Err(err);
+        }
+    };
     let spawned_attempt_trace = Arc::clone(&attempt_trace);
     let spawned_trace_data_dir = trace_data_dir.clone();
 
@@ -1976,6 +2348,19 @@ pub async fn send_message(
     tokio::spawn(async move {
         use tauri::Manager;
         let app_state: tauri::State<'_, AppState> = handle.state();
+        let execution_context = providers::LlmExecutionContext::default_with_token(
+            active_chat_attempt.cancellation.clone(),
+        )
+        .with_operation(providers::LlmOperationContext::chat(
+            nb_id.clone(),
+            conv_id.clone(),
+            msg_id.clone(),
+            epoch,
+            spawned_attempt_id.clone(),
+            spawned_provider.clone(),
+            model.clone(),
+            spawned_operation_receipt_id.clone(),
+        ));
 
         // Acquire gates in the same order as the background summary loop:
         // GPU first, then LLM. Keeping one global order prevents lock-order
@@ -1995,6 +2380,7 @@ pub async fn send_message(
         {
             Ok(Some(permit)) => permit,
             Ok(None) => {
+                execution_context.cancellation.cancel();
                 record_chat_attempt_trace(
                     &spawned_attempt_trace,
                     &spawned_trace_data_dir,
@@ -2004,12 +2390,45 @@ pub async fn send_message(
                     Some("chat cancelled before acquiring GPU gate"),
                     |_| {},
                 );
+                persist_chat_attempt_status(
+                    &app_state,
+                    &nb_id,
+                    &conv_id,
+                    &spawned_attempt_id,
+                    &msg_id,
+                    Some(&spawned_user_message_id),
+                    Some(&spawned_provider),
+                    Some(&model),
+                    "cancelled",
+                    Some("gpu_gate_cancelled"),
+                    Some("cancelled"),
+                    Some("chat cancelled before acquiring GPU gate"),
+                    None,
+                    true,
+                );
+                app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
                 terminal.emit_cancelled("Chat cancelled before acquiring GPU gate");
                 return;
             }
             Err(e) => {
                 tracing::error!(message_id = %msg_id, error = %e, "GPU gate acquisition failed");
                 terminal.emit_error(&e.to_string());
+                persist_chat_attempt_status(
+                    &app_state,
+                    &nb_id,
+                    &conv_id,
+                    &spawned_attempt_id,
+                    &msg_id,
+                    Some(&spawned_user_message_id),
+                    Some(&spawned_provider),
+                    Some(&model),
+                    "error",
+                    Some("gpu_gate_error"),
+                    Some("gate_error"),
+                    Some(&e.to_string()),
+                    None,
+                    true,
+                );
                 record_chat_attempt_trace(
                     &spawned_attempt_trace,
                     &spawned_trace_data_dir,
@@ -2019,9 +2438,11 @@ pub async fn send_message(
                     Some(&e.to_string()),
                     |_| {},
                 );
+                app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
                 return;
             }
         };
+        let _gpu_owner = app_state.gate_owner_guard("GPU gate", "chat", &msg_id);
 
         let permit = match acquire_gate_with_epoch(
             &handle,
@@ -2038,6 +2459,7 @@ pub async fn send_message(
         {
             Ok(Some(permit)) => permit,
             Ok(None) => {
+                execution_context.cancellation.cancel();
                 app_state.clear_gate_owner("GPU gate", "chat");
                 drop(gpu_permit);
                 record_chat_attempt_trace(
@@ -2049,6 +2471,23 @@ pub async fn send_message(
                     Some("chat cancelled before acquiring LLM gate"),
                     |_| {},
                 );
+                persist_chat_attempt_status(
+                    &app_state,
+                    &nb_id,
+                    &conv_id,
+                    &spawned_attempt_id,
+                    &msg_id,
+                    Some(&spawned_user_message_id),
+                    Some(&spawned_provider),
+                    Some(&model),
+                    "cancelled",
+                    Some("llm_gate_cancelled"),
+                    Some("cancelled"),
+                    Some("chat cancelled before acquiring LLM gate"),
+                    None,
+                    true,
+                );
+                app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
                 terminal.emit_cancelled("Chat cancelled before acquiring LLM gate");
                 return;
             }
@@ -2056,6 +2495,22 @@ pub async fn send_message(
                 app_state.clear_gate_owner("GPU gate", "chat");
                 drop(gpu_permit);
                 terminal.emit_error(&e.to_string());
+                persist_chat_attempt_status(
+                    &app_state,
+                    &nb_id,
+                    &conv_id,
+                    &spawned_attempt_id,
+                    &msg_id,
+                    Some(&spawned_user_message_id),
+                    Some(&spawned_provider),
+                    Some(&model),
+                    "error",
+                    Some("llm_gate_error"),
+                    Some("gate_error"),
+                    Some(&e.to_string()),
+                    None,
+                    true,
+                );
                 record_chat_attempt_trace(
                     &spawned_attempt_trace,
                     &spawned_trace_data_dir,
@@ -2065,9 +2520,11 @@ pub async fn send_message(
                     Some(&e.to_string()),
                     |_| {},
                 );
+                app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
                 return;
             }
         };
+        let _llm_owner = app_state.gate_owner_guard("LLM gate", "chat", &msg_id);
 
         let result = stream_chat_response(
             &handle,
@@ -2087,6 +2544,7 @@ pub async fn send_message(
             model_context_window,
             &spawned_attempt_trace,
             &spawned_trace_data_dir,
+            execution_context.clone(),
         )
         .await;
 
@@ -2095,11 +2553,28 @@ pub async fn send_message(
                 let full_response = &stream_result.full_response;
                 if !app_state.is_active_notebook_epoch(&nb_id, epoch) {
                     // Notebook switched after stream completed — emit cancelled terminal
+                    persist_chat_attempt_status(
+                        &app_state,
+                        &nb_id,
+                        &conv_id,
+                        &spawned_attempt_id,
+                        &msg_id,
+                        Some(&spawned_user_message_id),
+                        Some(&spawned_provider),
+                        Some(&model),
+                        "cancelled",
+                        Some("late_cancelled_after_stream"),
+                        Some("cancelled"),
+                        Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
+                        stream_result.generation_receipt.response_digest.as_deref(),
+                        true,
+                    );
                     terminal.emit_cancelled(CHAT_CANCELLED_NOTEBOOK_SWITCH);
                     app_state.clear_gate_owner("GPU gate", "chat");
                     app_state.clear_gate_owner("LLM gate", "chat");
                     drop(gpu_permit);
                     drop(permit);
+                    app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
                     return;
                 }
 
@@ -2154,12 +2629,29 @@ pub async fn send_message(
                         Some(&e.to_string()),
                         |_| {},
                     );
+                    persist_chat_attempt_status(
+                        &app_state,
+                        &nb_id,
+                        &conv_id,
+                        &spawned_attempt_id,
+                        &msg_id,
+                        Some(&spawned_user_message_id),
+                        Some(&spawned_provider),
+                        Some(&model),
+                        "error",
+                        Some("assistant_persist_error"),
+                        Some("assistant_persist_error"),
+                        Some(&e.to_string()),
+                        stream_result.generation_receipt.response_digest.as_deref(),
+                        true,
+                    );
                     // DB insert failure → chat:error, NOT chat:done.
                     terminal.emit_error(&format!("Assistant message persistence failed: {e}"));
                     app_state.clear_gate_owner("GPU gate", "chat");
                     app_state.clear_gate_owner("LLM gate", "chat");
                     drop(gpu_permit);
                     drop(permit);
+                    app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
                     return;
                 } else {
                     let prompt_json = serde_json::to_string(&stream_result.prompt_receipt).ok();
@@ -2209,33 +2701,71 @@ pub async fn send_message(
                             trace.assistant_persisted = true;
                         },
                     );
+                    persist_chat_attempt_status(
+                        &app_state,
+                        &nb_id,
+                        &conv_id,
+                        &spawned_attempt_id,
+                        &msg_id,
+                        Some(&spawned_user_message_id),
+                        Some(&spawned_provider),
+                        Some(&model),
+                        "succeeded",
+                        Some("assistant_persisted"),
+                        None,
+                        None,
+                        stream_result.generation_receipt.response_digest.as_deref(),
+                        true,
+                    );
                 }
                 // Assistant message persisted successfully — now emit evidence and chat:done.
-                if let Err(e) = handle.emit(
-                    "chat:evidence",
-                    serde_json::json!({
-                        "notebook_id": nb_id,
-                        "conversation_id": conv_id,
-                        "message_id": msg_id,
-                        "citations": citations_payload.citations,
-                        "evidence": citations_payload.evidence,
-                    }),
-                ) {
-                    tracing::debug!("failed to emit chat:evidence: {e}");
-                }
+                emit_chat_evidence(
+                    &handle,
+                    &nb_id,
+                    &conv_id,
+                    &msg_id,
+                    serde_json::to_value(&citations_payload.citations)
+                        .unwrap_or_else(|_| serde_json::json!([])),
+                    serde_json::to_value(&citations_payload.evidence)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                );
                 terminal.emit_done();
             }
             Err(e) => {
-                if e.to_string() == CHAT_CANCELLED_NOTEBOOK_SWITCH {
+                let cancellation_reason = e.to_string();
+                if cancellation_reason == CHAT_CANCELLED_NOTEBOOK_SWITCH
+                    || cancellation_reason == CHAT_CANCELLED_USER_REQUEST
+                {
                     // Notebook-switch cancellation — emit chat:cancelled so frontend can clear state.
-                    terminal.emit_cancelled(CHAT_CANCELLED_NOTEBOOK_SWITCH);
+                    let terminal_reason = if cancellation_reason == CHAT_CANCELLED_NOTEBOOK_SWITCH {
+                        CHAT_CANCELLED_NOTEBOOK_SWITCH
+                    } else {
+                        "Chat cancelled by user"
+                    };
+                    terminal.emit_cancelled(terminal_reason);
+                    persist_chat_attempt_status(
+                        &app_state,
+                        &nb_id,
+                        &conv_id,
+                        &spawned_attempt_id,
+                        &msg_id,
+                        Some(&spawned_user_message_id),
+                        Some(&spawned_provider),
+                        Some(&model),
+                        "cancelled",
+                        Some("stream_cancelled"),
+                        Some("cancelled"),
+                        Some(terminal_reason),
+                        None,
+                        true,
+                    );
                     record_chat_attempt_trace(
                         &spawned_attempt_trace,
                         &spawned_trace_data_dir,
                         "cancelled",
                         Some(Duration::ZERO),
-                        Some("Chat cancelled by notebook switch during streaming"),
-                        Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
+                        Some("Chat cancelled during streaming"),
+                        Some(terminal_reason),
                         |_| {},
                     );
                 } else {
@@ -2259,6 +2789,22 @@ pub async fn send_message(
                         Some(&error_text),
                     );
                     terminal.emit_error(&error_text);
+                    persist_chat_attempt_status(
+                        &app_state,
+                        &nb_id,
+                        &conv_id,
+                        &spawned_attempt_id,
+                        &msg_id,
+                        Some(&spawned_user_message_id),
+                        Some(&spawned_provider),
+                        Some(&model),
+                        "error",
+                        Some("stream_error"),
+                        Some("provider_error"),
+                        Some(&error_text),
+                        None,
+                        true,
+                    );
                     record_chat_attempt_trace(
                         &spawned_attempt_trace,
                         &spawned_trace_data_dir,
@@ -2277,6 +2823,7 @@ pub async fn send_message(
         app_state.clear_gate_owner("LLM gate", "chat");
         drop(gpu_permit);
         drop(permit);
+        app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
     });
 
     Ok(message_id)
@@ -2390,36 +2937,48 @@ pub async fn debug_chat_provider_smoke(
         |_| {},
     );
 
-    let mut token_stream =
-        match tokio::time::timeout(CHAT_PROVIDER_START_TIMEOUT, provider.chat(request)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => {
-                let error = err.to_string();
-                record_chat_attempt_trace(
-                    &attempt_trace,
-                    &trace_data_dir,
-                    "provider_start_error",
-                    Some(started.elapsed()),
-                    Some("Provider-only smoke failed before stream start"),
-                    Some(&error),
-                    |_| {},
-                );
-                return Ok(chat_attempt_trace_snapshot(&attempt_trace));
-            }
-            Err(_) => {
-                let error = "Provider-only smoke did not start streaming before timeout";
-                record_chat_attempt_trace(
-                    &attempt_trace,
-                    &trace_data_dir,
-                    "provider_start_timeout",
-                    Some(started.elapsed()),
-                    Some(error),
-                    Some(error),
-                    |_| {},
-                );
-                return Ok(chat_attempt_trace_snapshot(&attempt_trace));
-            }
-        };
+    let smoke_context = providers::LlmExecutionContext::default_with_token(
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .with_attempt_id(chat_attempt_trace_snapshot(&attempt_trace).attempt_id);
+    let chat_future = provider.chat(request, smoke_context.clone());
+    tokio::pin!(chat_future);
+    let mut token_stream = loop {
+        if started.elapsed() >= CHAT_PROVIDER_START_TIMEOUT {
+            smoke_context.cancellation.cancel();
+            let error = "Provider-only smoke did not start streaming before timeout";
+            record_chat_attempt_trace(
+                &attempt_trace,
+                &trace_data_dir,
+                "provider_start_timeout",
+                Some(started.elapsed()),
+                Some(error),
+                Some(error),
+                |_| {},
+            );
+            return Ok(chat_attempt_trace_snapshot(&attempt_trace));
+        }
+
+        tokio::select! {
+            result = &mut chat_future => match result {
+                Ok(stream) => break stream,
+                Err(err) => {
+                    let error = err.to_string();
+                    record_chat_attempt_trace(
+                        &attempt_trace,
+                        &trace_data_dir,
+                        "provider_start_error",
+                        Some(started.elapsed()),
+                        Some("Provider-only smoke failed before stream start"),
+                        Some(&error),
+                        |_| {},
+                    );
+                    return Ok(chat_attempt_trace_snapshot(&attempt_trace));
+                }
+            },
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+    };
 
     let first_token_wait_started = Instant::now();
     let mut full_response = String::new();
@@ -2443,6 +3002,7 @@ pub async fn debug_chat_provider_smoke(
                     first_token_wait_started.elapsed()
                 };
                 if elapsed >= timeout {
+                    smoke_context.cancellation.cancel();
                     let error = if first_token_seen {
                         "Provider-only smoke stream idle timeout"
                     } else {
@@ -2474,10 +3034,15 @@ pub async fn debug_chat_provider_smoke(
             Ok(token) => token,
             Err(err) => {
                 let error = err.to_string();
+                let phase = if smoke_context.is_cancelled() {
+                    "cancelled"
+                } else {
+                    "provider_stream_error"
+                };
                 record_chat_attempt_trace(
                     &attempt_trace,
                     &trace_data_dir,
-                    "provider_stream_error",
+                    phase,
                     Some(started.elapsed()),
                     Some("Provider-only smoke stream yielded an error"),
                     Some(&error),
@@ -2613,5 +3178,25 @@ mod tests {
     #[test]
     fn chat_done_frame_without_eof() {
         chat_stream_contract_done_frame_no_eof_terminal_metadata();
+    }
+
+    #[test]
+    fn retrieval_fallback_text_maps_to_typed_reason_codes() {
+        assert_eq!(
+            retrieval_reason_code_from_text("search-timeout"),
+            Some(RetrievalReasonCode::SemanticMemoryTimeout)
+        );
+        assert_eq!(
+            retrieval_reason_code_from_text("projection-required"),
+            Some(RetrievalReasonCode::SemanticMemoryLinksMissing)
+        );
+        assert_eq!(
+            retrieval_reason_code_from_text("embedding index native-hnsw is stale"),
+            Some(RetrievalReasonCode::EmbeddingIndexMetadataStale)
+        );
+        assert_eq!(
+            retrieval_reason_code_from_text("semantic-memory returned no mapped candidates"),
+            Some(RetrievalReasonCode::NoRetrievalContext)
+        );
     }
 }

@@ -1,4 +1,7 @@
-use super::{provider_http_error, ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
+use super::{
+    provider_cancelled_error, provider_http_error, ChatRequest, ChatToken, LlmExecutionContext,
+    LlmProvider, ModelInfo, ProviderType,
+};
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
@@ -146,20 +149,23 @@ impl LlmProvider for OllamaProvider {
     async fn chat(
         &self,
         request: ChatRequest,
+        ctx: LlmExecutionContext,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatToken, GlossError>> + Send>>, GlossError> {
+        ctx.check_cancelled("ollama", "before_request_build")?;
         let url = format!("{}/api/chat", self.base_url);
         let body = build_ollama_chat_body(&request);
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| GlossError::Provider {
+        ctx.check_cancelled("ollama", "before_http_send")?;
+        let send = self.client.post(&url).json(&body).send();
+        let resp = tokio::select! {
+            _ = ctx.cancellation.cancelled() => {
+                return Err(provider_cancelled_error("ollama", "waiting_for_response_headers", ctx.attempt_id.as_deref()));
+            }
+            result = send => result.map_err(|e| GlossError::Provider {
                 provider: "ollama".into(),
                 source: e.into(),
-            })?;
+            })?
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -182,27 +188,54 @@ impl LlmProvider for OllamaProvider {
             use llm_pipeline::StreamingDecoder;
 
             let stream = stream::unfold(
-                (byte_stream, StreamingDecoder::new()),
-                |(mut byte_stream, mut decoder)| async move {
+                (byte_stream, StreamingDecoder::new(), ctx.clone()),
+                |(mut byte_stream, mut decoder, ctx)| async move {
                     use futures::TryStreamExt;
                     loop {
-                        match byte_stream.try_next().await {
+                        let next = tokio::select! {
+                            _ = ctx.cancellation.cancelled() => {
+                                return Some((
+                                    stream::iter(vec![Err(provider_cancelled_error("ollama", "reading_stream_chunk", ctx.attempt_id.as_deref()))]),
+                                    (byte_stream, decoder, ctx),
+                                ));
+                            }
+                            next = byte_stream.try_next() => next,
+                        };
+                        match next {
                             Ok(Some(bytes)) => {
+                                if ctx.is_cancelled() {
+                                    return Some((
+                                        stream::iter(vec![Err(provider_cancelled_error("ollama", "before_yield_token", ctx.attempt_id.as_deref()))]),
+                                        (byte_stream, decoder, ctx),
+                                    ));
+                                }
                                 let values = decoder.decode(&bytes);
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
                                 for val in values {
                                     tokens.push(ollama_chat_token_from_value(&val));
                                 }
                                 if !tokens.is_empty() {
-                                    return Some((stream::iter(tokens), (byte_stream, decoder)));
+                                    if ctx.is_cancelled() {
+                                        return Some((
+                                            stream::iter(vec![Err(provider_cancelled_error("ollama", "before_yield_token", ctx.attempt_id.as_deref()))]),
+                                            (byte_stream, decoder, ctx),
+                                        ));
+                                    }
+                                    return Some((stream::iter(tokens), (byte_stream, decoder, ctx)));
                                 }
                             }
                             Ok(None) => {
                                 // Stream ended — flush decoder
                                 if let Some(val) = decoder.flush() {
+                                    if ctx.is_cancelled() {
+                                        return Some((
+                                            stream::iter(vec![Err(provider_cancelled_error("ollama", "before_terminal_frame", ctx.attempt_id.as_deref()))]),
+                                            (byte_stream, decoder, ctx),
+                                        ));
+                                    }
                                     return Some((
                                         stream::iter(vec![ollama_chat_token_from_value(&val)]),
-                                        (byte_stream, decoder),
+                                        (byte_stream, decoder, ctx),
                                     ));
                                 }
                                 return None;
@@ -213,7 +246,7 @@ impl LlmProvider for OllamaProvider {
                                         provider: "ollama".into(),
                                         source: e.into(),
                                     })]),
-                                    (byte_stream, decoder),
+                                    (byte_stream, decoder, ctx),
                                 ));
                             }
                         }
@@ -225,10 +258,16 @@ impl LlmProvider for OllamaProvider {
             Ok(Box::pin(stream))
         } else {
             // Non-streaming: parse single response
-            let body: serde_json::Value = resp.json().await.map_err(|e| GlossError::Provider {
+            let body: serde_json::Value = tokio::select! {
+                _ = ctx.cancellation.cancelled() => {
+                    return Err(provider_cancelled_error("ollama", "reading_non_stream_response", ctx.attempt_id.as_deref()));
+                }
+                result = resp.json() => result.map_err(|e| GlossError::Provider {
                 provider: "ollama".into(),
                 source: e.into(),
-            })?;
+                })?
+            };
+            ctx.check_cancelled("ollama", "before_terminal_frame")?;
 
             if let Some(error) = body.get("error").and_then(|error| error.as_str()) {
                 return Err(GlossError::Provider {

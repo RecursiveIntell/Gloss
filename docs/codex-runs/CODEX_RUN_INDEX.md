@@ -1,6 +1,6 @@
 # Codex Run Index
 
-Updated UTC: `2026-05-26T16:11:56Z`
+Updated UTC: `2026-06-12T14:54:50Z`
 Archive root: `docs/codex-runs/archive`
 
 ## Archive Manifests
@@ -19,6 +19,7 @@ Archive root: `docs/codex-runs/archive`
 - `docs/codex-runs/archive/P33-20260524T080319Z/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P33/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P35/ARCHIVE_MANIFEST.json`
+- `docs/codex-runs/archive/P36/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/unclassified/20260513T034357Z/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/unclassified/20260513T080827Z/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/unclassified/20260513T153602Z/ARCHIVE_MANIFEST.json`

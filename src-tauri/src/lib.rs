@@ -80,7 +80,6 @@ pub fn run_inner() -> tauri::Result<()> {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
@@ -177,18 +176,19 @@ pub fn run_inner() -> tauri::Result<()> {
             commands::sources::semantic_memory_reindex_source,
             commands::sources::semantic_memory_rebuild_vector_artifacts,
             commands::sources::semantic_memory_vector_artifact_status,
-            commands::sources::compare_memory_backends,
             commands::chat::list_conversations,
             commands::chat::create_conversation,
             commands::chat::delete_conversation,
             commands::chat::stop_chat,
             commands::chat::load_messages,
+            commands::chat::get_chat_events_since,
             commands::chat::send_message,
             commands::chat::get_suggested_questions,
             commands::chat::debug_chat_provider_smoke,
             commands::chat::get_last_chat_attempt_trace,
             commands::studio::list_studio_outputs,
             commands::studio::generate_studio_output,
+            commands::studio::cancel_studio_generation,
             commands::studio::export_studio_output,
             commands::notes::list_notes,
             commands::notes::create_note,

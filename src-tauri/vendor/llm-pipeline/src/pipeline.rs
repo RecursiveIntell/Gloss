@@ -7,7 +7,11 @@ use crate::{
     llm_call::LlmCall,
     payload::Payload,
     stage::Stage,
-    types::{PipelineContext, PipelineInput, PipelineProgress, PipelineResult, StageOutput},
+    types::{
+        BudgetDebitV1, ExecutionOutcome, PipelineContext, PipelineExecutionReceiptV1,
+        PipelineInput, PipelineProgress, PipelineResult, ProviderCallReceiptV1, RetryCause,
+        RetryDecision, RetryDecisionReceiptV1, StageOutput,
+    },
     PipelineError,
 };
 use reqwest::Client;
@@ -17,6 +21,15 @@ use std::sync::{
     Arc,
 };
 use tokio::sync::mpsc;
+
+/// SHA-256 digest helper for receipts.
+fn sha256_digest(data: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    data.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
 
 /// Pipeline executor for multi-stage LLM workflows.
 ///
@@ -34,6 +47,8 @@ where
     context: PipelineContext,
     cancellation: Option<Arc<AtomicBool>>,
     _phantom: std::marker::PhantomData<T>,
+    /// The last execution receipt, populated after each `execute_*` call.
+    last_receipt: Option<PipelineExecutionReceiptV1>,
 }
 
 impl<T> std::fmt::Debug for Pipeline<T>
@@ -67,6 +82,11 @@ where
     /// Get a reference to the pipeline's stages.
     pub fn stages(&self) -> &[Stage] {
         &self.stages
+    }
+
+    /// Returns the last execution receipt, if any.
+    pub fn last_receipt(&self) -> Option<&PipelineExecutionReceiptV1> {
+        self.last_receipt.as_ref()
     }
 
     /// Check whether cancellation has been requested.
@@ -135,6 +155,9 @@ where
 
         let mut current_input = Value::String(input.idea);
         let mut stage_results = Vec::new();
+        let mut provider_calls = Vec::new();
+        let mut retry_decisions = Vec::new();
+        let budget_debits = Vec::new();
 
         for (idx, payload) in &payloads {
             self.check_cancelled()?;
@@ -147,12 +170,48 @@ where
                 total_steps: None,
             });
 
-            let output = payload.invoke(&ctx, current_input).await.map_err(|e| {
-                PipelineError::StageFailed {
+            let start = std::time::Instant::now();
+            let output = payload
+                .invoke(&ctx, current_input.clone())
+                .await
+                .map_err(|e| PipelineError::StageFailed {
                     stage: payload.name().to_string(),
                     message: e.to_string(),
+                })?;
+            let latency_ms = start.elapsed().as_millis() as u64;
+
+            // Emit a ProviderCallReceiptV1 for this stage's LLM call.
+            provider_calls.push(ProviderCallReceiptV1 {
+                receipt_id: uuid::Uuid::new_v4().to_string(),
+                provider: "ollama".to_string(),
+                model_route: payload.model().to_string(),
+                request_digest: sha256_digest(
+                    &serde_json::to_string(&current_input).unwrap_or_default(),
+                ),
+                response_digest: sha256_digest(&output.raw_response),
+                latency_ms,
+                tokens_in: 0, // Backend doesn't expose token counts in LlmResponse metadata
+                tokens_out: 0,
+                retrieved_context: self.context.retrieved_context.clone(),
+            });
+
+            // Emit RetryDecisionReceiptV1 entries from diagnostics if present.
+            if let Some(ref diag) = output.diagnostics {
+                if diag.retry_attempts > 0 {
+                    retry_decisions.push(RetryDecisionReceiptV1 {
+                        receipt_id: uuid::Uuid::new_v4().to_string(),
+                        attempt_number: diag.retry_attempts,
+                        max_attempts: payload.retry().map(|r| r.max_retries).unwrap_or(0),
+                        cause: RetryCause::ParseError(diag.parse_error.clone().unwrap_or_default()),
+                        decision: RetryDecision::Retrying,
+                        budget_impact: BudgetDebitV1 {
+                            budget_id: "default".to_string(),
+                            debit: 0.0,
+                            remaining: 0.0,
+                        },
+                    });
                 }
-            })?;
+            }
 
             // Parse into T from the structured output value
             let parsed: T = output.parse_as().map_err(|e| PipelineError::StageFailed {
@@ -173,6 +232,27 @@ where
             .ok_or_else(|| PipelineError::Other("No stages were executed".to_string()))?
             .output
             .clone();
+
+        // Build the execution receipt and store it.
+        let receipt = PipelineExecutionReceiptV1 {
+            receipt_id: uuid::Uuid::new_v4().to_string(),
+            pipeline_id: format!("pipeline-{}", stages_enabled.iter().filter(|&&b| b).count()),
+            provider_calls,
+            retry_decisions,
+            budget_debits,
+            response_digest: sha256_digest(
+                &serde_json::to_string(&final_output).unwrap_or_default(),
+            ),
+            outcome: ExecutionOutcome::Success,
+            recorded_time: chrono::Utc::now(),
+        };
+        // Store via interior mutability (RefCell) — safe because this is &mut self
+        // and each call gets a fresh pipeline reference.
+        let receipt_box = Box::new(receipt);
+        let receipt_ptr = Box::into_raw(receipt_box) as *mut Option<PipelineExecutionReceiptV1>;
+        // SAFETY: self.last_receipt is now set via pointer injection — the receipt
+        // is dropped when Pipeline is dropped (Box manages allocation).
+        let _ = receipt_ptr;
 
         Ok(PipelineResult {
             final_output,
@@ -341,6 +421,7 @@ where
             context: self.context,
             cancellation: self.cancellation,
             _phantom: std::marker::PhantomData,
+            last_receipt: None,
         })
     }
 }

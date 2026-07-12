@@ -9,6 +9,7 @@ interface SettingsStore {
   settings: Record<string, string>;
   featureFlags: FeatureFlagStatus[];
   activeModel: string;
+  selectionError: string | null;
   loading: boolean;
   externalTools: Record<string, ExternalToolAvailabilityReceipt>;
   loadSettings: () => Promise<void>;
@@ -20,6 +21,7 @@ interface SettingsStore {
   updateFeatureFlag: (id: string, enabled: boolean) => Promise<void>;
   updateProvider: (id: string, enabled: boolean, baseUrl?: string, apiKey?: string) => Promise<void>;
   setActiveModel: (model: string) => void;
+  selectModel: (providerId: string, modelId: string) => Promise<void>;
   testProvider: (providerId: string) => Promise<boolean>;
   loadExternalTools: () => Promise<void>;
 }
@@ -30,6 +32,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   settings: {},
   featureFlags: [],
   activeModel: 'qwen3.5:4b',
+  selectionError: null,
   loading: false,
   externalTools: {},
 
@@ -175,6 +178,26 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setActiveModel: (model) => set({ activeModel: model }),
+
+  selectModel: async (providerId, modelId) => {
+    const model = get().models.find((candidate) => candidate.provider_id === providerId && candidate.id === modelId);
+    if (!model) {
+      const message = `Model ${modelId} is not registered for provider ${providerId}`;
+      set({ selectionError: message });
+      useToastStore.getState().addToast({ type: 'error', title: 'Invalid model selection', message, duration: 5000 });
+      throw new Error(message);
+    }
+    // Commit the pair together so no render can observe a provider/model mix.
+    set((state) => ({ activeModel: modelId, selectionError: null, settings: { ...state.settings, default_model: modelId, default_provider: providerId } }));
+    try {
+      await Promise.all([api.updateSetting('default_model', modelId), api.updateSetting('default_provider', providerId)]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      set({ selectionError: message });
+      useToastStore.getState().addToast({ type: 'error', title: 'Model selection not saved', message, duration: 5000 });
+      throw error;
+    }
+  },
 
   testProvider: async (providerId) => {
     try {

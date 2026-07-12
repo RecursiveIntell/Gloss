@@ -104,7 +104,11 @@ pub mod streaming {
         loop {
             let t = result.trim_end();
             if t.ends_with(',') {
-                result = t.strip_suffix(',').unwrap().to_string();
+                if let Some(without_suffix) = t.strip_suffix(',') {
+                    result = without_suffix.to_string();
+                } else {
+                    break;
+                }
             } else if let Some(before_colon) = t.strip_suffix(':') {
                 let without_colon = before_colon.trim_end();
                 if let Some(quote_pos) = without_colon.rfind('"') {
@@ -134,7 +138,9 @@ pub mod streaming {
                 if let Some(open_pos) = inner.rfind('"') {
                     let before = inner[..open_pos].trim_end();
                     if before.ends_with(',') {
-                        result = before.strip_suffix(',').unwrap().to_string();
+                        if let Some(without_suffix) = before.strip_suffix(',') {
+                            result = without_suffix.to_string();
+                        }
                     }
                 }
             }

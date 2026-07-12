@@ -97,6 +97,7 @@ pub fn local_retrieval_outcome(
         embedder,
         index,
         None,
+        None,
         native_indexing_enabled,
         scope,
         top_k,
@@ -116,6 +117,7 @@ pub fn local_retrieval_outcome_with_query(
     embedder: Option<&EmbeddingService>,
     index: Option<&HnswIndex>,
     query_embedding: Option<&[f32]>,
+    dense_block_reason: Option<RetrievalReasonCode>,
     native_indexing_enabled: bool,
     scope: &ResolvedSourceScope,
     top_k: usize,
@@ -180,7 +182,10 @@ pub fn local_retrieval_outcome_with_query(
     let mut dense_available = false;
     let mut dense_reason = None;
 
-    if !native_indexing_enabled {
+    if let Some(reason) = dense_block_reason {
+        dense_reason = Some(reason.clone());
+        fallback_chain.push(reason);
+    } else if !native_indexing_enabled {
         dense_reason = Some(RetrievalReasonCode::NativeIndexingDisabled);
         fallback_chain.push(RetrievalReasonCode::NativeIndexingDisabled);
     } else if coverage.embedded_chunks == 0 {
@@ -901,6 +906,49 @@ mod tests {
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>()
             .contains(&"partial_embedding_coverage"));
+    }
+
+    #[test]
+    fn stale_embedding_index_metadata_blocks_dense_with_typed_reason() {
+        let dir = tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let selected = source("selected");
+        db.insert_source(&selected).unwrap();
+        let mut record = chunk("c1", "selected");
+        record.content = "needle lexical content".to_string();
+        record.embedding_id = Some(7);
+        record.embedding_model = Some("old-384d".to_string());
+        db.insert_chunk(&record).unwrap();
+        let scope = SourceScope::Explicit(vec!["selected".to_string()]).resolve(&[selected]);
+
+        let outcome = local_retrieval_outcome_with_query(
+            "needle",
+            &db,
+            None,
+            None,
+            None,
+            Some(RetrievalReasonCode::EmbeddingIndexMetadataStale),
+            true,
+            &scope,
+            4,
+            "trace-stale-index".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.mode, RetrievalMode::Bm25Only);
+        assert!(outcome
+            .fallback_chain
+            .contains(&RetrievalReasonCode::EmbeddingIndexMetadataStale));
+        let dense = outcome
+            .engines
+            .iter()
+            .find(|engine| engine.engine == "native_dense_hnsw")
+            .unwrap();
+        assert!(!dense.attempted);
+        assert_eq!(
+            dense.reason_code,
+            Some(RetrievalReasonCode::EmbeddingIndexMetadataStale)
+        );
     }
 
     #[test]

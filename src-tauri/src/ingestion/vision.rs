@@ -1,5 +1,5 @@
 use crate::error::GlossError;
-use crate::providers::{ChatMessage, ChatRequest, LlmProvider};
+use crate::providers::{ChatMessage, ChatRequest, LlmExecutionContext, LlmProvider};
 use futures::StreamExt;
 use std::time::Instant;
 
@@ -53,7 +53,9 @@ pub async fn describe_image(
     let start = Instant::now();
     let provider_type = provider.provider_type().as_str().to_string();
     let result = async {
-        let mut stream = provider.chat(request).await?;
+        let mut stream = provider
+            .chat(request, LlmExecutionContext::uncancellable())
+            .await?;
         let mut response = String::new();
         while let Some(token_result) = stream.next().await {
             let token = token_result?;

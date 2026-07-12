@@ -5,7 +5,7 @@
 use crate::commands::chat::types::*;
 use crate::db::notebook_db::Message;
 use crate::error::GlossError;
-use crate::providers::{ChatMessage, ChatRequest, ChatToken, LlmProvider};
+use crate::providers::{ChatMessage, ChatRequest, ChatToken, LlmExecutionContext, LlmProvider};
 use crate::retrieval::context::ContextPassage;
 use crate::retrieval::source_scope::ResolvedSourceScope;
 use crate::state::AppState;
@@ -15,15 +15,12 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::Emitter;
 
-use super::emit::emit_chat_status;
+use super::emit::{emit_chat_status, emit_chat_token};
 use super::receipts;
 
 const CHAT_CANCELLED_NOTEBOOK_SWITCH: &str = "__chat_cancelled_notebook_switch__";
-const CHAT_PROVIDER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const CHAT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(168);
-const CHAT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(84);
+const CHAT_CANCELLED_USER_REQUEST: &str = "__chat_cancelled_user_request__";
 
 pub(crate) fn digest_text(text: &str) -> String {
     let mut hasher = Sha256::new();
@@ -65,9 +62,13 @@ pub(crate) async fn stream_chat_response(
     model_context_window: Option<i32>,
     attempt_trace: &Arc<Mutex<ChatAttemptTraceV1>>,
     trace_data_dir: &Path,
+    execution_context: LlmExecutionContext,
 ) -> Result<ChatStreamResult, GlossError> {
     use tauri::Manager;
     let state: tauri::State<'_, AppState> = app_handle.state();
+    let provider_start_timeout = execution_context.timeouts.provider_start;
+    let first_token_timeout = execution_context.timeouts.first_token;
+    let stream_idle_timeout = execution_context.timeouts.stream_idle;
 
     // Build system prompt with source manifest and authority rules only.
     let system_prompt = crate::retrieval::context::ContextAssembler::build_system_prompt(
@@ -258,7 +259,7 @@ pub(crate) async fn stream_chat_response(
         None,
         None,
         started.elapsed(),
-        Some(CHAT_PROVIDER_START_TIMEOUT),
+        Some(provider_start_timeout),
         false,
         None,
     );
@@ -271,10 +272,23 @@ pub(crate) async fn stream_chat_response(
         None,
         |_| {},
     );
-    let chat_future = provider.chat(request);
+    let chat_future = provider.chat(request, execution_context.clone());
     tokio::pin!(chat_future);
     let mut token_stream = loop {
+        if execution_context.is_cancelled() {
+            receipts::record_chat_attempt_trace(
+                attempt_trace,
+                trace_data_dir,
+                "cancelled",
+                Some(started.elapsed()),
+                Some("Chat cancelled by user before provider start completed"),
+                Some(CHAT_CANCELLED_USER_REQUEST),
+                |_| {},
+            );
+            return Err(GlossError::Other(CHAT_CANCELLED_USER_REQUEST.into()));
+        }
         if !state.is_active_notebook_epoch(notebook_id, epoch) {
+            execution_context.cancellation.cancel();
             receipts::record_chat_attempt_trace(
                 attempt_trace,
                 trace_data_dir,
@@ -286,7 +300,8 @@ pub(crate) async fn stream_chat_response(
             );
             return Err(GlossError::Other(CHAT_CANCELLED_NOTEBOOK_SWITCH.into()));
         }
-        if started.elapsed() >= CHAT_PROVIDER_START_TIMEOUT {
+        if started.elapsed() >= provider_start_timeout {
+            execution_context.cancellation.cancel();
             let error = "Provider did not start streaming before the provider-start timeout";
             emit_chat_status(
                 app_handle,
@@ -301,7 +316,7 @@ pub(crate) async fn stream_chat_response(
                 None,
                 None,
                 started.elapsed(),
-                Some(CHAT_PROVIDER_START_TIMEOUT),
+                Some(provider_start_timeout),
                 false,
                 Some(error),
             );
@@ -321,6 +336,18 @@ pub(crate) async fn stream_chat_response(
         }
 
         tokio::select! {
+            _ = execution_context.cancellation.cancelled() => {
+                receipts::record_chat_attempt_trace(
+                    attempt_trace,
+                    trace_data_dir,
+                    "cancelled",
+                    Some(started.elapsed()),
+                    Some("Chat cancelled by user while waiting for provider start"),
+                    Some(CHAT_CANCELLED_USER_REQUEST),
+                    |_| {},
+                );
+                return Err(GlossError::Other(CHAT_CANCELLED_USER_REQUEST.into()));
+            }
             result = &mut chat_future => match result {
                 Ok(stream) => break stream,
                 Err(err) => {
@@ -362,7 +389,7 @@ pub(crate) async fn stream_chat_response(
         None,
         None,
         first_token_wait_started.elapsed(),
-        Some(CHAT_FIRST_TOKEN_TIMEOUT),
+        Some(first_token_timeout),
         false,
         None,
     );
@@ -385,7 +412,20 @@ pub(crate) async fn stream_chat_response(
     let mut terminal_cause: Option<&'static str> = None;
 
     loop {
+        if execution_context.is_cancelled() {
+            receipts::record_chat_attempt_trace(
+                attempt_trace,
+                trace_data_dir,
+                "cancelled",
+                Some(started.elapsed()),
+                Some("Chat cancelled by user during provider stream"),
+                Some(CHAT_CANCELLED_USER_REQUEST),
+                |_| {},
+            );
+            return Err(GlossError::Other(CHAT_CANCELLED_USER_REQUEST.into()));
+        }
         if !state.is_active_notebook_epoch(notebook_id, epoch) {
+            execution_context.cancellation.cancel();
             receipts::record_chat_attempt_trace(
                 attempt_trace,
                 trace_data_dir,
@@ -398,14 +438,28 @@ pub(crate) async fn stream_chat_response(
             return Err(GlossError::Other(CHAT_CANCELLED_NOTEBOOK_SWITCH.into()));
         }
 
-        let next = match tokio::time::timeout(Duration::from_millis(250), token_stream.next()).await
-        {
+        let next = tokio::select! {
+            _ = execution_context.cancellation.cancelled() => {
+                receipts::record_chat_attempt_trace(
+                    attempt_trace,
+                    trace_data_dir,
+                    "cancelled",
+                    Some(started.elapsed()),
+                    Some("Chat cancelled by user while waiting for provider token"),
+                    Some(CHAT_CANCELLED_USER_REQUEST),
+                    |_| {},
+                );
+                return Err(GlossError::Other(CHAT_CANCELLED_USER_REQUEST.into()));
+            }
+            next = tokio::time::timeout(Duration::from_millis(250), token_stream.next()) => next
+        };
+        let next = match next {
             Ok(next) => next,
             Err(_) => {
                 let timeout = if first_token_seen {
-                    CHAT_STREAM_IDLE_TIMEOUT
+                    stream_idle_timeout
                 } else {
-                    CHAT_FIRST_TOKEN_TIMEOUT
+                    first_token_timeout
                 };
                 let elapsed = if first_token_seen {
                     last_token_at.elapsed()
@@ -413,6 +467,7 @@ pub(crate) async fn stream_chat_response(
                     first_token_wait_started.elapsed()
                 };
                 if elapsed >= timeout {
+                    execution_context.cancellation.cancel();
                     let phase = if first_token_seen {
                         "stream_idle_timeout"
                     } else {
@@ -462,9 +517,34 @@ pub(crate) async fn stream_chat_response(
             break;
         };
 
+        if execution_context.is_cancelled() {
+            receipts::record_chat_attempt_trace(
+                attempt_trace,
+                trace_data_dir,
+                "late_chunk_after_cancel",
+                Some(started.elapsed()),
+                Some("Provider yielded a chunk after cancellation; chunk was ignored"),
+                Some(CHAT_CANCELLED_USER_REQUEST),
+                |_| {},
+            );
+            return Err(GlossError::Other(CHAT_CANCELLED_USER_REQUEST.into()));
+        }
+
         let ChatToken { token, done } = match result {
             Ok(token) => token,
             Err(err) => {
+                if execution_context.is_cancelled() {
+                    receipts::record_chat_attempt_trace(
+                        attempt_trace,
+                        trace_data_dir,
+                        "cancelled",
+                        Some(started.elapsed()),
+                        Some("Provider stream observed cancellation"),
+                        Some(CHAT_CANCELLED_USER_REQUEST),
+                        |_| {},
+                    );
+                    return Err(GlossError::Other(CHAT_CANCELLED_USER_REQUEST.into()));
+                }
                 let error = err.to_string();
                 let invocation = LlmInvocationReceiptV1 {
                     provider: provider.provider_type().as_str().to_string(),
@@ -542,18 +622,14 @@ pub(crate) async fn stream_chat_response(
             );
         }
 
-        if let Err(e) = app_handle.emit(
-            "chat:token",
-            serde_json::json!({
-                "notebook_id": notebook_id,
-                "conversation_id": conversation_id,
-                "message_id": message_id,
-                "token": token,
-                "done": done && provider_done_terminal_decision().emit_done_on_current_token,
-            }),
-        ) {
-            tracing::warn!("failed to emit chat:token: {e}");
-        }
+        emit_chat_token(
+            app_handle,
+            notebook_id,
+            conversation_id,
+            message_id,
+            &token,
+            done && provider_done_terminal_decision().emit_done_on_current_token,
+        );
 
         if done_frame_seen && provider_done_terminal_decision().break_stream_loop {
             break;

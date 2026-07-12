@@ -4,7 +4,7 @@ use crate::memory::backend::{excluded_source_count, invalid_requested_source_ids
 use crate::memory::backend::{requested_source_ids, scope_echo, MemorySearchBackend};
 use crate::memory::types::{
     IndexSourceReceipt, IndexSourceRequest, MemoryBackendStatus, MemorySearchCandidate,
-    MemorySearchRequest, MemorySearchResponse, MEMORY_BACKEND_GLOSS_LOCAL,
+    MemorySearchRequest, MemorySearchResponse, RetrievalReasonCode, MEMORY_BACKEND_GLOSS_LOCAL,
 };
 use crate::retrieval::hybrid_search::{local_intent_rerank_boost, sanitize_fts_query};
 use std::collections::HashMap;
@@ -47,8 +47,10 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
             last_retrieval_receipt_id: None,
             last_receipt_ref: None,
             fallback_reason: None,
+            fallback_reason_code: None,
             degradation_markers: Vec::new(),
             backend_version_or_digest: None,
+            embedding_index_metadata: Vec::new(),
             degraded: false,
             diagnostic: None,
         }
@@ -81,6 +83,7 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
             .collect::<HashMap<_, _>>();
         let mut candidates = Vec::new();
         let mut fallback_reason = None;
+        let mut fallback_reason_code = None;
         let mut degradation_markers = Vec::new();
         let mut fallback_used = false;
         let mut retrieval_mode = "gloss-local-fts5-bm25";
@@ -89,6 +92,7 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
             let fts_query = sanitize_fts_query(&request.query);
             if fts_query.is_empty() {
                 fallback_reason = Some("local FTS5 query sanitized to empty".to_string());
+                fallback_reason_code = Some(RetrievalReasonCode::Bm25QuerySanitizedEmpty);
             } else {
                 match self.nb_db.fts_search_chunks_in_sources(
                     &fts_query,
@@ -114,10 +118,12 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
                         if candidates.is_empty() {
                             fallback_reason =
                                 Some("local FTS5/BM25 returned no matching chunks".to_string());
+                            fallback_reason_code = Some(RetrievalReasonCode::Bm25NoMatches);
                         }
                     }
                     Err(err) => {
                         fallback_reason = Some(format!("local FTS5/BM25 failed: {err}"));
+                        fallback_reason_code = Some(RetrievalReasonCode::IndexMissing);
                     }
                 }
             }
@@ -192,10 +198,12 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
                 "retrieval_mode": retrieval_mode,
                 "fallback_used": fallback_used,
                 "fallback_reason": fallback_reason.clone(),
+                "fallback_reason_code": fallback_reason_code.as_ref().map(RetrievalReasonCode::as_str),
                 "degradation_markers": degradation_markers.clone(),
                 "source_scope_preserved": source_scope_preserved
             }),
             fallback_reason,
+            fallback_reason_code,
             degradation_markers,
             source_scope_preserved,
             fallback_used,

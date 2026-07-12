@@ -1,0 +1,25 @@
+[package]
+name = "llm-tool-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Provider-agnostic tool contracts, registry, dispatch, and receipt plumbing for llm-pipeline"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+semantic-memory-forge = { version = "0.1.1", path = "../semantic-memory-forge" }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+stack-ids = { version = "0.1.1", path = "../stack-ids" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+# LIB-005: inherit workspace lint policy
+[lints]
+workspace = true

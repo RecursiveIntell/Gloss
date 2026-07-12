@@ -99,6 +99,7 @@ pub mod payload;
 pub mod retry;
 pub mod retry_policy;
 pub mod streaming;
+pub mod tool_loop;
 #[allow(deprecated)]
 pub mod trace;
 
@@ -125,6 +126,9 @@ pub use payload::{BoxFut, Payload, PayloadOutput};
 pub use retry::RetryConfig;
 pub use retry_policy::{SemanticRetryPolicy, TransportRetryPolicy};
 pub use streaming::StreamingDecoder;
+pub use tool_loop::{
+    ToolInvocation, ToolLoopChoice, ToolLoopRequest, ToolLoopResponse, ToolLoopRunner,
+};
 #[allow(deprecated)]
 pub use trace::TraceId;
 
@@ -136,4 +140,8 @@ pub use client::LlmConfig;
 pub use error::{PipelineError, Result};
 pub use pipeline::{Pipeline, PipelineBuilder};
 pub use stage::{Stage, StageBuilder};
-pub use types::{PipelineContext, PipelineInput, PipelineProgress, PipelineResult, StageOutput};
+pub use types::{
+    BudgetDebitV1, ExecutionOutcome, PipelineContext, PipelineExecutionReceiptV1, PipelineInput,
+    PipelineProgress, PipelineResult, ProviderCallReceiptV1, RetrievedContextProvenanceV1,
+    RetryCause, RetryDecision, RetryDecisionReceiptV1, StageOutput,
+};

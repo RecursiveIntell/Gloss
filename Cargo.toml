@@ -25,6 +25,7 @@ unimplemented = "deny"
 expect_used = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
+async-trait = "0.1"
 blake3 = "1.8.3"
 chrono = "0.4.44"
 proptest = "1.10.0"

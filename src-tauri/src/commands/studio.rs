@@ -1,8 +1,10 @@
-use crate::db::notebook_db::StudioOutput;
+use crate::db::notebook_db::{Chunk, Source, StudioOutput};
 use crate::error::GlossError;
-use crate::providers::{build_provider, ChatMessage, ChatRequest};
+use crate::providers::{
+    build_provider, ChatMessage, ChatRequest, LlmExecutionContext, LlmPhaseTimeouts,
+};
 use crate::redaction::redact_path;
-use crate::state::AppState;
+use crate::state::{ActiveStudioAttempt, AppState};
 use crate::studio::{
     build_snippets, generate_artifact, validate_artifact, StudioCitation, StudioOutputKind,
 };
@@ -10,14 +12,151 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tauri::State;
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_STUDIO_MAX_ITEMS: usize = 8;
 const MAX_STUDIO_ITEMS: usize = 20;
 /// Max chars of source text to feed the LLM per source (keeps context window manageable).
 const MAX_SOURCE_CHARS_FOR_LLM: usize = 4000;
+const STUDIO_PROVIDER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const STUDIO_FIRST_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const STUDIO_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StudioFallbackReason {
+    ProviderStartTimeout,
+    FirstTokenTimeout,
+    StreamIdleTimeout,
+    ProviderError,
+    InvalidStructuredOutput,
+}
+
+impl StudioFallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderStartTimeout => "provider_start_timeout",
+            Self::FirstTokenTimeout => "first_token_timeout",
+            Self::StreamIdleTimeout => "stream_idle_timeout",
+            Self::ProviderError => "provider_error",
+            Self::InvalidStructuredOutput => "invalid_structured_output",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StudioTerminalFailureReason {
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+struct StudioGenerationFailure {
+    reason: StudioGenerationFailureReason,
+    message: String,
+    elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StudioGenerationFailureReason {
+    Fallback(StudioFallbackReason),
+    Terminal(StudioTerminalFailureReason),
+}
+
+impl StudioGenerationFailure {
+    fn fallback(reason: StudioFallbackReason, message: String, elapsed_ms: u128) -> Self {
+        Self {
+            reason: StudioGenerationFailureReason::Fallback(reason),
+            message,
+            elapsed_ms,
+        }
+    }
+
+    fn terminal(reason: StudioTerminalFailureReason, message: String, elapsed_ms: u128) -> Self {
+        Self {
+            reason: StudioGenerationFailureReason::Terminal(reason),
+            message,
+            elapsed_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct StudioFallbackReceipt {
+    schema: &'static str,
+    receipt_id: String,
+    attempt_id: String,
+    reason: StudioFallbackReason,
+    reason_code: &'static str,
+    provider_cancelled: bool,
+    elapsed_ms: u128,
+    detail: String,
+    recorded_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct StudioProviderRuntimeReceipt {
+    schema: &'static str,
+    attempt_id: String,
+    purpose: String,
+    phase: &'static str,
+    provider: String,
+    model: String,
+    elapsed_ms: u128,
+    provider_cancelled: bool,
+    recorded_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct StudioSkippedSource {
+    source_id: String,
+    title: String,
+    status: String,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct StudioSourceReadiness {
+    schema: &'static str,
+    requested_source_ids: Vec<String>,
+    effective_source_ids: Vec<String>,
+    ready_source_count: usize,
+    skipped_source_count: usize,
+    skipped_sources: Vec<StudioSkippedSource>,
+}
+
+struct StudioAttemptGuard<'a> {
+    state: &'a AppState,
+    notebook_id: String,
+    attempt_id: String,
+    cancellation: CancellationToken,
+}
+
+impl Drop for StudioAttemptGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active_studio_attempts.lock() {
+            let should_clear = active
+                .get(&self.notebook_id)
+                .is_some_and(|attempt| attempt.attempt_id == self.attempt_id);
+            if should_clear {
+                active.remove(&self.notebook_id);
+            }
+        }
+    }
+}
+
+impl StudioAttemptGuard<'_> {
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StudioOutputView {
@@ -71,9 +210,12 @@ pub async fn generate_studio_output(
     title: Option<String>,
     max_items: Option<usize>,
     refine: Option<bool>,
+    attempt_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<StudioOutputView, GlossError> {
     let kind = StudioOutputKind::parse(&output_type)?;
+    let attempt_id = normalize_studio_attempt_id(attempt_id);
+    let attempt_guard = register_studio_attempt(&state, &notebook_id, &attempt_id)?;
     let max_items = max_items
         .unwrap_or(DEFAULT_STUDIO_MAX_ITEMS)
         .clamp(1, MAX_STUDIO_ITEMS);
@@ -81,46 +223,56 @@ pub async fn generate_studio_output(
 
     // Phase 1 (read): build the deterministic artifact and collect full source
     // texts. No write lock is held during the (potentially long) LLM phase.
-    let (mut artifact, full_texts, citation_pool) = state.with_notebook_db(&notebook_id, |db| {
-        let mut sources = db.list_sources()?;
-        let mut chunks_by_source = Vec::new();
-        for source in &mut sources {
-            let chunks = db.get_chunks_for_source(&source.id)?;
-            if chunks.is_empty() {
-                *source = db.get_source(&source.id)?;
+    let (mut artifact, full_texts, citation_pool, source_readiness) =
+        state.with_notebook_db(&notebook_id, |db| {
+            let mut sources = db.list_sources()?;
+            let mut chunks_by_source = Vec::new();
+            for source in &mut sources {
+                let chunks = db.get_chunks_for_source(&source.id)?;
+                if chunks.is_empty() {
+                    *source = db.get_source(&source.id)?;
+                }
+                chunks_by_source.push((source.id.clone(), chunks));
             }
-            chunks_by_source.push((source.id.clone(), chunks));
-        }
 
-        let requested = source_ids.as_deref();
-        let (scope, snippets) =
-            build_snippets(&sources, &chunks_by_source, requested, max_items, max_items)?;
-        let citation_pool = snippets
-            .iter()
-            .map(|snippet| snippet.citation())
-            .collect::<Vec<_>>();
-        let artifact = generate_artifact(kind, title, scope, &snippets)?;
+            let requested = source_ids.as_deref();
+            let (scope, snippets) =
+                build_snippets(&sources, &chunks_by_source, requested, max_items, max_items)?;
+            let source_readiness = studio_source_readiness(
+                &sources,
+                &chunks_by_source,
+                requested,
+                &scope.effective_source_ids,
+            );
+            let citation_pool = snippets
+                .iter()
+                .map(|snippet| snippet.citation())
+                .collect::<Vec<_>>();
+            let artifact = generate_artifact(kind, title, scope, &snippets)?;
 
-        // list_sources() excludes content_text (heavy field), so we must
-        // call get_source() for each effective source to get the text.
-        let mut full_texts: Vec<(String, String)> = Vec::new();
-        for sid in &artifact.source_scope.effective_source_ids {
-            if let Ok(full_source) = db.get_source(sid) {
-                if let Some(text) = full_source.content_text.as_deref() {
-                    if !text.trim().is_empty() {
-                        let truncated = truncate_to_char_boundary(text, MAX_SOURCE_CHARS_FOR_LLM);
-                        full_texts.push((full_source.title, truncated));
+            // list_sources() excludes content_text (heavy field), so we must
+            // call get_source() for each effective source to get the text.
+            let mut full_texts: Vec<(String, String)> = Vec::new();
+            for sid in &artifact.source_scope.effective_source_ids {
+                if let Ok(full_source) = db.get_source(sid) {
+                    if let Some(text) = full_source.content_text.as_deref() {
+                        if !text.trim().is_empty() {
+                            let truncated =
+                                truncate_to_char_boundary(text, MAX_SOURCE_CHARS_FOR_LLM);
+                            full_texts.push((full_source.title, truncated));
+                        }
                     }
                 }
             }
-        }
-        Ok((artifact, full_texts, citation_pool))
-    })?;
+            Ok((artifact, full_texts, citation_pool, source_readiness))
+        })?;
 
     // Phase 2 (no DB lock): LLM generation. Widget kinds (flashcards, quiz,
     // mind map) get structured JSON content the interactive widgets can
     // render; prose kinds get refined markdown. Both fall back to the
     // deterministic template artifact on failure.
+    let mut fallback_receipt: Option<StudioFallbackReceipt> = None;
+    let mut provider_runtime_receipt: Option<StudioProviderRuntimeReceipt> = None;
     let (prose_content, prompt_used) = if should_refine && !full_texts.is_empty() {
         if is_widget_kind(kind) {
             match generate_structured_widget_content(
@@ -130,10 +282,13 @@ pub async fn generate_studio_output(
                 &citation_pool,
                 max_items,
                 &state,
+                attempt_guard.cancellation(),
+                &attempt_id,
             )
             .await
             {
-                Ok(content) => {
+                Ok((content, receipt)) => {
+                    provider_runtime_receipt = Some(receipt);
                     artifact.content = content;
                     artifact.prompt_used = "llm_structured_source_grounded_v1".to_string();
                     artifact.validation = validate_artifact(&artifact);
@@ -146,35 +301,59 @@ pub async fn generate_studio_output(
                     }
                     (None, artifact.prompt_used.clone())
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Studio structured generation failed, using deterministic template: {e}"
-                    );
-                    (None, artifact.prompt_used.clone())
-                }
+                Err(failure) => handle_studio_generation_failure(
+                    failure,
+                    &attempt_id,
+                    &artifact.prompt_used,
+                    &mut fallback_receipt,
+                )?,
             }
         } else {
-            match refine_studio_artifact(&artifact, &full_texts, &state).await {
-                Ok(prose) => (Some(prose), "source_grounded_refined_v1".to_string()),
-                Err(e) => {
-                    tracing::warn!("Studio LLM refinement failed, falling back: {e}");
-                    (None, artifact.prompt_used.clone())
+            match refine_studio_artifact(
+                &artifact,
+                &full_texts,
+                &state,
+                attempt_guard.cancellation(),
+                &attempt_id,
+            )
+            .await
+            {
+                Ok((prose, receipt)) => {
+                    provider_runtime_receipt = Some(receipt);
+                    (Some(prose), "source_grounded_refined_v1".to_string())
                 }
+                Err(failure) => handle_studio_generation_failure(
+                    failure,
+                    &attempt_id,
+                    &artifact.prompt_used,
+                    &mut fallback_receipt,
+                )?,
             }
         }
     } else {
         (None, artifact.prompt_used.clone())
     };
 
+    if attempt_guard.cancellation().is_cancelled() {
+        return Err(GlossError::Studio {
+            output_type: output_type.clone(),
+            message: format!("Studio generation cancelled: attempt_id={attempt_id}"),
+        });
+    }
+
     let raw_content = serde_json::to_string_pretty(&artifact)?;
     let config = serde_json::to_string(&json!({
         "schema": "StudioOutputConfigV1",
+        "attempt_id": attempt_id,
         "deterministic": artifact.validation.deterministic,
         "source_bound": true,
         "schema_validated": artifact.validation.schema_validated,
         "all_items_source_cited": artifact.validation.all_items_source_cited,
         "max_items": max_items,
         "receipt_id": artifact.receipt_id,
+        "source_readiness": source_readiness,
+        "provider_runtime_receipt": provider_runtime_receipt,
+        "fallback_receipt": fallback_receipt,
     }))?;
     let source_ids_json = serde_json::to_string(&artifact.source_scope.effective_source_ids)?;
     let now = chrono::Utc::now().to_rfc3339();
@@ -199,11 +378,183 @@ pub async fn generate_studio_output(
     studio_output_view(output)
 }
 
+#[tauri::command]
+pub async fn cancel_studio_generation(
+    notebook_id: String,
+    attempt_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<bool, GlossError> {
+    let active = {
+        let active = state
+            .active_studio_attempts
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        active.get(&notebook_id).cloned()
+    };
+    let Some(active) = active else {
+        return Ok(false);
+    };
+    if let Some(expected) = attempt_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if active.attempt_id != expected {
+            return Ok(false);
+        }
+    }
+    active.cancellation.cancel();
+    tracing::info!(
+        notebook_id = %active.notebook_id,
+        attempt_id = %active.attempt_id,
+        "Studio generation cancellation requested"
+    );
+    Ok(true)
+}
+
 fn is_widget_kind(kind: StudioOutputKind) -> bool {
     matches!(
         kind,
         StudioOutputKind::Flashcards | StudioOutputKind::Quiz | StudioOutputKind::MindMap
     )
+}
+
+fn normalize_studio_attempt_id(attempt_id: Option<String>) -> String {
+    attempt_id
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| format!("studio-attempt-{}", uuid::Uuid::new_v4()))
+}
+
+fn register_studio_attempt<'a>(
+    state: &'a AppState,
+    notebook_id: &str,
+    attempt_id: &str,
+) -> Result<StudioAttemptGuard<'a>, GlossError> {
+    let cancellation = CancellationToken::new();
+    let mut active = state
+        .active_studio_attempts
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    if let Some(existing) = active.get(notebook_id) {
+        return Err(GlossError::Studio {
+            output_type: "runtime".to_string(),
+            message: format!(
+                "studio_generation_in_flight: active_attempt_id={}; repeated clicks reuse the active attempt until it completes or is cancelled",
+                existing.attempt_id
+            ),
+        });
+    }
+    active.insert(
+        notebook_id.to_string(),
+        ActiveStudioAttempt {
+            notebook_id: notebook_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            cancellation: cancellation.clone(),
+        },
+    );
+    Ok(StudioAttemptGuard {
+        state,
+        notebook_id: notebook_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        cancellation,
+    })
+}
+
+fn studio_source_readiness(
+    sources: &[Source],
+    chunks_by_source: &[(String, Vec<Chunk>)],
+    requested_source_ids: Option<&[String]>,
+    effective_source_ids: &[String],
+) -> StudioSourceReadiness {
+    let effective = effective_source_ids.iter().cloned().collect::<HashSet<_>>();
+    let requested = requested_source_ids.unwrap_or(&[]);
+    let requested_set = requested.iter().cloned().collect::<HashSet<_>>();
+    let any_selected = sources.iter().any(|source| source.selected);
+    let scoped_sources = sources.iter().filter(|source| {
+        if !requested.is_empty() {
+            requested_set.contains(&source.id)
+        } else if any_selected {
+            source.selected
+        } else {
+            true
+        }
+    });
+    let skipped_sources = scoped_sources
+        .filter(|source| !effective.contains(&source.id))
+        .map(|source| {
+            let chunks = chunks_by_source
+                .iter()
+                .find(|(source_id, _)| source_id == &source.id)
+                .map(|(_, chunks)| chunks.as_slice())
+                .unwrap_or(&[]);
+            let has_text = source
+                .content_text
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty());
+            let reason = if source.status != "ready" {
+                "source_not_ready"
+            } else if chunks.is_empty() && !has_text {
+                "no_text_or_chunks"
+            } else {
+                "source_or_snippet_limit"
+            };
+            StudioSkippedSource {
+                source_id: source.id.clone(),
+                title: source.title.clone(),
+                status: source.status.clone(),
+                reason,
+            }
+        })
+        .collect::<Vec<_>>();
+    StudioSourceReadiness {
+        schema: "StudioSourceReadinessV1",
+        requested_source_ids: requested.to_vec(),
+        effective_source_ids: effective_source_ids.to_vec(),
+        ready_source_count: effective_source_ids.len(),
+        skipped_source_count: skipped_sources.len(),
+        skipped_sources,
+    }
+}
+
+fn handle_studio_generation_failure(
+    failure: StudioGenerationFailure,
+    attempt_id: &str,
+    deterministic_prompt: &str,
+    fallback_receipt: &mut Option<StudioFallbackReceipt>,
+) -> Result<(Option<String>, String), GlossError> {
+    match failure.reason {
+        StudioGenerationFailureReason::Terminal(StudioTerminalFailureReason::Cancelled) => {
+            Err(GlossError::Studio {
+                output_type: "runtime".to_string(),
+                message: failure.message,
+            })
+        }
+        StudioGenerationFailureReason::Fallback(reason) => {
+            tracing::warn!(
+                reason = reason.as_str(),
+                attempt_id = %attempt_id,
+                "Studio provider generation failed; using deterministic source-bound template"
+            );
+            *fallback_receipt = Some(StudioFallbackReceipt {
+                schema: "StudioFallbackReceiptV1",
+                receipt_id: format!("studio-fallback-{}", uuid::Uuid::new_v4()),
+                attempt_id: attempt_id.to_string(),
+                reason,
+                reason_code: reason.as_str(),
+                provider_cancelled: matches!(
+                    reason,
+                    StudioFallbackReason::ProviderStartTimeout
+                        | StudioFallbackReason::FirstTokenTimeout
+                        | StudioFallbackReason::StreamIdleTimeout
+                ),
+                elapsed_ms: failure.elapsed_ms,
+                detail: failure.message,
+                recorded_utc: chrono::Utc::now().to_rfc3339(),
+            });
+            Ok((None, deterministic_prompt.to_string()))
+        }
+    }
 }
 
 #[tauri::command]
@@ -345,38 +696,41 @@ async fn run_studio_llm(
     user_prompt: String,
     temperature: f32,
     purpose: &str,
-) -> Result<String, GlossError> {
+    cancellation: CancellationToken,
+    attempt_id: &str,
+) -> Result<(String, StudioProviderRuntimeReceipt), StudioGenerationFailure> {
     let (config, model) = {
         let app_db = state
             .app_db
             .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
+            .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
         let model = app_db
-            .get_setting("default_model")?
+            .get_setting("default_model")
+            .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?
             .unwrap_or_else(|| "qwen3.5:4b".to_string());
         let config = crate::providers::provider_config_from_db(&app_db, &state.secret_store, {
             let selected = app_db
-                .get_setting("default_provider")?
+                .get_setting("default_provider")
+                .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?
                 .and_then(|p| crate::providers::ProviderType::from_str(p.trim()));
             selected.unwrap_or(crate::providers::ProviderType::Ollama)
-        })?;
+        })
+        .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
         (config, model)
     };
+    let provider_name = config.provider_type.as_str().to_string();
 
-    let _llm_permit = state
-        .llm_gate
-        .acquire()
-        .await
-        .map_err(|e| GlossError::Other(format!("Failed to acquire LLM gate: {e}")))?;
-    let _gpu_permit = state
-        .gpu_gate
-        .acquire()
-        .await
-        .map_err(|e| GlossError::Other(format!("Failed to acquire GPU gate: {e}")))?;
+    let _llm_permit = state.llm_gate.acquire().await.map_err(|e| {
+        studio_provider_error(attempt_id, &format!("Failed to acquire LLM gate: {e}"), 0)
+    })?;
+    let _gpu_permit = state.gpu_gate.acquire().await.map_err(|e| {
+        studio_provider_error(attempt_id, &format!("Failed to acquire GPU gate: {e}"), 0)
+    })?;
 
-    let provider = build_provider(&config)?;
+    let provider = build_provider(&config)
+        .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
     let request = ChatRequest {
-        model,
+        model: model.clone(),
         system_prompt: Some(system_prompt),
         messages: vec![ChatMessage {
             role: "user".to_string(),
@@ -394,42 +748,149 @@ async fn run_studio_llm(
     };
 
     let start = Instant::now();
-    // Hard timeout: on slow CPU ollama + large system prompts, the first
-    // byte can take many minutes (or never arrive). Without this guard the
-    // Studio Generate button just spins forever. On timeout, the caller falls
-    // through to the deterministic template artifact (see Err(e) branch in
-    // generate_studio_output), which is built locally and returns in <1s.
-    const STUDIO_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     tracing::info!(
-        "Studio LLM call ({purpose}) starting, timeout={}s",
-        STUDIO_LLM_TIMEOUT.as_secs()
+        attempt_id = %attempt_id,
+        purpose = %purpose,
+        provider = %provider_name,
+        model = %model,
+        provider_start_timeout_s = STUDIO_PROVIDER_START_TIMEOUT.as_secs(),
+        first_token_timeout_s = STUDIO_FIRST_TOKEN_TIMEOUT.as_secs(),
+        stream_idle_timeout_s = STUDIO_STREAM_IDLE_TIMEOUT.as_secs(),
+        "Studio provider call starting"
     );
-    let stream_result = tokio::time::timeout(STUDIO_LLM_TIMEOUT, provider.chat(request)).await;
-    let mut stream = match stream_result {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(e),
-        Err(_elapsed) => {
-            tracing::warn!(
-                "Studio LLM call ({purpose}) timed out after {}s; caller will fall back to template",
-                STUDIO_LLM_TIMEOUT.as_secs()
-            );
-            return Err(GlossError::Other(format!(
-                "Studio LLM call timed out after {}s",
-                STUDIO_LLM_TIMEOUT.as_secs()
-            )));
+    let studio_context = LlmExecutionContext::new(
+        cancellation.clone(),
+        LlmPhaseTimeouts {
+            provider_start: STUDIO_PROVIDER_START_TIMEOUT,
+            first_token: STUDIO_FIRST_TOKEN_TIMEOUT,
+            stream_idle: STUDIO_STREAM_IDLE_TIMEOUT,
+        },
+    )
+    .with_attempt_id(attempt_id.to_string());
+    let chat_future = provider.chat(request, studio_context.clone());
+    tokio::pin!(chat_future);
+    let mut stream = tokio::select! {
+        result = &mut chat_future => {
+            match result {
+                Ok(stream) => stream,
+                Err(_error) if cancellation.is_cancelled() => {
+                    return Err(studio_cancelled(attempt_id, start.elapsed().as_millis()));
+                }
+                Err(error) => {
+                    return Err(studio_provider_error(attempt_id, &error.to_string(), start.elapsed().as_millis()));
+                }
+            }
+        }
+        _ = cancellation.cancelled() => {
+            return Err(studio_cancelled(attempt_id, start.elapsed().as_millis()));
+        }
+        _ = tokio::time::sleep(studio_context.timeouts.provider_start) => {
+            studio_context.cancellation.cancel();
+            return Err(StudioGenerationFailure::fallback(
+                StudioFallbackReason::ProviderStartTimeout,
+                format!(
+                    "Studio provider start timed out after {}s",
+                    studio_context.timeouts.provider_start.as_secs()
+                ),
+                start.elapsed().as_millis(),
+            ));
         }
     };
     let mut response = String::new();
-    while let Some(token_result) = stream.next().await {
-        let token = token_result?;
+    let mut saw_token = false;
+    loop {
+        let phase_timeout = if saw_token {
+            studio_context.timeouts.stream_idle
+        } else {
+            studio_context.timeouts.first_token
+        };
+        let timeout_reason = if saw_token {
+            StudioFallbackReason::StreamIdleTimeout
+        } else {
+            StudioFallbackReason::FirstTokenTimeout
+        };
+        let timeout_phase = if saw_token {
+            "stream idle"
+        } else {
+            "first token"
+        };
+        let next = tokio::select! {
+            token_result = stream.next() => token_result,
+            _ = cancellation.cancelled() => {
+                return Err(studio_cancelled(attempt_id, start.elapsed().as_millis()));
+            }
+            _ = tokio::time::sleep(phase_timeout) => {
+                studio_context.cancellation.cancel();
+                return Err(StudioGenerationFailure::fallback(
+                    timeout_reason,
+                    format!(
+                        "Studio provider {timeout_phase} timed out after {}s",
+                        phase_timeout.as_secs()
+                    ),
+                    start.elapsed().as_millis(),
+                ));
+            }
+        };
+        let Some(token_result) = next else {
+            break;
+        };
+        let token = match token_result {
+            Ok(token) => token,
+            Err(_error) if cancellation.is_cancelled() => {
+                return Err(studio_cancelled(attempt_id, start.elapsed().as_millis()));
+            }
+            Err(error) => {
+                return Err(studio_provider_error(
+                    attempt_id,
+                    &error.to_string(),
+                    start.elapsed().as_millis(),
+                ));
+            }
+        };
+        saw_token = true;
         response.push_str(&token.token);
     }
     tracing::info!(
-        "Studio LLM call ({purpose}) completed in {}ms, output: {} chars",
-        start.elapsed().as_millis(),
-        response.trim().len()
+        attempt_id = %attempt_id,
+        purpose = %purpose,
+        elapsed_ms = start.elapsed().as_millis(),
+        chars = response.trim().len(),
+        "Studio provider call completed"
     );
-    Ok(response.trim().to_string())
+    Ok((
+        response.trim().to_string(),
+        StudioProviderRuntimeReceipt {
+            schema: "StudioProviderRuntimeReceiptV1",
+            attempt_id: attempt_id.to_string(),
+            purpose: purpose.to_string(),
+            phase: "completed",
+            provider: provider_name,
+            model,
+            elapsed_ms: start.elapsed().as_millis(),
+            provider_cancelled: false,
+            recorded_utc: chrono::Utc::now().to_rfc3339(),
+        },
+    ))
+}
+
+fn studio_cancelled(attempt_id: &str, elapsed_ms: u128) -> StudioGenerationFailure {
+    StudioGenerationFailure::terminal(
+        StudioTerminalFailureReason::Cancelled,
+        format!("Studio generation cancelled: attempt_id={attempt_id}"),
+        elapsed_ms,
+    )
+}
+
+fn studio_provider_error(
+    attempt_id: &str,
+    message: &str,
+    elapsed_ms: u128,
+) -> StudioGenerationFailure {
+    StudioGenerationFailure::fallback(
+        StudioFallbackReason::ProviderError,
+        format!("Studio provider error for attempt_id={attempt_id}: {message}"),
+        elapsed_ms,
+    )
 }
 
 fn studio_source_material(full_texts: &[(String, String)]) -> String {
@@ -449,7 +910,9 @@ async fn refine_studio_artifact(
     artifact: &crate::studio::StudioArtifact,
     full_texts: &[(String, String)], // (title, text)
     state: &AppState,
-) -> Result<String, GlossError> {
+    cancellation: CancellationToken,
+    attempt_id: &str,
+) -> Result<(String, StudioProviderRuntimeReceipt), StudioGenerationFailure> {
     let source_material = studio_source_material(full_texts);
     let (system_prompt, user_prompt) = studio_prompt_for_kind(
         &artifact.output_type,
@@ -463,6 +926,8 @@ async fn refine_studio_artifact(
         user_prompt,
         0.3,
         &artifact.output_type,
+        cancellation,
+        attempt_id,
     )
     .await
 }
@@ -556,12 +1021,13 @@ async fn generate_structured_widget_content(
     citation_pool: &[StudioCitation],
     max_items: usize,
     state: &AppState,
-) -> Result<serde_json::Value, GlossError> {
+    cancellation: CancellationToken,
+    attempt_id: &str,
+) -> Result<(serde_json::Value, StudioProviderRuntimeReceipt), StudioGenerationFailure> {
     let source_material = studio_source_material(full_texts);
     let title = &artifact.title;
-    let structured_err = |message: String| GlossError::Studio {
-        output_type: kind.as_str().to_string(),
-        message,
+    let structured_err = |message: String| {
+        StudioGenerationFailure::fallback(StudioFallbackReason::InvalidStructuredOutput, message, 0)
     };
 
     match kind {
@@ -578,8 +1044,16 @@ async fn generate_structured_widget_content(
                  \"source_title\":\"exact title of the supporting source\"}}]}}\n\n\
                  Title: {title}\n\n## Sources\n\n{source_material}"
             );
-            let response =
-                run_studio_llm(state, system, user, 0.2, "flashcards_structured").await?;
+            let (response, receipt) = run_studio_llm(
+                state,
+                system,
+                user,
+                0.2,
+                "flashcards_structured",
+                cancellation,
+                attempt_id,
+            )
+            .await?;
             let parsed: LlmFlashcards = llm_pipeline::parsing::parse_as(&response)
                 .map_err(|e| structured_err(format!("flashcards JSON parse failed: {e}")))?;
             let cards = parsed
@@ -600,7 +1074,7 @@ async fn generate_structured_widget_content(
             if cards.is_empty() {
                 return Err(structured_err("LLM produced no usable flashcards".into()));
             }
-            Ok(json!({ "cards": cards }))
+            Ok((json!({ "cards": cards }), receipt))
         }
         StudioOutputKind::Quiz => {
             let system = "You design multiple-choice quizzes from source material. Respond with \
@@ -616,7 +1090,16 @@ async fn generate_structured_widget_content(
                  \"source_title\":\"exact title of the supporting source\"}}]}}\n\n\
                  Title: {title}\n\n## Sources\n\n{source_material}"
             );
-            let response = run_studio_llm(state, system, user, 0.2, "quiz_structured").await?;
+            let (response, receipt) = run_studio_llm(
+                state,
+                system,
+                user,
+                0.2,
+                "quiz_structured",
+                cancellation,
+                attempt_id,
+            )
+            .await?;
             let parsed: LlmQuiz = llm_pipeline::parsing::parse_as(&response)
                 .map_err(|e| structured_err(format!("quiz JSON parse failed: {e}")))?;
             let questions = parsed
@@ -644,7 +1127,7 @@ async fn generate_structured_widget_content(
                     "LLM produced no usable quiz questions".into(),
                 ));
             }
-            Ok(json!({ "questions": questions }))
+            Ok((json!({ "questions": questions }), receipt))
         }
         StudioOutputKind::MindMap => {
             let system = "You extract concept graphs from source material for mind map \
@@ -661,7 +1144,16 @@ async fn generate_structured_widget_content(
                  \"edges\":[{{\"from\":\"n1\",\"to\":\"n2\",\"label\":\"relationship\"}}]}}\n\n\
                  Title: {title}\n\n## Sources\n\n{source_material}"
             );
-            let response = run_studio_llm(state, system, user, 0.2, "mind_map_structured").await?;
+            let (response, receipt) = run_studio_llm(
+                state,
+                system,
+                user,
+                0.2,
+                "mind_map_structured",
+                cancellation,
+                attempt_id,
+            )
+            .await?;
             let parsed: LlmMindMap = llm_pipeline::parsing::parse_as(&response)
                 .map_err(|e| structured_err(format!("mind map JSON parse failed: {e}")))?;
             let node_ids = parsed
@@ -700,7 +1192,7 @@ async fn generate_structured_widget_content(
                     "LLM produced no usable mind map nodes".into(),
                 ));
             }
-            Ok(json!({ "nodes": nodes, "edges": edges }))
+            Ok((json!({ "nodes": nodes, "edges": edges }), receipt))
         }
         _ => Err(structured_err(
             "structured generation only supports widget output kinds".into(),
@@ -891,10 +1383,47 @@ fn studio_prompt_for_kind(
         ),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source(id: &str, title: &str, status: &str, selected: bool) -> Source {
+        Source {
+            id: id.to_string(),
+            source_type: "text".to_string(),
+            title: title.to_string(),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: Some(format!("{title} body text")),
+            word_count: Some(3),
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: status.to_string(),
+            error_message: None,
+            selected,
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+            processing_state: None,
+        }
+    }
+
+    fn chunk(source_id: &str, id: &str) -> Chunk {
+        Chunk {
+            id: id.to_string(),
+            source_id: source_id.to_string(),
+            chunk_index: 0,
+            content: "chunk text".to_string(),
+            token_count: Some(2),
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: None,
+            embedding_model: None,
+        }
+    }
 
     fn output_for_export() -> StudioOutput {
         StudioOutput {
@@ -945,5 +1474,55 @@ mod tests {
             value["artifact"]["validation"]["all_items_source_cited"],
             true
         );
+    }
+
+    #[test]
+    fn studio_attempt_id_is_normalized_or_generated() {
+        assert_eq!(
+            normalize_studio_attempt_id(Some("  studio-attempt-client  ".to_string())),
+            "studio-attempt-client"
+        );
+        assert!(normalize_studio_attempt_id(Some(" ".to_string())).starts_with("studio-attempt-"));
+        assert!(normalize_studio_attempt_id(None).starts_with("studio-attempt-"));
+    }
+
+    #[test]
+    fn studio_source_readiness_records_skipped_sources() {
+        let sources = vec![
+            source("src-ready", "Ready", "ready", true),
+            source("src-processing", "Processing", "processing", true),
+        ];
+        let chunks = vec![
+            ("src-ready".to_string(), vec![chunk("src-ready", "chunk-1")]),
+            ("src-processing".to_string(), Vec::new()),
+        ];
+        let readiness =
+            studio_source_readiness(&sources, &chunks, None, &["src-ready".to_string()]);
+
+        assert_eq!(readiness.schema, "StudioSourceReadinessV1");
+        assert_eq!(readiness.ready_source_count, 1);
+        assert_eq!(readiness.skipped_source_count, 1);
+        assert_eq!(readiness.skipped_sources[0].reason, "source_not_ready");
+    }
+
+    #[test]
+    fn studio_fallback_receipt_uses_typed_reason() {
+        let failure = StudioGenerationFailure::fallback(
+            StudioFallbackReason::FirstTokenTimeout,
+            "timed out".to_string(),
+            61000,
+        );
+        let mut receipt = None;
+        let (prose, prompt) =
+            handle_studio_generation_failure(failure, "attempt-1", "deterministic", &mut receipt)
+                .unwrap();
+
+        assert!(prose.is_none());
+        assert_eq!(prompt, "deterministic");
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt.schema, "StudioFallbackReceiptV1");
+        assert_eq!(receipt.reason, StudioFallbackReason::FirstTokenTimeout);
+        assert_eq!(receipt.reason_code, "first_token_timeout");
+        assert!(receipt.provider_cancelled);
     }
 }

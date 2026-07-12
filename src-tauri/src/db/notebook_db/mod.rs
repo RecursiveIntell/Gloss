@@ -72,6 +72,78 @@ pub struct Chunk {
 
 pub type ChunkSearchHit = (Chunk, f64);
 
+pub const EMBEDDING_INDEX_SCHEMA_VERSION: i32 = 1;
+pub const NATIVE_HNSW_INDEX_ID: &str = "native_hnsw";
+pub const SEMANTIC_MEMORY_INDEX_ID: &str = "semantic_memory";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingIndexMetadata {
+    pub index_id: String,
+    pub provider: String,
+    pub model: String,
+    pub model_digest: Option<String>,
+    pub dimensions: Option<usize>,
+    pub schema_version: i32,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub created_at: Option<String>,
+    pub validated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingIndexMetadataStatus {
+    Unknown,
+    Building,
+    Ready,
+    Stale,
+    Blocked,
+}
+
+impl EmbeddingIndexMetadataStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Building => "building",
+            Self::Ready => "ready",
+            Self::Stale => "stale",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+impl EmbeddingIndexMetadata {
+    pub fn ready(
+        index_id: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        model_digest: Option<String>,
+        dimensions: usize,
+    ) -> Self {
+        Self {
+            index_id: index_id.into(),
+            provider: provider.into(),
+            model: model.into(),
+            model_digest,
+            dimensions: Some(dimensions),
+            schema_version: EMBEDDING_INDEX_SCHEMA_VERSION,
+            status: EmbeddingIndexMetadataStatus::Ready.as_str().to_string(),
+            status_reason: None,
+            created_at: None,
+            validated_at: None,
+        }
+    }
+
+    pub fn identity_matches(&self, expected: &EmbeddingIndexMetadata) -> bool {
+        self.provider == expected.provider
+            && self.model == expected.model
+            && self.model_digest == expected.model_digest
+            && self.dimensions == expected.dimensions
+            && self.schema_version == expected.schema_version
+            && self.status == EmbeddingIndexMetadataStatus::Ready.as_str()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: String,
@@ -93,6 +165,25 @@ pub struct Message {
     pub tokens_prompt: Option<i32>,
     pub tokens_response: Option<i32>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatAttemptStatus {
+    pub attempt_id: String,
+    pub notebook_id: String,
+    pub conversation_id: String,
+    pub assistant_message_id: String,
+    pub user_message_id: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub status: String,
+    pub phase: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub request_digest: Option<String>,
+    pub response_digest: Option<String>,
+    pub partial_policy: Option<String>,
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -907,6 +998,34 @@ impl NotebookDb {
         Ok(chunks)
     }
 
+    /// Get chunks for a source that don't yet have embeddings.
+    pub fn get_chunks_without_embedding(&self, source_id: &str) -> Result<Vec<Chunk>, GlossError> {
+        let sql =
+            "SELECT id, source_id, chunk_index, content, token_count, start_offset, end_offset,
+                    metadata, embedding_id, embedding_model
+                 FROM chunks WHERE source_id = ?1 AND embedding_id IS NULL ORDER BY chunk_index";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([source_id], |row| {
+            Ok(Chunk {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                chunk_index: row.get(2)?,
+                content: row.get(3)?,
+                token_count: row.get(4)?,
+                start_offset: row.get(5)?,
+                end_offset: row.get(6)?,
+                metadata: row.get(7)?,
+                embedding_id: row.get(8)?,
+                embedding_model: row.get(9)?,
+            })
+        })?;
+        let mut chunks = Vec::new();
+        for row in rows {
+            chunks.push(row?);
+        }
+        Ok(chunks)
+    }
+
     /// Returns true when every chunk in the selected scope has an embedding and
     /// there is at least one embedded chunk available for hybrid search.
     pub fn can_run_hybrid_search(&self, scoped_ids: &[String]) -> Result<bool, GlossError> {
@@ -1060,6 +1179,17 @@ impl NotebookDb {
                     link_scope.1.as_slice(),
                     |row| row.get(0),
                 )?;
+            let projection_unit_count: i64 = self.conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM semantic_memory_links{}{}",
+                    link_scope.0,
+                    " AND projection_unit_kind IS NOT NULL AND projection_unit_kind != 'chunk'"
+                ),
+                link_scope.1.as_slice(),
+                |row| row.get(0),
+            )?;
+            let healthy_parent_link_count = healthy.saturating_sub(projection_unit_count).max(0);
+            let _projection_unit_summary = (projection_unit_count, healthy_parent_link_count);
             (
                 total.max(0) as usize,
                 healthy.max(0) as usize,
@@ -1739,6 +1869,58 @@ impl NotebookDb {
         Ok(())
     }
 
+    pub fn upsert_chat_attempt_status(
+        &self,
+        attempt: &ChatAttemptStatus,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT INTO chat_attempts (
+                attempt_id, notebook_id, conversation_id, assistant_message_id,
+                user_message_id, provider, model, status, phase, error_code,
+                error_message, request_digest, response_digest, partial_policy,
+                created_at, updated_at, terminal_at
+             )
+             VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                datetime('now'), datetime('now'), CASE WHEN ?15 THEN datetime('now') ELSE NULL END
+             )
+             ON CONFLICT(attempt_id) DO UPDATE SET
+                notebook_id = excluded.notebook_id,
+                conversation_id = excluded.conversation_id,
+                assistant_message_id = excluded.assistant_message_id,
+                user_message_id = COALESCE(excluded.user_message_id, chat_attempts.user_message_id),
+                provider = COALESCE(excluded.provider, chat_attempts.provider),
+                model = COALESCE(excluded.model, chat_attempts.model),
+                status = excluded.status,
+                phase = excluded.phase,
+                error_code = excluded.error_code,
+                error_message = excluded.error_message,
+                request_digest = COALESCE(excluded.request_digest, chat_attempts.request_digest),
+                response_digest = COALESCE(excluded.response_digest, chat_attempts.response_digest),
+                partial_policy = COALESCE(excluded.partial_policy, chat_attempts.partial_policy),
+                updated_at = datetime('now'),
+                terminal_at = CASE WHEN ?15 THEN datetime('now') ELSE chat_attempts.terminal_at END",
+            rusqlite::params![
+                attempt.attempt_id,
+                attempt.notebook_id,
+                attempt.conversation_id,
+                attempt.assistant_message_id,
+                attempt.user_message_id,
+                attempt.provider,
+                attempt.model,
+                attempt.status,
+                attempt.phase,
+                attempt.error_code,
+                attempt.error_message,
+                attempt.request_digest,
+                attempt.response_digest,
+                attempt.partial_policy,
+                attempt.terminal,
+            ],
+        )?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn insert_prompt_receipt(
         &self,
@@ -2132,6 +2314,126 @@ impl NotebookDb {
         Ok(result)
     }
 
+    pub fn embedding_index_metadata(
+        &self,
+        index_id: &str,
+    ) -> Result<Option<EmbeddingIndexMetadata>, GlossError> {
+        self.conn
+            .query_row(
+                "SELECT index_id, provider, model, model_digest, dimensions, schema_version,
+                        status, status_reason, created_at, validated_at
+                 FROM embedding_index_metadata
+                 WHERE index_id = ?1",
+                rusqlite::params![index_id],
+                |row| {
+                    let dimensions: Option<i64> = row.get(4)?;
+                    Ok(EmbeddingIndexMetadata {
+                        index_id: row.get(0)?,
+                        provider: row.get(1)?,
+                        model: row.get(2)?,
+                        model_digest: row.get(3)?,
+                        dimensions: dimensions.and_then(|value| usize::try_from(value).ok()),
+                        schema_version: row.get(5)?,
+                        status: row.get(6)?,
+                        status_reason: row.get(7)?,
+                        created_at: row.get(8)?,
+                        validated_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(GlossError::from)
+    }
+
+    pub fn list_embedding_index_metadata(&self) -> Result<Vec<EmbeddingIndexMetadata>, GlossError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT index_id, provider, model, model_digest, dimensions, schema_version,
+                    status, status_reason, created_at, validated_at
+             FROM embedding_index_metadata
+             ORDER BY index_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let dimensions: Option<i64> = row.get(4)?;
+            Ok(EmbeddingIndexMetadata {
+                index_id: row.get(0)?,
+                provider: row.get(1)?,
+                model: row.get(2)?,
+                model_digest: row.get(3)?,
+                dimensions: dimensions.and_then(|value| usize::try_from(value).ok()),
+                schema_version: row.get(5)?,
+                status: row.get(6)?,
+                status_reason: row.get(7)?,
+                created_at: row.get(8)?,
+                validated_at: row.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_embedding_index_metadata(
+        &self,
+        metadata: &EmbeddingIndexMetadata,
+    ) -> Result<(), GlossError> {
+        let dimensions = metadata
+            .dimensions
+            .map(|value| i64::try_from(value).unwrap_or(i64::MAX));
+        self.conn.execute(
+            "INSERT INTO embedding_index_metadata
+             (index_id, provider, model, model_digest, dimensions, schema_version,
+              status, status_reason, created_at, validated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))
+             ON CONFLICT(index_id) DO UPDATE SET
+                provider = excluded.provider,
+                model = excluded.model,
+                model_digest = excluded.model_digest,
+                dimensions = excluded.dimensions,
+                schema_version = excluded.schema_version,
+                status = excluded.status,
+                status_reason = excluded.status_reason,
+                validated_at = datetime('now')",
+            rusqlite::params![
+                metadata.index_id,
+                metadata.provider,
+                metadata.model,
+                metadata.model_digest,
+                dimensions,
+                metadata.schema_version,
+                metadata.status,
+                metadata.status_reason,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_embedding_index_status(
+        &self,
+        index_id: &str,
+        status: EmbeddingIndexMetadataStatus,
+        reason: Option<&str>,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT INTO embedding_index_metadata
+             (index_id, provider, model, model_digest, dimensions, schema_version,
+              status, status_reason, created_at, validated_at)
+             VALUES (?1, '', '', NULL, NULL, ?2, ?3, ?4, datetime('now'), datetime('now'))
+             ON CONFLICT(index_id) DO UPDATE SET
+                status = excluded.status,
+                status_reason = excluded.status_reason,
+                validated_at = datetime('now')",
+            rusqlite::params![
+                index_id,
+                EMBEDDING_INDEX_SCHEMA_VERSION,
+                status.as_str(),
+                reason
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Delete all chunks for a source.
     pub fn delete_chunks_for_source(&self, source_id: &str) -> Result<(), GlossError> {
         self.conn
@@ -2349,6 +2651,43 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks.get(&11).map(|chunk| chunk.id.as_str()), Some("c1"));
         assert_eq!(chunks.get(&22).map(|chunk| chunk.id.as_str()), Some("c2"));
+    }
+
+    #[test]
+    fn embedding_index_metadata_round_trips_and_marks_stale() {
+        let dir = tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let metadata = EmbeddingIndexMetadata::ready(
+            NATIVE_HNSW_INDEX_ID,
+            "ollama",
+            "all-minilm",
+            Some("digest-384".to_string()),
+            384,
+        );
+
+        db.upsert_embedding_index_metadata(&metadata).unwrap();
+        let stored = db
+            .embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
+            .unwrap()
+            .expect("metadata row should exist");
+        assert!(stored.identity_matches(&metadata));
+        assert_eq!(stored.dimensions, Some(384));
+
+        db.mark_embedding_index_status(
+            NATIVE_HNSW_INDEX_ID,
+            EmbeddingIndexMetadataStatus::Stale,
+            Some("model switched to 1024d"),
+        )
+        .unwrap();
+        let stale = db
+            .embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
+            .unwrap()
+            .expect("metadata row should still exist");
+        assert_eq!(stale.status, EmbeddingIndexMetadataStatus::Stale.as_str());
+        assert_eq!(
+            stale.status_reason.as_deref(),
+            Some("model switched to 1024d")
+        );
     }
 
     #[test]

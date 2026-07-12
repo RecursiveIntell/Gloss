@@ -1,11 +1,10 @@
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useSourceStore } from "../../stores/sourceStore";
-import * as api from "../../lib/tauri";
-import type { MemoryBackendStatus, QueueStatus, SemanticMemoryProfileStatus } from "../../lib/types";
 import {
   Wifi, WifiOff, RefreshCw,
 } from "lucide-react";
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect } from "react";
+import { useHealthStore } from "../../stores/healthStore";
 
 /**
  * Diagnostics panel — shows provider health, model availability,
@@ -16,7 +15,6 @@ export function DiagnosticsPanel({ notebookId }: { notebookId: string }) {
   const activeModel = useSettingsStore((s) => s.activeModel);
   const models = useSettingsStore((s) => s.models);
   const settings = useSettingsStore((s) => s.settings);
-  const testProvider = useSettingsStore((s) => s.testProvider);
   const refreshModels = useSettingsStore((s) => s.refreshModels);
   const loading = useSettingsStore((s) => s.loading);
   const stats = useSourceStore((s) => s.stats);
@@ -30,31 +28,17 @@ export function DiagnosticsPanel({ notebookId }: { notebookId: string }) {
   const selectedModelAvailable = Boolean(activeModelRecord && activeModelRecord.available && !activeModelRecord.stale);
   const selectedModelError = activeModelRecord?.last_error ?? null;
 
-  const [chatConnected, setChatConnected] = useState<boolean | null>(null);
-  const [memoryStatus, setMemoryStatus] = useState<MemoryBackendStatus | null>(null);
-  const [profileStatus, setProfileStatus] = useState<SemanticMemoryProfileStatus | null>(null);
-  const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
+  const chatConnected = useHealthStore((s) => s.chatConnected);
+  const memoryStatus = useHealthStore((s) => s.memoryStatus);
+  const profileStatus = useHealthStore((s) => s.profileStatus);
+  const queueStatus = useHealthStore((s) => s.queueStatus);
+  const startHealthPolling = useHealthStore((s) => s.startPolling);
   const [refreshing, setRefreshing] = useState(false);
-  const pollEpochRef = useRef(0);
-
-  const poll = useCallback(() => {
-    const newEpoch = ++pollEpochRef.current;
-    if (activeProviderId) {
-      testProvider(activeProviderId).then((result) => { if (pollEpochRef.current === newEpoch) setChatConnected(result); }).catch((err) => { console.warn("testProvider failed:", err); if (pollEpochRef.current === newEpoch) setChatConnected(false); });
-    }
-    if (notebookId) {
-      api.memoryBackendStatus(notebookId).then((result) => { if (pollEpochRef.current === newEpoch) setMemoryStatus(result); }).catch((err) => { console.warn("memoryBackendStatus failed:", err); if (pollEpochRef.current === newEpoch) setMemoryStatus(null); });
-      api.getSemanticMemoryProfileStatus(notebookId, { kind: "all" }).then((result) => { if (pollEpochRef.current === newEpoch) setProfileStatus(result); }).catch((err) => { console.warn("profileStatus failed:", err); if (pollEpochRef.current === newEpoch) setProfileStatus(null); });
-      api.getQueueStatus().then((result) => { if (pollEpochRef.current === newEpoch) setQueueStatus(result); }).catch((err) => { console.warn("queueStatus failed:", err); if (pollEpochRef.current === newEpoch) setQueueStatus(null); });
-      useSourceStore.getState().loadStats(notebookId);
-    }
-  }, [activeProviderId, notebookId, testProvider]);
+  const poll = useHealthStore((s) => s.poll);
 
   useEffect(() => {
-    poll();
-    const interval = setInterval(poll, 10000);
-    return () => clearInterval(interval);
-  }, [poll]);
+    startHealthPolling(notebookId, activeProviderId);
+  }, [activeProviderId, notebookId, startHealthPolling]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -119,11 +103,19 @@ export function DiagnosticsPanel({ notebookId }: { notebookId: string }) {
         />
         {memoryStatus?.fallback_reason && (
           <div className="rounded bg-warning/10 px-2 py-1 text-warning">
-            Fallback: {memoryStatus.fallback_reason}
+            Fallback: {memoryStatus.fallback_reason_code ?? "unclassified"} · {memoryStatus.fallback_reason}
           </div>
         )}
         <KVRow label="Default" value={memoryStatus?.default_backend ?? "—"} />
         <KVRow label="Index sync" value={memoryStatus?.index_sync_status ?? "unknown"} />
+        {memoryStatus?.embedding_index_metadata?.map((metadata) => (
+          <KVRow
+            key={metadata.index_id}
+            label={metadata.index_id}
+            value={`${metadata.status} ${metadata.provider}:${metadata.model}${metadata.dimensions ? ` (${metadata.dimensions}d)` : ""}${metadata.status_reason ? ` - ${metadata.status_reason}` : ""}`}
+            warn={["stale", "blocked", "unknown"].includes(metadata.status)}
+          />
+        ))}
         {memoryStatus?.degradation_markers.length ? (
           <KVRow label="Degradation" value={memoryStatus.degradation_markers.join(", ")} warn />
         ) : null}

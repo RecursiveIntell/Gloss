@@ -361,7 +361,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     updateSetting,
     updateProvider,
     updateFeatureFlag,
-    setActiveModel,
+    selectModel,
     loadExternalTools,
   } = useSettingsStore();
   const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
@@ -506,9 +506,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   };
 
   const handleSelectModel = async (providerId: string, modelId: string) => {
-    setActiveModel(modelId);
-    await updateSetting("default_model", modelId);
-    await updateSetting("default_provider", providerId);
+    await selectModel(providerId, modelId);
   };
 
   const handleSelectMemoryBackend = async (backendId: string) => {
@@ -1044,6 +1042,23 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 )}
               </div>
             )}
+            {memoryStatus?.embedding_index_metadata?.length ? (
+              <div className="rounded border border-border bg-bg-tertiary/40 px-3 py-2 text-xs text-text-secondary">
+                <div className="grid gap-1 sm:grid-cols-2">
+                  {memoryStatus.embedding_index_metadata.map((metadata) => (
+                    <div key={metadata.index_id} className="min-w-0">
+                      <span className="text-text-muted">{metadata.index_id}</span>{" "}
+                      <span>{metadata.status}</span>{" "}
+                      <span>{metadata.provider}:{metadata.model}</span>{" "}
+                      <span>{metadata.dimensions ? `${metadata.dimensions}d` : "dims unknown"}</span>
+                      {metadata.status_reason && (
+                        <p className="truncate text-[11px] text-warning">{metadata.status_reason}</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             {memoryStatus?.fallback_reason && (
               <p className="rounded border border-warning/30 bg-warning/5 px-2 py-1 text-xs text-warning">
                 {memoryStatus.fallback_reason}

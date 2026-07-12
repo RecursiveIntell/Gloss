@@ -13,8 +13,9 @@ use crate::memory::gloss_local::GlossLocalMemoryBackend;
 #[cfg(feature = "semantic-memory-backend")]
 use crate::memory::semantic_memory_adapter;
 use crate::memory::{
-    compare_memory_backends_for_notebook, MemoryBackendComparison, MemoryBackendStatus,
-    MemorySearchRequest, RetrievalCoverage, SemanticMemoryLinkStatus, MEMORY_BACKEND_GLOSS_LOCAL,
+    compare_memory_backends_for_notebook, EmbeddingIndexStatusView, MemoryBackendComparison,
+    MemoryBackendStatus, MemorySearchRequest, RetrievalCoverage, RetrievalReasonCode,
+    SemanticMemoryLinkStatus, MEMORY_BACKEND_GLOSS_LOCAL,
 };
 use crate::redaction::redact_path;
 use crate::retrieval::source_scope::SourceScope;
@@ -589,6 +590,20 @@ fn run_ingestion_inner(
             if opts.save_index {
                 state.save_hnsw_index(notebook_id)?;
             }
+        } else if crate::state::NATIVE_SEMANTIC_INDEXING_ENABLED {
+            // Deferred indexing is a real queue lane, not a dormant job enum:
+            // callers that intentionally skip synchronous embeddings enqueue
+            // the same canonical dense artifact work for later execution.
+            let job = QueueJob::new(GlossJob::IndexChunks {
+                epoch: queue_epoch_for_notebook(state, notebook_id),
+                notebook_id: notebook_id.to_string(),
+                source_id: source_id.to_string(),
+                data_dir: state.data_dir.to_string_lossy().to_string(),
+            })
+            .with_priority(QueuePriority::Low);
+            queue.add(job).map_err(|error| {
+                GlossError::Other(format!("Failed to queue deferred chunk indexing: {error}"))
+            })?;
         }
 
         // Mark ready
@@ -4213,6 +4228,29 @@ pub async fn memory_backend_status(
         .as_deref()
         .map(|id| link_status_for_notebook(&state, id))
         .transpose()?;
+    let embedding_index_metadata = notebook_id
+        .as_deref()
+        .map(|id| {
+            state.with_notebook_db(id, |db| {
+                db.list_embedding_index_metadata().map(|rows| {
+                    rows.into_iter()
+                        .map(|row| EmbeddingIndexStatusView {
+                            index_id: row.index_id,
+                            provider: row.provider,
+                            model: row.model,
+                            model_digest: row.model_digest,
+                            dimensions: row.dimensions,
+                            schema_version: row.schema_version,
+                            status: row.status,
+                            status_reason: row.status_reason,
+                            validated_at: row.validated_at,
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     let index_sync_status = link_status
         .as_ref()
@@ -4231,14 +4269,36 @@ pub async fn memory_backend_status(
         .to_string();
     let mut degradation_markers = Vec::new();
     let mut fallback_reason = None;
+    let mut fallback_reason_code = None;
     if requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
         && !semantic_memory_available
     {
         fallback_reason = Some("semantic-memory-flag-off".to_string());
+        fallback_reason_code = Some(RetrievalReasonCode::SemanticMemoryFeatureDisabled);
         degradation_markers.push("semantic_memory_feature_disabled".to_string());
     }
     if index_sync_status == "failed" || index_sync_status == "degraded" {
         degradation_markers.push(format!("semantic-memory-sync-{index_sync_status}"));
+    }
+    for metadata in &embedding_index_metadata {
+        if matches!(metadata.status.as_str(), "stale" | "blocked" | "unknown") {
+            degradation_markers.push(format!(
+                "embedding-index-{}-{}",
+                metadata.index_id, metadata.status
+            ));
+            fallback_reason.get_or_insert_with(|| {
+                metadata.status_reason.clone().unwrap_or_else(|| {
+                    format!(
+                        "embedding index {} is {}",
+                        metadata.index_id, metadata.status
+                    )
+                })
+            });
+            fallback_reason_code.get_or_insert(match metadata.status.as_str() {
+                "stale" => RetrievalReasonCode::EmbeddingIndexMetadataStale,
+                _ => RetrievalReasonCode::EmbeddingIndexMetadataUnknown,
+            });
+        }
     }
 
     let degraded = fallback_reason.is_some() || !degradation_markers.is_empty();
@@ -4263,8 +4323,10 @@ pub async fn memory_backend_status(
         last_retrieval_receipt_id: None,
         last_receipt_ref: None,
         fallback_reason: fallback_reason.clone(),
+        fallback_reason_code,
         degradation_markers,
         backend_version_or_digest: None,
+        embedding_index_metadata,
         degraded,
         diagnostic: fallback_reason,
     })
@@ -4520,8 +4582,7 @@ pub async fn semantic_memory_vector_artifact_status(
     })
 }
 
-#[tauri::command]
-pub async fn compare_memory_backends(
+async fn compare_memory_backends(
     notebook_id: String,
     query: String,
     source_scope: SourceScope,
@@ -4603,7 +4664,7 @@ mod tests {
     use crate::db::notebook_db::NotebookDb;
     use crate::provider_config_store::SecretStore;
     use crate::providers::ModelRegistry;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -4647,10 +4708,14 @@ mod tests {
             llm_gate: tokio::sync::Semaphore::new(1),
             gpu_gate: tokio::sync::Semaphore::new(1),
             gate_owners: Mutex::new(HashMap::new()),
+            active_chat_attempts: Mutex::new(HashMap::new()),
+            active_studio_attempts: Mutex::new(HashMap::new()),
             active_notebook_id: Mutex::new(Some(notebook_id.clone())),
             active_epoch: AtomicU64::new(1),
             chat_grace_until: Mutex::new(0),
             last_user_activity: Mutex::new(0),
+            chat_stream_events: Mutex::new(VecDeque::new()),
+            chat_stream_next_seq: AtomicU64::new(1),
         };
 
         (dir, state, notebook_id)

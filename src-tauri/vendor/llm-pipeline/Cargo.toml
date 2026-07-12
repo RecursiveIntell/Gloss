@@ -18,6 +18,7 @@ openai = []
 
 [dependencies]
 llm-output-parser = { path = "../llm-output-parser" }
+llm-tool-runtime = { path = "../llm-tool-runtime" }
 stack-ids = { path = "../stack-ids" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -27,12 +28,14 @@ anyhow = "1"
 thiserror = "2"
 futures = "0.3"
 async-trait = "0.1"
+chrono = "0.4"
 fastrand = "2"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"
 
 [[example]]
 name = "basic_pipeline"

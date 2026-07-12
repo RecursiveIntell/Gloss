@@ -2,9 +2,23 @@
 //!
 //! Extracted from chat/mod.rs to reduce file size and improve cohesion.
 
-use crate::memory::{RetrievalCapabilityDecisionV1, RetrievalOutcome};
+use crate::memory::{RetrievalCapabilityDecisionV1, RetrievalOutcome, RetrievalReasonCode};
 use crate::retrieval::citations;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+pub(crate) type ChatAttemptId = String;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatStreamEventV1 {
+    pub seq: u64,
+    pub attempt_id: ChatAttemptId,
+    pub kind: String,
+    pub notebook_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub payload: serde_json::Value,
+    pub recorded_at: String,
+}
 
 // ---------------------------------------------------------------------------
 // Chat evidence disclosure
@@ -17,6 +31,7 @@ pub(crate) struct ChatEvidenceDisclosure {
     pub retrieval_mode: String,
     pub fallback_used: bool,
     pub fallback_reason: Option<String>,
+    pub fallback_reason_code: Option<RetrievalReasonCode>,
     pub degradation_markers: Vec<String>,
     pub source_scope_mode: String,
     pub requested_source_ids: Vec<String>,

@@ -64,12 +64,23 @@ impl SourceScope {
             },
             SourceScope::Explicit(ids) => {
                 let mut seen = HashSet::new();
-                let manifest_sources: Vec<Source> = ids
+                let requested_ids: Vec<&String> =
+                    ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+                let manifest_sources: Vec<Source> = requested_ids
                     .iter()
-                    .filter(|id| seen.insert(id.as_str()))
-                    .filter_map(|id| all_sources.iter().find(|source| source.id == *id).cloned())
+                    .filter_map(|id| {
+                        all_sources
+                            .iter()
+                            .find(|source| source.id == id.as_str())
+                            .cloned()
+                    })
                     .collect();
 
+                // Explicit means exactly this source set. If ALL requested IDs
+                // are invalid/stale, the scope is None — it must not quietly
+                // turn into a wider retrieval. If only SOME are invalid, we
+                // resolve to the valid subset; the invalid IDs are reported
+                // separately by invalid_requested_source_ids().
                 if manifest_sources.is_empty() {
                     return ResolvedSourceScope {
                         kind: ResolvedSourceScopeKind::None,
@@ -194,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_scope_with_one_valid_and_invalid_stays_bounded_to_valid() {
+    fn explicit_scope_with_one_valid_and_invalid_partially_resolves() {
         let all_sources = vec![source("a", "Alpha"), source("b", "Beta")];
 
         let resolved = SourceScope::Explicit(vec!["missing".to_string(), "a".to_string()])
@@ -202,7 +213,19 @@ mod tests {
 
         assert_eq!(resolved.kind(), ResolvedSourceScopeKind::Explicit);
         assert_eq!(resolved.source_ids(), &["a".to_string()]);
-        assert_eq!(resolved.manifest_sources().len(), 1);
+        assert!(resolved.allows("a"));
+        assert!(!resolved.allows("b"));
+    }
+
+    #[test]
+    fn explicit_scope_with_any_invalid_id_partially_resolves() {
+        let all_sources = vec![source("a", "Alpha"), source("b", "Beta")];
+
+        let resolved = SourceScope::Explicit(vec!["a".to_string(), "missing".to_string()])
+            .resolve(&all_sources);
+
+        assert_eq!(resolved.kind(), ResolvedSourceScopeKind::Explicit);
+        assert_eq!(resolved.source_ids(), &["a".to_string()]);
         assert!(resolved.allows("a"));
         assert!(!resolved.allows("b"));
     }

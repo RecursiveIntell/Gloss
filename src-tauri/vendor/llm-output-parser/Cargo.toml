@@ -7,6 +7,9 @@ license = "MIT"
 keywords = ["llm", "parser", "json", "ai", "langchain"]
 categories = ["parsing", "text-processing"]
 readme = "README.md"
+repository = "https://github.com/RecursiveIntell/Libraries"
+homepage = "https://github.com/RecursiveIntell/Libraries"
+documentation = "https://docs.rs/llm-output-parser"
 
 [features]
 default = []

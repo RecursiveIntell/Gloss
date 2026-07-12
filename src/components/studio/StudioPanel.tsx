@@ -7,6 +7,7 @@ import {
   HelpCircle,
   ListTree,
   Map,
+  OctagonX,
   Network,
   RefreshCw,
   Rows3,
@@ -23,6 +24,8 @@ import ReactMarkdown from "react-markdown";
 import { FlashcardWidget, parseCards } from "./FlashcardWidget";
 import { QuizWidget, parseQuiz } from "./QuizWidget";
 import { MindMapGraph, parseMindMap } from "./MindMapGraph";
+import { TimelineView } from "./TimelineView";
+import { DataTableView } from "./DataTableView";
 
 interface StudioPanelProps {
   notebookId: string;
@@ -43,17 +46,24 @@ const OUTPUT_TYPES = [
 
 export function StudioPanel({ notebookId }: StudioPanelProps) {
   const selectedSourceIds = useSourceStore((state) => state.selectedSourceIds);
+  const sources = useSourceStore((state) => state.sources);
+  const sourceListStatus = useSourceStore((state) => state.sourceListStatus);
+  const sourceListError = useSourceStore((state) => state.sourceListError);
+  const stats = useSourceStore((state) => state.stats);
   const {
     outputs,
     activeOutputType,
     activeOutputId,
     status,
+    generationPhase,
+    activeGeneration,
     error,
     lastExportReceipt,
     setActiveOutputType,
     setActiveOutputId,
     loadOutputs,
     generateOutput,
+    cancelGeneration,
     exportOutput,
   } = useStudioStore();
   const addToast = useToastStore((state) => state.addToast);
@@ -69,6 +79,46 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
   );
   const selectedIds = useMemo(() => Array.from(selectedSourceIds), [selectedSourceIds]);
   const busy = status === "loading" || status === "generating" || status === "exporting";
+  const readinessLabel = useMemo(() => {
+    if (sourceListStatus === "error") {
+      return `sources degraded: ${sourceListError ?? "list unavailable"}`;
+    }
+    if (sourceListStatus === "loading") {
+      return "checking sources";
+    }
+    const readyCount = sources.filter((source) => source.status === "ready").length;
+    const totalCount = stats?.source_count ?? sources.length;
+    if (selectedIds.length > 0) {
+      const selectedReady = sources.filter(
+        (source) => selectedSourceIds.has(source.id) && source.status === "ready"
+      ).length;
+      return `${selectedReady}/${selectedIds.length} selected ready`;
+    }
+    if (totalCount === 0) {
+      return "no sources ready";
+    }
+    return `${readyCount}/${totalCount} sources ready`;
+  }, [selectedIds.length, selectedSourceIds, sourceListError, sourceListStatus, sources, stats]);
+  const generationLabel = useMemo(() => {
+    switch (generationPhase) {
+      case "source_readiness":
+        return "checking source readiness";
+      case "provider_start":
+        return "provider starting";
+      case "first_token_wait":
+        return "waiting for first token";
+      case "streaming":
+        return "streaming provider output";
+      case "fallback":
+        return "deterministic fallback returned";
+      case "cancelled":
+        return "generation cancelled";
+      case "error":
+        return "generation failed";
+      default:
+        return null;
+    }
+  }, [generationPhase]);
 
   const handleGenerate = async () => {
     const output = await generateOutput(notebookId, activeOutputType, selectedIds, maxItems);
@@ -80,6 +130,10 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
         duration: 3000,
       });
     }
+  };
+
+  const handleCancel = async () => {
+    await cancelGeneration(notebookId);
   };
 
   const handleExport = async () => {
@@ -132,9 +186,20 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
             onChange={(event) => setMaxItems(Math.min(20, Math.max(1, Number(event.target.value) || 1)))}
             className="h-8 w-16 rounded border border-border bg-bg px-2 text-xs text-text"
           />
-          <span className="min-w-0 flex-1 truncate text-[11px] text-text-muted">
-            {selectedIds.length > 0 ? `${selectedIds.length} scoped` : "selected/all ready"}
+          <span className="min-w-0 flex-1 truncate text-[11px] text-text-muted" title={readinessLabel}>
+            {readinessLabel}
           </span>
+          {activeGeneration && (
+            <button
+              type="button"
+              onClick={handleCancel}
+              title="Cancel Studio generation"
+              className="flex h-8 items-center gap-1 rounded border border-error/50 bg-error/10 px-2 text-xs text-error hover:bg-error/20"
+            >
+              <OctagonX className="h-3.5 w-3.5" />
+              Cancel
+            </button>
+          )}
           <button
             type="button"
             onClick={handleGenerate}
@@ -150,6 +215,12 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
       {error && (
         <div className="border-b border-error/30 bg-error/10 px-3 py-2 text-xs text-error">
           {error}
+        </div>
+      )}
+      {generationLabel && (
+        <div className="border-b border-border bg-bg-tertiary px-3 py-1.5 text-[11px] text-text-muted">
+          <span>{generationLabel}</span>
+          {activeGeneration && <span className="ml-2 gloss-mono">{activeGeneration.attemptId}</span>}
         </div>
       )}
 
@@ -193,6 +264,11 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
             <StudioOutputBody output={activeOutput} />
             <div className="border-t border-border px-3 py-1.5 text-[10px] text-text-muted">
               <span className="gloss-mono">sources {activeOutput.source_ids.length}</span>
+              {activeOutput.config?.fallback_receipt && (
+                <span className="ml-2 gloss-mono">
+                  fallback {activeOutput.config.fallback_receipt.reason_code}
+                </span>
+              )}
               {activeOutput.file_path && <span className="ml-2 truncate">export {activeOutput.file_path}</span>}
               {lastExportReceipt?.output_id === activeOutput.id && (
                 <span className="ml-2 gloss-mono">sha {lastExportReceipt.sha256.slice(0, 12)}</span>
@@ -249,6 +325,16 @@ function StudioOutputBody({ output }: { output: StudioOutput }) {
         <MindMapGraph output={output} />
       </div>
     );
+  }
+
+  // Timeline renderer
+  if (output.output_type === "timeline") {
+    return <TimelineView output={output} />;
+  }
+
+  // Data Table renderer
+  if (output.output_type === "compare_table") {
+    return <DataTableView output={output} />;
   }
 
   // LLM-refined prose takes priority — full width, no sidebar

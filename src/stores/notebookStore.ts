@@ -20,10 +20,16 @@ interface NotebookStore {
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
 
+function readActiveNotebookId(): string | null {
+  return typeof globalThis.localStorage === 'undefined'
+    ? null
+    : globalThis.localStorage.getItem(ACTIVE_NB_KEY);
+}
+
 export const useNotebookStore = create<NotebookStore>((set, get) => ({
   notebooks: [],
-  activeNotebookId: localStorage.getItem(ACTIVE_NB_KEY),
-  activationStatus: localStorage.getItem(ACTIVE_NB_KEY) ? 'pending' : 'idle',
+  activeNotebookId: readActiveNotebookId(),
+  activationStatus: readActiveNotebookId() ? 'pending' : 'idle',
   loading: false,
 
   loadNotebooks: async () => {

@@ -1,0 +1,42 @@
+# Security policy for the resolved Rust workspace graph. Keep vulnerability and
+# unsoundness advisories as errors; only informational maintenance notices warn.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# The Linux Tauri/Wry stack still pulls GTK3 bindings transitively. These are
+# explicitly warnings, not ignored, until Tauri upstream removes the GTK3 path.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-2.1-or-later",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

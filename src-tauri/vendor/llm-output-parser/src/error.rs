@@ -164,11 +164,15 @@ pub(crate) fn record_extracted_span(trace: &mut ParseTrace, cleaned: &str, extra
 }
 
 /// Truncate a string to at most `max_len` characters, appending "..." if truncated.
+/// Uses char-wise iteration to preserve UTF-8 codepoint boundaries and prevent panics
+/// on multi-byte characters (em-dashes, CJK, emoji, etc.).
 #[allow(dead_code)]
 pub(crate) fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let mut chars = s.chars();
+    if chars.by_ref().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{}...", truncated)
     }
 }

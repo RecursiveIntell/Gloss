@@ -143,15 +143,19 @@ impl OpenAiBackend {
         None
     }
 
-    /// Build the reqwest request with appropriate headers.
+    /// Build the reqwest request with appropriate headers and optional per-request timeout.
     fn build_http_request(
         &self,
         client: &Client,
         url: &str,
         body: &Value,
+        request_timeout: Option<std::time::Duration>,
     ) -> reqwest::RequestBuilder {
         let mut req = client.post(url).json(body);
 
+        if let Some(timeout) = request_timeout {
+            req = req.timeout(timeout);
+        }
         if let Some(ref key) = self.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
@@ -201,7 +205,7 @@ impl Backend for OpenAiBackend {
         let body = Self::build_body(request, false);
 
         let resp = self
-            .build_http_request(client, &url, &body)
+            .build_http_request(client, &url, &body, request.request_timeout)
             .send()
             .await
             .map_err(|e| {
@@ -254,7 +258,7 @@ impl Backend for OpenAiBackend {
         let body = Self::build_body(request, true);
 
         let resp = self
-            .build_http_request(client, &url, &body)
+            .build_http_request(client, &url, &body, request.request_timeout)
             .send()
             .await
             .map_err(|e| {
@@ -341,6 +345,7 @@ mod tests {
             messages: Vec::new(),
             config: LlmConfig::default(),
             stream: false,
+            request_timeout: None,
         }
     }
 
@@ -418,7 +423,12 @@ mod tests {
         let client = Client::new();
         let body = json!({"test": true});
         let req = backend
-            .build_http_request(&client, "https://api.openai.com/v1/chat/completions", &body)
+            .build_http_request(
+                &client,
+                "https://api.openai.com/v1/chat/completions",
+                &body,
+                None,
+            )
             .build()
             .expect("build request");
 
@@ -439,7 +449,12 @@ mod tests {
         let client = Client::new();
         let body = json!({"test": true});
         let req = backend
-            .build_http_request(&client, "https://api.openai.com/v1/chat/completions", &body)
+            .build_http_request(
+                &client,
+                "https://api.openai.com/v1/chat/completions",
+                &body,
+                None,
+            )
             .build()
             .expect("build request");
 

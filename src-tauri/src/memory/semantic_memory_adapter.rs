@@ -1,4 +1,7 @@
-use crate::db::notebook_db::{Chunk, NotebookDb, SemanticMemoryProjectionStatusUpdate, Source};
+use crate::db::notebook_db::{
+    Chunk, EmbeddingIndexMetadata, EmbeddingIndexMetadataStatus, NotebookDb,
+    SemanticMemoryProjectionStatusUpdate, Source, SEMANTIC_MEMORY_INDEX_ID,
+};
 use crate::error::GlossError;
 use crate::memory::backend::{
     excluded_source_count, filter_semantic_candidates_by_scope, invalid_requested_source_ids,
@@ -8,9 +11,8 @@ use crate::memory::types::{
     IndexSourceReceipt, MemorySearchRequest, MemorySearchResponse, SemanticCandidateEnvelope,
     SemanticLinkRow, MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
 };
-use crate::redaction::redact_path;
 use crate::retrieval::source_scope::ResolvedSourceScope;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::NomicV2MoeTextEmbedding;
 use semantic_memory::embedder::{EmbedBatchFuture, EmbedFuture};
 use semantic_memory::{
     ChunkManifestEntry, ChunkManifestIngestOptions, Embedder, EmbeddingConfig, MemoryConfig,
@@ -18,20 +20,19 @@ use semantic_memory::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const BACKEND_VERSION: &str = "semantic-memory 0.5.0";
-// User-forbidden: in-process FastEmbed crashes Gloss on batch imports.
-// Default and migrations now route everything to Ollama (out-of-process).
-// The FastEmbed variant is kept for tests that explicitly construct it
-// under the `fastembed-backend` feature flag, but it is never the default.
-const DEFAULT_EMBEDDING_PROVIDER: EmbeddingProviderKind = EmbeddingProviderKind::Ollama;
-const FASTEMBED_MODEL_NAME: &str = "fastembed:NomicEmbedTextV15";
-const FASTEMBED_DIMENSIONS: usize = 768;
-const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL: &str = "http://localhost:11434";
-const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL: &str = "nomic-embed-text";
+// FastEmbed is now the only embedding provider (Nomic v2 MoE, 768d, candle-based).
+// The previous Ollama default was changed to avoid ort version conflicts with TTS.
+const DEFAULT_EMBEDDING_PROVIDER: EmbeddingProviderKind = EmbeddingProviderKind::FastEmbed;
+pub(crate) const FASTEMBED_MODEL_NAME: &str = "nomic-ai/nomic-embed-text-v1.5";
+pub(crate) const FASTEMBED_DIMENSIONS: usize = 768;
+pub(crate) const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL: &str = "http://localhost:11434";
+pub(crate) const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL: &str = "nomic-embed-text";
 const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS: u64 = 10;
 // Projection batch cap. all-minilm (and similar 384-dim embedders) handle
 // 32 chunks/batch comfortably. The previous cap of 4 was 8x too conservative
@@ -64,24 +65,41 @@ impl EmbeddingProviderKind {
 }
 
 struct FastEmbedSemanticMemoryEmbedder {
-    model: Arc<Mutex<TextEmbedding>>,
+    model: Arc<Mutex<NomicV2MoeTextEmbedding>>,
     model_name: String,
     dimensions: usize,
 }
 
 impl FastEmbedSemanticMemoryEmbedder {
-    fn try_new(cache_dir: PathBuf, download_consent: bool) -> Result<Self, GlossError> {
-        std::fs::create_dir_all(&cache_dir).map_err(|e| {
-            GlossError::Embedding(format!(
-                "Failed to create FastEmbed cache directory {}: {e}",
-                redact_path(&cache_dir)
-            ))
-        })?;
-        crate::ingestion::embed::require_fastembed_download_consent(&cache_dir, download_consent)?;
-        let options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15).with_cache_dir(cache_dir);
-        let model = TextEmbedding::try_new(options).map_err(|e| {
-            GlossError::Embedding(format!("Failed to initialize FastEmbed model: {e}"))
-        })?;
+    fn try_new(_cache_dir: PathBuf, download_consent: bool) -> Result<Self, GlossError> {
+        // For candle backend, we don't use the cache_dir parameter.
+        // The model downloads to ~/.cache/huggingface/hub automatically.
+        if !download_consent {
+            // Check HF cache for existing model
+            let hf_cache = directories::ProjectDirs::from("com", "gloss", "gloss")
+                .map(|p| p.cache_dir().to_path_buf())
+                .unwrap_or_else(|| std::env::temp_dir().to_path_buf())
+                .join("huggingface")
+                .join("hub");
+            if !hf_cache
+                .join("models--nomic-ai--nomic-embed-text-v1.5")
+                .exists()
+            {
+                return Err(GlossError::Embedding(
+                    "FastEmbed download consent required for first-time model download".into(),
+                ));
+            }
+        }
+
+        let device = candle_core::Device::Cpu;
+        let model = NomicV2MoeTextEmbedding::from_hf(
+            "nomic-ai/nomic-embed-text-v1.5",
+            &device,
+            candle_core::DType::F32,
+            2048,
+        )
+        .map_err(|e| GlossError::Embedding(format!("Failed to initialize NomicV2Moe: {e}")))?;
+
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
             model_name: FASTEMBED_MODEL_NAME.to_string(),
@@ -107,9 +125,11 @@ impl Embedder for FastEmbedSemanticMemoryEmbedder {
                 let model = model.lock().map_err(|e| {
                     MemoryError::Other(format!("FastEmbed model lock poisoned: {e}"))
                 })?;
+                // Convert Vec<String> to &[&str] for NomicV2MoeTextEmbedding
+                let texts_ref: Vec<&str> = texts.iter().map(String::as_str).collect();
                 model
-                    .embed(texts, None)
-                    .map_err(|e| MemoryError::Other(format!("FastEmbed embedding failed: {e}")))
+                    .embed(&texts_ref)
+                    .map_err(|e| MemoryError::Other(format!("NomicV2Moe embedding failed: {e}")))
             })
             .await
             .map_err(|e| MemoryError::Other(format!("FastEmbed task failed: {e}")))?
@@ -176,7 +196,7 @@ impl Default for SemanticMemoryRuntimeConfig {
         Self {
             embedding_provider: DEFAULT_EMBEDDING_PROVIDER,
             embedding_ollama_url: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL.to_string(),
-            embedding_model: FASTEMBED_MODEL_NAME.to_string(),
+            embedding_model: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL.to_string(),
             embedding_timeout_secs: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS,
             fastembed_download_consent: false,
             turbo_quant_enabled: false,
@@ -228,19 +248,12 @@ pub fn validate_embedding_model_role(
     if config.embedding_provider == EmbeddingProviderKind::FastEmbed {
         return Ok(());
     }
-    let model = config.embedding_model.trim().to_ascii_lowercase();
-    let looks_embedding_capable = model.contains("embed")
-        || model.contains("nomic")
-        || model.contains("bge")
-        || model.contains("e5")
-        || model.contains("gte");
-    if looks_embedding_capable {
-        return Ok(());
+    if config.embedding_model.trim().is_empty() {
+        return Err(GlossError::Search(
+            "semantic-memory projection requires a configured Ollama embedding model".to_string(),
+        ));
     }
-    Err(GlossError::Search(format!(
-        "semantic-memory projection rejects chat-only model as embedder: {}",
-        config.embedding_model
-    )))
+    Ok(())
 }
 
 pub fn semantic_memory_base_dir(data_dir: &Path, notebook_id: &str) -> PathBuf {
@@ -253,6 +266,51 @@ pub fn content_digest(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn embedding_identity_digest(provider: &str, url: &str, model: &str, dimensions: usize) -> String {
+    let mut hasher = Sha256::new();
+    let dimensions = dimensions.to_string();
+    for part in [provider, url, model, dimensions.as_str()] {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn expected_embedding_index_metadata(
+    runtime_config: &SemanticMemoryRuntimeConfig,
+) -> Result<EmbeddingIndexMetadata, GlossError> {
+    let dimensions = match runtime_config.embedding_provider {
+        EmbeddingProviderKind::FastEmbed => FASTEMBED_DIMENSIONS,
+        EmbeddingProviderKind::Ollama => probe_ollama_embedding_dimension(runtime_config)?,
+    };
+    let provider = match runtime_config.embedding_provider {
+        EmbeddingProviderKind::FastEmbed => "fastembed",
+        EmbeddingProviderKind::Ollama => "ollama",
+    };
+    let model = if runtime_config.embedding_provider == EmbeddingProviderKind::FastEmbed {
+        FASTEMBED_MODEL_NAME.to_string()
+    } else {
+        runtime_config.embedding_model.clone()
+    };
+    let url = if runtime_config.embedding_provider == EmbeddingProviderKind::Ollama {
+        runtime_config
+            .embedding_ollama_url
+            .trim_end_matches('/')
+            .to_string()
+    } else {
+        "fastembed-cache".to_string()
+    };
+    Ok(EmbeddingIndexMetadata::ready(
+        SEMANTIC_MEMORY_INDEX_ID,
+        provider,
+        model.clone(),
+        Some(embedding_identity_digest(
+            provider, &url, &model, dimensions,
+        )),
+        dimensions,
+    ))
+}
+
 fn open_store(
     base_dir: PathBuf,
     runtime_config: Option<&SemanticMemoryRuntimeConfig>,
@@ -263,12 +321,10 @@ fn open_store(
     };
     if let Some(runtime_config) = runtime_config {
         let defaults = EmbeddingConfig::default();
-        config.embedding.dimensions =
-            if runtime_config.embedding_provider == EmbeddingProviderKind::FastEmbed {
-                FASTEMBED_DIMENSIONS
-            } else {
-                defaults.dimensions
-            };
+        config.embedding.dimensions = match runtime_config.embedding_provider {
+            EmbeddingProviderKind::FastEmbed => FASTEMBED_DIMENSIONS,
+            EmbeddingProviderKind::Ollama => probe_ollama_embedding_dimension(runtime_config)?,
+        };
         config.embedding.ollama_url = if runtime_config.embedding_ollama_url.trim().is_empty() {
             defaults.ollama_url
         } else {
@@ -314,6 +370,128 @@ fn open_store(
         EmbeddingProviderKind::Ollama => MemoryStore::open(config)
             .map_err(|e| GlossError::Search(format!("semantic-memory: {e}"))),
     }
+}
+
+pub(crate) fn probe_ollama_embedding_dimension(
+    runtime_config: &SemanticMemoryRuntimeConfig,
+) -> Result<usize, GlossError> {
+    fn block_on_probe<F, T>(future: F) -> Result<T, GlossError>
+    where
+        F: Future<Output = Result<T, reqwest::Error>>,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+            Err(_) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        GlossError::Embedding(format!("probe runtime build failed: {e}"))
+                    })?;
+                runtime.block_on(future)
+            }
+        }
+        .map_err(|e| GlossError::Embedding(format!("Ollama embedding dimension probe failed: {e}")))
+    }
+
+    fn embedding_dimension_from_embed_response(
+        json: &serde_json::Value,
+    ) -> Result<usize, GlossError> {
+        json.get("embeddings")
+            .and_then(|value| value.as_array())
+            .and_then(|embeddings| embeddings.first())
+            .and_then(|embedding| embedding.as_array())
+            .map(Vec::len)
+            .filter(|dimension| *dimension > 0)
+            .ok_or_else(|| {
+                GlossError::Embedding(
+                    "Ollama /api/embed dimension probe returned no embedding vector".to_string(),
+                )
+            })
+    }
+
+    fn embedding_dimension_from_show_value(value: &serde_json::Value) -> Option<usize> {
+        match value {
+            serde_json::Value::Number(number) => number.as_u64().and_then(|v| {
+                if v > 0 && v <= usize::MAX as u64 {
+                    Some(v as usize)
+                } else {
+                    None
+                }
+            }),
+            serde_json::Value::Array(values) => {
+                values.iter().find_map(embedding_dimension_from_show_value)
+            }
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    let key = key.to_ascii_lowercase();
+                    if key.ends_with("embedding_length")
+                        || key.ends_with("embedding_dimensions")
+                        || key == "dimensions"
+                    {
+                        if let Some(dimension) = embedding_dimension_from_show_value(value) {
+                            return Some(dimension);
+                        }
+                    }
+                }
+                map.values().find_map(embedding_dimension_from_show_value)
+            }
+            _ => None,
+        }
+    }
+
+    let timeout = Duration::from_secs(runtime_config.embedding_timeout_secs.clamp(2, 300));
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| GlossError::Embedding(format!("HTTP client build failed: {e}")))?;
+    let url = runtime_config.embedding_ollama_url.trim_end_matches('/');
+    let body = serde_json::json!({
+        "model": runtime_config.embedding_model,
+        "input": "semantic-memory-dimension-probe"
+    });
+    let embed_error =
+        match block_on_probe(client.post(format!("{url}/api/embed")).json(&body).send()) {
+            Ok(response) if response.status().is_success() => {
+                let json = block_on_probe(response.json::<serde_json::Value>()).map_err(|e| {
+                    GlossError::Embedding(format!(
+                        "Ollama /api/embed dimension probe parse failed: {e}"
+                    ))
+                })?;
+                return embedding_dimension_from_embed_response(&json);
+            }
+            Ok(response) => format!("HTTP {}", response.status()),
+            Err(err) => err.to_string(),
+        };
+
+    let show_body = serde_json::json!({
+        "model": runtime_config.embedding_model
+    });
+    let show_response = block_on_probe(
+        client
+            .post(format!("{url}/api/show"))
+            .json(&show_body)
+            .send(),
+    )?;
+    if !show_response.status().is_success() {
+        return Err(GlossError::Embedding(format!(
+            "Ollama embedding dimension probe failed: /api/embed {}; /api/show HTTP {}",
+            embed_error,
+            show_response.status()
+        )));
+    }
+    let show_json = block_on_probe(show_response.json::<serde_json::Value>()).map_err(|e| {
+        GlossError::Embedding(format!(
+            "Ollama /api/show dimension probe parse failed: {e}"
+        ))
+    })?;
+    embedding_dimension_from_show_value(&show_json).ok_or_else(|| {
+        GlossError::Embedding(format!(
+            "Ollama embedding dimension probe failed: /api/embed {}; /api/show returned no embedding_length metadata",
+            embed_error
+        ))
+    })
 }
 
 #[cfg(feature = "semantic-memory-turbo-quant")]
@@ -365,14 +543,19 @@ fn upsert_failed_link_rows(
         nb_db.conn().execute(
             "INSERT INTO semantic_memory_links
              (chunk_id, notebook_id, source_id, sm_document_id, sm_chunk_id, sm_episode_id,
+              gloss_chunk_id, projection_unit_id, projection_unit_kind, projection_unit_ordinal,
               content_digest, backend_version, sync_status, sync_error, synced_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(chunk_id) DO UPDATE SET
                 notebook_id = excluded.notebook_id,
                 source_id = excluded.source_id,
                 sm_document_id = excluded.sm_document_id,
                 sm_chunk_id = excluded.sm_chunk_id,
                 sm_episode_id = excluded.sm_episode_id,
+                gloss_chunk_id = excluded.gloss_chunk_id,
+                projection_unit_id = excluded.projection_unit_id,
+                projection_unit_kind = excluded.projection_unit_kind,
+                projection_unit_ordinal = excluded.projection_unit_ordinal,
                 content_digest = excluded.content_digest,
                 backend_version = excluded.backend_version,
                 sync_status = excluded.sync_status,
@@ -385,6 +568,10 @@ fn upsert_failed_link_rows(
                 Option::<&str>::None,
                 Option::<&str>::None,
                 sm_episode_id,
+                chunk.id,
+                chunk.id,
+                "chunk",
+                Option::<i64>::None,
                 content_digest(&chunk.content),
                 BACKEND_VERSION,
                 "failed",
@@ -494,14 +681,19 @@ fn upsert_synced_link_rows(
         nb_db.conn().execute(
             "INSERT INTO semantic_memory_links
              (chunk_id, notebook_id, source_id, sm_document_id, sm_chunk_id, sm_episode_id,
+              gloss_chunk_id, projection_unit_id, projection_unit_kind, projection_unit_ordinal,
               content_digest, backend_version, sync_status, sync_error, synced_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'synced', NULL, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'synced', NULL, ?13)
              ON CONFLICT(chunk_id) DO UPDATE SET
                 notebook_id = excluded.notebook_id,
                 source_id = excluded.source_id,
                 sm_document_id = excluded.sm_document_id,
                 sm_chunk_id = excluded.sm_chunk_id,
                 sm_episode_id = excluded.sm_episode_id,
+                gloss_chunk_id = excluded.gloss_chunk_id,
+                projection_unit_id = excluded.projection_unit_id,
+                projection_unit_kind = excluded.projection_unit_kind,
+                projection_unit_ordinal = excluded.projection_unit_ordinal,
                 content_digest = excluded.content_digest,
                 backend_version = excluded.backend_version,
                 sync_status = excluded.sync_status,
@@ -514,6 +706,10 @@ fn upsert_synced_link_rows(
                 sm_document_id,
                 sm_chunk_id,
                 Option::<&str>::None,
+                chunk.id,
+                chunk.id,
+                "chunk",
+                Option::<i64>::None,
                 digest,
                 BACKEND_VERSION,
                 now,
@@ -562,14 +758,19 @@ fn upsert_synced_subchunk_link_rows(
         nb_db.conn().execute(
             "INSERT INTO semantic_memory_links
              (chunk_id, notebook_id, source_id, sm_document_id, sm_chunk_id, sm_episode_id,
+              gloss_chunk_id, projection_unit_id, projection_unit_kind, projection_unit_ordinal,
               content_digest, backend_version, sync_status, sync_error, synced_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'synced', NULL, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'synced', NULL, ?13)
              ON CONFLICT(chunk_id) DO UPDATE SET
                 notebook_id = excluded.notebook_id,
                 source_id = excluded.source_id,
                 sm_document_id = excluded.sm_document_id,
                 sm_chunk_id = excluded.sm_chunk_id,
                 sm_episode_id = excluded.sm_episode_id,
+                gloss_chunk_id = excluded.gloss_chunk_id,
+                projection_unit_id = excluded.projection_unit_id,
+                projection_unit_kind = excluded.projection_unit_kind,
+                projection_unit_ordinal = excluded.projection_unit_ordinal,
                 content_digest = excluded.content_digest,
                 backend_version = excluded.backend_version,
                 sync_status = excluded.sync_status,
@@ -582,6 +783,10 @@ fn upsert_synced_subchunk_link_rows(
                 sm_document_id,
                 sm_chunk_id,
                 Option::<&str>::None,
+                subchunk.parent_chunk_id,
+                subchunk.gloss_subchunk_id,
+                "projection_unit_subchunk",
+                i64::try_from(subchunk.ordinal).ok(),
                 digest,
                 BACKEND_VERSION,
                 now,
@@ -666,7 +871,9 @@ fn projection_subchunk_manifest_entries(
             token_count_estimate: Some(subchunk.token_count_estimate),
             content_digest: Some(content_digest(&subchunk.content)),
             metadata: Some(serde_json::json!({
-                "gloss_chunk_id": subchunk.gloss_subchunk_id,
+                "gloss_chunk_id": subchunk.parent_chunk_id,
+                "gloss_projection_unit_id": subchunk.gloss_subchunk_id,
+                "gloss_projection_unit_kind": "projection_unit_subchunk",
                 "gloss_parent_chunk_id": subchunk.parent_chunk_id,
                 "gloss_source_id": subchunk.source_id,
                 "gloss_chunk_index": subchunk.chunk_index,
@@ -838,6 +1045,42 @@ pub async fn reindex_source_with_options(
             None,
         )?;
     }
+
+    let expected_embedding_metadata = if let Some(config) = runtime_config.as_ref() {
+        match expected_embedding_index_metadata(config) {
+            Ok(mut metadata) => {
+                metadata.status = EmbeddingIndexMetadataStatus::Building.as_str().to_string();
+                let nb_db = NotebookDb::connect(notebook_db_path)?;
+                nb_db.upsert_embedding_index_metadata(&metadata)?;
+                metadata.status = EmbeddingIndexMetadataStatus::Ready.as_str().to_string();
+                Some(metadata)
+            }
+            Err(error) => {
+                let reason = format!("embedding-index-blocked: {error}");
+                let nb_db = NotebookDb::connect(notebook_db_path)?;
+                nb_db.mark_embedding_index_status(
+                    SEMANTIC_MEMORY_INDEX_ID,
+                    EmbeddingIndexMetadataStatus::Blocked,
+                    Some(&reason),
+                )?;
+                upsert_projection_status(
+                    &nb_db,
+                    notebook_id,
+                    source_id,
+                    "failed",
+                    chunks.len(),
+                    0,
+                    0,
+                    chunks.len(),
+                    Some(receipt_id.clone()),
+                    Some(reason.clone()),
+                )?;
+                return Err(GlossError::Embedding(reason));
+            }
+        }
+    } else {
+        None
+    };
 
     let store = open_store(
         semantic_memory_base_dir(data_dir, notebook_id),
@@ -1106,6 +1349,10 @@ pub async fn reindex_source_with_options(
     } else {
         None
     };
+    if let Some(metadata) = expected_embedding_metadata.as_ref() {
+        let nb_db = NotebookDb::connect(notebook_db_path)?;
+        nb_db.upsert_embedding_index_metadata(metadata)?;
+    }
 
     Ok(IndexSourceReceipt {
         backend_id: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
@@ -1173,6 +1420,7 @@ pub async fn search_preview(
     all_sources: &[Source],
     request: MemorySearchRequest,
     runtime_config: Option<SemanticMemoryRuntimeConfig>,
+    stored_embedding_metadata: Option<EmbeddingIndexMetadata>,
 ) -> Result<MemorySearchResponse, GlossError> {
     let resolved_scope: ResolvedSourceScope = request.source_scope.resolve(all_sources);
     let requested_ids = requested_source_ids(&request);
@@ -1204,11 +1452,38 @@ pub async fn search_preview(
                 "reason": "source scope resolved to none"
             }),
             fallback_reason: None,
+            fallback_reason_code: None,
             degradation_markers: Vec::new(),
             source_scope_preserved,
             fallback_used: false,
             degraded: false,
         });
+    }
+
+    if let Some(runtime_config) = runtime_config.as_ref() {
+        let expected_metadata = expected_embedding_index_metadata(runtime_config)?;
+        match stored_embedding_metadata.as_ref() {
+            Some(stored) if stored.identity_matches(&expected_metadata) => {}
+            Some(stored) => {
+                return Err(GlossError::Search(format!(
+                    "embedding-index-stale: semantic-memory metadata {}/{}/{:?}/{} does not match active {}/{}/{:?}/{}",
+                    stored.provider,
+                    stored.model,
+                    stored.dimensions,
+                    stored.status,
+                    expected_metadata.provider,
+                    expected_metadata.model,
+                    expected_metadata.dimensions,
+                    expected_metadata.status
+                )));
+            }
+            None => {
+                return Err(GlossError::Search(
+                    "embedding-index-unknown: semantic-memory index has no durable metadata"
+                        .to_string(),
+                ));
+            }
+        }
     }
 
     let store = open_store(
@@ -1333,6 +1608,7 @@ pub async fn search_preview(
             "source_scope_preserved": source_scope_preserved
         }),
         fallback_reason: None,
+        fallback_reason_code: None,
         degradation_markers,
         source_scope_preserved,
         fallback_used: false,
@@ -1344,6 +1620,10 @@ pub async fn search_preview(
 mod tests {
     use super::*;
     use crate::retrieval::source_scope::SourceScope;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
     use tempfile::tempdir;
 
     fn test_source(id: &str) -> Source {
@@ -1369,22 +1649,114 @@ mod tests {
         }
     }
 
+    fn test_runtime_config(base_url: String) -> SemanticMemoryRuntimeConfig {
+        SemanticMemoryRuntimeConfig {
+            embedding_provider: EmbeddingProviderKind::Ollama,
+            embedding_ollama_url: base_url,
+            embedding_model: "bge-m3".to_string(),
+            embedding_timeout_secs: 2,
+            fastembed_download_consent: false,
+            turbo_quant_enabled: false,
+            turbo_quant_require_fresh_artifacts: true,
+            provekv_pool_enabled: false,
+        }
+    }
+
+    fn mock_ollama_server(
+        responses: Vec<(u16, String)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("<unknown>")
+                    .to_string();
+                captured.lock().unwrap().push(path);
+                let reason = if status == 200 { "OK" } else { "ERROR" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{addr}"), requests, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ollama_dimension_probe_uses_api_embed_vector_length() {
+        let body = serde_json::json!({
+            "embeddings": [vec![0.0f32; 1024]]
+        })
+        .to_string();
+        let (base_url, requests, handle) = mock_ollama_server(vec![(200, body)]);
+
+        let dimensions = probe_ollama_embedding_dimension(&test_runtime_config(base_url)).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(dimensions, 1024);
+        assert_eq!(requests.lock().unwrap().as_slice(), ["/api/embed"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ollama_dimension_probe_falls_back_to_api_show_embedding_length() {
+        let show_body = serde_json::json!({
+            "model_info": {
+                "nomic.embedding_length": 768
+            }
+        })
+        .to_string();
+        let (base_url, requests, handle) = mock_ollama_server(vec![
+            (500, "{\"error\":\"embed failed\"}".to_string()),
+            (200, show_body),
+        ]);
+
+        let dimensions = probe_ollama_embedding_dimension(&test_runtime_config(base_url)).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(dimensions, 768);
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            ["/api/embed", "/api/show"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ollama_dimension_probe_reports_both_failures_without_default_dimension() {
+        let (base_url, _requests, handle) = mock_ollama_server(vec![
+            (500, "{\"error\":\"embed failed\"}".to_string()),
+            (500, "{\"error\":\"show failed\"}".to_string()),
+        ]);
+
+        let error = probe_ollama_embedding_dimension(&test_runtime_config(base_url))
+            .expect_err("both probe paths failing must not use a default dimension")
+            .to_string();
+        handle.join().unwrap();
+
+        assert!(error.contains("/api/embed"));
+        assert!(error.contains("/api/show"));
+        assert!(!error.contains("384"));
+        assert!(!error.contains("768"));
+    }
+
     #[test]
     fn runtime_config_defaults_turbo_quant_off() {
         let config =
             runtime_config_from_settings(None, None, None, None, false, false, true, false);
-        // v3 default: Ollama (out-of-process, crash-isolated). The previous
-        // default of FastEmbed was removed because in-process ONNX was
-        // killing Gloss on batch imports (per hostile audit A1).
-        assert_eq!(config.embedding_provider, EmbeddingProviderKind::Ollama);
-        assert_eq!(
-            config.embedding_ollama_url,
-            DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL
-        );
-        assert_eq!(
-            config.embedding_model,
-            DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL
-        );
+        // FastEmbed is now the default (Nomic v2 MoE via candle, 768d).
+        // The Ollama default was removed because we now require FastEmbed-only
+        // to avoid ONNX/candle conflicts with TTS (any-tts).
+        assert_eq!(config.embedding_provider, EmbeddingProviderKind::FastEmbed);
         assert_eq!(
             config.embedding_timeout_secs,
             DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS
@@ -1573,6 +1945,10 @@ mod tests {
             let db = NotebookDb::connect(&db_path)?;
             load_links(&db)?
         };
+        let stored_embedding_metadata = {
+            let db = NotebookDb::connect(&db_path)?;
+            db.embedding_index_metadata(SEMANTIC_MEMORY_INDEX_ID)?
+        };
         let response = search_preview(
             dir.path(),
             notebook_id,
@@ -1587,6 +1963,7 @@ mod tests {
                 allow_fallback: false,
             },
             Some(runtime_config),
+            stored_embedding_metadata,
         )
         .await?;
         if response.candidates.is_empty() {

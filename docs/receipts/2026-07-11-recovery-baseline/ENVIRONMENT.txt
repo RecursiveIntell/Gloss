@@ -1,0 +1,6 @@
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+v26.0.0
+11.12.1
+Python 3.14.6
+Linux nobara-pc 7.0.9-200.nobara.fc43.x86_64 #1 SMP PREEMPT_DYNAMIC Sun May 17 16:46:25 UTC 2026 x86_64 GNU/Linux

@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { useSourceStore } from '../sourceStore';
+import { useNotebookStore } from '../notebookStore';
+import * as api from '../../lib/tauri';
 
 // Mock the Tauri API layer
 vi.mock('../../lib/tauri', () => ({
@@ -32,6 +34,7 @@ vi.mock('../chatStore', () => ({
 // Mock notebookRefresh
 vi.mock('../notebookRefresh', () => ({
   refreshNotebookList: vi.fn().mockResolvedValue(undefined),
+  registerNotebookListRefresher: vi.fn(),
 }));
 
 // Mock localStorage
@@ -61,6 +64,7 @@ describe('sourceStore', () => {
     });
     localStorageMock.clear();
     localStorageMock.setItem('gloss:activeNotebookId', 'nb-1');
+    useNotebookStore.setState({ activeNotebookId: 'nb-1', activationStatus: 'confirmed' });
   });
 
   it('initial state has empty source list', () => {
@@ -106,5 +110,26 @@ describe('sourceStore', () => {
     });
 
     expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'all' });
+  });
+
+  it('does not let a late notebook A load overwrite notebook B', async () => {
+    let resolveA!: (sources: never[]) => void;
+    let resolveB!: (sources: never[]) => void;
+    vi.mocked(api.listSources)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveA = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveB = resolve; }));
+    const a = useSourceStore.getState().loadSources('nb-a');
+    useNotebookStore.setState({ activeNotebookId: 'nb-b', activationStatus: 'confirmed' });
+    const b = useSourceStore.getState().loadSources('nb-b');
+    resolveA([]);
+    await a;
+    resolveB([]);
+    await b;
+    expect(useSourceStore.getState().loadedNotebookId).toBe('nb-b');
+  });
+
+  it('preserves invalid explicit ids instead of silently changing scope to none', () => {
+    useSourceStore.setState({ sourceScopeMode: 'explicit', selectedSourceIds: new Set(['missing-source']), sourceListStatus: 'ready' });
+    expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'explicit', ids: ['missing-source'] });
   });
 });

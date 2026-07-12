@@ -153,6 +153,17 @@ export function App() {
   // Listen for all Tauri events — consolidated cleanup
   useEffect(() => {
     const unlisteners: Promise<VoidFunction>[] = [];
+    const replayThenRehydrate = (notebookId: string, conversationId: string) => {
+      const chatStore = useChatStore.getState();
+      void chatStore
+        .replayChatEvents(notebookId, conversationId)
+        .catch((error) => {
+          console.warn("Failed to replay chat events:", error);
+        })
+        .finally(() => {
+          void useChatStore.getState().rehydrateConversation(notebookId, conversationId);
+        });
+    };
 
     unlisteners.push(onChatToken((payload) => {
       const chatStore = useChatStore.getState();
@@ -165,11 +176,11 @@ export function App() {
         );
       }
       if (payload.done) {
-        chatStore.finalizeMessage(
+        void chatStore.finalizeMessage(
           payload.notebook_id,
           payload.conversation_id,
           payload.message_id
-        );
+        ).finally(() => replayThenRehydrate(payload.notebook_id, payload.conversation_id));
       }
     }));
 
@@ -185,6 +196,7 @@ export function App() {
         payload.message_id,
         payload.error
       );
+      replayThenRehydrate(payload.notebook_id, payload.conversation_id);
       useToastStore.getState().addToast({
         type: 'error',
         title: 'Chat Error',
@@ -201,6 +213,7 @@ export function App() {
         payload.message_id,
         payload.reason
       );
+      replayThenRehydrate(payload.notebook_id, payload.conversation_id);
     }));
 
     unlisteners.push(onChatEvidence((payload) => {
@@ -355,6 +368,33 @@ export function App() {
       if (batchToastTimerRef.current) clearTimeout(batchToastTimerRef.current);
       if (batchCreatedDebounceRef.current) clearTimeout(batchCreatedDebounceRef.current);
       if (jobCompletedDebounceRef.current) clearTimeout(jobCompletedDebounceRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    const rehydrateActiveConversation = () => {
+      const notebookId = useNotebookStore.getState().activeNotebookId;
+      const conversationId = useChatStore.getState().activeConversationId;
+      if (!notebookId || !conversationId) return;
+      void useChatStore.getState()
+        .replayChatEvents(notebookId, conversationId)
+        .catch((error) => {
+          console.warn("Failed to replay chat events on focus:", error);
+        })
+        .finally(() => {
+          void useChatStore.getState().rehydrateConversation(notebookId, conversationId);
+        });
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        rehydrateActiveConversation();
+      }
+    };
+    window.addEventListener("focus", rehydrateActiveConversation);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("focus", rehydrateActiveConversation);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, []);
 

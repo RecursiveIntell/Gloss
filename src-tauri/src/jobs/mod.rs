@@ -322,7 +322,7 @@ async fn execute_index_chunks(
         .map_err(|e| {
             QueueError::Execution(format!("Failed to read embedding download consent: {e}"))
         })
-        .map(|value| crate::commands::chat::setting_is_enabled(value))?;
+        .map(crate::commands::chat::setting_is_enabled)?;
     let embedder = crate::ingestion::embed::EmbeddingService::new_with_download_policy(
         &cache_dir,
         false,

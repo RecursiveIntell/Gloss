@@ -862,6 +862,7 @@ fn attrs_for_element(
                         extraction_error(source, &format!("invalid XML attribute: {e}"))
                     })?;
                     let key = local_xml_name(attr.key.as_ref());
+                    #[allow(deprecated)]
                     let value = attr
                         .decode_and_unescape_value(reader.decoder())
                         .map_err(|e| {
@@ -896,6 +897,7 @@ fn attr_value(
             message: format!("invalid worksheet attribute: {e}"),
         })?;
         if local_xml_name(attr.key.as_ref()) == attr_name {
+            #[allow(deprecated)]
             let value = attr
                 .decode_and_unescape_value(reader.decoder())
                 .map_err(|e| GlossError::Ingestion {

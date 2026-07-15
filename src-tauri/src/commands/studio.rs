@@ -203,6 +203,7 @@ pub async fn list_studio_outputs(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_studio_output(
     notebook_id: String,
     output_type: String,
@@ -1014,6 +1015,7 @@ fn citations_json(citation: Option<&StudioCitation>) -> serde_json::Value {
 
 /// Generate real, LLM-authored structured content for the interactive Studio
 /// widgets, with per-item citations injected from the source scope.
+#[allow(clippy::too_many_arguments)]
 async fn generate_structured_widget_content(
     kind: StudioOutputKind,
     artifact: &crate::studio::StudioArtifact,

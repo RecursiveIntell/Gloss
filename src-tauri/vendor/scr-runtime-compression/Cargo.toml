@@ -1,0 +1,47 @@
+[package]
+name = "scr-runtime-compression"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Runtime integration adapter for semantic-memory compression layer — CompressedSearchPath and ExactFallbackAdapter delegates to turbo-quant/fib-quant"
+license = "MIT"
+authors = ["sikmindz"]
+readme = "README.md"
+repository = "https://github.com/nousresearch/Libraries"
+homepage = "https://github.com/nousresearch/Libraries/tree/main/scr-runtime-compression"
+documentation = "https://docs.rs/scr-runtime-compression"
+keywords = ['compression', 'runtime', 'semantic-memory', 'quantization', 'adapter']
+categories = ['compression', 'database']
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+quant-governor = { path = "../quant-governor" }
+
+# Optional codec dependencies — brought in by feature flags
+turbo-quant = { path = "../turbo-quant", optional = true }
+fib-quant = { path = "../fib-quant", optional = true }
+
+[features]
+default = ["turbo", "fib", "polar", "qjl"]
+turbo = ["dep:turbo-quant"]
+fib = ["dep:fib-quant"]
+# Polar-only quantization (asymmetric, no reconstruction).
+# Adds PolarQuantCodec to the scr-runtime-compression dispatch table.
+polar = ["dep:turbo-quant"]
+# QJL random-projection sketch (asymmetric inner-product).
+# Adds QjlSketchCodec to the scr-runtime-compression dispatch table.
+qjl = ["dep:turbo-quant"]
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+bytemuck = "1"
+rand = "0.8"
+rand_chacha = "0.3"
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,35 @@
+[package]
+name = "quant-governor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Governance policy routing for governed compression — codec selection with admissibility classes and degradation receipts"
+license = "MIT"
+authors = ["sikmindz"]
+readme = "README.md"
+repository = "https://github.com/nousresearch/Libraries"
+homepage = "https://github.com/nousresearch/Libraries/tree/main/quant-governor"
+documentation = "https://docs.rs/quant-governor"
+keywords = ['quantization', 'governance', 'compression', 'policy', 'routing']
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+blake3 = "1.5"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full"] }
+
+[[example]]
+name = "basic_policy"
+path = "examples/basic_policy.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

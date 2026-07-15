@@ -175,19 +175,18 @@ pub struct ActiveChatAttemptLease<'a> {
 }
 
 impl ActiveChatAttemptLease<'_> {
-    pub fn cancellation(&self) -> CancellationToken {
+    pub fn cancellation(&self) -> Result<CancellationToken, GlossError> {
         self.attempt
             .as_ref()
-            .expect("active chat attempt lease must hold an attempt before activation")
-            .cancellation
-            .clone()
+            .map(|attempt| attempt.cancellation.clone())
+            .ok_or_else(|| GlossError::Other("active chat attempt lease has no attempt".into()))
     }
 
     /// Transfers cleanup responsibility to the spawned stream task.
-    pub fn activate(mut self) -> ActiveChatAttempt {
+    pub fn activate(mut self) -> Result<ActiveChatAttempt, GlossError> {
         self.attempt
             .take()
-            .expect("active chat attempt lease must hold an attempt before activation")
+            .ok_or_else(|| GlossError::Other("active chat attempt lease has no attempt".into()))
     }
 }
 

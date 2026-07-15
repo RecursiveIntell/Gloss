@@ -25,9 +25,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 log = "0.4"
 # === Canonical Libraries crates ===
-# Exact external sources keep clean checkouts independent of the local Libraries tree.
-# llm-pipeline 0.2.0 is not published yet, so its reviewed source is vendored with
-# llm-output-parser and llm-tool-runtime under src-tauri/vendor.
+# llm-pipeline 0.2.0 is published on crates.io, but vendored source is kept
+# for controlled updates and offline builds. llm-output-parser and
+# llm-tool-runtime are also vendored.
 llm-pipeline = { path = "vendor/llm-pipeline" }
 tauri-queue = "=0.3.0"
 
@@ -57,7 +57,7 @@ candle-core = "0.10"
 
 # === Vector search ===
 usearch = "2.25"
-semantic-memory = { version = "=0.5.8", optional = true }
+semantic-memory = { version = "=0.5.11", optional = true }
 
 # === Database ===
 rusqlite = { version = "0.32", features = ["bundled", "vtab"] }

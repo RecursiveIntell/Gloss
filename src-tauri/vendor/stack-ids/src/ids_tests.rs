@@ -193,9 +193,9 @@ struct FinalCloseoutIdentity {
 macro_rules! assert_id_roundtrip {
     ($ty:ty, $raw:expr) => {{
         let id = <$ty>::new($raw);
-        let parsed: $ty = $raw.parse().unwrap();
+        let parsed: $ty = id.as_str().parse().unwrap();
         assert_eq!(parsed, id);
-        assert_eq!(parsed.to_string(), $raw);
+        assert!(parsed.to_string().ends_with($raw));
 
         let encoded = serde_json::to_string(&id).unwrap();
         let decoded: $ty = serde_json::from_str(&encoded).unwrap();
@@ -206,15 +206,15 @@ macro_rules! assert_id_roundtrip {
 #[test]
 fn id_creation_and_display() {
     let id = EnvelopeId::new("env-001");
-    assert_eq!(id.as_str(), "env-001");
-    assert_eq!(id.to_string(), "env-001");
+    assert_eq!(id.as_str(), "envelope:env-001");
+    assert_eq!(id.to_string(), "envelope:env-001");
     assert!(!id.is_empty());
 }
 
 #[test]
 fn id_from_string() {
-    let id: ClaimId = "claim-123".into();
-    assert_eq!(id.as_str(), "claim-123");
+    let id = ClaimId::try_new("claim-123").unwrap();
+    assert_eq!(id.as_str(), "claim:claim-123");
 }
 
 #[test]
@@ -226,8 +226,7 @@ fn id_generate_is_unique() {
 
 #[test]
 fn id_empty_check() {
-    let id = EntityId::new("");
-    assert!(id.is_empty());
+    assert!(EntityId::try_new("").is_err());
 
     let id = EntityId::new("e-1");
     assert!(!id.is_empty());
@@ -237,7 +236,7 @@ fn id_empty_check() {
 fn id_serde_roundtrip() {
     let id = TrialId::new("trial-42");
     let json = serde_json::to_string(&id).unwrap();
-    assert_eq!(json, "\"trial-42\"");
+    assert_eq!(json, "\"trial:trial-42\"");
     let back: TrialId = serde_json::from_str(&json).unwrap();
     assert_eq!(back, id);
 }
@@ -647,7 +646,7 @@ fn versioned_operator_identity_json_format_is_stable() {
     let encoded = serde_json::to_string(&identity).unwrap();
     assert_eq!(
         encoded,
-        r#"{"operator_id":"operator-1","operator_version_id":"operator-version-1"}"#
+        r#"{"operator_id":"operator:operator-1","operator_version_id":"operator-version:operator-version-1"}"#
     );
 
     let decoded: VersionedOperatorIdentity = serde_json::from_str(&encoded).unwrap();
@@ -679,7 +678,7 @@ fn kernel_artifact_identity_json_format_is_stable() {
     let encoded = serde_json::to_string(&identity).unwrap();
     assert_eq!(
         encoded,
-        r#"{"kernel_run_id":"run-1","constraint_id":"constraint-1","hyperedge_id":"hyperedge-1","residual_id":"residual-1","syndrome_id":"syndrome-1","witness_id":"witness-1","certificate_id":"certificate-1","oracle_slice_id":"oracle-slice-1","region_id":"region-1","region_digest_id":"region-digest-1","artifact_transport_id":"artifact-transport-1","repair_route_id":"repair-route-1","repair_candidate_id":"repair-candidate-1","nuisance_state_id":"nuisance-state-1","convergence_report_id":"convergence-report-1","refutation_result_id":"refutation-1","calibration_report_id":"calibration-1"}"#
+        r#"{"kernel_run_id":"kernel-run:run-1","constraint_id":"constraint:constraint-1","hyperedge_id":"hyperedge:hyperedge-1","residual_id":"residual:residual-1","syndrome_id":"syndrome:syndrome-1","witness_id":"witness:witness-1","certificate_id":"certificate:certificate-1","oracle_slice_id":"oracle-slice:oracle-slice-1","region_id":"region:region-1","region_digest_id":"region-digest:region-digest-1","artifact_transport_id":"artifact-transport:artifact-transport-1","repair_route_id":"repair-route:repair-route-1","repair_candidate_id":"repair-candidate:repair-candidate-1","nuisance_state_id":"nuisance-state:nuisance-state-1","convergence_report_id":"convergence-report:convergence-report-1","refutation_result_id":"refutation-result:refutation-1","calibration_report_id":"calibration-report:calibration-1"}"#
     );
 
     let decoded: KernelArtifactIdentity = serde_json::from_str(&encoded).unwrap();
@@ -706,7 +705,7 @@ fn control_plane_identity_json_format_is_stable() {
     let encoded = serde_json::to_string(&identity).unwrap();
     assert_eq!(
         encoded,
-        r#"{"verification_case_id":"case-1","check_plan_id":"plan-1","control_receipt_id":"control-receipt-1","ledger_entry_id":"ledger-entry-1","policy_decision_id":"policy-1","approval_record_id":"approval-1","promotion_decision_id":"promotion-1","refutation_decision_id":"refutation-decision-1","rollback_plan_id":"rollback-1","calibration_snapshot_id":"calibration-snapshot-1","learning_update_id":"learning-update-1","boundary_repair_record_id":"boundary-repair-1"}"#
+        r#"{"verification_case_id":"verification-case:case-1","check_plan_id":"check-plan:plan-1","control_receipt_id":"control-receipt:control-receipt-1","ledger_entry_id":"ledger-entry:ledger-entry-1","policy_decision_id":"policy-decision:policy-1","approval_record_id":"approval-record:approval-1","promotion_decision_id":"promotion-decision:promotion-1","refutation_decision_id":"refutation-decision:refutation-decision-1","rollback_plan_id":"rollback-plan:rollback-1","calibration_snapshot_id":"calibration-snapshot:calibration-snapshot-1","learning_update_id":"learning-update:learning-update-1","boundary_repair_record_id":"boundary-repair-record:boundary-repair-1"}"#
     );
 
     let decoded: ControlPlaneIdentity = serde_json::from_str(&encoded).unwrap();
@@ -730,7 +729,7 @@ fn semantic_contract_identity_json_format_is_stable() {
     let encoded = serde_json::to_string(&identity).unwrap();
     assert_eq!(
         encoded,
-        r#"{"semantics_profile_id":"semantics-profile-1","claim_state_id":"claim-state-1","semantic_diff_id":"semantic-diff-1","causal_attribution_bundle_id":"causal-attribution-1","degradation_record_id":"degradation-record-1","exactness_budget_id":"exactness-budget-1","support_set_id":"support-set-1","contradiction_witness_id":"contradiction-witness-1","retraction_record_id":"retraction-record-1"}"#
+        r#"{"semantics_profile_id":"semantics-profile:semantics-profile-1","claim_state_id":"claim-state:claim-state-1","semantic_diff_id":"semantic-diff:semantic-diff-1","causal_attribution_bundle_id":"causal-attribution-bundle:causal-attribution-1","degradation_record_id":"degradation-record:degradation-record-1","exactness_budget_id":"exactness-budget:exactness-budget-1","support_set_id":"support-set:support-set-1","contradiction_witness_id":"contradiction-witness:contradiction-witness-1","retraction_record_id":"retraction-record:retraction-record-1"}"#
     );
 
     let decoded: SemanticContractIdentity = serde_json::from_str(&encoded).unwrap();
@@ -772,7 +771,7 @@ fn endgame_identity_json_format_is_stable() {
     let encoded = serde_json::to_string(&identity).unwrap();
     assert_eq!(
         encoded,
-        r#"{"intervention_id":"intervention-1","outcome_schema_id":"outcome-schema-1","experiment_case_id":"experiment-case-1","cohort_contract_id":"cohort-contract-1","comparability_matrix_id":"comparability-matrix-1","counterfactual_slice_id":"counterfactual-slice-1","decision_trace_id":"decision-trace-1","refuter_suite_id":"refuter-suite-1","refuter_result_id":"refuter-result-1","rollout_decision_id":"rollout-decision-1","rollback_decision_id":"rollback-decision-1","experiment_budget_id":"experiment-budget-1","attestation_envelope_id":"attestation-envelope-1","trust_root_set_id":"trust-root-set-1","artifact_admission_policy_id":"artifact-admission-policy-1","transparency_receipt_id":"transparency-receipt-1","attestation_revocation_id":"attestation-revocation-1","attestation_supersession_id":"attestation-supersession-1","remote_oracle_lease_id":"remote-oracle-lease-1","remote_slice_request_id":"remote-slice-request-1","remote_slice_result_id":"remote-slice-result-1","cross_runtime_replay_ticket_id":"cross-runtime-replay-ticket-1","dispute_bundle_id":"dispute-bundle-1","disclosure_policy_id":"disclosure-policy-1","disclosure_budget_id":"disclosure-budget-1"}"#
+        r#"{"intervention_id":"intervention:intervention-1","outcome_schema_id":"outcome-schema:outcome-schema-1","experiment_case_id":"experiment-case:experiment-case-1","cohort_contract_id":"cohort-contract:cohort-contract-1","comparability_matrix_id":"comparability-matrix:comparability-matrix-1","counterfactual_slice_id":"counterfactual-slice:counterfactual-slice-1","decision_trace_id":"decision-trace:decision-trace-1","refuter_suite_id":"refuter-suite:refuter-suite-1","refuter_result_id":"refuter-result:refuter-result-1","rollout_decision_id":"rollout-decision:rollout-decision-1","rollback_decision_id":"rollback-decision:rollback-decision-1","experiment_budget_id":"experiment-budget:experiment-budget-1","attestation_envelope_id":"attestation-envelope:attestation-envelope-1","trust_root_set_id":"trust-root-set:trust-root-set-1","artifact_admission_policy_id":"artifact-admission-policy:artifact-admission-policy-1","transparency_receipt_id":"transparency-receipt:transparency-receipt-1","attestation_revocation_id":"attestation-revocation:attestation-revocation-1","attestation_supersession_id":"attestation-supersession:attestation-supersession-1","remote_oracle_lease_id":"remote-oracle-lease:remote-oracle-lease-1","remote_slice_request_id":"remote-slice-request:remote-slice-request-1","remote_slice_result_id":"remote-slice-result:remote-slice-result-1","cross_runtime_replay_ticket_id":"cross-runtime-replay-ticket:cross-runtime-replay-ticket-1","dispute_bundle_id":"dispute-bundle:dispute-bundle-1","disclosure_policy_id":"disclosure-policy:disclosure-policy-1","disclosure_budget_id":"disclosure-budget:disclosure-budget-1"}"#
     );
 
     let decoded: EndgameIdentity = serde_json::from_str(&encoded).unwrap();
@@ -925,11 +924,11 @@ mod v25_profile_runtime_identity_tests {
     macro_rules! assert_id_roundtrip_local {
         ($ty:ty, $value:expr) => {{
             let id = <$ty>::new($value);
-            assert_eq!(id.to_string(), $value);
-            let reparsed: $ty = $value.parse().unwrap();
+            assert!(id.to_string().ends_with($value));
+            let reparsed: $ty = id.as_str().parse().unwrap();
             assert_eq!(reparsed, id);
             let json = serde_json::to_string(&id).unwrap();
-            assert_eq!(json, format!("\"{}\"", $value));
+            assert_eq!(json, format!("\"{}\"", id));
             let decoded: $ty = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, id);
         }};

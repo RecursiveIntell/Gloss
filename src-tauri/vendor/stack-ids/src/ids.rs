@@ -5,8 +5,59 @@
 //! authority crates; `stack-ids` only provides the type contract.
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
+
+/// Validation error for a family-qualified opaque ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdParseError {
+    family: String,
+    reason: &'static str,
+}
+
+impl std::fmt::Display for IdParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid {} ID: {}", self.family, self.reason)
+    }
+}
+
+impl std::error::Error for IdParseError {}
+
+impl IdParseError {
+    /// Canonical ID family that rejected the input.
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    /// Stable validation failure reason.
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+fn family_name(type_name: &str) -> String {
+    let stem = type_name.strip_suffix("Id").unwrap_or(type_name);
+    let mut family = String::new();
+    for (index, character) in stem.chars().enumerate() {
+        if character.is_ascii_uppercase() {
+            if index != 0 {
+                family.push('-');
+            }
+            family.push(character.to_ascii_lowercase());
+        } else {
+            family.push(character);
+        }
+    }
+    family
+}
+
+fn valid_payload(payload: &str) -> bool {
+    let mut characters = payload.chars();
+    matches!(characters.next(), Some(first) if first.is_ascii_alphanumeric())
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_' | '~' | ':')
+        })
+}
 
 /// Macro to generate an opaque string-wrapper ID type with standard impls.
 macro_rules! define_id {
@@ -15,19 +66,51 @@ macro_rules! define_id {
         $name:ident
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, JsonSchema)]
         #[serde(transparent)]
         pub struct $name(pub String);
 
         impl $name {
-            /// Create from any string-like value.
+            /// Creates an ID from a canonical family-qualified string or a
+            /// validated payload that will be family-qualified.
+            ///
+            /// Panics when the value is empty, non-canonical, or belongs to a
+            /// different ID family. Use try_new for untrusted input.
             pub fn new(value: impl Into<String>) -> Self {
-                Self(value.into())
+                Self::try_new(value).unwrap_or_else(|error| panic!("{error}"))
+            }
+
+            /// Fallible constructor for untrusted ID input or payloads.
+            pub fn try_new(value: impl Into<String>) -> Result<Self, IdParseError> {
+                let value = value.into();
+                let family = family_name(stringify!($name));
+                if let Some((actual_family, payload)) = value.split_once(':') {
+                    if actual_family != family {
+                        return Err(IdParseError {
+                            family,
+                            reason: "cross-family substitution",
+                        });
+                    }
+                    if !valid_payload(payload) {
+                        return Err(IdParseError {
+                            family,
+                            reason: "payload is empty or non-canonical",
+                        });
+                    }
+                    return Ok(Self(value));
+                }
+                if !valid_payload(&value) {
+                    return Err(IdParseError {
+                        family,
+                        reason: "payload is empty or non-canonical",
+                    });
+                }
+                Ok(Self(format!("{family}:{value}")))
             }
 
             /// Generate a new random UUID v4 ID.
             pub fn generate() -> Self {
-                Self(uuid::Uuid::new_v4().to_string())
+                Self::new(uuid::Uuid::new_v4().to_string())
             }
 
             /// Borrow as a string slice.
@@ -36,6 +119,8 @@ macro_rules! define_id {
             }
 
             /// Returns true if the inner string is empty.
+            ///
+            /// Valid IDs are never empty; retained for source compatibility.
             pub fn is_empty(&self) -> bool {
                 self.0.is_empty()
             }
@@ -47,18 +132,6 @@ macro_rules! define_id {
             }
         }
 
-        impl From<String> for $name {
-            fn from(value: String) -> Self {
-                Self(value)
-            }
-        }
-
-        impl From<&str> for $name {
-            fn from(value: &str) -> Self {
-                Self(value.to_string())
-            }
-        }
-
         impl AsRef<str> for $name {
             fn as_ref(&self) -> &str {
                 &self.0
@@ -66,10 +139,44 @@ macro_rules! define_id {
         }
 
         impl FromStr for $name {
-            type Err = std::convert::Infallible;
+            type Err = IdParseError;
 
             fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Ok(Self::new(value))
+                let family = family_name(stringify!($name));
+                // Accept family-prefixed values directly
+                if let Some((actual_family, payload)) = value.split_once(':') {
+                    if actual_family != family {
+                        return Err(IdParseError {
+                            family: family.clone(),
+                            reason: "cross-family substitution",
+                        });
+                    }
+                    if !valid_payload(payload) {
+                        return Err(IdParseError {
+                            family,
+                            reason: "payload is empty or non-canonical",
+                        });
+                    }
+                    return Ok(Self(value.to_string()));
+                }
+                // Accept unprefixed values and prepend the family (backward compat)
+                if !valid_payload(value) {
+                    return Err(IdParseError {
+                        family,
+                        reason: "payload is empty or non-canonical",
+                    });
+                }
+                Ok(Self(format!("{family}:{value}")))
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                value.parse().map_err(serde::de::Error::custom)
             }
         }
     };

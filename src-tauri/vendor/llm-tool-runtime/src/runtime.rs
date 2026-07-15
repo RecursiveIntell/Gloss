@@ -2,7 +2,7 @@ pub use crate::ToolError as ToolRuntimeError;
 use crate::{
     validate_arguments_against_schema, ApprovalGrantEffectClass, ToolApprovalKind,
     ToolApprovalState, ToolCall, ToolDescriptor, ToolError, ToolErrorClass, ToolExecutionPermit,
-    ToolReceipt, ToolReceiptPersistence, ToolRegistry, ToolResult, ToolRetryOwner,
+    ToolReceipt, ToolReceiptPhase, ToolReceiptResolution, ToolRegistry, ToolResult, ToolRetryOwner,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -42,7 +42,7 @@ impl ApprovalPolicy for StaticApprovalPolicy {
                 format!("tool {} requires an execution permit", descriptor.name),
             )
         })?;
-        if !execution_permit_authorizes(permit, ctx, call) {
+        if !execution_permit_authorizes(permit, descriptor, ctx, call) {
             return Err(ToolError::new(
                 ToolErrorClass::Denied,
                 format!("execution permit does not cover tool {}", descriptor.name),
@@ -80,6 +80,7 @@ fn descriptor_has_tokenless_read_only_path(descriptor: &ToolDescriptor) -> bool 
 
 fn execution_permit_authorizes(
     permit: &ToolExecutionPermit,
+    descriptor: &ToolDescriptor,
     ctx: &crate::ToolCtx,
     call: &ToolCall,
 ) -> bool {
@@ -89,10 +90,13 @@ fn execution_permit_authorizes(
     if permit.scope().namespace() != scope.namespace {
         return false;
     }
-    let Some(target_key) = extract_target_key(call) else {
+    let Ok(intent) = descriptor.describe_effect(&call.arguments) else {
         return false;
     };
-    permit.scope().target_key() == target_key
+    permit.scope().target_key() == intent.target_key
+        && permit
+            .validate_binding(&descriptor.method_digest(), &intent.digest(), Utc::now())
+            .is_ok()
 }
 
 fn approval_grant_authorizes(
@@ -139,12 +143,11 @@ fn approval_grant_authorizes(
     if grant.scope.namespace != scope.namespace {
         return false;
     }
-    if grant
-        .scope
-        .target_key
-        .as_ref()
-        .is_some_and(|target_key| Some(target_key.as_str()) != extract_target_key(call))
-    {
+    if grant.scope.target_key.as_ref().is_some_and(|target_key| {
+        descriptor
+            .describe_effect(&call.arguments)
+            .map_or(true, |intent| target_key != &intent.target_key)
+    }) {
         return false;
     }
     if let Some(permit) = ctx.execution_permit.as_ref() {
@@ -169,15 +172,11 @@ fn approval_grant_authorizes(
     true
 }
 
-fn extract_target_key(call: &ToolCall) -> Option<&str> {
-    ["target", "artifact_id", "candidate_id", "task_id"]
-        .into_iter()
-        .find_map(|key| call.arguments.get(key).and_then(|value| value.as_str()))
-}
-
 #[async_trait]
 pub trait ToolReceiptSink: Send + Sync {
+    async fn health_check(&self) -> Result<(), ToolError>;
     async fn persist(&self, receipt: &ToolReceipt) -> Result<(), ToolError>;
+    async fn mark_unresolved(&self, preflight_receipt_id: &str) -> Result<(), ToolError>;
 }
 
 #[derive(Default)]
@@ -197,11 +196,33 @@ impl InMemoryReceiptSink {
 
 #[async_trait]
 impl ToolReceiptSink for InMemoryReceiptSink {
+    async fn health_check(&self) -> Result<(), ToolError> {
+        Ok(())
+    }
+
     async fn persist(&self, receipt: &ToolReceipt) -> Result<(), ToolError> {
         self.receipts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(receipt.clone());
+        Ok(())
+    }
+
+    async fn mark_unresolved(&self, preflight_receipt_id: &str) -> Result<(), ToolError> {
+        let mut receipts = self
+            .receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let receipt = receipts
+            .iter_mut()
+            .find(|receipt| receipt.receipt_id == preflight_receipt_id)
+            .ok_or_else(|| {
+                ToolError::new(
+                    ToolErrorClass::ReceiptPersistence,
+                    "preflight receipt not found for unresolved marking",
+                )
+            })?;
+        receipt.resolution = ToolReceiptResolution::Unresolved;
         Ok(())
     }
 }
@@ -272,12 +293,12 @@ impl ToolRuntime {
         &self,
         ctx: &crate::ToolCtx,
         call: &ToolCall,
-        permit: Option<&ToolExecutionPermit>,
+        permit: Option<Arc<ToolExecutionPermit>>,
         cancel: Option<&AtomicBool>,
     ) -> ToolExecution {
         let started_at = Utc::now();
         let mut execution_ctx = ctx.clone();
-        execution_ctx.execution_permit = permit.cloned();
+        execution_ctx.execution_permit = permit.clone();
         let descriptor = match self.registry.get(&call.descriptor_name) {
             Some(tool) => tool.descriptor().clone(),
             None => {
@@ -361,6 +382,128 @@ impl ToolRuntime {
                 receipt,
             };
         };
+
+        let effectful = !descriptor_has_tokenless_read_only_path(&descriptor);
+        if cfg!(not(debug_assertions)) && effectful && !descriptor.receipt_persistence.is_durable()
+        {
+            let error = ToolError::new(
+                ToolErrorClass::ReceiptPersistence,
+                format!(
+                    "effectful tool {} requires durable receipt persistence in release mode",
+                    descriptor.name
+                ),
+            );
+            let receipt = self.failure_receipt_with_approval(
+                ctx,
+                call,
+                started_at,
+                error.clone(),
+                &descriptor,
+                approval_state,
+            );
+            return ToolExecution {
+                result: Err(error),
+                receipt,
+            };
+        }
+
+        let preflight_receipt = if descriptor.receipt_persistence.is_durable() {
+            let Some(sink) = &self.receipt_sink else {
+                let error = ToolError::new(
+                    ToolErrorClass::ReceiptPersistence,
+                    format!("tool {} requires a durable receipt sink", descriptor.name),
+                );
+                let receipt = self.failure_receipt_with_approval(
+                    ctx,
+                    call,
+                    started_at,
+                    error.clone(),
+                    &descriptor,
+                    approval_state,
+                );
+                return ToolExecution {
+                    result: Err(error),
+                    receipt,
+                };
+            };
+            if let Err(error) = sink.health_check().await {
+                let receipt = self.failure_receipt_with_approval(
+                    ctx,
+                    call,
+                    started_at,
+                    error.clone(),
+                    &descriptor,
+                    approval_state,
+                );
+                return ToolExecution {
+                    result: Err(error),
+                    receipt,
+                };
+            }
+            let preflight = self.preflight_receipt(
+                &execution_ctx,
+                call,
+                &descriptor,
+                started_at,
+                approval_state.clone(),
+            );
+            if let Err(error) = sink.persist(&preflight).await {
+                let receipt = self.failure_receipt_with_approval(
+                    ctx,
+                    call,
+                    started_at,
+                    error.clone(),
+                    &descriptor,
+                    approval_state,
+                );
+                return ToolExecution {
+                    result: Err(error),
+                    receipt,
+                };
+            }
+            Some(preflight)
+        } else {
+            None
+        };
+
+        if effectful {
+            let Some(permit) = permit.as_ref() else {
+                let error = ToolError::new(
+                    ToolErrorClass::ApprovalRequired,
+                    format!("tool {} requires an execution permit", descriptor.name),
+                );
+                let receipt = self.failure_receipt_with_approval(
+                    ctx,
+                    call,
+                    started_at,
+                    error.clone(),
+                    &descriptor,
+                    approval_state,
+                );
+                return ToolExecution {
+                    result: Err(error),
+                    receipt,
+                };
+            };
+            if let Err(error) = permit.consume() {
+                if let (Some(sink), Some(preflight)) = (&self.receipt_sink, &preflight_receipt) {
+                    let _ = sink.mark_unresolved(&preflight.receipt_id).await;
+                }
+                let receipt = self.failure_receipt_with_approval(
+                    &execution_ctx,
+                    call,
+                    started_at,
+                    error.clone(),
+                    &descriptor,
+                    approval_state,
+                );
+                return ToolExecution {
+                    result: Err(error),
+                    receipt,
+                };
+            }
+        }
+
         let timeout_ms = resolve_timeout_ms(&descriptor, ctx, self.config.default_timeout_ms);
         let fut = async {
             if let Some(flag) = cancel {
@@ -402,9 +545,9 @@ impl ToolRuntime {
             Err(error) => Err(error),
         };
 
-        let receipt = match &result {
+        let mut receipt = match &result {
             Ok(tool_result) => self.success_receipt(
-                ctx,
+                &execution_ctx,
                 call,
                 &descriptor,
                 started_at,
@@ -412,7 +555,7 @@ impl ToolRuntime {
                 approval_state.clone(),
             ),
             Err(error) => self.failure_receipt_with_approval(
-                ctx,
+                &execution_ctx,
                 call,
                 started_at,
                 error.clone(),
@@ -421,17 +564,39 @@ impl ToolRuntime {
             ),
         };
 
-        if descriptor.receipt_persistence == ToolReceiptPersistence::ForgeRaw {
+        if result.is_err() {
+            if let Some(action) = &descriptor.rollback_contract {
+                if let Err(error) = action.compensate(&receipt).await {
+                    return ToolExecution {
+                        result: Err(error),
+                        receipt,
+                    };
+                }
+            }
+        }
+
+        if let Some(preflight) = &preflight_receipt {
+            receipt.preflight_receipt_id = Some(preflight.receipt_id.clone());
+        }
+
+        if descriptor.receipt_persistence.is_durable() {
             if let Some(sink) = &self.receipt_sink {
                 if let Err(error) = sink.persist(&receipt).await {
-                    let receipt = self.failure_receipt_with_approval(
-                        ctx,
+                    if let Some(preflight) = &preflight_receipt {
+                        let _ = sink.mark_unresolved(&preflight.receipt_id).await;
+                    }
+                    let mut receipt = self.failure_receipt_with_approval(
+                        &execution_ctx,
                         call,
                         started_at,
                         error.clone(),
                         &descriptor,
                         approval_state,
                     );
+                    receipt.resolution = ToolReceiptResolution::Unresolved;
+                    receipt.preflight_receipt_id = preflight_receipt
+                        .as_ref()
+                        .map(|preflight| preflight.receipt_id.clone());
                     return ToolExecution {
                         result: Err(error),
                         receipt,
@@ -478,6 +643,9 @@ impl ToolRuntime {
             output_digest_or_refs: output_digest_or_refs(result),
             policy_hash: policy_hash(descriptor),
             approval_state,
+            phase: ToolReceiptPhase::Outcome,
+            resolution: ToolReceiptResolution::Resolved,
+            authority_lineage: authority_lineage(ctx, call, Some(descriptor)),
             host_identity: ctx.caller.clone(),
             started_at: started_at.to_rfc3339(),
             finished_at: Utc::now().to_rfc3339(),
@@ -489,6 +657,7 @@ impl ToolRuntime {
             workload_class: ctx.workload_class.clone(),
             budget_context: ctx.budget_context.clone(),
             parent_receipt_id: ctx.parent_receipt_id.clone(),
+            preflight_receipt_id: None,
             family_receipt_id: ctx.family_receipt_id.clone(),
             replay_parent_receipt_id: ctx.replay_parent_receipt_id.clone(),
             remote_oracle_lease_id: ctx.remote_oracle_lease_id.clone(),
@@ -530,6 +699,9 @@ impl ToolRuntime {
             output_digest_or_refs: serde_json::json!({"error": error.message}),
             policy_hash,
             approval_state: ToolApprovalState::Denied,
+            phase: ToolReceiptPhase::Outcome,
+            resolution: ToolReceiptResolution::Resolved,
+            authority_lineage: authority_lineage(ctx, call, descriptor),
             host_identity: ctx.caller.clone(),
             started_at: started_at.to_rfc3339(),
             finished_at: Utc::now().to_rfc3339(),
@@ -541,6 +713,7 @@ impl ToolRuntime {
             workload_class: ctx.workload_class.clone(),
             budget_context: ctx.budget_context.clone(),
             parent_receipt_id: ctx.parent_receipt_id.clone(),
+            preflight_receipt_id: None,
             family_receipt_id: ctx.family_receipt_id.clone(),
             replay_parent_receipt_id: ctx.replay_parent_receipt_id.clone(),
             remote_oracle_lease_id: ctx.remote_oracle_lease_id.clone(),
@@ -573,6 +746,9 @@ impl ToolRuntime {
             output_digest_or_refs: serde_json::json!({"error": error.message}),
             policy_hash: policy_hash(descriptor),
             approval_state,
+            phase: ToolReceiptPhase::Outcome,
+            resolution: ToolReceiptResolution::Resolved,
+            authority_lineage: authority_lineage(ctx, call, Some(descriptor)),
             host_identity: ctx.caller.clone(),
             started_at: started_at.to_rfc3339(),
             finished_at: Utc::now().to_rfc3339(),
@@ -584,6 +760,7 @@ impl ToolRuntime {
             workload_class: ctx.workload_class.clone(),
             budget_context: ctx.budget_context.clone(),
             parent_receipt_id: ctx.parent_receipt_id.clone(),
+            preflight_receipt_id: None,
             family_receipt_id: ctx.family_receipt_id.clone(),
             replay_parent_receipt_id: ctx.replay_parent_receipt_id.clone(),
             remote_oracle_lease_id: ctx.remote_oracle_lease_id.clone(),
@@ -597,6 +774,53 @@ impl ToolRuntime {
             provider_call_id: call.provider_call_id.clone(),
         }
     }
+
+    fn preflight_receipt(
+        &self,
+        ctx: &crate::ToolCtx,
+        call: &ToolCall,
+        descriptor: &ToolDescriptor,
+        started_at: DateTime<Utc>,
+        approval_state: ToolApprovalState,
+    ) -> ToolReceipt {
+        let mut receipt = self.failure_receipt_with_approval(
+            ctx,
+            call,
+            started_at,
+            ToolError::new(ToolErrorClass::Execution, "effect outcome pending"),
+            descriptor,
+            approval_state,
+        );
+        receipt.phase = ToolReceiptPhase::Preflight;
+        receipt.resolution = ToolReceiptResolution::Pending;
+        receipt.error_class = None;
+        receipt.output_digest_or_refs = serde_json::json!({"outcome": "pending"});
+        receipt
+    }
+}
+
+fn authority_lineage(
+    ctx: &crate::ToolCtx,
+    call: &ToolCall,
+    descriptor: Option<&ToolDescriptor>,
+) -> Vec<crate::AuthorityLineageEntry> {
+    let permit_id = ctx
+        .execution_permit
+        .as_ref()
+        .map(|permit| permit.execution_permit_id().as_str().to_owned())
+        .unwrap_or_else(|| "tokenless-read-only".into());
+    let policy_version = descriptor
+        .map(|descriptor| format!("{}:{}", descriptor.version, policy_hash(descriptor).hex()))
+        .unwrap_or_else(|| call.descriptor_version.clone());
+    ["request", "policy", "approval", "permit", "effect"]
+        .into_iter()
+        .map(|origin_class| crate::AuthorityLineageEntry {
+            origin_class: origin_class.into(),
+            principal: ctx.caller.clone(),
+            permit_id: permit_id.clone(),
+            policy_version: policy_version.clone(),
+        })
+        .collect()
 }
 
 fn resolve_timeout_ms(
@@ -688,14 +912,16 @@ async fn wait_for_cancel(flag: &AtomicBool) {
 mod tests {
     use super::*;
     use crate::{
-        Tool, ToolApprovalKind, ToolBackendKind, ToolBudgetContext, ToolCall, ToolCtx,
-        ToolDescriptor, ToolExposureMode, ToolExposurePolicy, ToolIdempotencyClass, ToolOriginKind,
-        ToolOutputMode, ToolPlannerStage, ToolReceiptPersistence, ToolResult, ToolSideEffectClass,
+        CompensatingAction, Tool, ToolApprovalKind, ToolBackendKind, ToolBudgetContext, ToolCall,
+        ToolCtx, ToolDescriptor, ToolErrorClass, ToolExposureMode, ToolExposurePolicy,
+        ToolIdempotencyClass, ToolOriginKind, ToolOutputMode, ToolPlannerStage,
+        ToolReceiptPersistence, ToolResult, ToolSideEffectClass,
     };
     use async_trait::async_trait;
     use semantic_memory_forge::FORGE_TOOL_RECEIPT_V2_SCHEMA;
     use serde_json::json;
     use stack_ids::{AttemptId, TraceCtx, TrialId};
+    use std::sync::atomic::AtomicBool;
 
     #[derive(Clone)]
     struct EchoTool {
@@ -705,6 +931,38 @@ mod tests {
     struct SlowTool {
         descriptor: ToolDescriptor,
         delay_ms: u64,
+    }
+
+    struct FailingTool {
+        descriptor: ToolDescriptor,
+    }
+
+    #[derive(Clone)]
+    struct TestRollback {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl CompensatingAction for TestRollback {
+        async fn compensate(&self, receipt: &crate::ToolReceipt) -> Result<(), ToolError> {
+            let _ = receipt.replay_link.as_deref();
+            self.called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.descriptor
+        }
+
+        async fn invoke(&self, _ctx: &ToolCtx, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            Err(ToolError::new(
+                ToolErrorClass::Execution,
+                "execution failed for rollback coverage",
+            ))
+        }
     }
 
     #[async_trait]
@@ -734,8 +992,24 @@ mod tests {
 
     #[async_trait]
     impl ToolReceiptSink for RecordingSink {
+        async fn health_check(&self) -> Result<(), ToolError> {
+            Ok(())
+        }
+
         async fn persist(&self, receipt: &ToolReceipt) -> Result<(), ToolError> {
             self.0.lock().unwrap().push(receipt.clone());
+            Ok(())
+        }
+
+        async fn mark_unresolved(&self, preflight_receipt_id: &str) -> Result<(), ToolError> {
+            let mut receipts = self.0.lock().unwrap();
+            let receipt = receipts
+                .iter_mut()
+                .find(|receipt| receipt.receipt_id == preflight_receipt_id)
+                .ok_or_else(|| {
+                    ToolError::new(ToolErrorClass::ReceiptPersistence, "missing preflight")
+                })?;
+            receipt.resolution = ToolReceiptResolution::Unresolved;
             Ok(())
         }
     }
@@ -767,8 +1041,13 @@ mod tests {
                 ..Default::default()
             },
             receipt_persistence: ToolReceiptPersistence::ForgeRaw,
+            effect_target: crate::EffectTargetSpec {
+                aliases: vec!["target".into()],
+                compound: Vec::new(),
+            },
             output_size_limit_bytes: None,
             provider_payload: None,
+            rollback_contract: None,
         }
     }
 
@@ -799,12 +1078,23 @@ mod tests {
     }
 
     fn execution_permit_for(target_key: &str) -> crate::ToolExecutionPermit {
+        let mut descriptor = echo_descriptor();
+        descriptor.name = "submit_patch".into();
+        descriptor.read_only = false;
+        descriptor.side_effect_class = crate::ToolSideEffectClass::Write;
+        let intent = descriptor
+            .describe_effect(&json!({"target": target_key, "message": "hello"}))
+            .unwrap();
         crate::ToolExecutionPermit::new(
             stack_ids::ExecutionPermitId::generate(),
             stack_ids::PolicyDecisionId::generate(),
             None,
             "runtime-tests",
             target_key,
+            descriptor.method_digest(),
+            intent.digest(),
+            Some(Utc::now() + chrono::Duration::minutes(5)),
+            uuid::Uuid::new_v4().to_string(),
         )
     }
 
@@ -863,7 +1153,10 @@ mod tests {
         let value = execution.result.unwrap().payload;
         assert_eq!(value["message"], "hello");
         assert!(execution.receipt.error_class.is_none());
-        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        let receipts = sink.0.lock().unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].phase, ToolReceiptPhase::Preflight);
+        assert_eq!(receipts[1].phase, ToolReceiptPhase::Outcome);
     }
 
     #[tokio::test]
@@ -1032,7 +1325,7 @@ mod tests {
                 .remote_oracle_lease_id
                 .as_ref()
                 .map(|id| id.as_str()),
-            Some("lease-1")
+            Some("remote-oracle-lease:lease-1")
         );
         assert_eq!(
             execution
@@ -1040,7 +1333,7 @@ mod tests {
                 .remote_slice_result_id
                 .as_ref()
                 .map(|id| id.as_str()),
-            Some("result-1")
+            Some("remote-slice-result:result-1")
         );
         assert_eq!(
             execution
@@ -1048,7 +1341,7 @@ mod tests {
                 .attestation_envelope_id
                 .as_ref()
                 .map(|id| id.as_str()),
-            Some("attestation-1")
+            Some("attestation-envelope:attestation-1")
         );
         assert_eq!(
             execution
@@ -1056,10 +1349,10 @@ mod tests {
                 .cross_runtime_replay_ticket_id
                 .as_ref()
                 .map(|id| id.as_str()),
-            Some("cross-runtime-replay-ticket-1")
+            Some("cross-runtime-replay-ticket:cross-runtime-replay-ticket-1")
         );
         assert_eq!(execution.receipt.planner_stage, ToolPlannerStage::Audit);
-        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert_eq!(sink.0.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1184,7 +1477,9 @@ mod tests {
         ctx.scope = Some(stack_ids::ScopeKey::namespace_only("runtime-tests"));
         let permit = execution_permit_for("src/lib.rs");
 
-        let execution = runtime.execute(&ctx, &call, Some(&permit), None).await;
+        let execution = runtime
+            .execute(&ctx, &call, Some(Arc::new(permit)), None)
+            .await;
         let error = execution.result.unwrap_err();
 
         assert_eq!(error.class, ToolErrorClass::ApprovalRequired);
@@ -1220,7 +1515,9 @@ mod tests {
         ctx.scope = Some(stack_ids::ScopeKey::namespace_only("runtime-tests"));
         let permit = execution_permit_for("other.rs");
 
-        let execution = runtime.execute(&ctx, &call, Some(&permit), None).await;
+        let execution = runtime
+            .execute(&ctx, &call, Some(Arc::new(permit)), None)
+            .await;
         let error = execution.result.unwrap_err();
 
         assert_eq!(error.class, ToolErrorClass::Denied);
@@ -1262,7 +1559,9 @@ mod tests {
         ));
         let permit = execution_permit_for("src/lib.rs");
 
-        let execution = runtime.execute(&ctx, &call, Some(&permit), None).await;
+        let execution = runtime
+            .execute(&ctx, &call, Some(Arc::new(permit)), None)
+            .await;
         let error = execution.result.unwrap_err();
 
         assert_eq!(error.class, ToolErrorClass::Denied);
@@ -1306,7 +1605,9 @@ mod tests {
         ctx.approval_grant = Some(grant);
         let permit = execution_permit_for("src/lib.rs");
 
-        let execution = runtime.execute(&ctx, &call, Some(&permit), None).await;
+        let execution = runtime
+            .execute(&ctx, &call, Some(Arc::new(permit)), None)
+            .await;
         let error = execution.result.unwrap_err();
 
         assert_eq!(error.class, ToolErrorClass::Denied);
@@ -1348,7 +1649,9 @@ mod tests {
         ));
         let permit = execution_permit_for("src/lib.rs");
 
-        let execution = runtime.execute(&ctx, &call, Some(&permit), None).await;
+        let execution = runtime
+            .execute(&ctx, &call, Some(Arc::new(permit)), None)
+            .await;
         let error = execution.result.unwrap_err();
 
         assert_eq!(error.class, ToolErrorClass::Denied);
@@ -1390,11 +1693,87 @@ mod tests {
         ));
         let permit = execution_permit_for("src/lib.rs");
 
-        let execution = runtime.execute(&ctx, &call, Some(&permit), None).await;
+        let execution = runtime
+            .execute(&ctx, &call, Some(Arc::new(permit)), None)
+            .await;
         assert!(execution.result.is_ok());
         assert_eq!(
             execution.receipt.approval_state,
             ToolApprovalState::Approved
         );
+        assert!(execution.receipt.verify_authority_lineage().is_ok());
+        let mut incomplete = execution.receipt.clone();
+        incomplete.authority_lineage.clear();
+        assert!(incomplete.verify_authority_lineage().is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_calls_compensation_contract_on_failure() {
+        let mut registry = ToolRegistry::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let mut descriptor = echo_descriptor();
+        descriptor.name = "failing_tool".into();
+        descriptor.rollback_contract = Some(Arc::new(TestRollback {
+            called: called.clone(),
+        }));
+        // AUTH-008: durable receipt persistence requires a sink
+        descriptor.receipt_persistence = ToolReceiptPersistence::Ephemeral;
+        registry.register(FailingTool { descriptor });
+        let runtime = ToolRuntime::new(registry);
+
+        let execution = runtime
+            .execute(
+                &tool_ctx(),
+                &ToolCall::new(
+                    "failing_tool",
+                    "1.0.0",
+                    json!({"message": "will fail"}),
+                    ToolOriginKind::Test,
+                ),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(execution.result.is_err());
+        assert_eq!(
+            execution.receipt.error_class,
+            Some(ToolErrorClass::Execution)
+        );
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn runtime_does_not_call_compensation_contract_without_contract() {
+        let mut registry = ToolRegistry::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let mut descriptor = echo_descriptor();
+        descriptor.name = "failing_tool".into();
+        descriptor.rollback_contract = None;
+        // AUTH-008: durable receipt persistence requires a sink
+        descriptor.receipt_persistence = ToolReceiptPersistence::Ephemeral;
+        registry.register(FailingTool { descriptor });
+        let runtime = ToolRuntime::new(registry);
+
+        let execution = runtime
+            .execute(
+                &tool_ctx(),
+                &ToolCall::new(
+                    "failing_tool",
+                    "1.0.0",
+                    json!({"message": "will fail"}),
+                    ToolOriginKind::Test,
+                ),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(execution.result.is_err());
+        assert_eq!(
+            execution.receipt.error_class,
+            Some(ToolErrorClass::Execution)
+        );
+        assert!(!called.load(Ordering::SeqCst));
     }
 }

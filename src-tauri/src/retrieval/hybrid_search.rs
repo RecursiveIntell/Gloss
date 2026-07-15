@@ -5,9 +5,11 @@ use crate::memory::types::{
     RetrievalCoverage, RetrievalEngineStatus, RetrievalMode, RetrievalOutcome, RetrievalReasonCode,
     RetrievalResult,
 };
+use crate::providers::{ChatMessage, ChatRequest, LlmExecutionContext, LlmProvider};
 use crate::retrieval::source_scope::ResolvedSourceScope;
+use futures::StreamExt;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A search result with relevance score.
 #[derive(Debug, Clone)]
@@ -123,6 +125,68 @@ pub fn local_retrieval_outcome_with_query(
     top_k: usize,
     trace_ref: String,
 ) -> Result<RetrievalOutcome, GlossError> {
+    local_retrieval_outcome_with_query_variants(
+        query,
+        &[query.to_string()],
+        nb_db,
+        embedder,
+        index,
+        query_embedding,
+        dense_block_reason,
+        native_indexing_enabled,
+        scope,
+        top_k,
+        trace_ref,
+    )
+}
+
+/// Provider-aware local retrieval variant for SPEC §7.1 multi-angle retrieval.
+/// The LLM rewrite step is fail-open and bounded to avoid blocking chat.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub async fn local_retrieval_outcome_with_provider(
+    query: &str,
+    provider: Option<&dyn LlmProvider>,
+    nb_db: &NotebookDb,
+    embedder: Option<&EmbeddingService>,
+    index: Option<&HnswIndex>,
+    query_embedding: Option<&[f32]>,
+    dense_block_reason: Option<RetrievalReasonCode>,
+    native_indexing_enabled: bool,
+    scope: &ResolvedSourceScope,
+    top_k: usize,
+    trace_ref: String,
+) -> Result<RetrievalOutcome, GlossError> {
+    let queries = rewrite_query_multi_angle(query, provider).await;
+    local_retrieval_outcome_with_query_variants(
+        query,
+        &queries,
+        nb_db,
+        embedder,
+        index,
+        query_embedding,
+        dense_block_reason,
+        native_indexing_enabled,
+        scope,
+        top_k,
+        trace_ref,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_retrieval_outcome_with_query_variants(
+    query: &str,
+    query_variants: &[String],
+    nb_db: &NotebookDb,
+    embedder: Option<&EmbeddingService>,
+    index: Option<&HnswIndex>,
+    query_embedding: Option<&[f32]>,
+    dense_block_reason: Option<RetrievalReasonCode>,
+    native_indexing_enabled: bool,
+    scope: &ResolvedSourceScope,
+    top_k: usize,
+    trace_ref: String,
+) -> Result<RetrievalOutcome, GlossError> {
     let coverage = nb_db.retrieval_coverage(scope)?;
     if scope.is_none() {
         return Ok(unavailable_outcome(
@@ -143,34 +207,57 @@ pub fn local_retrieval_outcome_with_query(
     }
 
     let bm25_started = Instant::now();
-    let fts_query = sanitize_fts_query(query);
+    let queries_used = normalize_query_variants(query, query_variants);
+    let mut sanitized_fts_queries = Vec::new();
     let mut bm25_chunks: Vec<(Chunk, usize)> = Vec::new();
     let mut bm25_reason = None;
-    if fts_query.is_empty() {
-        bm25_reason = Some(RetrievalReasonCode::Bm25QuerySanitizedEmpty);
-        fallback_chain.push(RetrievalReasonCode::Bm25QuerySanitizedEmpty);
-    } else {
-        let scoped_source_ids: Vec<&str> = scope.source_ids().iter().map(String::as_str).collect();
+    let mut bm25_error_count = 0usize;
+    let scoped_source_ids: Vec<&str> = scope.source_ids().iter().map(String::as_str).collect();
+    let mut ranked_chunks: HashMap<String, (Chunk, usize)> = HashMap::new();
+
+    for variant in &queries_used {
+        let fts_query = sanitize_fts_query(variant);
+        if fts_query.is_empty() {
+            continue;
+        }
+        sanitized_fts_queries.push(fts_query.clone());
         match nb_db.fts_search_chunks_in_sources_batched(
             &fts_query,
             &scoped_source_ids,
             k_per_source,
         ) {
             Ok(results) => {
-                bm25_chunks = results
-                    .into_iter()
-                    .enumerate()
-                    .map(|(rank, (chunk, _score))| (chunk, rank))
-                    .collect();
-                if bm25_chunks.is_empty() {
-                    bm25_reason = Some(RetrievalReasonCode::Bm25NoMatches);
-                    fallback_chain.push(RetrievalReasonCode::Bm25NoMatches);
+                let query_offset = sanitized_fts_queries.len().saturating_sub(1) * k_per_source;
+                for (rank, (chunk, _score)) in results.into_iter().enumerate() {
+                    let merged_rank = query_offset + rank;
+                    ranked_chunks
+                        .entry(chunk.id.clone())
+                        .and_modify(|(_, existing_rank)| {
+                            *existing_rank = (*existing_rank).min(merged_rank);
+                        })
+                        .or_insert((chunk, merged_rank));
                 }
             }
             Err(err) => {
+                bm25_error_count += 1;
+                tracing::warn!("FTS5/BM25 retrieval failed: {}", err);
+            }
+        }
+    }
+
+    if sanitized_fts_queries.is_empty() {
+        bm25_reason = Some(RetrievalReasonCode::Bm25QuerySanitizedEmpty);
+        fallback_chain.push(RetrievalReasonCode::Bm25QuerySanitizedEmpty);
+    } else {
+        bm25_chunks = ranked_chunks.into_values().collect();
+        bm25_chunks.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.id.cmp(&b.0.id)));
+        if bm25_chunks.is_empty() {
+            if bm25_error_count >= sanitized_fts_queries.len() {
                 bm25_reason = Some(RetrievalReasonCode::IndexMissing);
                 fallback_chain.push(RetrievalReasonCode::IndexMissing);
-                tracing::warn!("FTS5/BM25 retrieval failed: {}", err);
+            } else {
+                bm25_reason = Some(RetrievalReasonCode::Bm25NoMatches);
+                fallback_chain.push(RetrievalReasonCode::Bm25NoMatches);
             }
         }
     }
@@ -297,13 +384,18 @@ pub fn local_retrieval_outcome_with_query(
         engines: vec![
             RetrievalEngineStatus {
                 engine: "bm25_fts5".to_string(),
-                attempted: !fts_query.is_empty(),
+                attempted: !sanitized_fts_queries.is_empty(),
                 available: true,
                 contributed: !bm25_chunks.is_empty(),
                 candidate_count: bm25_chunks.len(),
                 elapsed_ms: bm25_elapsed,
                 reason_code: bm25_reason,
-                detail: Some("Stable local sparse retriever".to_string()),
+                detail: Some(format!(
+                    "Stable local sparse retriever; queries_used={}; sanitized_fts_queries={}",
+                    serde_json::to_string(&queries_used).unwrap_or_else(|_| "[]".to_string()),
+                    serde_json::to_string(&sanitized_fts_queries)
+                        .unwrap_or_else(|_| "[]".to_string())
+                )),
             },
             RetrievalEngineStatus {
                 engine: "native_dense_hnsw".to_string(),
@@ -533,6 +625,118 @@ fn user_visible_summary(
     }
 }
 
+pub async fn rewrite_query_multi_angle(
+    query: &str,
+    provider: Option<&dyn LlmProvider>,
+) -> Vec<String> {
+    let original_only = || vec![query.trim().to_string()];
+    let Some(provider) = provider else {
+        return original_only();
+    };
+    let trimmed_query = query.trim();
+    if trimmed_query.is_empty() {
+        return original_only();
+    }
+
+    let rewrite = async {
+        let models = provider.list_models().await?;
+        let model = models.first().ok_or_else(|| GlossError::Provider {
+            provider: provider.provider_type().as_str().to_string(),
+            source: anyhow::anyhow!("no models available for query rewriting"),
+        })?;
+        let prompt = format!(
+            "Rephrase this search query in 2 different ways to find the same information: {trimmed_query}"
+        );
+        let request = ChatRequest {
+            model: model.id.clone(),
+            system_prompt: Some(
+                "Return exactly two concise search query rewrites, one per line. Do not add commentary."
+                    .to_string(),
+            ),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: prompt,
+                images: None,
+            }],
+            max_tokens: 120,
+            temperature: 0.2,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+            stream: false,
+            num_ctx: Some(2048),
+        };
+        let mut stream = provider
+            .chat(request, LlmExecutionContext::uncancellable())
+            .await?;
+        let mut response = String::new();
+        while let Some(token) = stream.next().await {
+            response.push_str(&token?.token);
+        }
+        Ok::<String, GlossError>(response)
+    };
+
+    match tokio::time::timeout(Duration::from_secs(5), rewrite).await {
+        Ok(Ok(response)) => {
+            normalize_query_variants(trimmed_query, &parse_query_rewrites(&response))
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "multi-angle query rewrite failed; using original query");
+            original_only()
+        }
+        Err(_) => {
+            tracing::warn!("multi-angle query rewrite timed out; using original query");
+            original_only()
+        }
+    }
+}
+
+fn parse_query_rewrites(response: &str) -> Vec<String> {
+    response
+        .lines()
+        .flat_map(|line| line.split(';'))
+        .map(|line| {
+            line.trim()
+                .trim_start_matches(|c: char| {
+                    c.is_ascii_digit()
+                        || c == '.'
+                        || c == ')'
+                        || c == '-'
+                        || c == '*'
+                        || c == '"'
+                        || c == '\''
+                })
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .take(2)
+        .collect()
+}
+
+fn normalize_query_variants(original: &str, variants: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(3);
+    for candidate in std::iter::once(original.to_string()).chain(variants.iter().cloned()) {
+        let candidate = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+        if candidate.is_empty() {
+            continue;
+        }
+        if !out
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&candidate))
+        {
+            out.push(candidate);
+        }
+        if out.len() >= 3 {
+            break;
+        }
+    }
+    out
+}
+
 /// Perform hybrid search: HNSW semantic + FTS5 keyword, fused with RRF.
 #[allow(dead_code)]
 pub fn hybrid_search(
@@ -543,8 +747,44 @@ pub fn hybrid_search(
     scope: &ResolvedSourceScope,
     top_k: usize,
 ) -> Result<Vec<SearchResult>, GlossError> {
+    hybrid_search_with_query_variants(
+        query,
+        &[query.to_string()],
+        nb_db,
+        embedder,
+        index,
+        scope,
+        top_k,
+    )
+}
+
+#[allow(dead_code)]
+pub async fn hybrid_search_with_provider(
+    query: &str,
+    provider: Option<&dyn LlmProvider>,
+    nb_db: &NotebookDb,
+    embedder: &EmbeddingService,
+    index: &HnswIndex,
+    scope: &ResolvedSourceScope,
+    top_k: usize,
+) -> Result<Vec<SearchResult>, GlossError> {
+    let queries_used = rewrite_query_multi_angle(query, provider).await;
+    hybrid_search_with_query_variants(query, &queries_used, nb_db, embedder, index, scope, top_k)
+}
+
+fn hybrid_search_with_query_variants(
+    query: &str,
+    query_variants: &[String],
+    nb_db: &NotebookDb,
+    embedder: &EmbeddingService,
+    index: &HnswIndex,
+    scope: &ResolvedSourceScope,
+    top_k: usize,
+) -> Result<Vec<SearchResult>, GlossError> {
     // Scale the pre-rerank pool proportionally to top_k
     let k_per_source = (top_k * 5).max(20);
+    let queries_used = normalize_query_variants(query, query_variants);
+    tracing::info!(queries_used = ?queries_used, "hybrid retrieval query variants");
 
     // 1. Semantic search via HNSW
     let query_embedding = embedder.embed_one(query)?;
@@ -563,27 +803,38 @@ pub fn hybrid_search(
     }
 
     // 2. Keyword search via FTS5
-    // Escape FTS5 special characters
-    let fts_query = sanitize_fts_query(query);
-    let fts_results = match nb_db.fts_search(&fts_query, k_per_source) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("FTS search failed (non-fatal): {}", e);
-            Vec::new()
+    let mut keyword_by_chunk: HashMap<String, (Chunk, usize)> = HashMap::new();
+    for (query_index, variant) in queries_used.iter().enumerate() {
+        let fts_query = sanitize_fts_query(variant);
+        if fts_query.is_empty() {
+            continue;
         }
-    };
-
-    let mut keyword_chunks: Vec<(Chunk, usize)> = Vec::new();
-    for (rank, (rowid, _score)) in fts_results.iter().enumerate() {
-        match nb_db.get_chunk_by_rowid(*rowid) {
-            Ok(chunk) => {
-                if scope_allows_chunk(scope, &chunk) {
-                    keyword_chunks.push((chunk, rank));
-                }
+        let fts_results = match nb_db.fts_search(&fts_query, k_per_source) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("FTS search failed (non-fatal): {}", e);
+                Vec::new()
             }
-            Err(_) => continue,
+        };
+        for (rank, (rowid, _score)) in fts_results.iter().enumerate() {
+            match nb_db.get_chunk_by_rowid(*rowid) {
+                Ok(chunk) => {
+                    if scope_allows_chunk(scope, &chunk) {
+                        let merged_rank = query_index * k_per_source + rank;
+                        keyword_by_chunk
+                            .entry(chunk.id.clone())
+                            .and_modify(|(_, existing_rank)| {
+                                *existing_rank = (*existing_rank).min(merged_rank);
+                            })
+                            .or_insert((chunk, merged_rank));
+                    }
+                }
+                Err(_) => continue,
+            }
         }
     }
+    let mut keyword_chunks: Vec<(Chunk, usize)> = keyword_by_chunk.into_values().collect();
+    keyword_chunks.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.id.cmp(&b.0.id)));
 
     // 3. Reciprocal Rank Fusion (RRF)
     let rrf_k = 60.0;

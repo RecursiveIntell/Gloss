@@ -28,6 +28,7 @@
 //! direct-write facility must remain exceptional, auditable, and disabled
 //! by default in release builds.
 
+pub mod audit_candidate;
 pub mod bundle;
 pub mod envelope;
 pub mod estimator;
@@ -37,6 +38,10 @@ pub mod v13;
 pub mod v14;
 pub mod v9;
 
+pub use audit_candidate::{
+    ForgeAuditCandidateSearchRequestV1, ForgeAuditCandidateSearchResultV1,
+    FORGE_AUDIT_CANDIDATE_SEARCH_V1_SCHEMA,
+};
 pub use bundle::{
     CausalQuestion, ComparabilitySnapshot, EvidenceBundle, EvidenceBundleId, OutcomeSpec,
     PromotionState, RefutationArtifactRecord, RefutationAttempt, RefutationResult, TreatmentSpec,

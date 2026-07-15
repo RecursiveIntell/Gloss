@@ -5,21 +5,25 @@ edition = "2021"
 rust-version = "1.75.0"
 description = "Transform Forge export envelopes into projection import batches for semantic-memory"
 license = "Apache-2.0"
+authors = ["Josh Stevenson <j.stevenson.cs@gmail.com>"]
 readme = "README.md"
+repository = "https://github.com/RecursiveIntell/forge-memory-bridge"
+homepage = "https://github.com/RecursiveIntell/forge-memory-bridge"
+documentation = "https://docs.rs/forge-memory-bridge"
+keywords = ['forge', 'memory', 'projection', 'import', 'bitemporal']
 
 [dependencies]
-semantic-memory-forge = { version = "0.1.1", path = "../semantic-memory-forge" }
-stack-ids = { version = "0.1.1", path = "../stack-ids" }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
-uuid = { workspace = true, features = ["v4"] }
-schemars = { workspace = true }
+semantic-memory-forge = { path = "../semantic-memory-forge" }
+stack-ids = { path = "../stack-ids" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+schemars = "0.8.22"
+sha2 = "0.10"
 
 [dev-dependencies]
-serde_json = { workspace = true }
+serde_json = "1.0"
 
 # LIB-005: inherit workspace lint policy
-[lints]
-workspace = true

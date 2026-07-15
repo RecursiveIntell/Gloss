@@ -211,6 +211,19 @@ pub(crate) fn decode_projection_batch_json_compat(
         .or_insert_with(|| serde_json::json!(JSON_COMPAT_DEFAULT_TIMESTAMP));
     root.entry("transformed_at".to_string())
         .or_insert_with(|| serde_json::json!(JSON_COMPAT_DEFAULT_TIMESTAMP));
+    if let Some(raw_digest) = root
+        .get("content_digest")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    {
+        let hex = raw_digest.strip_prefix("blake3:").unwrap_or(&raw_digest);
+        let digest = ContentDigest::from_hex(hex.to_string())
+            .unwrap_or_else(|_| ContentDigest::compute_str(&raw_digest));
+        root.insert(
+            "content_digest".to_string(),
+            serde_json::to_value(digest).map_err(|error| json_compat_invalid(error.to_string()))?,
+        );
+    }
 
     let default_source_envelope_id = root.get("source_envelope_id").cloned();
     let default_source_authority = root.get("source_authority").cloned();

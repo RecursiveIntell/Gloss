@@ -18,6 +18,22 @@ const OPENAI_EGRESS_HOST: &str = "api.openai.com";
 const ANTHROPIC_EGRESS_HOST: &str = "api.anthropic.com";
 
 const ALLOW_LAN_LOCAL_PROVIDERS_KEY: &str = "allow_lan_local_providers";
+const ALLOW_CUSTOM_CLOUD_ENDPOINTS_KEY: &str = "allow_custom_cloud_endpoints";
+
+fn setting_is_enabled(value: Option<String>) -> bool {
+    value
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "enabled"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn read_setting_flag(app_db: &crate::db::app_db::AppDb, key: &str) -> bool {
+    setting_is_enabled(app_db.get_setting(key).ok().flatten())
+}
 
 fn is_rfc1918_host(host: &str) -> bool {
     // 10.0.0.0/8
@@ -51,17 +67,11 @@ fn is_rfc1918_host(host: &str) -> bool {
 }
 
 pub fn lan_local_providers_allowed(app_db: &crate::db::app_db::AppDb) -> bool {
-    app_db
-        .get_setting(ALLOW_LAN_LOCAL_PROVIDERS_KEY)
-        .ok()
-        .flatten()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on" | "enabled"
-            )
-        })
-        .unwrap_or(false)
+    read_setting_flag(app_db, ALLOW_LAN_LOCAL_PROVIDERS_KEY)
+}
+
+pub fn custom_cloud_endpoints_allowed(app_db: &crate::db::app_db::AppDb) -> bool {
+    read_setting_flag(app_db, ALLOW_CUSTOM_CLOUD_ENDPOINTS_KEY)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -331,8 +341,15 @@ pub fn validate_provider_base_url(
     provider_type: ProviderType,
     base_url: &str,
     allow_lan: bool,
+    allow_custom_cloud_endpoints: bool,
 ) -> Result<NetworkScopeReceiptV1, GlossError> {
-    validate_base_url_inner(provider_type, base_url, allow_lan, false)
+    validate_base_url_inner(
+        provider_type,
+        base_url,
+        allow_lan,
+        allow_custom_cloud_endpoints,
+        false,
+    )
 }
 
 /// Validate an embedding URL against the same LAN/loopback policy as provider URLs.
@@ -345,7 +362,7 @@ pub fn validate_embedding_url(
 ) -> Result<NetworkScopeReceiptV1, GlossError> {
     // Embedding endpoints are treated as local providers (Ollama/LlamaCpp)
     // — they must be loopback or LAN-with-opt-in.
-    validate_base_url_inner(ProviderType::Ollama, base_url, allow_lan, true)
+    validate_base_url_inner(ProviderType::Ollama, base_url, allow_lan, false, true)
 }
 
 /// Build a shared reqwest::Client suitable for all supported providers.
@@ -367,6 +384,7 @@ fn validate_base_url_inner(
     provider_type: ProviderType,
     base_url: &str,
     allow_lan: bool,
+    allow_custom_cloud_endpoints: bool,
     is_embedding: bool,
 ) -> Result<NetworkScopeReceiptV1, GlossError> {
     let label = if is_embedding {
@@ -409,33 +427,64 @@ fn validate_base_url_inner(
         .to_ascii_lowercase();
     let is_loopback = LOCAL_EGRESS_HOSTS.contains(&host.as_str());
     let is_lan = is_rfc1918_host(&host);
-    let (allowed, egress_class, policy, cloud_opt_in_required, lan_opt_in_applied) = match provider_type {
-        ProviderType::Ollama | ProviderType::LlamaCpp => {
-            if is_loopback {
-                (true, "local_loopback", "local providers default to loopback endpoints", false, false)
-            } else if is_lan && allow_lan {
-                (true, "local_lan", "LAN local providers permitted by operator opt-in (allow_lan_local_providers=true)", false, true)
-            } else if is_lan {
-                (false, "lan_rejected", "LAN local provider URL rejected; set allow_lan_local_providers=true to permit RFC1918 LAN endpoints", false, false)
-            } else {
-                (false, "public_rejected", "local providers are restricted to loopback (or LAN with opt-in); public IPs are always rejected", false, false)
+    let (allowed, egress_class, policy, cloud_opt_in_required, lan_opt_in_applied) =
+        match provider_type {
+            ProviderType::Ollama | ProviderType::LlamaCpp => {
+                if is_loopback {
+                    (
+                        true,
+                        "local_loopback",
+                        "local providers default to loopback endpoints",
+                        false,
+                        false,
+                    )
+                } else if is_lan && allow_lan {
+                    (true, "local_lan", "LAN local providers permitted by operator opt-in (allow_lan_local_providers=true)", false, true)
+                } else if is_lan {
+                    (false, "lan_rejected", "LAN local provider URL rejected; set allow_lan_local_providers=true to permit RFC1918 LAN endpoints", false, false)
+                } else {
+                    (false, "public_rejected", "local providers are restricted to loopback (or LAN with opt-in); public IPs are always rejected", false, false)
+                }
             }
-        }
-        ProviderType::OpenAI => (
-            parsed.scheme() == "https" && host == OPENAI_EGRESS_HOST,
-            "cloud_default",
-            "OpenAI provider is restricted to https://api.openai.com without custom endpoint opt-in",
-            true,
-            false,
-        ),
-        ProviderType::Anthropic => (
-            parsed.scheme() == "https" && host == ANTHROPIC_EGRESS_HOST,
-            "cloud_default",
-            "Anthropic provider is restricted to https://api.anthropic.com without custom endpoint opt-in",
-            true,
-            false,
-        ),
-    };
+            ProviderType::OpenAI => {
+                if allow_custom_cloud_endpoints {
+                    (
+                        parsed.scheme() == "https",
+                        "custom_cloud",
+                        "custom cloud endpoint permitted by operator opt-in",
+                        false,
+                        false,
+                    )
+                } else {
+                    (
+                    parsed.scheme() == "https" && host == OPENAI_EGRESS_HOST,
+                    "cloud_default",
+                    "OpenAI provider is restricted to https://api.openai.com without custom endpoint opt-in",
+                    true,
+                    false,
+                )
+                }
+            }
+            ProviderType::Anthropic => {
+                if allow_custom_cloud_endpoints {
+                    (
+                        parsed.scheme() == "https",
+                        "custom_cloud",
+                        "custom cloud endpoint permitted by operator opt-in",
+                        false,
+                        false,
+                    )
+                } else {
+                    (
+                    parsed.scheme() == "https" && host == ANTHROPIC_EGRESS_HOST,
+                    "cloud_default",
+                    "Anthropic provider is restricted to https://api.anthropic.com without custom endpoint opt-in",
+                    true,
+                    false,
+                )
+                }
+            }
+        };
     if !allowed {
         return Err(GlossError::Config(format!(
             "Provider '{}' base URL '{}' is outside the active NetworkScopePolicy: {}",
@@ -623,9 +672,16 @@ fn validated_provider_base_url(
     row: &Provider,
     provider_type: ProviderType,
     allow_lan: bool,
+    allow_custom_cloud_endpoints: bool,
 ) -> Result<String, GlossError> {
     let base_url = provider_base_url(row, provider_type);
-    Ok(validate_provider_base_url(provider_type, &base_url, allow_lan)?.base_url)
+    Ok(validate_provider_base_url(
+        provider_type,
+        &base_url,
+        allow_lan,
+        allow_custom_cloud_endpoints,
+    )?
+    .base_url)
 }
 
 pub fn provider_config_from_db(
@@ -634,6 +690,7 @@ pub fn provider_config_from_db(
     provider_type: ProviderType,
 ) -> Result<ProviderConfig, GlossError> {
     let allow_lan = lan_local_providers_allowed(app_db);
+    let allow_custom_cloud_endpoints = custom_cloud_endpoints_allowed(app_db);
     let providers = app_db.list_providers()?;
     let row = provider_row(&providers, provider_type).ok_or_else(|| {
         GlossError::Config(format!(
@@ -650,7 +707,12 @@ pub fn provider_config_from_db(
 
     Ok(ProviderConfig {
         provider_type,
-        base_url: validated_provider_base_url(row, provider_type, allow_lan)?,
+        base_url: validated_provider_base_url(
+            row,
+            provider_type,
+            allow_lan,
+            allow_custom_cloud_endpoints,
+        )?,
         api_key: provider_type
             .api_key_setting_key()
             .map(|key| secret_store.get(key))
@@ -674,11 +736,20 @@ impl ModelRegistry {
     /// Create registry from app database config.
     pub fn new(app_db: &AppDb, secret_store: &SecretStore) -> Result<Self, GlossError> {
         let allow_lan = lan_local_providers_allowed(app_db);
+        let allow_custom_cloud_endpoints = custom_cloud_endpoints_allowed(app_db);
         let providers = app_db.list_providers()?;
         let shared_client = build_shared_client();
         let ollama = provider_row(&providers, ProviderType::Ollama)
             .filter(|row| row.enabled)
-            .and_then(|row| validated_provider_base_url(row, ProviderType::Ollama, allow_lan).ok())
+            .and_then(|row| {
+                validated_provider_base_url(
+                    row,
+                    ProviderType::Ollama,
+                    allow_lan,
+                    allow_custom_cloud_endpoints,
+                )
+                .ok()
+            })
             .map(|base_url| ollama::OllamaProvider::new(&base_url, shared_client.clone()));
 
         let openai = match provider_row(&providers, ProviderType::OpenAI) {
@@ -688,7 +759,12 @@ impl ModelRegistry {
                     None
                 } else {
                     Some(openai::OpenAIProvider::new(
-                        &validated_provider_base_url(row, ProviderType::OpenAI, allow_lan)?,
+                        &validated_provider_base_url(
+                            row,
+                            ProviderType::OpenAI,
+                            allow_lan,
+                            allow_custom_cloud_endpoints,
+                        )?,
                         &key,
                         shared_client.clone(),
                     ))
@@ -704,7 +780,12 @@ impl ModelRegistry {
                     None
                 } else {
                     Some(anthropic::AnthropicProvider::new(
-                        &validated_provider_base_url(row, ProviderType::Anthropic, allow_lan)?,
+                        &validated_provider_base_url(
+                            row,
+                            ProviderType::Anthropic,
+                            allow_lan,
+                            allow_custom_cloud_endpoints,
+                        )?,
                         &key,
                         shared_client.clone(),
                     ))
@@ -716,7 +797,13 @@ impl ModelRegistry {
         let llamacpp = provider_row(&providers, ProviderType::LlamaCpp)
             .filter(|row| row.enabled)
             .and_then(|row| {
-                validated_provider_base_url(row, ProviderType::LlamaCpp, allow_lan).ok()
+                validated_provider_base_url(
+                    row,
+                    ProviderType::LlamaCpp,
+                    allow_lan,
+                    allow_custom_cloud_endpoints,
+                )
+                .ok()
             })
             .map(|base_url| llamacpp::LlamaCppProvider::new(&base_url, shared_client.clone()));
 
@@ -1176,15 +1263,20 @@ mod tests {
 
     #[test]
     fn network_scope_policy_allows_loopback_local_providers() {
-        let receipt =
-            validate_provider_base_url(ProviderType::Ollama, "http://localhost:11434/", false)
-                .unwrap();
+        let receipt = validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://localhost:11434/",
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(receipt.egress_class, "local_loopback");
         assert_eq!(receipt.base_url, "http://localhost:11434");
         assert!(!receipt.lan_opt_in_applied);
         assert!(validate_provider_base_url(
             ProviderType::LlamaCpp,
             "http://127.0.0.1:8080/v1",
+            false,
             false
         )
         .is_ok());
@@ -1196,20 +1288,28 @@ mod tests {
         assert!(validate_provider_base_url(
             ProviderType::Ollama,
             "http://192.168.1.7:11434",
+            false,
             false
         )
         .is_err());
-        assert!(
-            validate_provider_base_url(ProviderType::Ollama, "http://10.0.0.5:11434", false)
-                .is_err()
-        );
-        assert!(
-            validate_provider_base_url(ProviderType::Ollama, "http://172.16.0.1:11434", false)
-                .is_err()
-        );
+        assert!(validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://10.0.0.5:11434",
+            false,
+            false
+        )
+        .is_err());
+        assert!(validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://172.16.0.1:11434",
+            false,
+            false
+        )
+        .is_err());
         assert!(validate_provider_base_url(
             ProviderType::LlamaCpp,
             "http://192.168.1.100:8080/v1",
+            false,
             false
         )
         .is_err());
@@ -1218,21 +1318,29 @@ mod tests {
     #[test]
     fn network_scope_policy_allows_lan_with_opt_in() {
         // LAN IPs accepted when allow_lan = true
-        let receipt =
-            validate_provider_base_url(ProviderType::Ollama, "http://192.168.1.7:11434", true)
-                .unwrap();
+        let receipt = validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://192.168.1.7:11434",
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(receipt.egress_class, "local_lan");
         assert!(receipt.lan_opt_in_applied);
 
         let receipt2 =
-            validate_provider_base_url(ProviderType::Ollama, "http://10.0.0.5:11434", true)
+            validate_provider_base_url(ProviderType::Ollama, "http://10.0.0.5:11434", true, false)
                 .unwrap();
         assert_eq!(receipt2.egress_class, "local_lan");
         assert!(receipt2.lan_opt_in_applied);
 
-        let receipt3 =
-            validate_provider_base_url(ProviderType::LlamaCpp, "http://172.16.5.20:8080/v1", true)
-                .unwrap();
+        let receipt3 = validate_provider_base_url(
+            ProviderType::LlamaCpp,
+            "http://172.16.5.20:8080/v1",
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(receipt3.egress_class, "local_lan");
         assert!(receipt3.lan_opt_in_applied);
     }
@@ -1240,13 +1348,20 @@ mod tests {
     #[test]
     fn network_scope_policy_rejects_public_ips_even_with_opt_in() {
         // Public IPs always rejected, even with allow_lan = true
-        assert!(
-            validate_provider_base_url(ProviderType::Ollama, "http://203.0.113.5:11434", true)
-                .is_err()
-        );
-        assert!(
-            validate_provider_base_url(ProviderType::Ollama, "http://8.8.8.8:11434", true).is_err()
-        );
+        assert!(validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://203.0.113.5:11434",
+            true,
+            false
+        )
+        .is_err());
+        assert!(validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://8.8.8.8:11434",
+            true,
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -1255,6 +1370,7 @@ mod tests {
         assert!(validate_provider_base_url(
             ProviderType::OpenAI,
             "https://token@example.com/v1",
+            false,
             false
         )
         .is_err());
@@ -1262,6 +1378,7 @@ mod tests {
         assert!(validate_provider_base_url(
             ProviderType::Anthropic,
             "https://api.anthropic.com/v1?key=***\n",
+            false,
             false
         )
         .is_err());
@@ -1269,6 +1386,7 @@ mod tests {
         assert!(validate_provider_base_url(
             ProviderType::Ollama,
             "http://localhost:11434/#fragment",
+            false,
             false
         )
         .is_err());
@@ -1276,21 +1394,24 @@ mod tests {
         assert!(validate_provider_base_url(
             ProviderType::Ollama,
             "http://user:pass@192.168.1.7:11434",
-            true
+            true,
+            false
         )
         .is_err());
         // Query string even with LAN opt-in
         assert!(validate_provider_base_url(
             ProviderType::Ollama,
             "http://192.168.1.7:11434?token=abc",
-            true
+            true,
+            false
         )
         .is_err());
         // Fragment even with LAN opt-in
         assert!(validate_provider_base_url(
             ProviderType::Ollama,
             "http://192.168.1.7:11434#section",
-            true
+            true,
+            false
         )
         .is_err());
     }
@@ -1300,28 +1421,76 @@ mod tests {
         assert!(validate_provider_base_url(
             ProviderType::OpenAI,
             "https://api.openai.com/v1",
+            false,
             false
         )
         .is_ok());
         assert!(validate_provider_base_url(
             ProviderType::OpenAI,
             "https://openai-compatible.example.test/v1",
+            false,
             false
         )
         .is_err());
         assert!(validate_provider_base_url(
             ProviderType::Anthropic,
             "https://api.anthropic.com/v1",
+            false,
             false
         )
         .is_ok());
     }
 
     #[test]
+    fn network_scope_policy_allows_custom_cloud_endpoints_when_opted_in() {
+        let openai = validate_provider_base_url(
+            ProviderType::OpenAI,
+            "https://example.openai-compatible.azure.com/openai/deployments/gpt-4o",
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(openai.egress_class, "custom_cloud");
+        assert!(!openai.cloud_opt_in_required);
+
+        let anthropic = validate_provider_base_url(
+            ProviderType::Anthropic,
+            "https://custom.anthropic.endpoint/v1",
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(anthropic.egress_class, "custom_cloud");
+        assert!(!anthropic.cloud_opt_in_required);
+    }
+
+    #[test]
+    fn network_scope_policy_rejects_http_for_custom_cloud_opt_in() {
+        assert!(validate_provider_base_url(
+            ProviderType::OpenAI,
+            "http://api.openai.com/v1",
+            false,
+            true
+        )
+        .is_err());
+        assert!(validate_provider_base_url(
+            ProviderType::Anthropic,
+            "http://custom.anthropic.endpoint/v1",
+            false,
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
     fn lan_opt_in_not_applied_for_loopback() {
-        let receipt =
-            validate_provider_base_url(ProviderType::Ollama, "http://localhost:11434/", true)
-                .unwrap();
+        let receipt = validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://localhost:11434/",
+            true,
+            false,
+        )
+        .unwrap();
         // Even with allow_lan=true, loopback should be local_loopback, not local_lan
         assert_eq!(receipt.egress_class, "local_loopback");
         assert!(!receipt.lan_opt_in_applied);

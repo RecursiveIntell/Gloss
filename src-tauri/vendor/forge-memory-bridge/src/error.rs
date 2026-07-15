@@ -34,6 +34,18 @@ pub enum BridgeError {
     /// cannot synthesize without violating the episode-first identity law.
     #[error("missing episode identity in legacy import: {record_context}")]
     MissingEpisodeIdentity { record_context: String },
+
+    /// A canonical V3 claim omitted its stable claim identity.
+    #[error("canonical V3 claim is missing claim_id at record {record_index}")]
+    MissingCanonicalClaimId { record_index: usize },
+
+    /// A canonical V3 claim omitted its version identity.
+    #[error("canonical V3 claim is missing claim_version_id at record {record_index}")]
+    MissingCanonicalClaimVersionId { record_index: usize },
+
+    /// A canonical V3 relation omitted its version identity.
+    #[error("canonical V3 relation is missing relation_version_id at record {record_index}")]
+    MissingCanonicalRelationVersionId { record_index: usize },
 }
 
 impl BridgeError {
@@ -47,6 +59,11 @@ impl BridgeError {
             Self::InvalidRecord { .. } => "invalid_record",
             Self::TransformFailed { .. } => "transform_failed",
             Self::MissingEpisodeIdentity { .. } => "missing_episode_identity",
+            Self::MissingCanonicalClaimId { .. } => "missing_canonical_claim_id",
+            Self::MissingCanonicalClaimVersionId { .. } => "missing_canonical_claim_version_id",
+            Self::MissingCanonicalRelationVersionId { .. } => {
+                "missing_canonical_relation_version_id"
+            }
         }
     }
 }

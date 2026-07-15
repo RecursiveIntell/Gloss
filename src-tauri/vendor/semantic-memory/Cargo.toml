@@ -1,47 +1,201 @@
 [package]
 name = "semantic-memory"
-version = "0.5.0"
+version = "0.5.11"
 edition = "2021"
 rust-version = "1.75"
-description = "Hybrid semantic search with SQLite, FTS5, and HNSW — built for AI agents"
+description = "Local-first hybrid semantic search (SQLite + FTS5 + usearch 2.25) with bitemporal truth and typed receipts"
 license = "Apache-2.0"
-repository = "https://www.github.com/recursiveintell/semantic-memory"
-homepage = "https://www.github.com/recursiveintell/semantic-memory"
-keywords = ["search", "semantic", "sqlite", "hnsw", "embeddings"]
-categories = ["database", "text-processing"]
+authors = ["Josh Stevenson <j.stevenson.cs@gmail.com>"]
 readme = "README.md"
+repository = "https://github.com/RecursiveIntell/semantic-memory"
+homepage = "https://github.com/RecursiveIntell/semantic-memory"
+documentation = "https://docs.rs/semantic-memory"
+keywords = ['search', 'semantic', 'sqlite', 'vector', 'usearch']
+categories = ["database", "text-processing", "data-structures"]
 
 [features]
-default = ["hnsw"]
+# Default backend: usearch 2.25 (high-performance single-file vector search,
+# cxx-bridge to C++). Switched to default in 2026-06-02 after the
+# hnsw_rs 0.3 vs usearch 2.25 benchmark in commit 1c2179f showed usearch
+# winning by 2-78× on every metric that matters for a desktop RAG app
+# (Gloss), and +4pp better recall@10 at D=768. See
+# HNSW_RESEARCH_2026-06-02.md §10a and HNSW_BENCH_RESULTS_2026-06-02.md.
+#
+# Callers can still opt back into hnsw_rs by setting
+# `default-features = false, features = ["hnsw"]` on the dependency.
+# Both backends can technically be enabled simultaneously but the
+# runtime will prefer the first matching feature gate (hnsw takes
+# precedence if both are explicitly enabled — see the dispatch in
+# vector_backend.rs).
+default = ["usearch-backend"]
+# usearch 2.25 — high-performance single-file vector search, cxx-bridge
+# to C++. The default backend. Adds cxx + cxx-build build deps. See
+# HNSW_RESEARCH_2026-06-02.md.
+usearch-backend = ["dep:usearch", "dep:cxx-build", "dep:cxx"]
+# Legacy hnsw_rs 0.3 backend. Opt-in only now (was default until
+# 2026-06-02). bincode 1.3.3 advisory (RUSTSEC-2025-0141) only applies
+# when this feature is enabled.
 hnsw = ["dep:hnsw_rs"]
+# Pure-Rust brute-force backend (no ANN). Useful for small corpora and as
+# a fallback when no compiled C++ toolchain is available.
 brute-force = []
+# Phase 2: semiring provenance — append-only provenance records backed by
+# Boolean/Tropical/Probability/Confidence semirings. Opt-in only; the
+# provenance table is created via migration V25 when this feature is enabled.
+provenance = []
+# Phase 3: temporal field provenance — computed temporal_weight score per
+# fact/chunk/message factoring age, supersession, support, and contradiction.
+# Depends on provenance for support/contradiction counts. Opt-in only; the
+# temporal_weight columns are added via migration V26.
+temporal = ["provenance"]
+# Multiscale retrieval scheduling pipeline (staged search with budgets and
+# confidence thresholds). Opt-in only; the existing search() surface works
+# without it.
+multiscale = []
+# Admin-only operations: hard delete/update of truth-bearing rows.
+# NOT enabled by default — use supersession instead.
+admin-ops = []
+# Discord-structured second-order retrieval: surface graph neighbours of the
+# top-K direct results that are not themselves direct results. Opt-in only.
+discord = []
+# Phase 6: decoder architecture — treats contradictions as syndromes and
+# computes the smallest globally consistent correction. Opt-in only.
+decoder = []
+# Phase 7: lawful subtraction engine — determines what to forget, compress,
+# quarantine, or retire while preserving invariants. Opt-in only.
+subtraction = []
+# Phase 8: simplified compression governor — per-vector importance scoring
+# that determines quantization level. No turbo-quant dependency. Opt-in only.
+compression-governor = []
+# Phase 9: adaptive retrieval routing — query-aware stage selection.
+routing = []
+# Phase 9b: benchmark harness for routing — requires routing.
+benchmark = ["routing"]
+# Phase 10: cross-feature integration wiring — requires all constituent features.
+integration = ["provenance", "temporal", "multiscale", "discord", "decoder", "subtraction", "compression-governor", "routing", "topology", "community", "subgraph-pruning", "matryoshka"]
+# ColBERT-style late interaction multi-vector retrieval (3rd RRF signal).
+late-interaction = []
+# Persistent homology and topological void detection for knowledge graphs.
+topology = []
+# Matryoshka Representation Learning: multi-resolution embedding truncation.
+matryoshka = []
+# Leiden community detection with contradiction tracking.
+community = []
+# MemRL-style RL routing over receipts.
+rl-routing = ["routing"]
+# Reasoning subgraph pruning with lawful subtraction.
+subgraph-pruning = ["subtraction"]
 testing = []
-turbo-quant-codec = ["dep:turbo-quant"]
+turbo-quant-codec = ["dep:turbo-quant", "dep:quant-governor", "dep:scr-runtime-compression"]
+# poly-kv two-tier compressed KV cache pool for shared context compression.
+# Enables ProveKvPoolCandidateOnly search policy for approximate candidate
+# generation from compressed embedding pools.
+poly-kv-codec = ["dep:poly-kv"]
+# In-process Candle embedder (pure-Rust, CPU-only, no Ollama required).
+# When enabled, MemoryStore::open() defaults to CandleEmbedder instead of
+# OllamaEmbedder. Ollama remains available via MemoryStore::open_with_embedder
+# or by constructing OllamaEmbedder explicitly.
+candle-embedder = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub", "dep:tokenizers"]
+
 
 [dependencies]
+lru = "0.16.3"
 bytemuck = { version = "1", features = ["derive"] }
+blake3 = "1.8.3"
+sha2 = "0.10"
 rusqlite = { workspace = true, features = ["bundled", "blob"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros", "sync"] }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
-chrono = { workspace = true, features = ["serde"] }
-stack-ids = { version = "0.1.1", path = "../stack-ids" }
-forge-memory-bridge = { version = "0.1.1", path = "../forge-memory-bridge" }
-schemars = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+stack-ids = { path = "../stack-ids" }
+forge-memory-bridge = { path = "../forge-memory-bridge" }
+schemars = "0.8.22"
+boundary-compiler = { path = "../boundary-compiler" }
+bitemporal-runtime = { path = "../bitemporal-runtime" }
 
-# HNSW approximate nearest neighbor search (optional)
+# Vector search backends may be compiled together intentionally. Runtime dispatch has explicit,
+# tested precedence (`hnsw` before `usearch-backend`) when both are enabled.
 hnsw_rs = { version = "0.3", optional = true }
-turbo-quant = { version = "0.2.0-alpha.1", path = "../turbo-quant", optional = true }
+usearch = { version = "2.25", default-features = false, optional = true }
+turbo-quant = { path = "../turbo-quant", optional = true }
+quant-governor = { path = "../quant-governor", optional = true }
+scr-runtime-compression = { path = "../scr-runtime-compression", optional = true }
+poly-kv = { path = "../poly-kv", optional = true }
+# Candle in-process embedder deps (feature-gated, CPU-only)
+candle-core = { version = "0.10", optional = true }
+candle-nn = { version = "0.10", optional = true }
+candle-transformers = { version = "0.10", optional = true }
+hf-hub = { version = "1.0.0-rc.1", default-features = false, features = ["blocking"], optional = true }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+
+[build-dependencies]
+# cc compiles the C SIMD kernel (c-kernels/similarity.c) for cosine_similarity.
+cc = "1.0"
+# cxx-build is only needed when the usearch backend is enabled (it triggers
+# the C++ bridge compilation). Declared unconditionally so the build script
+# can switch behavior based on the active feature.
+cxx-build = { version = "1.0", optional = true }
+cxx = { version = "1.0", optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = { workspace = true }
-semantic-memory-forge = { version = "0.1.1", path = "../semantic-memory-forge" }
+proptest = "1.0"
+semantic-memory-forge = { path = "../semantic-memory-forge" }
+
+[[example]]
+name = "hostile_memory_integrity"
+path = "examples/hostile_memory_integrity.rs"
+required-features = ["testing"]
+
+[[example]]
+name = "migrate_legacy_facts"
+path = "examples/migrate_legacy_facts.rs"
+required-features = ["testing", "candle-embedder"]
+
+[[test]]
+name = "authority_transactions"
+path = "tests/authority_transactions.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "transition_compiler"
+path = "tests/transition_compiler.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "forgetting_closure"
+path = "tests/forgetting_closure.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "shadow_policy"
+path = "tests/shadow_policy.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "procedural_memory"
+path = "tests/procedural_memory.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "evidence_gap"
+path = "tests/evidence_gap.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "origin_authority"
+path = "tests/origin_authority.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "multi_principal_policy"
+path = "tests/multi_principal_policy.rs"
+required-features = ["testing"]
 
 # LIB-005: inherit workspace lint policy
-[lints]
-workspace = true

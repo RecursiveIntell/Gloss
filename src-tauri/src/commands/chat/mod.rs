@@ -951,7 +951,11 @@ pub async fn send_message(
         );
     }
 
-    if active_chat_attempt_lease.cancellation().is_cancelled() {
+    if active_chat_attempt_lease
+        .cancellation()
+        .map(|c| c.is_cancelled())
+        .unwrap_or(true)
+    {
         let error = "Chat cancelled during retrieval setup";
         emit_chat_status(
             &app_handle,
@@ -2323,7 +2327,36 @@ pub async fn send_message(
         |_| {},
     );
 
-    let active_chat_attempt = active_chat_attempt_lease.activate();
+    let active_chat_attempt = match active_chat_attempt_lease.activate() {
+        Ok(attempt) => attempt,
+        Err(err) => {
+            let error = err.to_string();
+            emit_chat_error(
+                &app_handle,
+                &notebook_id,
+                &conversation_id,
+                &message_id,
+                &error,
+            );
+            persist_chat_attempt_status(
+                &state,
+                &notebook_id,
+                &conversation_id,
+                &attempt_id,
+                &message_id,
+                Some(&user_msg.id),
+                provider_config.provider_type.as_str().into(),
+                Some(&model),
+                "error",
+                Some("lease_activation_failed"),
+                Some("lease_activation_failed"),
+                Some(&error),
+                None,
+                true,
+            );
+            return Err(err);
+        }
+    };
 
     // Construct the provider outside any lock (provider_config was extracted above)
     let provider = match providers::build_provider(&provider_config) {

@@ -389,7 +389,7 @@ pub(crate) fn query_import_log(
                 let status_parsed = ImportStatus::from_str_value(&status);
                 let was_duplicate = matches!(status_parsed, ImportStatus::AlreadyImported);
                 ImportReceipt {
-                    envelope_id: EnvelopeId(envelope_id),
+                    envelope_id: EnvelopeId::new(envelope_id),
                     schema_version,
                     content_digest,
                     status: status_parsed,

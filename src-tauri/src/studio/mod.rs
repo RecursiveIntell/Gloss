@@ -20,6 +20,12 @@ pub enum StudioOutputKind {
     Timeline,
     CompareTable,
     ActionPlan,
+    BriefingDoc,
+    StudyGuide,
+    CustomReport,
+    SlideDeck,
+    Infographic,
+    AudioOverview,
 }
 
 impl StudioOutputKind {
@@ -35,6 +41,12 @@ impl StudioOutputKind {
             "timeline" => Ok(Self::Timeline),
             "compare_table" | "compare" | "table" => Ok(Self::CompareTable),
             "action" | "actions" | "action_plan" => Ok(Self::ActionPlan),
+            "briefing" | "briefing_doc" | "briefing_document" => Ok(Self::BriefingDoc),
+            "study" | "study_guide" => Ok(Self::StudyGuide),
+            "custom" | "custom_report" => Ok(Self::CustomReport),
+            "slides" | "slide_deck" | "slidedeck" => Ok(Self::SlideDeck),
+            "infographic" => Ok(Self::Infographic),
+            "audio" | "audio_overview" => Ok(Self::AudioOverview),
             other => Err(GlossError::Studio {
                 output_type: other.to_string(),
                 message: "unsupported Studio output type".to_string(),
@@ -54,6 +66,12 @@ impl StudioOutputKind {
             Self::Timeline => "timeline",
             Self::CompareTable => "compare_table",
             Self::ActionPlan => "action_plan",
+            Self::BriefingDoc => "briefing_doc",
+            Self::StudyGuide => "study_guide",
+            Self::CustomReport => "custom_report",
+            Self::SlideDeck => "slide_deck",
+            Self::Infographic => "infographic",
+            Self::AudioOverview => "audio_overview",
         }
     }
 }
@@ -305,6 +323,12 @@ pub fn generate_artifact(
         StudioOutputKind::Timeline => timeline_content(snippets),
         StudioOutputKind::CompareTable => compare_table_content(snippets),
         StudioOutputKind::ActionPlan => action_plan_content(snippets),
+        StudioOutputKind::BriefingDoc => briefing_doc_content(snippets),
+        StudioOutputKind::StudyGuide => study_guide_content(snippets),
+        StudioOutputKind::CustomReport => custom_report_content(snippets),
+        StudioOutputKind::SlideDeck => slide_deck_content(snippets),
+        StudioOutputKind::Infographic => infographic_content(snippets),
+        StudioOutputKind::AudioOverview => audio_overview_content(snippets),
     };
     let mut artifact = StudioArtifact {
         schema: STUDIO_ARTIFACT_SCHEMA.to_string(),
@@ -344,6 +368,12 @@ fn default_title(kind: StudioOutputKind) -> String {
         StudioOutputKind::Timeline => "Source-grounded timeline",
         StudioOutputKind::CompareTable => "Source-grounded compare table",
         StudioOutputKind::ActionPlan => "Source-grounded action plan",
+        StudioOutputKind::BriefingDoc => "Source-grounded briefing doc",
+        StudioOutputKind::StudyGuide => "Source-grounded study guide",
+        StudioOutputKind::CustomReport => "Source-grounded custom report",
+        StudioOutputKind::SlideDeck => "Source-grounded slide deck",
+        StudioOutputKind::Infographic => "Source-grounded infographic",
+        StudioOutputKind::AudioOverview => "Source-grounded audio overview",
     }
     .to_string()
 }
@@ -471,6 +501,124 @@ fn action_plan_content(snippets: &[StudioSnippet]) -> Value {
     })
 }
 
+fn briefing_doc_content(snippets: &[StudioSnippet]) -> Value {
+    json!({
+        "executive_summary": snippets.iter().take(2).map(|snippet| {
+            cited_item(snippet, json!({
+                "text": snippet.text,
+                "source_title": snippet.source_title,
+            }))
+        }).collect::<Vec<_>>(),
+        "key_points": snippets.iter().enumerate().map(|(index, snippet)| {
+            cited_item(snippet, json!({
+                "point": index + 1,
+                "text": snippet.text,
+                "source_title": snippet.source_title,
+            }))
+        }).collect::<Vec<_>>(),
+        "recommendations": snippets.iter().enumerate().map(|(index, snippet)| {
+            cited_item(snippet, json!({
+                "priority": index + 1,
+                "recommendation": format!("Use the evidence from {} when making the related decision.", snippet.source_title),
+                "rationale": snippet.text,
+            }))
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn study_guide_content(snippets: &[StudioSnippet]) -> Value {
+    json!({
+        "topics": snippets.iter().enumerate().map(|(index, snippet)| {
+            cited_item(snippet, json!({
+                "topic": format!("Topic {}", index + 1),
+                "overview": snippet.text,
+                "source_title": snippet.source_title,
+            }))
+        }).collect::<Vec<_>>(),
+        "key_concepts": snippets.iter().map(|snippet| {
+            cited_item(snippet, json!({
+                "concept": snippet.source_title,
+                "explanation": snippet.text,
+            }))
+        }).collect::<Vec<_>>(),
+        "review_questions": snippets.iter().map(|snippet| {
+            cited_item(snippet, json!({
+                "question": format!("What key concept is supported by {}?", snippet.source_title),
+                "answer": snippet.text,
+            }))
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn custom_report_content(snippets: &[StudioSnippet]) -> Value {
+    json!({
+        "sections": snippets.iter().enumerate().map(|(index, snippet)| {
+            cited_item(snippet, json!({
+                "section_id": format!("section_{}", index + 1),
+                "heading": snippet.source_title,
+                "body": snippet.text,
+            }))
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn slide_deck_content(snippets: &[StudioSnippet]) -> Value {
+    json!({
+        "slides": snippets.iter().enumerate().map(|(index, snippet)| {
+            cited_item(snippet, json!({
+                "slide_number": index + 1,
+                "title": snippet.source_title,
+                "bullets": [snippet.text.as_str()],
+                "speaker_notes": format!("Discuss the source-grounded point from {}.", snippet.source_title),
+            }))
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn infographic_content(snippets: &[StudioSnippet]) -> Value {
+    json!({
+        "sections": snippets.iter().enumerate().map(|(index, snippet)| {
+            cited_item(snippet, json!({
+                "label": format!("Section {}", index + 1),
+                "title": snippet.source_title,
+                "description": snippet.text,
+            }))
+        }).collect::<Vec<_>>(),
+        "stats": snippets.iter().enumerate().map(|(index, snippet)| {
+            cited_item(snippet, json!({
+                "label": format!("Evidence item {}", index + 1),
+                "value": 1,
+                "unit": "source-backed point",
+                "context": snippet.text,
+            }))
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn audio_overview_content(snippets: &[StudioSnippet]) -> Value {
+    let intro_snippet = &snippets[0];
+    let outro_snippet = snippets.last().unwrap_or(intro_snippet);
+    json!({
+        "intro": [
+            cited_item(intro_snippet, json!({
+                "text": format!("This overview is grounded in selected sources, beginning with {}.", intro_snippet.source_title),
+            }))
+        ],
+        "segments": snippets.iter().enumerate().map(|(index, snippet)| {
+            cited_item(snippet, json!({
+                "segment": index + 1,
+                "title": snippet.source_title,
+                "script": snippet.text,
+            }))
+        }).collect::<Vec<_>>(),
+        "outro": [
+            cited_item(outro_snippet, json!({
+                "text": format!("The final takeaway is supported by {}: {}", outro_snippet.source_title, outro_snippet.text),
+            }))
+        ]
+    })
+}
+
 pub fn validate_artifact(artifact: &StudioArtifact) -> StudioValidation {
     let mut errors = Vec::new();
     if artifact.schema != STUDIO_ARTIFACT_SCHEMA {
@@ -589,6 +737,12 @@ mod tests {
             StudioOutputKind::Timeline,
             StudioOutputKind::CompareTable,
             StudioOutputKind::ActionPlan,
+            StudioOutputKind::BriefingDoc,
+            StudioOutputKind::StudyGuide,
+            StudioOutputKind::CustomReport,
+            StudioOutputKind::SlideDeck,
+            StudioOutputKind::Infographic,
+            StudioOutputKind::AudioOverview,
         ] {
             let artifact = generate_artifact(kind, None, scope.clone(), &snippets).unwrap();
             assert_eq!(artifact.schema, STUDIO_ARTIFACT_SCHEMA);

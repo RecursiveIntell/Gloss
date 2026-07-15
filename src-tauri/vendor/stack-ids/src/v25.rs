@@ -46,11 +46,11 @@ impl V25ConstitutionCitation {
 impl Default for V25ConstitutionCitation {
     fn default() -> Self {
         Self {
-            applicability_context_id: ApplicabilityContextId::new(""),
-            profile_set_id: ProfileSetId::new(""),
-            composition_receipt_id: CompositionReceiptId::new(""),
-            effective_constitution_id: EffectiveConstitutionId::new(""),
-            compiled_obligation_set_id: CompiledObligationSetId::new(""),
+            applicability_context_id: ApplicabilityContextId::new("unset"),
+            profile_set_id: ProfileSetId::new("unset"),
+            composition_receipt_id: CompositionReceiptId::new("unset"),
+            effective_constitution_id: EffectiveConstitutionId::new("unset"),
+            compiled_obligation_set_id: CompiledObligationSetId::new("unset"),
             composition_conflict_set_id: None,
             profile_exception_bundle_ids: Vec::new(),
         }

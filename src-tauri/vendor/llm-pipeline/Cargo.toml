@@ -36,27 +36,3 @@ tracing = "0.1"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
-
-[[example]]
-name = "basic_pipeline"
-path = "examples/basic_pipeline.rs"
-
-[[example]]
-name = "streaming_pipeline"
-path = "examples/streaming_pipeline.rs"
-
-[[example]]
-name = "thinking_mode"
-path = "examples/thinking_mode.rs"
-
-[[example]]
-name = "context_injection"
-path = "examples/context_injection.rs"
-
-[[example]]
-name = "payload_chain"
-path = "examples/payload_chain.rs"
-
-[[example]]
-name = "mock_example"
-path = "examples/mock_example.rs"

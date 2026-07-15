@@ -46,7 +46,7 @@ pub struct ToolLoopRequest {
     pub dry_run: bool,
     pub scope: Option<ScopeKey>,
     pub approval_grant: Option<ApprovalGrant>,
-    pub execution_permit: Option<ToolExecutionPermit>,
+    pub execution_permit: Option<std::sync::Arc<ToolExecutionPermit>>,
     pub stream: bool,
     pub api_key: Option<String>,
     pub organization: Option<String>,
@@ -178,7 +178,7 @@ impl ToolLoopRunner {
             .execute(
                 &tool_ctx,
                 &call,
-                request.execution_permit.as_ref(),
+                request.execution_permit.clone(),
                 ctx.cancel_flag(),
             )
             .await;
@@ -958,6 +958,8 @@ mod tests {
             receipt_persistence: ToolReceiptPersistence::Ephemeral,
             output_size_limit_bytes: None,
             provider_payload: None,
+            effect_target: Default::default(),
+            rollback_contract: None,
         }
     }
 

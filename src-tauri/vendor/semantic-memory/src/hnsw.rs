@@ -2,9 +2,18 @@
 //!
 //! SQLite remains the source of truth. The on-disk HNSW files are a recoverable
 //! acceleration sidecar that can be rebuilt from SQLite whenever needed.
+//!
+//! ## Backend selection (2026-06-02)
+//!
+//! This file is the **hnsw_rs 0.3 backend** implementation of the
+//! [`VectorBackend`] trait (see `vector_backend.rs`). It is the default
+//! backend as of 2026-06-02 but is being phased out in favor of the
+//! usearch 2.25 backend (see `usearch_backend.rs`). Both backends implement
+//! the same trait so that callers don't need to change.
 
 use crate::db;
 use crate::error::MemoryError;
+use crate::vector_backend::{VectorBackend, VectorHit, VectorIndexConfig};
 use hnsw_rs::prelude::*;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -22,51 +31,19 @@ const HNSW_SIDECAR_VERSION: u16 = 1;
 const HNSW_SIDECAR_HEADER_LEN: u16 = 24;
 const HNSW_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-/// Configuration for the HNSW index.
-#[derive(Debug, Clone)]
-pub struct HnswConfig {
-    pub m: usize,
-    pub ef_construction: usize,
-    pub ef_search: usize,
-    pub dimensions: usize,
-    pub max_elements: usize,
-    pub compaction_threshold: f32,
-    pub flush_interval_secs: Option<u64>,
-}
+/// Configuration for the HNSW index. Type alias to the canonical
+/// `VectorIndexConfig` (in `vector_backend.rs`) so the same config can be
+/// used regardless of which backend is active. Field access is preserved.
+pub type HnswConfig = VectorIndexConfig;
 
-impl Default for HnswConfig {
-    fn default() -> Self {
-        Self {
-            m: 16,
-            ef_construction: 200,
-            ef_search: 50,
-            dimensions: 768,
-            max_elements: 100_000,
-            compaction_threshold: 0.3,
-            flush_interval_secs: None,
-        }
-    }
-}
+/// A single hit from HNSW search. Type alias to the canonical
+/// `VectorHit`. Field access is preserved.
+pub type HnswHit = VectorHit;
 
-/// A single hit from HNSW search.
-#[derive(Debug, Clone)]
-pub struct HnswHit {
-    pub key: String,
-    pub distance: f32,
-}
-
-impl HnswHit {
-    pub fn similarity(&self) -> f32 {
-        (1.0 - self.distance).max(0.0)
-    }
-
-    /// Split the sidecar key into `(domain, identifier)`.
-    pub fn parse_key(&self) -> Result<(&str, &str), MemoryError> {
-        self.key
-            .split_once(':')
-            .ok_or_else(|| MemoryError::InvalidKey(self.key.clone()))
-    }
-}
+// Note: the previous HnswConfig struct + impl Default block lived here.
+// It has been moved to `vector_backend.rs` as the canonical
+// `VectorIndexConfig` + `impl Default for VectorIndexConfig`.
+// Existing call sites continue to work via the `HnswConfig` type alias.
 
 struct HnswIndexInner {
     graph: Hnsw<'static, f32, DistCosine>,
@@ -566,6 +543,52 @@ impl HnswIndex {
         }
         vectors.sort_by_key(|(id, _)| *id);
         Ok(vectors)
+    }
+}
+
+// =====================================================================
+// VectorBackend trait implementation for the hnsw_rs 0.3 wrapper.
+// =====================================================================
+
+impl VectorBackend for HnswIndex {
+    fn insert(&self, key: String, vector: &[f32]) -> Result<(), MemoryError> {
+        HnswIndex::insert(self, key, vector)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), MemoryError> {
+        HnswIndex::delete(self, key)
+    }
+
+    fn update(&self, key: String, vector: &[f32]) -> Result<(), MemoryError> {
+        HnswIndex::update(self, key, vector)
+    }
+
+    fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorHit>, MemoryError> {
+        // The hnsw_rs search returns `Vec<Neighbour>`; convert to VectorHit.
+        HnswIndex::search(self, query, top_k).map(|hits| {
+            hits.into_iter()
+                .map(|h| VectorHit {
+                    key: h.key.clone(),
+                    distance: h.distance,
+                })
+                .collect()
+        })
+    }
+
+    fn len(&self) -> usize {
+        HnswIndex::len(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        HnswIndex::is_empty(self)
+    }
+
+    fn save(&self, dir: &Path, basename: &str) -> Result<(), MemoryError> {
+        HnswIndex::save(self, dir, basename)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "hnsw_rs 0.3 (with hnswio bincode 1.3.3 — see RUSTSEC-2025-0141)"
     }
 }
 

@@ -75,7 +75,7 @@ fn transform_claim_envelope() {
 
     match &batch.records[0] {
         ImportProjectionRecord::ClaimVersion(cv) => {
-            assert_eq!(cv.claim_id.as_str(), "claim-1");
+            assert_eq!(cv.claim_id.as_str(), "claim:claim-1");
             assert!(!cv.claim_version_id.is_empty());
             assert_eq!(cv.claim_state, ClaimState::Active);
             assert_eq!(cv.predicate, "has_type");
@@ -85,6 +85,18 @@ fn transform_claim_envelope() {
         }
         _ => panic!("expected ClaimVersion"),
     }
+}
+
+#[test]
+fn explicit_stamp_makes_transform_byte_identical() {
+    let env = make_claim_envelope();
+    let a = transform_envelope_at(&env, "2026-07-12T00:00:00Z").unwrap();
+    let b = transform_envelope_at(&env, "2026-07-12T00:00:00Z").unwrap();
+    assert_eq!(
+        serde_json::to_vec(&a).unwrap(),
+        serde_json::to_vec(&b).unwrap()
+    );
+    assert_eq!(a.transformed_at, "2026-07-12T00:00:00Z");
 }
 
 #[test]
@@ -616,11 +628,11 @@ fn brg003_entity_alias_bridge_defaults() {
             );
             assert_eq!(
                 alias.superseded_by_entity_id.as_ref().map(|id| id.as_str()),
-                Some("ent-old")
+                Some("entity:ent-old")
             );
             assert_eq!(
                 alias.split_from_entity_id.as_ref().map(|id| id.as_str()),
-                Some("ent-split")
+                Some("entity:ent-split")
             );
         }
         _ => panic!("expected EntityAlias"),

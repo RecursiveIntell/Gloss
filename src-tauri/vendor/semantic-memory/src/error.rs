@@ -12,6 +12,11 @@ pub enum MemoryError {
     #[error("Embedding request failed: {0}")]
     EmbeddingRequest(#[from] reqwest::Error),
 
+    /// Error from the Candle ML framework (in-process embedder).
+    #[cfg(feature = "candle-embedder")]
+    #[error("Candle error: {0}")]
+    CandleError(#[from] candle_core::Error),
+
     /// Embedding vector has wrong number of dimensions.
     #[error("Embedding provider returned {actual} dimensions, expected {expected}")]
     DimensionMismatch { expected: usize, actual: usize },
@@ -96,6 +101,10 @@ pub enum MemoryError {
     /// HNSW index error.
     #[error("HNSW index error: {0}")]
     HnswError(String),
+
+    /// Vector backend not yet implemented (e.g. usearch stub during migration).
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 
     /// Invalid HNSW key format.
     #[error("Invalid HNSW key format: {0}")]
@@ -227,6 +236,75 @@ pub enum MemoryError {
         detail: String,
     },
 
+    /// The authority permit does not grant the operation's capability.
+    #[error("authority permit unauthorized for {operation}: principal '{principal}'")]
+    AuthorityUnauthorized {
+        operation: String,
+        principal: String,
+    },
+
+    /// A capability-bearing authority append lacked an admissible evidence basis.
+    #[error("authority admission rejected for principal '{principal}': {reason}")]
+    AuthorityAdmissionRejected { principal: String, reason: String },
+
+    /// A governed path lacked a valid, consistent, in-scope origin label.
+    #[error("origin authority rejected for principal '{principal}': {reason}")]
+    OriginAuthorityRejected { principal: String, reason: String },
+
+    /// An idempotency key was reused with a different operation payload.
+    #[error("authority idempotency conflict for key '{key}'")]
+    AuthorityIdempotencyConflict { key: String },
+
+    /// Authority lineage state is not a single, internally consistent head.
+    #[error("inconsistent authority lineage '{lineage_id}': {detail}")]
+    AuthorityLineageInconsistent { lineage_id: String, detail: String },
+
+    /// A test-only authority fault was deliberately injected.
+    #[error("authority fault injected at stage {stage:?}")]
+    AuthorityFaultInjected {
+        stage: crate::authority_contracts::AuthorityFaultStage,
+    },
+
+    /// Selective forgetting could not prove a complete authorized closure.
+    #[error("forgetting closure is incomplete: {detail}")]
+    ForgettingClosureIncomplete { detail: String },
+
+    /// Selective forgetting exhausted its deterministic closure budget before mutation.
+    #[error("forgetting closure budget exceeded: budget {budget}, required at least {required}")]
+    ForgettingBudgetExceeded { budget: usize, required: usize },
+
+    /// A shadow policy proposal or promotion failed its deterministic control-plane gate.
+    #[error("shadow policy rejected: {reason}")]
+    ShadowPolicyRejected { reason: String },
+
+    /// A shadow policy proposal or receipt could not be found for the caller's principal.
+    #[error("shadow policy proposal not found: {proposal_id}")]
+    ShadowPolicyNotFound { proposal_id: String },
+
+    /// A shadow policy idempotency key was reused with different content.
+    #[error("shadow policy conflict for key '{key}'")]
+    ShadowPolicyConflict { key: String },
+
+    /// A shadow policy promotion lacked a valid elevated principal.
+    #[error("shadow policy unauthorized for principal '{principal}'")]
+    ShadowPolicyUnauthorized { principal: String },
+
+    /// A procedural artifact or lifecycle operation failed deterministic validation.
+    #[error("procedural memory rejected: {reason}")]
+    ProceduralMemoryRejected { reason: String },
+
+    /// A procedural lifecycle idempotency key was reused for a different payload.
+    #[error("procedural memory conflict for key '{key}'")]
+    ProceduralMemoryConflict { key: String },
+
+    /// The requested isolated procedure does not exist for the governed caller.
+    #[error("procedural memory artifact not found: {artifact_id}")]
+    ProceduralMemoryNotFound { artifact_id: String },
+
+    /// A procedural promotion/quarantine/revocation lacked its explicit elevated permit.
+    #[error("procedural memory unauthorized for principal '{principal}'")]
+    ProceduralMemoryUnauthorized { principal: String },
+
     /// Catch-all for other errors.
     #[error("{0}")]
     Other(String),
@@ -238,6 +316,8 @@ impl MemoryError {
         match self {
             Self::Database(_) => "database",
             Self::EmbeddingRequest(_) => "embedding_request",
+            #[cfg(feature = "candle-embedder")]
+            Self::CandleError(_) => "candle_error",
             Self::DimensionMismatch { .. } => "dimension_mismatch",
             Self::EmbeddingBatchCountMismatch { .. } => "embedding_batch_count_mismatch",
             Self::EmbeddingDimensionMismatch { .. } => "embedding_dimension_mismatch",
@@ -258,6 +338,7 @@ impl MemoryError {
             Self::EmbedderUnavailable(_) => "embedder_unavailable",
             Self::MigrationFailed { .. } => "migration_failed",
             Self::HnswError(_) => "hnsw_error",
+            Self::NotImplemented(_) => "not_implemented",
             Self::InvalidKey(_) => "invalid_key",
             Self::QuantizationError(_) => "quantization_error",
             Self::StorageError(_) => "storage_error",
@@ -271,6 +352,22 @@ impl MemoryError {
             Self::ImportInvalid { .. } => "import_invalid",
             Self::ImportDuplicate { .. } => "import_duplicate",
             Self::ImportMigrationRequired { .. } => "import_migration_required",
+            Self::AuthorityUnauthorized { .. } => "authority_unauthorized",
+            Self::AuthorityAdmissionRejected { .. } => "authority_admission_rejected",
+            Self::OriginAuthorityRejected { .. } => "origin_authority_rejected",
+            Self::AuthorityIdempotencyConflict { .. } => "authority_idempotency_conflict",
+            Self::AuthorityLineageInconsistent { .. } => "authority_lineage_inconsistent",
+            Self::AuthorityFaultInjected { .. } => "authority_fault_injected",
+            Self::ForgettingClosureIncomplete { .. } => "forgetting_closure_incomplete",
+            Self::ForgettingBudgetExceeded { .. } => "forgetting_budget_exceeded",
+            Self::ShadowPolicyRejected { .. } => "shadow_policy_rejected",
+            Self::ShadowPolicyNotFound { .. } => "shadow_policy_not_found",
+            Self::ShadowPolicyConflict { .. } => "shadow_policy_conflict",
+            Self::ShadowPolicyUnauthorized { .. } => "shadow_policy_unauthorized",
+            Self::ProceduralMemoryRejected { .. } => "procedural_memory_rejected",
+            Self::ProceduralMemoryConflict { .. } => "procedural_memory_conflict",
+            Self::ProceduralMemoryNotFound { .. } => "procedural_memory_not_found",
+            Self::ProceduralMemoryUnauthorized { .. } => "procedural_memory_unauthorized",
             Self::Other(_) => "other",
         }
     }

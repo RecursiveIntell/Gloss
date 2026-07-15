@@ -111,6 +111,11 @@ pub(crate) fn query_claim_versions(
            ON pil.source_envelope_id = cv.source_envelope_id
           AND pil.imported_at = cv.recorded_at
          WHERE cv.scope_namespace = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM forgetting_artifact_invalidations fai
+               WHERE (fai.surface_kind = 'claim_version' AND fai.artifact_id = cv.claim_version_id)
+                  OR (fai.surface_kind = 'claim' AND fai.artifact_id = cv.claim_id)
+           )
            AND ((?2 IS NULL AND cv.scope_domain IS NULL) OR cv.scope_domain = ?2)
            AND ((?3 IS NULL AND cv.scope_workspace_id IS NULL) OR cv.scope_workspace_id = ?3)
            AND ((?4 IS NULL AND cv.scope_repo_id IS NULL) OR cv.scope_repo_id = ?4)
@@ -239,6 +244,11 @@ pub(crate) fn query_relation_versions(
            ON pil.source_envelope_id = rv.source_envelope_id
           AND pil.imported_at = rv.recorded_at
          WHERE rv.scope_namespace = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM forgetting_artifact_invalidations fai
+               WHERE fai.surface_kind = 'relation_version'
+                 AND fai.artifact_id = rv.relation_version_id
+           )
            AND ((?2 IS NULL AND rv.scope_domain IS NULL) OR rv.scope_domain = ?2)
            AND ((?3 IS NULL AND rv.scope_workspace_id IS NULL) OR rv.scope_workspace_id = ?3)
            AND ((?4 IS NULL AND rv.scope_repo_id IS NULL) OR rv.scope_repo_id = ?4)
@@ -358,6 +368,10 @@ pub(crate) fn query_episode_rows(
            ON pil.source_envelope_id = el.source_envelope_id
           AND pil.imported_at = el.recorded_at
          WHERE pil.scope_namespace = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM forgetting_artifact_invalidations fai
+               WHERE fai.surface_kind = 'episode' AND fai.artifact_id = el.episode_id
+           )
            AND ((?2 IS NULL AND pil.scope_domain IS NULL) OR pil.scope_domain = ?2)
            AND ((?3 IS NULL AND pil.scope_workspace_id IS NULL) OR pil.scope_workspace_id = ?3)
            AND ((?4 IS NULL AND pil.scope_repo_id IS NULL) OR pil.scope_repo_id = ?4)
@@ -460,6 +474,11 @@ pub(crate) fn query_entity_aliases(
            ON pil.source_envelope_id = ea.source_envelope_id
           AND pil.imported_at = ea.recorded_at
          WHERE ea.scope_namespace = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM forgetting_artifact_invalidations fai
+               WHERE fai.surface_kind IN ('entity', 'entity_alias')
+                 AND fai.artifact_id = ea.canonical_entity_id
+           )
            AND ((?2 IS NULL AND ea.scope_domain IS NULL) OR ea.scope_domain = ?2)
            AND ((?3 IS NULL AND ea.scope_workspace_id IS NULL) OR ea.scope_workspace_id = ?3)
            AND ((?4 IS NULL AND ea.scope_repo_id IS NULL) OR ea.scope_repo_id = ?4)
@@ -559,6 +578,11 @@ pub(crate) fn query_evidence_refs(
            ON pil.source_envelope_id = er.source_envelope_id
           AND pil.imported_at = er.recorded_at
          WHERE pil.scope_namespace = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM forgetting_artifact_invalidations fai
+               WHERE fai.surface_kind = 'evidence_ref'
+                 AND fai.artifact_id = er.fetch_handle
+           )
            AND ((?2 IS NULL AND pil.scope_domain IS NULL) OR pil.scope_domain = ?2)
            AND ((?3 IS NULL AND pil.scope_workspace_id IS NULL) OR pil.scope_workspace_id = ?3)
            AND ((?4 IS NULL AND pil.scope_repo_id IS NULL) OR pil.scope_repo_id = ?4)

@@ -1,16 +1,46 @@
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use stack_ids::{
     ApplicabilityContextId, ApprovalGrantId, ApprovalRecordId, ArtifactId, AttemptId,
     AttestationEnvelopeId, CompiledObligationSetId, CompositionReceiptId, ContentDigest,
-    CrossRuntimeReplayTicketId, EffectCommitDecisionId, EffectExecutionReceiptId,
+    CrossRuntimeReplayTicketId, DigestBuilder, EffectCommitDecisionId, EffectExecutionReceiptId,
     EffectiveConstitutionId, ExecutionPermitId, PolicyDecisionId, ProfileSetId,
     RemoteOracleLeaseId, RemoteSliceResultId, ScopeKey, ToolEffectDispatchReceiptId, TraceCtx,
     TrialId,
 };
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
+
+#[async_trait]
+pub trait CompensatingAction: Send + Sync {
+    async fn compensate(&self, receipt: &ToolReceipt) -> Result<(), ToolError>;
+}
+
+#[derive(Debug)]
+pub struct ControlData<T>(pub(crate) T);
+
+#[derive(Debug, Clone)]
+pub struct UntrustedData<T>(pub T);
+
+/// Accepts only trusted control data.
+///
+/// `UntrustedData` cannot be passed into this function directly.
+///
+/// ```compile_fail
+/// use llm_tool_runtime::{accept_control_data, UntrustedData};
+///
+/// let untrusted = UntrustedData("payload".to_string());
+/// // Type mismatch: this function expects `ControlData`, not `UntrustedData`.
+/// accept_control_data(untrusted);
+/// ```
+pub fn accept_control_data<T>(data: ControlData<T>) -> T {
+    data.0
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionPermitScope {
@@ -30,22 +60,32 @@ impl ToolExecutionPermitScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ToolExecutionPermit {
     execution_permit_id: ExecutionPermitId,
     decision_id: PolicyDecisionId,
     approval_record_id: Option<ApprovalRecordId>,
     scope: ToolExecutionPermitScope,
+    expires_at: Option<DateTime<Utc>>,
+    nonce: String,
+    consumed: AtomicBool,
+    method_digest: ContentDigest,
+    effect_digest: ContentDigest,
 }
 
 impl ToolExecutionPermit {
     /// Builds a runtime execution permit snapshot for effectful tool dispatch.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         execution_permit_id: ExecutionPermitId,
         decision_id: PolicyDecisionId,
         approval_record_id: Option<ApprovalRecordId>,
         namespace: impl Into<String>,
         target_key: impl Into<String>,
+        method_digest: ContentDigest,
+        effect_digest: ContentDigest,
+        expires_at: Option<DateTime<Utc>>,
+        nonce: impl Into<String>,
     ) -> Self {
         Self {
             execution_permit_id,
@@ -55,6 +95,11 @@ impl ToolExecutionPermit {
                 namespace: namespace.into(),
                 target_key: target_key.into(),
             },
+            expires_at,
+            nonce: nonce.into(),
+            consumed: AtomicBool::new(false),
+            method_digest,
+            effect_digest,
         }
     }
 
@@ -76,6 +121,77 @@ impl ToolExecutionPermit {
     /// Returns the namespace/target scope enforced by this permit.
     pub fn scope(&self) -> &ToolExecutionPermitScope {
         &self.scope
+    }
+
+    /// Returns the expiry instant, when the issuing policy imposed one.
+    pub fn expires_at(&self) -> Option<&DateTime<Utc>> {
+        self.expires_at.as_ref()
+    }
+
+    /// Returns the issuer-provided replay nonce.
+    pub fn nonce(&self) -> &str {
+        &self.nonce
+    }
+
+    /// Returns the tool method digest bound to this permit.
+    pub fn method_digest(&self) -> &ContentDigest {
+        &self.method_digest
+    }
+
+    /// Returns the typed effect digest bound to this permit.
+    pub fn effect_digest(&self) -> &ContentDigest {
+        &self.effect_digest
+    }
+
+    /// Validates expiry and exact method/effect bindings without consuming the permit.
+    pub fn validate_binding(
+        &self,
+        method_digest: &ContentDigest,
+        effect_digest: &ContentDigest,
+        now: DateTime<Utc>,
+    ) -> Result<(), ToolError> {
+        if self
+            .expires_at
+            .as_ref()
+            .is_some_and(|expiry| expiry <= &now)
+        {
+            return Err(ToolError::new(
+                ToolErrorClass::Denied,
+                "execution permit expired",
+            ));
+        }
+        if &self.method_digest != method_digest || &self.effect_digest != effect_digest {
+            return Err(ToolError::new(
+                ToolErrorClass::Denied,
+                "execution permit method/effect binding mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Atomically consumes this one-shot permit.
+    pub fn consume(&self) -> Result<(), ToolError> {
+        if self
+            .expires_at
+            .as_ref()
+            .is_some_and(|expiry| expiry <= &Utc::now())
+        {
+            return Err(ToolError::new(
+                ToolErrorClass::Denied,
+                "execution permit expired",
+            ));
+        }
+        if self
+            .consumed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(ToolError::new(
+                ToolErrorClass::Denied,
+                "execution permit already consumed",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -172,8 +288,17 @@ pub enum McpSurfaceKind {
 #[serde(rename_all = "snake_case")]
 pub enum ToolReceiptPersistence {
     #[default]
+    Durable,
     Ephemeral,
+    /// Legacy name for durable Forge raw-receipt persistence.
     ForgeRaw,
+}
+
+impl ToolReceiptPersistence {
+    /// Returns whether this mode requires durable preflight and outcome receipts.
+    pub fn is_durable(&self) -> bool {
+        matches!(self, Self::Durable | Self::ForgeRaw)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,7 +499,40 @@ impl Default for ToolExposurePolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Typed declaration of how a tool maps arguments to one or more effect targets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectTargetSpec {
+    /// Equivalent argument names for a single logical target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Argument names that jointly form a compound effect scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compound: Vec<String>,
+}
+
+/// Concrete targets covered by an effect intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectScope {
+    pub targets: Vec<String>,
+}
+
+/// Canonical, typed description of the effect a tool call intends to perform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectIntent {
+    pub target_key: String,
+    pub effect_class: ToolSideEffectClass,
+    pub scope: EffectScope,
+    pub canonical_args_digest: ContentDigest,
+}
+
+impl EffectIntent {
+    /// Digests the complete typed effect rather than any provider-specific JSON spelling.
+    pub fn digest(&self) -> ContentDigest {
+        digest_serializable(self)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ToolDescriptor {
     pub name: String,
     pub version: String,
@@ -398,10 +556,27 @@ pub struct ToolDescriptor {
     pub exposure_policy: ToolExposurePolicy,
     #[serde(default)]
     pub receipt_persistence: ToolReceiptPersistence,
+    #[serde(default)]
+    pub effect_target: EffectTargetSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_size_limit_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_payload: Option<Value>,
+    #[serde(skip)]
+    pub rollback_contract: Option<Arc<dyn CompensatingAction + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ToolDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolDescriptor")
+            .field("name", &self.name)
+            .field("version", &self.version)
+            .field("backend_kind", &self.backend_kind)
+            .field("read_only", &self.read_only)
+            .field("side_effect_class", &self.side_effect_class)
+            .field("has_rollback", &self.rollback_contract.is_some())
+            .finish()
+    }
 }
 
 impl ToolDescriptor {
@@ -414,6 +589,80 @@ impl ToolDescriptor {
                 | ToolBackendKind::OllamaFunction
         )
     }
+
+    /// Returns the stable digest identifying this tool method and version.
+    pub fn method_digest(&self) -> ContentDigest {
+        digest_serializable(&serde_json::json!({
+            "name": self.name,
+            "version": self.version,
+        }))
+    }
+
+    /// Converts provider arguments into a typed, canonical effect intent.
+    pub fn describe_effect(&self, args: &Value) -> Result<EffectIntent, ToolError> {
+        let mut canonical_args = args.clone();
+        let targets = if !self.effect_target.compound.is_empty() {
+            self.effect_target
+                .compound
+                .iter()
+                .map(|name| required_target(args, name))
+                .collect::<Result<Vec<_>, _>>()?
+        } else if !self.effect_target.aliases.is_empty() {
+            let target = self
+                .effect_target
+                .aliases
+                .iter()
+                .find_map(|name| args.get(name).and_then(Value::as_str))
+                .ok_or_else(|| {
+                    ToolError::new(
+                        ToolErrorClass::InvalidArguments,
+                        "effect target is missing or is not a string",
+                    )
+                })?
+                .to_owned();
+            if let Value::Object(object) = &mut canonical_args {
+                for alias in &self.effect_target.aliases {
+                    object.remove(alias);
+                }
+                object.insert("$effect_target".into(), Value::String(target.clone()));
+            }
+            vec![target]
+        } else {
+            Vec::new()
+        };
+
+        let target_key = match targets.as_slice() {
+            [] => self.name.clone(),
+            [target] => target.clone(),
+            _ => serde_json::to_string(&targets).unwrap_or_else(|_| "[]".into()),
+        };
+        Ok(EffectIntent {
+            target_key,
+            effect_class: self.side_effect_class.clone(),
+            scope: EffectScope { targets },
+            canonical_args_digest: digest_serializable(&canonical_args),
+        })
+    }
+}
+
+fn required_target(args: &Value, name: &str) -> Result<String, ToolError> {
+    args.get(name)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ToolError::new(
+                ToolErrorClass::InvalidArguments,
+                format!("compound effect target {name} is missing or is not a string"),
+            )
+        })
+}
+
+fn digest_serializable(value: &impl Serialize) -> ContentDigest {
+    let mut builder = DigestBuilder::new();
+    if let Ok(value) = serde_json::to_value(value) {
+        let _ = builder.update_json(&value);
+    }
+    builder.finalize()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,7 +695,7 @@ pub struct ToolCtx {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_grant: Option<ApprovalGrant>,
     #[serde(default, skip_serializing, skip_deserializing)]
-    pub execution_permit: Option<ToolExecutionPermit>,
+    pub execution_permit: Option<Arc<ToolExecutionPermit>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     pub caller: String,
@@ -599,6 +848,58 @@ impl ToolError {
     }
 }
 
+/// One offline-verifiable hop in the authority chain for an execution receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityLineageEntry {
+    pub origin_class: String,
+    pub principal: String,
+    pub permit_id: String,
+    pub policy_version: String,
+}
+
+/// Verifies that authority lineage is populated and covers the complete execution chain.
+pub fn verify_authority_lineage(lineage: &[AuthorityLineageEntry]) -> Result<(), ToolError> {
+    const REQUIRED: [&str; 5] = ["request", "policy", "approval", "permit", "effect"];
+    if lineage.iter().any(|entry| {
+        entry.origin_class.is_empty()
+            || entry.principal.is_empty()
+            || entry.permit_id.is_empty()
+            || entry.policy_version.is_empty()
+    }) {
+        return Err(ToolError::new(
+            ToolErrorClass::ProviderContract,
+            "authority lineage contains an incomplete entry",
+        ));
+    }
+    if REQUIRED
+        .iter()
+        .any(|required| !lineage.iter().any(|entry| entry.origin_class == *required))
+    {
+        return Err(ToolError::new(
+            ToolErrorClass::ProviderContract,
+            "authority lineage does not cover request, policy, approval, permit, and effect",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolReceiptPhase {
+    Preflight,
+    #[default]
+    Outcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolReceiptResolution {
+    Pending,
+    #[default]
+    Resolved,
+    Unresolved,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolReceipt {
     pub receipt_id: String,
@@ -609,6 +910,12 @@ pub struct ToolReceipt {
     pub output_digest_or_refs: Value,
     pub policy_hash: ContentDigest,
     pub approval_state: ToolApprovalState,
+    #[serde(default)]
+    pub phase: ToolReceiptPhase,
+    #[serde(default)]
+    pub resolution: ToolReceiptResolution,
+    #[serde(default)]
+    pub authority_lineage: Vec<AuthorityLineageEntry>,
     pub host_identity: String,
     pub started_at: String,
     pub finished_at: String,
@@ -624,6 +931,8 @@ pub struct ToolReceipt {
     pub budget_context: Option<ToolBudgetContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_receipt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_receipt_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family_receipt_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -647,6 +956,11 @@ pub struct ToolReceipt {
 }
 
 impl ToolReceipt {
+    /// Verifies the embedded request-to-effect authority chain offline.
+    pub fn verify_authority_lineage(&self) -> Result<(), ToolError> {
+        verify_authority_lineage(&self.authority_lineage)
+    }
+
     /// Normalizes a runtime-native tool receipt into the canonical Forge receipt schema.
     pub fn to_forge_tool_receipt_v2(
         &self,

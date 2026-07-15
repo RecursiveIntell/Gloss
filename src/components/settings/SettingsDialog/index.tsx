@@ -376,6 +376,9 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const [dbDoctorReceipt, setDbDoctorReceipt] = useState<DbDoctorReceipt | null>(null);
   const [runningChatSmoke, setRunningChatSmoke] = useState(false);
   const [lastTrace, setLastTrace] = useState<ChatAttemptTraceV1 | null>(null);
+  const allowCustomCloudEndpoints =
+    settings["allow_custom_cloud_endpoints"] === "true" ||
+    settings["allow_custom_cloud_endpoints"] === "1";
 
   // Debounce the 5 text/number inputs that previously fired updateSetting on
   // every keystroke (H-4 from the hostile audit). Typing "http://localhost"
@@ -846,6 +849,27 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               />
               Allow LAN local providers (RFC1918)
               <span className="text-text-tertiary">— permits Ollama/llama.cpp on private-network IPs (e.g. 192.168.x.x, 10.x.x.x). Default: loopback only.</span>
+            </label>
+            <label className="mt-2 flex items-start gap-2 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={allowCustomCloudEndpoints}
+                onChange={(e) => {
+                  updateSetting(
+                    "allow_custom_cloud_endpoints",
+                    e.target.checked ? "true" : "false"
+                  );
+                }}
+                className="mt-0.5 rounded border-border"
+              />
+              <div className="leading-tight">
+                Allow custom OpenAI/Anthropic cloud endpoints
+                <p className="mt-0.5 text-text-tertiary">
+                  Warning: this permits non-default HTTPS cloud endpoints (for example
+                  OpenAI-compatible/OpenRouter/Azure endpoints). Credentials, query strings,
+                  and fragments remain blocked. Default: off.
+                </p>
+              </div>
             </label>
           </SettingsSection>
 

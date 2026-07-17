@@ -642,7 +642,9 @@ impl MemoryStore {
         let effective_token_count =
             token_count.or_else(|| Some(self.inner.token_counter.count_tokens(content) as u32));
 
-        let embedding = self.embed_text_internal(content).await?;
+        let (embedding, sparse, sparse_representation) = self
+            .embed_text_with_sparse_internal(content, crate::EmbeddingPurpose::Document)
+            .await?;
         self.validate_embedding_dimensions(&embedding)?;
         let embedding_bytes = crate::db::embedding_to_bytes(&embedding);
         // INTENTIONAL: q8 quantization is an optional search optimization; missing q8 is non-fatal
@@ -656,7 +658,7 @@ impl MemoryStore {
         let meta = merge_trace_ctx(metadata, trace_ctx);
         let msg_id = self
             .with_write_conn(move |conn| {
-                add_message_with_embedding_q8(
+                let message_id = add_message_with_embedding_q8(
                     conn,
                     &sid,
                     role,
@@ -665,7 +667,18 @@ impl MemoryStore {
                     meta.as_ref(),
                     &embedding_bytes,
                     q8_bytes.as_deref(),
-                )
+                )?;
+                if let Some((weights, representation)) =
+                    sparse.as_ref().zip(sparse_representation.as_deref())
+                {
+                    crate::db::store_sparse_vector(
+                        conn,
+                        &format!("msg:{message_id}"),
+                        weights,
+                        representation,
+                    )?;
+                }
+                Ok(message_id)
             })
             .await?;
 
@@ -688,7 +701,18 @@ impl MemoryStore {
             .unwrap_or(self.inner.config.search.default_top_k)
             .min(MAX_TOP_K);
 
-        let query_embedding = self.embed_text_internal(query).await?;
+        let (query_embedding, query_sparse) = if self.inner.config.search.sparse_weight > 0.0 {
+            let (dense, sparse, _) = self
+                .embed_text_with_sparse_internal(query, crate::EmbeddingPurpose::Query)
+                .await?;
+            (dense, sparse)
+        } else {
+            (
+                self.embed_text_internal(query, crate::EmbeddingPurpose::Query)
+                    .await?,
+                None,
+            )
+        };
 
         #[cfg(feature = "hnsw")]
         let hnsw_hits = {
@@ -741,43 +765,59 @@ impl MemoryStore {
             let sids_slice: Option<&[&str]> = sids_refs.as_deref();
             #[cfg(feature = "hnsw")]
             {
-                if hnsw_hits_owned.is_empty() {
-                    search::hybrid_search(
+                let execution = if hnsw_hits_owned.is_empty() {
+                    search::hybrid_search_detailed_with_context(
                         conn,
                         &q,
                         &query_embedding,
+                        query_sparse.as_ref(),
                         &config,
+                        &crate::SearchContext::default_now(),
                         k,
                         None,
                         Some(&[SearchSourceType::Messages]),
                         sids_slice,
                     )
                 } else {
-                    search::hybrid_search_with_hnsw(
+                    search::hybrid_search_with_hnsw_detailed_with_context(
                         conn,
                         &q,
                         &query_embedding,
+                        query_sparse.as_ref(),
                         &config,
+                        &crate::SearchContext::default_now(),
                         k,
                         None,
                         Some(&[SearchSourceType::Messages]),
                         sids_slice,
                         &hnsw_hits_owned,
                     )
-                }
+                }?;
+                Ok(execution
+                    .results
+                    .into_iter()
+                    .map(|result| result.result)
+                    .collect())
             }
             #[cfg(not(feature = "hnsw"))]
             {
-                search::hybrid_search(
+                let execution = search::hybrid_search_detailed_with_context(
                     conn,
                     &q,
                     &query_embedding,
+                    query_sparse.as_ref(),
                     &config,
+                    &crate::SearchContext::default_now(),
                     k,
                     None,
                     Some(&[SearchSourceType::Messages]),
                     sids_slice,
-                )
+                )?;
+                Ok(execution
+                    .results
+                    .into_iter()
+                    .map(|result| result.result)
+                    .collect())
             }
         })
         .await

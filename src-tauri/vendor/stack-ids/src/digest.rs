@@ -1,197 +1,327 @@
-//! Canonical content digest computation.
+//! Shared domain-separated content digest computation.
 //!
-//! ## Digest law (from MASTER_SUPPORTING_DELTA §7)
-//!
-//! The digest algorithm for export/import idempotency is:
-//! - Deterministic canonical serialization using normalized JSON object keys
-//!   and deterministic recursive traversal
-//! - UTF-8 encoding
-//! - BLAKE3 hash
-//! - Hex-encoded output (64 chars)
-//!
-//! The digest domain (which fields are included) is defined per envelope type.
-//! Bridge and importer must agree exactly on which fields are digested.
-//!
-//! `compute_json()` and `DigestBuilder::update_json()` do not trust map key order from
-//! transient serializer internals. Inputs that serialize to JSON objects are normalized
-//! before hashing so callers may use map-like structures without silently introducing
-//! unstable key-order behavior.
-//!
-//! ## Usage
-//!
-//! ```
-//! use stack_ids::ContentDigest;
-//!
-//! let digest = ContentDigest::compute(b"hello world");
-//! assert_eq!(digest.hex().len(), 64);
-//! ```
+//! Canonical JSON delegates to boundary-compiler so the stack has one RFC
+//! 8785 implementation and one JSON digest law.
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use schemars::{
+    r#gen::SchemaGenerator,
+    schema::{
+        InstanceType, Metadata, ObjectValidation, Schema, SchemaObject, StringValidation,
+        SubschemaValidation,
+    },
+    JsonSchema, Map, Set,
+};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
-/// A BLAKE3 content digest for idempotent deduplication.
-///
-/// The inner value is a 64-character hex string representing the BLAKE3 hash.
+/// Domain separator for non-JSON raw byte digests.
+pub const RAW_BYTES_DOMAIN: &str = "recursiveintell:raw-bytes:v1";
+
+/// Identity context cryptographically bound into a content digest.
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
-#[serde(transparent)]
-pub struct ContentDigest(pub String);
+pub struct DigestMetadata {
+    /// Hash algorithm.
+    pub algorithm: String,
+    /// Canonicalization algorithm/profile.
+    pub canonicalization_profile: String,
+    /// Schema identifier for the hashed value.
+    pub schema_id: String,
+    /// Schema version for the hashed value.
+    pub schema_version: String,
+    /// Domain separator preventing cross-protocol reuse.
+    pub domain_separator: String,
+}
 
-impl ContentDigest {
-    /// Compute a BLAKE3 digest from raw bytes.
-    pub fn compute(data: &[u8]) -> Self {
-        let hash = blake3::hash(data);
-        Self(hash.to_hex().to_string())
+impl DigestMetadata {
+    fn raw_bytes() -> Self {
+        Self {
+            algorithm: boundary_compiler::DIGEST_ALGORITHM.to_owned(),
+            canonicalization_profile: "raw-bytes".to_owned(),
+            schema_id: "application/octet-stream".to_owned(),
+            schema_version: "1".to_owned(),
+            domain_separator: RAW_BYTES_DOMAIN.to_owned(),
+        }
     }
 
-    /// Compute a BLAKE3 digest from a UTF-8 string.
+    fn from_boundary(metadata: &boundary_compiler::digest::DigestMetadata) -> Self {
+        Self {
+            algorithm: metadata.algorithm.clone(),
+            canonicalization_profile: metadata.canonicalization_profile.clone(),
+            schema_id: metadata.schema_id.clone(),
+            schema_version: metadata.schema_version.clone(),
+            domain_separator: metadata.domain_separator.clone(),
+        }
+    }
+}
+
+/// A BLAKE3 content digest with explicit identity context.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+pub struct ContentDigest {
+    hex: String,
+    metadata: DigestMetadata,
+}
+
+impl<'de> Deserialize<'de> for ContentDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ContentDigestWire {
+            Structured {
+                hex: String,
+                metadata: DigestMetadata,
+            },
+            LegacyHex(String),
+        }
+
+        match ContentDigestWire::deserialize(deserializer)? {
+            ContentDigestWire::Structured { hex, metadata } => {
+                let hex = validate_hex(hex).map_err(de::Error::custom)?;
+                Ok(Self { hex, metadata })
+            }
+            ContentDigestWire::LegacyHex(hex) => Self::from_hex(hex).map_err(de::Error::custom),
+        }
+    }
+}
+
+impl JsonSchema for ContentDigest {
+    fn schema_name() -> String {
+        "ContentDigest".to_owned()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let structured = SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(ObjectValidation {
+                properties: Map::from([
+                    ("hex".to_owned(), generator.subschema_for::<String>()),
+                    (
+                        "metadata".to_owned(),
+                        generator.subschema_for::<DigestMetadata>(),
+                    ),
+                ]),
+                required: Set::from(["hex".to_owned(), "metadata".to_owned()]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let legacy = SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                min_length: Some(64),
+                max_length: Some(64),
+                pattern: Some("^[0-9A-Fa-f]{64}$".to_owned()),
+            })),
+            ..Default::default()
+        };
+
+        Schema::Object(SchemaObject {
+            metadata: Some(Box::new(Metadata {
+                description: Some(
+                    "A BLAKE3 content digest with explicit identity context.".to_owned(),
+                ),
+                ..Default::default()
+            })),
+            subschemas: Some(Box::new(SubschemaValidation {
+                any_of: Some(vec![Schema::Object(structured), Schema::Object(legacy)]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+impl ContentDigest {
+    /// Computes a domain-separated digest from raw bytes.
+    pub fn compute(data: &[u8]) -> Self {
+        let metadata = DigestMetadata::raw_bytes();
+        Self {
+            hex: hash_with_metadata(&metadata, data),
+            metadata,
+        }
+    }
+
+    /// Computes a domain-separated digest from a UTF-8 string.
     pub fn compute_str(data: &str) -> Self {
         Self::compute(data.as_bytes())
     }
 
-    /// Compute a digest from a JSON-serializable value using canonical serialization.
-    ///
-    /// Canonical serialization means:
-    /// - JSON object key ordering is normalized recursively.
-    /// - `serde_json::to_string()` (compact, no trailing whitespace).
-    ///
-    /// For structured data with guaranteed field order (structs with named fields),
-    /// serde_json produces deterministic output by default.
-    pub fn compute_json<T: Serialize>(value: &T) -> Result<Self, DigestError> {
-        let canonical = canonicalize_json_value(serde_json::to_value(value).map_err(|e| {
-            DigestError::SerializationFailed {
-                reason: e.to_string(),
-            }
-        })?);
-        let canonical =
-            serde_json::to_string(&canonical).map_err(|e| DigestError::SerializationFailed {
-                reason: e.to_string(),
-            })?;
-        Ok(Self::compute_str(&canonical))
+    /// Computes an RFC 8785 digest using the default JSON schema identity.
+    pub fn compute_json<T: Serialize + ?Sized>(value: &T) -> Result<Self, DigestError> {
+        Self::compute_json_with_schema(
+            value,
+            boundary_compiler::DEFAULT_SCHEMA_ID,
+            boundary_compiler::DEFAULT_SCHEMA_VERSION,
+        )
     }
 
-    /// Get the hex representation.
+    /// Computes an RFC 8785 digest bound to a schema ID and version.
+    pub fn compute_json_with_schema<T: Serialize + ?Sized>(
+        value: &T,
+        schema_id: impl Into<String>,
+        schema_version: impl Into<String>,
+    ) -> Result<Self, DigestError> {
+        let value = serde_json::to_value(value).map_err(serialization_failed)?;
+        let digest = boundary_compiler::ContentDigest::compute_with_schema(
+            &value,
+            schema_id,
+            schema_version,
+        )
+        .map_err(|error| DigestError::SerializationFailed {
+            reason: error.to_string(),
+        })?;
+        Ok(Self {
+            hex: digest.hex(),
+            metadata: DigestMetadata::from_boundary(digest.metadata()),
+        })
+    }
+
+    /// Returns the hex representation.
     pub fn hex(&self) -> &str {
-        &self.0
+        &self.hex
     }
 
-    /// Create from a pre-computed hex string.
-    ///
-    /// Validates that the string is exactly 64 hex characters.
+    /// Returns the raw 32-byte digest.
+    pub fn as_bytes(&self) -> [u8; 32] {
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&self.hex[index * 2..index * 2 + 2], 16)
+                .expect("ContentDigest maintains validated hexadecimal");
+        }
+        bytes
+    }
+
+    /// Returns the identity context bound into the digest.
+    pub fn metadata(&self) -> &DigestMetadata {
+        &self.metadata
+    }
+
+    /// Creates a raw-byte digest wrapper from validated hex.
     pub fn from_hex(hex: impl Into<String>) -> Result<Self, DigestError> {
-        let hex = hex.into();
-        if hex.len() != 64 {
-            return Err(DigestError::InvalidDigest {
-                reason: format!("expected 64 hex chars, got {}", hex.len()),
-            });
-        }
-        if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(DigestError::InvalidDigest {
-                reason: "digest must contain only hex characters".into(),
-            });
-        }
-        Ok(Self(hex))
+        let hex = validate_hex(hex.into())?;
+        Ok(Self {
+            hex,
+            metadata: DigestMetadata::raw_bytes(),
+        })
     }
 
-    /// Create from a pre-computed hex string without validation.
-    ///
-    /// Use only when the digest is known to be valid (e.g. loaded from DB).
+    /// Creates a raw-byte digest wrapper without validating its hex.
     pub fn from_hex_unchecked(hex: impl Into<String>) -> Self {
-        Self(hex.into())
+        Self {
+            hex: hex.into(),
+            metadata: DigestMetadata::raw_bytes(),
+        }
     }
 }
 
 impl std::fmt::Display for ContentDigest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.hex)
     }
 }
 
-/// Incremental digest builder for computing digests over multiple fields.
-///
-/// Use this when the digest domain spans multiple fields and you want to
-/// hash them incrementally without allocating a single concatenated buffer.
+/// Incremental raw-byte digest builder.
 pub struct DigestBuilder {
     hasher: blake3::Hasher,
+    metadata: DigestMetadata,
 }
 
 impl DigestBuilder {
-    /// Create a new builder.
+    /// Creates a domain-separated raw-byte digest builder.
     pub fn new() -> Self {
-        Self {
-            hasher: blake3::Hasher::new(),
-        }
+        let metadata = DigestMetadata::raw_bytes();
+        let mut hasher = blake3::Hasher::new();
+        seed_metadata(&mut hasher, &metadata);
+        Self { hasher, metadata }
     }
 
-    /// Feed raw bytes into the digest.
+    /// Feeds raw bytes into the digest.
     pub fn update(&mut self, data: &[u8]) -> &mut Self {
         self.hasher.update(data);
         self
     }
 
-    /// Feed a UTF-8 string into the digest.
+    /// Feeds a UTF-8 string into the digest.
     pub fn update_str(&mut self, data: &str) -> &mut Self {
-        self.hasher.update(data.as_bytes());
-        self
+        self.update(data.as_bytes())
     }
 
-    /// Feed a field separator. Use between fields to prevent ambiguity.
+    /// Feeds a field separator.
     pub fn separator(&mut self) -> &mut Self {
-        self.hasher.update(b"\x00");
-        self
+        self.update(b"\0")
     }
 
-    /// Feed a JSON-serializable value using canonical serialization.
+    /// Feeds RFC 8785 bytes for a serializable JSON value.
     pub fn update_json<T: Serialize + ?Sized>(
         &mut self,
         value: &T,
     ) -> Result<&mut Self, DigestError> {
-        let canonical = canonicalize_json_value(serde_json::to_value(value).map_err(|e| {
-            DigestError::SerializationFailed {
-                reason: e.to_string(),
-            }
-        })?);
-        let canonical =
-            serde_json::to_string(&canonical).map_err(|e| DigestError::SerializationFailed {
-                reason: e.to_string(),
+        let value = serde_json::to_value(value).map_err(serialization_failed)?;
+        let bytes = boundary_compiler::Canonicalizer::new()
+            .canonicalize_bytes(&value)
+            .map_err(|error| DigestError::SerializationFailed {
+                reason: error.to_string(),
             })?;
-        self.hasher.update(canonical.as_bytes());
+        self.update(&bytes);
         Ok(self)
     }
 
-    /// Finalize and return the digest.
+    /// Finalizes the digest.
     pub fn finalize(self) -> ContentDigest {
-        let hash = self.hasher.finalize();
-        ContentDigest(hash.to_hex().to_string())
-    }
-}
-
-fn canonicalize_json_value(value: Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut entries = map
-                .into_iter()
-                .map(|(key, value)| (key, canonicalize_json_value(value)))
-                .collect::<Vec<(String, Value)>>();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            let mut ordered = serde_json::Map::new();
-            for (key, value) in entries {
-                ordered.insert(key, value);
-            }
-            Value::Object(ordered)
+        ContentDigest {
+            hex: self.hasher.finalize().to_hex().to_string(),
+            metadata: self.metadata,
         }
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(canonicalize_json_value).collect())
-        }
-        other => other,
     }
 }
 
 impl Default for DigestBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn seed_metadata(hasher: &mut blake3::Hasher, metadata: &DigestMetadata) {
+    for field in [
+        metadata.algorithm.as_bytes(),
+        metadata.canonicalization_profile.as_bytes(),
+        metadata.schema_id.as_bytes(),
+        metadata.schema_version.as_bytes(),
+        metadata.domain_separator.as_bytes(),
+    ] {
+        hasher.update(&(field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+}
+
+fn hash_with_metadata(metadata: &DigestMetadata, data: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    seed_metadata(&mut hasher, metadata);
+    hasher.update(&(data.len() as u64).to_be_bytes());
+    hasher.update(data);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn validate_hex(hex: String) -> Result<String, DigestError> {
+    if hex.len() != 64 {
+        return Err(DigestError::InvalidDigest {
+            reason: format!("expected 64 hex chars, got {}", hex.len()),
+        });
+    }
+    if !hex.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(DigestError::InvalidDigest {
+            reason: "digest must contain only hex characters".to_owned(),
+        });
+    }
+    Ok(hex)
+}
+
+fn serialization_failed(error: serde_json::Error) -> DigestError {
+    DigestError::SerializationFailed {
+        reason: error.to_string(),
     }
 }
 
@@ -205,6 +335,7 @@ pub enum DigestError {
 }
 
 impl DigestError {
+    /// Stable error kind.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::SerializationFailed { .. } => "serialization_failed",
@@ -219,9 +350,7 @@ impl std::fmt::Display for DigestError {
             Self::SerializationFailed { reason } => {
                 write!(f, "digest serialization failed: {reason}")
             }
-            Self::InvalidDigest { reason } => {
-                write!(f, "invalid digest: {reason}")
-            }
+            Self::InvalidDigest { reason } => write!(f, "invalid digest: {reason}"),
         }
     }
 }
@@ -231,130 +360,76 @@ impl std::error::Error for DigestError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
 
     #[test]
-    fn compute_and_verify_length() {
-        let digest = ContentDigest::compute(b"hello world");
-        assert_eq!(digest.hex().len(), 64);
-        assert!(digest.hex().chars().all(|c| c.is_ascii_hexdigit()));
+    fn raw_digest_is_deterministic_and_domain_bound() {
+        let first = ContentDigest::compute(b"test");
+        assert_eq!(first, ContentDigest::compute(b"test"));
+        assert_ne!(first, ContentDigest::compute(b"other"));
+        assert_eq!(first.hex().len(), 64);
+        assert_eq!(first.metadata().domain_separator, RAW_BYTES_DOMAIN);
     }
 
     #[test]
-    fn deterministic_same_input() {
-        let a = ContentDigest::compute(b"test data");
-        let b = ContentDigest::compute(b"test data");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn different_input_different_digest() {
-        let a = ContentDigest::compute(b"input A");
-        let b = ContentDigest::compute(b"input B");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn compute_json_deterministic() {
-        let mut map = BTreeMap::new();
-        map.insert("b", "two");
-        map.insert("a", "one");
-        let d1 = ContentDigest::compute_json(&map).unwrap();
-
-        let mut map2 = BTreeMap::new();
-        map2.insert("a", "one");
-        map2.insert("b", "two");
-        let d2 = ContentDigest::compute_json(&map2).unwrap();
-
-        // BTreeMap ensures sorted keys → same digest regardless of insertion order
-        assert_eq!(d1, d2);
-    }
-
-    #[test]
-    fn compute_json_normalizes_hash_map_key_order() {
-        let mut unsorted = HashMap::new();
-        unsorted.insert("b", "two");
-        unsorted.insert("a", "one");
-
-        let mut reordered = HashMap::new();
-        reordered.insert("a", "one");
-        reordered.insert("b", "two");
-
-        let left = ContentDigest::compute_json(&unsorted).unwrap();
-        let right = ContentDigest::compute_json(&reordered).unwrap();
-
-        assert_eq!(left, right);
-    }
-
-    #[test]
-    fn compute_json_matches_pinned_golden_digest() {
-        let mut ordered = BTreeMap::new();
-        ordered.insert("a", serde_json::json!({ "z": 1, "y": [3, 2, 1] }));
-        ordered.insert("b", serde_json::json!("two"));
-
-        let digest = ContentDigest::compute_json(&ordered).unwrap();
-
+    fn json_digest_normalizes_maps() {
+        let left = HashMap::from([("b", 2), ("a", 1)]);
+        let right = HashMap::from([("a", 1), ("b", 2)]);
         assert_eq!(
-            digest.hex(),
-            "5359182562bfb1083acba7077061a75d451f373026ae4a79c28118403f58cb1f"
+            ContentDigest::compute_json(&left).unwrap(),
+            ContentDigest::compute_json(&right).unwrap()
         );
     }
 
     #[test]
-    fn from_hex_valid() {
+    fn schema_identity_changes_json_digest() {
+        let value = serde_json::json!({"a": 1});
+        let first = ContentDigest::compute_json_with_schema(&value, "claim", "1").unwrap();
+        let second = ContentDigest::compute_json_with_schema(&value, "claim", "2").unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn from_hex_validates_and_serde_roundtrips_metadata() {
+        assert!(ContentDigest::from_hex("abc").is_err());
+        assert!(ContentDigest::from_hex("g".repeat(64)).is_err());
         let digest = ContentDigest::compute(b"test");
-        let restored = ContentDigest::from_hex(digest.hex()).unwrap();
-        assert_eq!(restored, digest);
+        let encoded = serde_json::to_string(&digest).unwrap();
+        let decoded: ContentDigest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, digest);
     }
 
     #[test]
-    fn from_hex_wrong_length() {
-        let err = ContentDigest::from_hex("abc").unwrap_err();
-        assert!(matches!(err, DigestError::InvalidDigest { .. }));
+    fn deserializes_legacy_hex_string_as_raw_bytes() {
+        let hex = "a".repeat(64);
+        let encoded = serde_json::to_string(&hex).unwrap();
+
+        let digest: ContentDigest = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(digest.hex(), hex);
+        assert_eq!(digest.metadata(), &DigestMetadata::raw_bytes());
     }
 
     #[test]
-    fn from_hex_non_hex_chars() {
-        let err = ContentDigest::from_hex("g".repeat(64)).unwrap_err();
-        assert!(matches!(err, DigestError::InvalidDigest { .. }));
-    }
-
-    #[test]
-    fn builder_deterministic() {
-        let d1 = {
-            let mut b = DigestBuilder::new();
-            b.update_str("field1").separator().update_str("field2");
-            b.finalize()
-        };
-        let d2 = {
-            let mut b = DigestBuilder::new();
-            b.update_str("field1").separator().update_str("field2");
-            b.finalize()
-        };
-        assert_eq!(d1, d2);
+    fn rejects_invalid_legacy_hex_strings() {
+        for hex in ["a".repeat(63), "g".repeat(64)] {
+            let encoded = serde_json::to_string(&hex).unwrap();
+            assert!(serde_json::from_str::<ContentDigest>(&encoded).is_err());
+        }
     }
 
     #[test]
     fn builder_separator_prevents_collision() {
-        // "ab" + "c" should differ from "a" + "bc"
-        let d1 = {
-            let mut b = DigestBuilder::new();
-            b.update_str("ab").separator().update_str("c");
-            b.finalize()
+        let first = {
+            let mut builder = DigestBuilder::new();
+            builder.update_str("ab").separator().update_str("c");
+            builder.finalize()
         };
-        let d2 = {
-            let mut b = DigestBuilder::new();
-            b.update_str("a").separator().update_str("bc");
-            b.finalize()
+        let second = {
+            let mut builder = DigestBuilder::new();
+            builder.update_str("a").separator().update_str("bc");
+            builder.finalize()
         };
-        assert_ne!(d1, d2);
-    }
-
-    #[test]
-    fn serde_roundtrip() {
-        let digest = ContentDigest::compute(b"test");
-        let json = serde_json::to_string(&digest).unwrap();
-        let back: ContentDigest = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, digest);
+        assert_ne!(first, second);
     }
 }

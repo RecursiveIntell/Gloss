@@ -3,3 +3,4 @@ pub mod notebooks;
 pub mod notes;
 pub mod settings;
 pub mod sources;
+pub mod studio;

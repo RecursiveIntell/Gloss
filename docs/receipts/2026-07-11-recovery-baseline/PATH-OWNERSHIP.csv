@@ -1,0 +1,61 @@
+path,preexisting_status,subsystem,intended_change,dependency_package,rollback_unit,validation_gate
+argo.lock,M,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+FIX_PLAN.md,M,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+docs/codex-runs/CODEX_RUN_INDEX.md,M,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+docs/codex-runs/CURRENT_RUN.md,M,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+package.json,M,build/dependencies,preserve then reconcile under master plan,R0 baseline,path-scoped diff,cargo check + npm build
+scripts/gloss_p36_perf_probe.py,D,validation/CI,preserve then reconcile under master plan,R0 baseline,path-scoped diff,canonical verifier self-test
+src-tauri/Cargo.toml,M,build/dependencies,preserve then reconcile under master plan,R0 baseline,path-scoped diff,cargo check + npm build
+src-tauri/src/commands/chat/emit.rs,M,chat lifecycle,preserve then reconcile under master plan,R0 baseline,path-scoped diff,targeted chat tests
+src-tauri/src/commands/chat/mod.rs,M,chat lifecycle,preserve then reconcile under master plan,R0 baseline,path-scoped diff,targeted chat tests
+src-tauri/src/commands/chat/streaming.rs,M,chat lifecycle,preserve then reconcile under master plan,R0 baseline,path-scoped diff,targeted chat tests
+src-tauri/src/commands/chat/types.rs,M,chat lifecycle,preserve then reconcile under master plan,R0 baseline,path-scoped diff,targeted chat tests
+src-tauri/src/commands/settings.rs,M,provider runtime,preserve then reconcile under master plan,R0 baseline,path-scoped diff,provider tests
+src-tauri/src/commands/sources/mod.rs,M,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+src-tauri/src/commands/studio.rs,M,Studio,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Studio tests + npm tests
+src-tauri/src/db/doctor.rs,M,DB/migrations,preserve then reconcile under master plan,R0 baseline,path-scoped diff,migration tests
+src-tauri/src/db/migrations.rs,M,DB/migrations,preserve then reconcile under master plan,R0 baseline,path-scoped diff,migration tests
+src-tauri/src/db/notebook_db/mod.rs,M,DB/migrations,preserve then reconcile under master plan,R0 baseline,path-scoped diff,migration tests
+src-tauri/src/ingestion/embed.rs,M,indexing/embedding,preserve then reconcile under master plan,R0 baseline,path-scoped diff,index/retrieval integration
+src-tauri/src/ingestion/summarize.rs,M,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+src-tauri/src/ingestion/vision.rs,M,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+src-tauri/src/jobs/mod.rs,M,indexing/embedding,preserve then reconcile under master plan,R0 baseline,path-scoped diff,index/retrieval integration
+src-tauri/src/lib.rs,M,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+src-tauri/src/memory/backend.rs,M,semantic memory/retrieval,preserve then reconcile under master plan,R0 baseline,path-scoped diff,memory/retrieval tests
+src-tauri/src/memory/gloss_local.rs,M,semantic memory/retrieval,preserve then reconcile under master plan,R0 baseline,path-scoped diff,memory/retrieval tests
+src-tauri/src/memory/semantic_memory_adapter.rs,M,semantic memory/retrieval,preserve then reconcile under master plan,R0 baseline,path-scoped diff,memory/retrieval tests
+src-tauri/src/memory/types.rs,M,semantic memory/retrieval,preserve then reconcile under master plan,R0 baseline,path-scoped diff,memory/retrieval tests
+src-tauri/src/providers/anthropic.rs,M,provider runtime,preserve then reconcile under master plan,R0 baseline,path-scoped diff,provider tests
+src-tauri/src/providers/llamacpp.rs,M,provider runtime,preserve then reconcile under master plan,R0 baseline,path-scoped diff,provider tests
+src-tauri/src/providers/mod.rs,M,provider runtime,preserve then reconcile under master plan,R0 baseline,path-scoped diff,provider tests
+src-tauri/src/providers/ollama.rs,M,provider runtime,preserve then reconcile under master plan,R0 baseline,path-scoped diff,provider tests
+src-tauri/src/providers/openai.rs,M,provider runtime,preserve then reconcile under master plan,R0 baseline,path-scoped diff,provider tests
+src-tauri/src/retrieval/hybrid_search.rs,M,semantic memory/retrieval,preserve then reconcile under master plan,R0 baseline,path-scoped diff,memory/retrieval tests
+src-tauri/src/state.rs,M,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+src/App.tsx,M,frontend state,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Vitest + npm build
+src/components/chat/ChatPanel.tsx,M,chat lifecycle,preserve then reconcile under master plan,R0 baseline,path-scoped diff,targeted chat tests
+src/components/inspector/DiagnosticsPanel.tsx,M,frontend state,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Vitest + npm build
+src/components/layout/StatusBar.tsx,M,frontend state,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Vitest + npm build
+src/components/settings/SettingsDialog/index.tsx,M,frontend state,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Vitest + npm build
+src/components/studio/StudioPanel.tsx,M,Studio,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Studio tests + npm tests
+src/lib/evidenceContract.test.ts,M,frontend state,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Vitest + npm build
+src/lib/tauri.ts,M,frontend state,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Vitest + npm build
+src/lib/types.ts,M,frontend state,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Vitest + npm build
+src/stores/__tests__/chatStore.test.ts,M,chat lifecycle,preserve then reconcile under master plan,R0 baseline,path-scoped diff,targeted chat tests
+src/stores/chatStore.ts,M,chat lifecycle,preserve then reconcile under master plan,R0 baseline,path-scoped diff,targeted chat tests
+src/stores/notebookStore.ts,M,frontend state,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Vitest + npm build
+src/stores/studioStore.ts,M,Studio,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Studio tests + npm tests
+.hermes/plans/2026-07-11_190035-gloss-wiring-recovery.md,??,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+AUDIT.md,??,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+docs/audits/,??,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+docs/plans/,??,docs/evidence,preserve then reconcile under master plan,R0 baseline,path-scoped diff,claim/receipt review
+scripts/run_repair_phase.sh,??,validation/CI,preserve then reconcile under master plan,R0 baseline,path-scoped diff,canonical verifier self-test
+src/components/studio/DataTableView.tsx,??,Studio,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Studio tests + npm tests
+src/components/studio/TimelineView.tsx,??,Studio,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Studio tests + npm tests
+src/stores/__tests__/studioStore.test.ts,??,Studio,preserve then reconcile under master plan,R0 baseline,path-scoped diff,Studio tests + npm tests
+validation/gloss_provider_cancellation_static_gate.py,??,validation/CI,preserve then reconcile under master plan,R0 baseline,path-scoped diff,canonical verifier self-test
+validation/gloss_receipt_consistency_gate.py,??,validation/CI,preserve then reconcile under master plan,R0 baseline,path-scoped diff,canonical verifier self-test
+validation/gloss_runtime_static_gate.py,??,validation/CI,preserve then reconcile under master plan,R0 baseline,path-scoped diff,canonical verifier self-test
+validation/gloss_semantic_memory_contract_gate.py,??,validation/CI,preserve then reconcile under master plan,R0 baseline,path-scoped diff,canonical verifier self-test
+validation/gloss_settings_contract_gate.py,??,validation/CI,preserve then reconcile under master plan,R0 baseline,path-scoped diff,canonical verifier self-test
+validation/run_all_gloss_repair_gates.sh,??,validation/CI,preserve then reconcile under master plan,R0 baseline,path-scoped diff,canonical verifier self-test

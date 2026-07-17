@@ -19,12 +19,14 @@ mod batch;
 mod error;
 #[allow(deprecated)]
 mod legacy;
+mod lifecycle;
 mod transform;
 
 pub use batch::*;
 pub use error::{
     BridgeError, BridgeImportFailureArtifact, BRIDGE_IMPORT_FAILURE_ARTIFACT_V1_SCHEMA,
 };
+pub use lifecycle::*;
 pub use transform::*;
 
 /// Compatibility-only legacy bridge helpers.
@@ -44,8 +46,8 @@ pub use transform::*;
 #[allow(deprecated)]
 pub mod compat {
     pub use crate::legacy::{
-        transform_legacy_envelope, upgrade_legacy_envelope, LegacyEpisodeMeta,
-        LegacyImportEnvelopeV1, LegacyImportRecord,
+        transform_legacy_envelope, transform_legacy_envelope_at, upgrade_legacy_envelope,
+        upgrade_legacy_envelope_at, LegacyEpisodeMeta, LegacyImportEnvelopeV1, LegacyImportRecord,
     };
 }
 

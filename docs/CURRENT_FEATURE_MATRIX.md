@@ -5,25 +5,29 @@ Status terms: `implemented`, `partial`, `degraded`, `deferred`, `blocked`.
 | Feature | Status | Runtime truth |
 | --- | --- | --- |
 | Text/Markdown/code file import | partial | Folder/file import supports text-like files and code; P34 adds batch receipts and stale-notebook cancellation. |
-| PDF ingestion | deferred | No PDF extractor is release-proven in current source. |
-| DOCX ingestion | deferred | No DOCX extractor is release-proven in current source. |
-| XLSX ingestion | deferred | No XLSX extractor is release-proven in current source. |
-| URL import | deferred | No web fetch/import pipeline is release-proven in current source. |
-| YouTube transcript import | deferred | No YouTube transcript pipeline is release-proven in current source. |
-| Audio transcription | deferred | No audio transcription pipeline is release-proven in current source. |
+| PDF ingestion | degraded | Bounded local pure-Rust PDF text extraction is implemented and fixture-tested; OCR, forms, and layout fidelity remain unsupported. |
+| DOC/DOCX ingestion | degraded | Bounded local OOXML ZIP/XML text-node extraction is implemented and fixture-tested for DOCX; legacy `.doc` uses bounded local `antiword` CLI text extraction with redacted runtime receipts. Layout/rendering fidelity remains unsupported. |
+| XLS/XLSX ingestion | degraded | Bounded local OOXML shared-string and worksheet-value extraction is implemented and fixture-tested for XLSX; legacy `.xls` uses bounded local `xls2csv` CLI text extraction with redacted runtime receipts. Formulas/charts/layout fidelity remain unsupported. |
+| PPT/PPTX ingestion | degraded | Bounded local OOXML slide text extraction is implemented and fixture-tested for PPTX; legacy `.ppt` uses bounded local `catppt` CLI text extraction with redacted runtime receipts. Speaker notes/layout fidelity remain unsupported. |
+| EPUB ingestion | degraded | Bounded local EPUB mimetype/container/spine XHTML text extraction is implemented and fixture-tested; DRM and advanced readability processing remain unsupported. |
+| URL import | degraded | One-shot user-consented HTTP(S) text fetch is implemented with public-host, DNS, redirect, content-type, byte, and timeout limits; no crawling, authenticated fetch, or high-fidelity readability extraction is claimed. |
+| YouTube transcript import | partial | Public YouTube caption tracks can be imported as timestamped transcript text with `YouTubeTranscriptReceiptV1`, per-import network consent, strict video-id parsing, bounded watch/transcript fetches, and source metadata timestamp spans. No video download, authenticated transcript access, or generated transcription is implemented. |
+| Audio transcription | partial | Audio files are accepted for ffprobe metadata extraction with tool receipts and optional cached Whisper CLI transcription. Transcription skips explicitly when no local model file exists; diarization, speaker labels, automatic model download, and long-audio certification are not implemented. |
 | Audio overview/TTS | deferred | No audio generation pipeline is release-proven in current source. |
 | Image/video import | partial | Queue paths exist, but end-to-end media smoke is not release-proven. |
 | Semantic-memory preview | degraded | Opt-in; P34 adds chunk-budgeted projection and per-chunk failure records, but runtime smoke is still required. |
 | TurboQuant acceleration | partial | Candidate acceleration only; exact rerank remains required. Release proof is pending full feature validation. |
 | BM25/local retrieval | implemented | Stable fallback path, with fallback/degradation disclosed per answer. |
 | Citation evidence | partial | `CitationAnchorV1` and `CitationFilterReasonV1` are emitted; runtime answer quality still needs smoke proof. |
-| Studio reports | deferred | Studio report generation is not release-proven. |
-| Studio flashcards/quizzes | deferred | Structured study outputs are not release-proven. |
-| Mind maps/timelines | deferred | Structured visualization outputs are not release-proven. |
-| Notebook export/import | deferred | Portable notebook package round-trip is not release-proven. |
-| Desktop smoke | partial | `scripts/gloss_desktop_smoke_harness.py` now validates scripted runtime contracts and emits `live_desktop_exercised=false` without a live receipt; release-grade GUI smoke remains blocked. |
-| DB doctor | deferred | No database repair/check command is release-proven. |
-| Release replay | partial | `scripts/gloss_release_replay_gate.py --repo .` validates active gate presence; P35 strengthens fresh-unzip command replay, but release readiness still requires live desktop proof. |
+| Studio reports | partial | Backend commands generate and persist deterministic source-cited, schema-validated report, summary, outline, FAQ, flashcards, quiz, mind map, timeline, compare table, and action-plan artifacts. Inspector Dock Studio UI can generate, list, inspect proof/citations, and export JSON artifacts with `StudioExportReceiptV1`. Model-generated Studio workflows remain incomplete. |
+| Studio flashcards/quizzes | partial | Flashcard and quiz artifacts are generated by the same source-cited Studio backend and reachable through the Inspector Dock Studio UI/export flow. Model-generated Studio workflows remain incomplete. |
+| Mind maps/timelines | partial | Backend deterministic source-cited Studio artifacts include mind map and timeline outputs and are reachable through the Studio panel/export flow. Model-generated workflows remain incomplete. |
+| Notebook export/import | implemented | Compressed `.glosspkg.tar.gz` archive export/import wraps a strict validated package with `notebook.db`, sources, embeddings, manifest digest, receipts, per-file hash validation, bounded extraction, and sidebar validation before import. App-level fresh-unzip replay and installed-launch/AppImage smoke remain tracked under release packaging. |
+| Desktop smoke | partial | `npm run desktop-smoke` now writes the current-run `LIVE_DESKTOP_SMOKE_RECEIPT.json`, validates scripted runtime contracts, records display/WebKit/Tauri capability probes, and honestly marks `live_desktop_exercised=false` / `release_grade=false` because no active automated live GUI driver exists. |
+| Installer package smoke | partial | `npm run installer-smoke` builds release `.deb` and `.rpm` bundles, validates package metadata, digests, dependencies, desktop entries, binary payload, icons, and isolated installed-package launch with app DB creation. Post-launch workflow smoke and AppImage remain unproven. |
+| DB doctor | partial | Backend check/repair detects missing notebook DBs, source-count drift, orphan notebook auxiliary rows, failed-import source rows, and stale queue jobs with receipts. Settings diagnostics can run check/repair and display queue/quarantine receipt fields. Sources panel exposes dedicated failed-import review/quarantine/delete actions with `FailedImportQuarantineReceiptV1`. |
+| Import performance telemetry | partial | Folder import terminal receipts include per-phase timing and throughput via `ImportBatchPerformanceReceiptV1`, and completion feedback can surface elapsed time. Large-notebook benchmark corpus and UI frame-budget receipts remain unproven. |
+| Release replay | implemented | `validation/gloss_fresh_unzip_replay_gate.py --repo .` builds a current Gloss+Libraries source zip, extracts it to a fresh temp tree, and runs active gates plus `cargo metadata` from the extracted copy. Live desktop GUI smoke and installed-launch/AppImage smoke remain separate release gates. |
 
 Validation:
 

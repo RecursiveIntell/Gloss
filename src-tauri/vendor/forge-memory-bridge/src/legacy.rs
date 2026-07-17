@@ -94,52 +94,78 @@ pub struct LegacyEpisodeMeta {
 pub fn upgrade_legacy_envelope(
     legacy: &LegacyImportEnvelopeV1,
 ) -> Result<ExportEnvelopeV1, BridgeError> {
+    upgrade_legacy_envelope_at(legacy, &chrono::Utc::now().to_rfc3339())
+}
+
+/// Deterministic legacy upgrade with the exporter timestamp supplied by the caller.
+#[allow(deprecated)]
+pub fn upgrade_legacy_envelope_at(
+    legacy: &LegacyImportEnvelopeV1,
+    exported_at: &str,
+) -> Result<ExportEnvelopeV1, BridgeError> {
     let scope_key = ScopeKey::from_legacy_namespace(&legacy.namespace);
 
     let records: Vec<ExportRecord> = legacy
         .records
         .iter()
-        .map(|r| match r {
-            LegacyImportRecord::Fact {
-                content,
-                source,
-                metadata,
-            } => ExportRecord::Claim(ExportClaim {
-                claim_id: None,
-                claim_version_id: None,
-                subject_entity_id: stack_ids::EntityId::new("_legacy_unresolved"),
-                predicate: "legacy_fact".into(),
-                object_anchor: serde_json::json!(content),
-                valid_from: None,
-                valid_to: None,
-                confidence: 1.0,
-                content: content.clone(),
-                projection_family: "legacy_import".into(),
-                supersedes_claim_id: None,
-                supersedes_claim_version_id: None,
-                metadata: {
-                    let mut meta = metadata.clone().unwrap_or(serde_json::json!({}));
-                    if let Some(src) = source {
-                        meta.as_object_mut()
-                            .map(|m| m.insert("_legacy_source".into(), serde_json::json!(src)));
-                    }
-                    Some(meta)
-                },
-            }),
-            LegacyImportRecord::Episode { document_id, meta } => {
-                ExportRecord::Episode(ExportEpisode {
-                    episode_id: Some(EpisodeId::generate()),
-                    document_id: document_id.clone(),
-                    cause_ids: meta.cause_ids.clone(),
-                    effect_type: meta.effect_type.clone(),
-                    outcome: meta.outcome.clone(),
-                    confidence: meta.confidence,
-                    experiment_id: meta.experiment_id.clone(),
-                    metadata: None,
-                })
-            }
+        .enumerate()
+        .map(|(index, r)| -> Result<ExportRecord, BridgeError> {
+            Ok(match r {
+                LegacyImportRecord::Fact {
+                    content,
+                    source,
+                    metadata,
+                } => ExportRecord::Claim(ExportClaim {
+                    claim_id: None,
+                    claim_version_id: None,
+                    subject_entity_id: stack_ids::EntityId::new("legacy-unresolved"),
+                    predicate: "legacy_fact".into(),
+                    object_anchor: serde_json::json!(content),
+                    valid_from: None,
+                    valid_to: None,
+                    confidence: 1.0,
+                    content: content.clone(),
+                    projection_family: "legacy_import".into(),
+                    supersedes_claim_id: None,
+                    supersedes_claim_version_id: None,
+                    metadata: {
+                        let mut meta = match metadata.clone() {
+                            Some(serde_json::Value::Object(object)) => {
+                                serde_json::Value::Object(object)
+                            }
+                            Some(value) => serde_json::json!({"_legacy_metadata": value}),
+                            None => serde_json::json!({}),
+                        };
+                        if let Some(src) = source {
+                            meta.as_object_mut()
+                                .map(|m| m.insert("_legacy_source".into(), serde_json::json!(src)));
+                        }
+                        Some(meta)
+                    },
+                }),
+                LegacyImportRecord::Episode { document_id, meta } => {
+                    ExportRecord::Episode(ExportEpisode {
+                        episode_id: Some(EpisodeId::new(derived_legacy_id(
+                            "episode",
+                            legacy.envelope_id.as_str(),
+                            index,
+                            r,
+                        )?)),
+                        document_id: document_id.clone(),
+                        cause_ids: meta.cause_ids.clone(),
+                        effect_type: meta.effect_type.clone(),
+                        outcome: meta.outcome.clone(),
+                        confidence: meta.confidence,
+                        experiment_id: meta.experiment_id.clone(),
+                        metadata: Some(serde_json::json!({
+                            "_migration_api": "upgrade_legacy_envelope_at",
+                            "_migration_synthesized_identity": {"episode_id": true}
+                        })),
+                    })
+                }
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let digest = ExportEnvelopeV1::compute_digest(&legacy.source_authority, &scope_key, &records)?;
 
@@ -155,7 +181,7 @@ pub fn upgrade_legacy_envelope(
         source_authority: legacy.source_authority.clone(),
         scope_key,
         trace_ctx,
-        exported_at: chrono::Utc::now().to_rfc3339(),
+        exported_at: exported_at.into(),
         records,
     })
 }
@@ -175,6 +201,37 @@ pub fn transform_legacy_envelope(
 ) -> Result<ProjectionImportBatchV1, BridgeError> {
     let upgraded = upgrade_legacy_envelope(legacy)?;
     crate::transform::transform_envelope(&upgraded)
+}
+
+/// Deterministic legacy transform with both execution timestamps supplied.
+#[allow(deprecated)]
+pub fn transform_legacy_envelope_at(
+    legacy: &LegacyImportEnvelopeV1,
+    exported_at: &str,
+    transformed_at: &str,
+) -> Result<ProjectionImportBatchV1, BridgeError> {
+    let upgraded = upgrade_legacy_envelope_at(legacy, exported_at)?;
+    crate::transform::transform_envelope_at(&upgraded, transformed_at)
+}
+
+fn derived_legacy_id<T: Serialize>(
+    domain: &str,
+    envelope_id: &str,
+    index: usize,
+    value: &T,
+) -> Result<String, BridgeError> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"forge-memory-bridge:legacy-derived-id:v1\0");
+    digest.update(domain.as_bytes());
+    digest.update([0]);
+    digest.update(envelope_id.as_bytes());
+    digest.update((index as u64).to_be_bytes());
+    let bytes = serde_json::to_vec(value).map_err(|error| BridgeError::TransformFailed {
+        reason: format!("legacy migration identity serialization failed: {error}"),
+    })?;
+    digest.update(bytes);
+    Ok(format!("{domain}-{:x}", digest.finalize()))
 }
 
 #[cfg(test)]
@@ -241,6 +298,25 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_preserves_source_when_legacy_metadata_is_scalar_or_array() {
+        for metadata in [serde_json::json!("scalar"), serde_json::json!([1, 2])] {
+            let mut legacy = make_legacy_envelope();
+            legacy.records[0] = LegacyImportRecord::Fact {
+                content: "fact".into(),
+                source: Some("legacy-source".into()),
+                metadata: Some(metadata.clone()),
+            };
+            let upgraded = upgrade_legacy_envelope_at(&legacy, "2026-01-01T00:00:00Z").unwrap();
+            let ExportRecord::Claim(claim) = &upgraded.records[0] else {
+                panic!("expected claim");
+            };
+            let preserved = claim.metadata.as_ref().unwrap();
+            assert_eq!(preserved["_legacy_source"], "legacy-source");
+            assert_eq!(preserved["_legacy_metadata"], metadata);
+        }
+    }
+
+    #[test]
     fn upgrade_preserves_episode() {
         let legacy = make_legacy_envelope();
         let upgraded = upgrade_legacy_envelope(&legacy).unwrap();
@@ -291,6 +367,14 @@ mod tests {
                 assert_eq!(cv.source_envelope_id, legacy.envelope_id);
                 assert_eq!(cv.source_authority, "forge");
                 assert_eq!(cv.projection_family, "legacy_import");
+                assert_eq!(
+                    cv.metadata.as_ref().unwrap()["_migration_api"],
+                    "legacy_v1_v2"
+                );
+                assert_eq!(
+                    cv.metadata.as_ref().unwrap()["_migration_synthesized_identity"]["claim_id"],
+                    true
+                );
             }
             _ => panic!("expected ClaimVersion"),
         }

@@ -1,15 +1,34 @@
 import { useState } from "react";
 import { useNotebookStore } from "../../stores/notebookStore";
-import { BookOpen, Plus, Trash2, Settings, Pencil, Save, X } from "lucide-react";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { BookOpen, Plus, Trash2, Settings, Pencil, Save, X, Download, Upload, Loader2 } from "lucide-react";
 import { SettingsDialog } from "../settings/SettingsDialog";
+import * as api from "../../lib/tauri";
+import { useToastStore } from "../../stores/toastStore";
+
+type NotebookStoreState = ReturnType<typeof useNotebookStore.getState>;
+
+function portableDefaultName(name: string): string {
+  const safe = name.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return `${safe || "notebook"}.glosspkg.tar.gz`;
+}
 
 export function NotebookSidebar() {
-  const { notebooks, activeNotebookId, setActive, createNotebook, renameNotebook, deleteNotebook } = useNotebookStore();
+  const notebooks = useNotebookStore((s: NotebookStoreState) => s.notebooks);
+  const activeNotebookId = useNotebookStore((s: NotebookStoreState) => s.activeNotebookId);
+  const setActive = useNotebookStore((s: NotebookStoreState) => s.setActive);
+  const createNotebook = useNotebookStore((s: NotebookStoreState) => s.createNotebook);
+  const renameNotebook = useNotebookStore((s: NotebookStoreState) => s.renameNotebook);
+  const deleteNotebook = useNotebookStore((s: NotebookStoreState) => s.deleteNotebook);
+  const loadNotebooks = useNotebookStore((s: NotebookStoreState) => s.loadNotebooks);
+  const activationStatus = useNotebookStore((s: NotebookStoreState) => s.activationStatus);
+  const addToast = useToastStore((s) => s.addToast);
   const [newName, setNewName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [editingNotebookId, setEditingNotebookId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [portableBusy, setPortableBusy] = useState<"export" | "import" | null>(null);
 
   const handleCreate = async () => {
     if (!newName.trim()) return;
@@ -18,7 +37,7 @@ export function NotebookSidebar() {
       setNewName("");
       setShowCreate(false);
     } catch (e) {
-      console.error('Failed to create notebook:', e);
+      console.warn('Failed to create notebook:', e);
     }
   };
 
@@ -38,7 +57,69 @@ export function NotebookSidebar() {
       await renameNotebook(id, editingName.trim());
       cancelRename();
     } catch (e) {
-      console.error("Failed to rename notebook:", e);
+      console.warn("Failed to rename notebook:", e);
+    }
+  };
+
+  const handleExportNotebook = async () => {
+    const notebook = notebooks.find((nb) => nb.id === activeNotebookId);
+    if (!notebook || portableBusy) return;
+    const packageDir = await save({
+      title: "Export notebook package",
+      defaultPath: portableDefaultName(notebook.name),
+    });
+    if (!packageDir) return;
+    setPortableBusy("export");
+    try {
+      const receipt = await api.exportNotebookArchive(notebook.id, packageDir);
+      addToast({
+        type: "success",
+        title: "Notebook exported",
+        message: `${receipt.file_count} files archived`,
+        duration: 5000,
+      });
+    } catch (e) {
+      addToast({
+        type: "error",
+        title: "Notebook export failed",
+        message: e instanceof Error ? e.message : String(e),
+        duration: 0,
+      });
+    } finally {
+      setPortableBusy(null);
+    }
+  };
+
+  const handleImportNotebook = async () => {
+    if (portableBusy) return;
+    const selected = await open({
+      title: "Import notebook package",
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Gloss notebook package", extensions: ["gz"] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    setPortableBusy("import");
+    try {
+      const manifest = await api.validateNotebookImportArchive(selected);
+      const receipt = await api.importNotebookArchive(selected);
+      await loadNotebooks();
+      await setActive(receipt.imported_notebook_id);
+      addToast({
+        type: "success",
+        title: "Notebook imported",
+        message: `${manifest.notebook_name} verified`,
+        duration: 5000,
+      });
+    } catch (e) {
+      addToast({
+        type: "error",
+        title: "Notebook import failed",
+        message: e instanceof Error ? e.message : String(e),
+        duration: 0,
+      });
+    } finally {
+      setPortableBusy(null);
     }
   };
 
@@ -69,12 +150,28 @@ export function NotebookSidebar() {
             onKeyDown={(e) => e.key === "Enter" && handleCreate()}
             placeholder="Notebook name..."
             className="w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-sm text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+            aria-label="New notebook name"
             autoFocus
           />
         </div>
       )}
 
-      <div className="flex-1 overflow-y-auto p-1.5">
+      <div className="relative flex-1 overflow-y-auto p-1.5">
+        {/* D14 — "Switching notebook..." overlay during activation. The
+            activationStatus flag is set to 'pending' in setActive() and
+            cleared to 'confirmed' once the backend confirms. While pending,
+            a backdrop-blur overlay prevents misclicks and shows a spinner. */}
+        {activationStatus === "pending" && (
+          <div
+            className="pointer-events-auto absolute inset-0 z-10 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+            data-testid="notebook-switch-overlay"
+          >
+            <div className="flex items-center gap-2 rounded border border-border bg-bg-secondary px-3 py-2 text-xs text-text">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <span>Switching notebook…</span>
+            </div>
+          </div>
+        )}
         {notebooks.map((nb) => (
           <div
             key={nb.id}
@@ -154,6 +251,24 @@ export function NotebookSidebar() {
 
       {/* Settings footer */}
       <div className="border-t border-border p-2">
+        <div className="mb-1 grid grid-cols-2 gap-1">
+          <button
+            onClick={() => void handleImportNotebook()}
+            disabled={portableBusy !== null}
+            className="flex items-center justify-center rounded border border-transparent px-2 py-1.5 text-text-secondary hover:border-border hover:bg-bg-tertiary hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+            title="Import notebook package"
+          >
+            <Upload className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => void handleExportNotebook()}
+            disabled={!activeNotebookId || portableBusy !== null}
+            className="flex items-center justify-center rounded border border-transparent px-2 py-1.5 text-text-secondary hover:border-border hover:bg-bg-tertiary hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+            title="Export active notebook"
+          >
+            <Download className="w-4 h-4" />
+          </button>
+        </div>
         <button
           onClick={() => setShowSettings(true)}
           className="flex w-full items-center gap-2 rounded border border-transparent px-2 py-1.5 text-sm text-text-secondary hover:border-border hover:bg-bg-tertiary hover:text-text"

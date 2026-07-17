@@ -4,7 +4,6 @@ import { useNotebookStore } from "../../stores/notebookStore";
 import { useToastStore } from "../../stores/toastStore";
 import { onEmbeddingModelStatus } from "../../lib/events";
 import * as api from "../../lib/tauri";
-import type { MemoryBackendStatus, QueueStatus, SemanticMemoryProfileStatus } from "../../lib/types";
 import {
   Wifi,
   WifiOff,
@@ -16,6 +15,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useState, useEffect, useCallback } from "react";
+import { useHealthStore } from "../../stores/healthStore";
 
 export function StatusBar() {
   const activeModel = useSettingsStore((s) => s.activeModel);
@@ -23,15 +23,15 @@ export function StatusBar() {
   const settings = useSettingsStore((s) => s.settings);
   const stats = useSourceStore((s) => s.stats);
   const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
-  const [chatConnected, setChatConnected] = useState(false);
-  const [backgroundConnected, setBackgroundConnected] = useState(false);
+  const chatConnected = useHealthStore((s) => s.chatConnected === true);
+  const backgroundConnected = useHealthStore((s) => s.backgroundConnected);
   const [embeddingStatus, setEmbeddingStatus] = useState<string | null>(null);
-  const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
-  const [memoryStatus, setMemoryStatus] = useState<MemoryBackendStatus | null>(null);
-  const [profileStatus, setProfileStatus] = useState<SemanticMemoryProfileStatus | null>(null);
+  const queueStatus = useHealthStore((s) => s.queueStatus);
+  const memoryStatus = useHealthStore((s) => s.memoryStatus);
+  const profileStatus = useHealthStore((s) => s.profileStatus);
+  const startHealthPolling = useHealthStore((s) => s.startPolling);
   const [generating, setGenerating] = useState(false);
   const [healthOpen, setHealthOpen] = useState(false);
-  const testProvider = useSettingsStore((s) => s.testProvider);
   const selectedProviderId = settings["default_provider"] || null;
   const activeModelRecord =
     models.find(
@@ -51,30 +51,7 @@ export function StatusBar() {
       : null;
   const backgroundProviderId = queueStatus?.summary_backend.provider_id ?? null;
 
-  useEffect(() => {
-    if (!activeProviderId) {
-      setChatConnected(false);
-      return;
-    }
-    testProvider(activeProviderId).then(setChatConnected);
-    const interval = setInterval(() => {
-      testProvider(activeProviderId).then(setChatConnected);
-    }, 30000);
-    return () => clearInterval(interval);
-  }, [activeProviderId, testProvider]);
-
-  useEffect(() => {
-    if (!backgroundProviderId || !queueStatus?.summary_backend.ready) {
-      setBackgroundConnected(false);
-      return;
-    }
-
-    testProvider(backgroundProviderId).then(setBackgroundConnected);
-    const interval = setInterval(() => {
-      testProvider(backgroundProviderId).then(setBackgroundConnected);
-    }, 30000);
-    return () => clearInterval(interval);
-  }, [backgroundProviderId, queueStatus?.summary_backend.ready, testProvider]);
+  useEffect(() => { startHealthPolling(activeNotebookId, activeProviderId, backgroundProviderId); }, [activeNotebookId, activeProviderId, backgroundProviderId, startHealthPolling]);
 
   // Listen for embedding model status events
   useEffect(() => {
@@ -90,26 +67,6 @@ export function StatusBar() {
     };
   }, []);
 
-  // Poll queue status + refresh stats when notebook changes or periodically
-  useEffect(() => {
-    const poll = () => {
-      api.getQueueStatus().then(setQueueStatus).catch(() => {});
-      api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch(() => {});
-      if (activeNotebookId) {
-        useSourceStore.getState().loadStats(activeNotebookId);
-        api
-          .getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" })
-          .then(setProfileStatus)
-          .catch(() => setProfileStatus(null));
-      } else {
-        setProfileStatus(null);
-      }
-    };
-    poll();
-    const interval = setInterval(poll, 5000);
-    return () => clearInterval(interval);
-  }, [activeNotebookId]);
-
   const handleTogglePause = useCallback(async () => {
     try {
       if (queueStatus?.paused) {
@@ -118,9 +75,9 @@ export function StatusBar() {
         await api.pauseSummaries();
       }
       const status = await api.getQueueStatus();
-      setQueueStatus(status);
+      useHealthStore.setState({ queueStatus: status });
     } catch (e) {
-      console.error("Failed to toggle summary pause:", e);
+      console.warn("Failed to toggle summary pause:", e);
     }
   }, [queueStatus]);
 
@@ -142,9 +99,9 @@ export function StatusBar() {
       }
       // Refresh queue status immediately
       const status = await api.getQueueStatus();
-      setQueueStatus(status);
+      useHealthStore.setState({ queueStatus: status });
     } catch (e) {
-      console.error("Failed to generate summaries:", e);
+      console.warn("Failed to generate summaries:", e);
     } finally {
       setGenerating(false);
     }
@@ -216,6 +173,7 @@ export function StatusBar() {
         onClick={() => setHealthOpen((open) => !open)}
         className="relative flex items-center gap-1.5 hover:text-text"
         title={memoryTooltip}
+        aria-label="Health status"
       >
         {memoryStatus?.degraded ? (
           <AlertTriangle className="w-3 h-3 text-warning" />
@@ -236,7 +194,15 @@ export function StatusBar() {
               <HealthLine label="Backend used" value={memoryStatus?.backend_used ?? "gloss-local"} />
               <HealthLine label="Default backend" value={memoryStatus?.default_backend ?? "gloss-local"} />
               <HealthLine label="Fallback" value={memoryStatus?.fallback_reason ?? "none"} />
+              <HealthLine label="Fallback code" value={memoryStatus?.fallback_reason_code ?? "none"} />
               <HealthLine label="Index state" value={memoryStatus?.index_sync_status ?? "unknown"} />
+              {memoryStatus?.embedding_index_metadata?.map((metadata) => (
+                <HealthLine
+                  key={metadata.index_id}
+                  label={metadata.index_id}
+                  value={`${metadata.status} ${metadata.provider}:${metadata.model}${metadata.dimensions ? ` (${metadata.dimensions}d)` : ""}`}
+                />
+              ))}
               <HealthLine label="Sources" value={`${stats?.source_count ?? 0}`} />
               <HealthLine label="Preview feature" value={memoryStatus?.semantic_memory_feature_enabled ? "enabled" : "disabled"} />
               <HealthLine label="Preview availability" value={memoryStatus?.semantic_memory_available ? "available" : "not active"} />

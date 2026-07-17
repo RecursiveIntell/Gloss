@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GenerationReceiptV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "receipt_id",
+    "answer_id",
+    "provider",
+    "model",
+    "status",
+    "decoding_settings_ref",
+    "prompt_receipt_ref",
+    "retrieval_decision_ref"
+  ],
+  "properties": {
+    "schema": {
+      "const": "GenerationReceiptV1"
+    },
+    "receipt_id": {
+      "type": "string"
+    },
+    "answer_id": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "queued",
+        "retrieving_context",
+        "generating",
+        "partial_timeout",
+        "partial_error",
+        "cancelled",
+        "complete",
+        "continued"
+      ]
+    },
+    "decoding_settings_ref": {
+      "type": "string"
+    },
+    "prompt_receipt_ref": {
+      "type": "string"
+    },
+    "retrieval_decision_ref": {
+      "type": "string"
+    },
+    "elapsed_ms": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "partial_output_digest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "final_output_digest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

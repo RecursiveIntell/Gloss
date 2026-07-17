@@ -1,0 +1,59 @@
+{
+  "discovered": {
+    "attestation-exchange": "/home/sikmindz/Coding/Libraries/_salvage_from_libraries2/Libraries2/repo_overlay/attestation-exchange",
+    "authority-delegation": "/home/sikmindz/Coding/Libraries/authority-delegation",
+    "contract-schema-gen": "/home/sikmindz/Coding/Libraries/contract-schema-gen",
+    "effect-runtime": "/home/sikmindz/Coding/Libraries/effect-runtime",
+    "knowledge-runtime": "/home/sikmindz/Coding/Libraries/knowledge-runtime",
+    "llm-tool-runtime": "/home/sikmindz/Coding/Libraries/llm-tool-runtime",
+    "semantic-memory-forge": "/home/sikmindz/Coding/Libraries/semantic-memory-forge",
+    "stack-ids": "/home/sikmindz/Coding/Libraries/stack-ids",
+    "verification-control": "/home/sikmindz/Coding/Libraries/verification-control",
+    "verification-policy": "/home/sikmindz/Coding/Libraries/verification-policy"
+  },
+  "known_owners": {
+    "attestation-exchange": [
+      "attestation",
+      "provenance",
+      "trust"
+    ],
+    "authority-delegation": [
+      "authority",
+      "delegation"
+    ],
+    "contract-schema-gen": [
+      "schema"
+    ],
+    "effect-runtime": [
+      "effect",
+      "action lifecycle"
+    ],
+    "knowledge-runtime": [
+      "runtime query provenance",
+      "temporal view"
+    ],
+    "llm-tool-runtime": [
+      "tool receipt",
+      "dispatch"
+    ],
+    "semantic-memory-forge": [
+      "evidence",
+      "export"
+    ],
+    "stack-ids": [
+      "id",
+      "digest",
+      "trace",
+      "replay"
+    ],
+    "verification-control": [
+      "control receipt",
+      "review",
+      "adjudication"
+    ],
+    "verification-policy": [
+      "policy",
+      "permit"
+    ]
+  }
+}

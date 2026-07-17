@@ -1,0 +1,60 @@
+M Cargo.lock
+ M FIX_PLAN.md
+ M docs/codex-runs/CODEX_RUN_INDEX.md
+ M docs/codex-runs/CURRENT_RUN.md
+ M package.json
+ D scripts/gloss_p36_perf_probe.py
+ M src-tauri/Cargo.toml
+ M src-tauri/src/commands/chat/emit.rs
+ M src-tauri/src/commands/chat/mod.rs
+ M src-tauri/src/commands/chat/streaming.rs
+ M src-tauri/src/commands/chat/types.rs
+ M src-tauri/src/commands/settings.rs
+ M src-tauri/src/commands/sources/mod.rs
+ M src-tauri/src/commands/studio.rs
+ M src-tauri/src/db/doctor.rs
+ M src-tauri/src/db/migrations.rs
+ M src-tauri/src/db/notebook_db/mod.rs
+ M src-tauri/src/ingestion/embed.rs
+ M src-tauri/src/ingestion/summarize.rs
+ M src-tauri/src/ingestion/vision.rs
+ M src-tauri/src/jobs/mod.rs
+ M src-tauri/src/lib.rs
+ M src-tauri/src/memory/backend.rs
+ M src-tauri/src/memory/gloss_local.rs
+ M src-tauri/src/memory/semantic_memory_adapter.rs
+ M src-tauri/src/memory/types.rs
+ M src-tauri/src/providers/anthropic.rs
+ M src-tauri/src/providers/llamacpp.rs
+ M src-tauri/src/providers/mod.rs
+ M src-tauri/src/providers/ollama.rs
+ M src-tauri/src/providers/openai.rs
+ M src-tauri/src/retrieval/hybrid_search.rs
+ M src-tauri/src/state.rs
+ M src/App.tsx
+ M src/components/chat/ChatPanel.tsx
+ M src/components/inspector/DiagnosticsPanel.tsx
+ M src/components/layout/StatusBar.tsx
+ M src/components/settings/SettingsDialog/index.tsx
+ M src/components/studio/StudioPanel.tsx
+ M src/lib/evidenceContract.test.ts
+ M src/lib/tauri.ts
+ M src/lib/types.ts
+ M src/stores/__tests__/chatStore.test.ts
+ M src/stores/chatStore.ts
+ M src/stores/notebookStore.ts
+ M src/stores/studioStore.ts
+?? .hermes/plans/2026-07-11_190035-gloss-wiring-recovery.md
+?? AUDIT.md
+?? docs/audits/
+?? docs/plans/
+?? scripts/run_repair_phase.sh
+?? src/components/studio/DataTableView.tsx
+?? src/components/studio/TimelineView.tsx
+?? src/stores/__tests__/studioStore.test.ts
+?? validation/gloss_provider_cancellation_static_gate.py
+?? validation/gloss_receipt_consistency_gate.py
+?? validation/gloss_runtime_static_gate.py
+?? validation/gloss_semantic_memory_contract_gate.py
+?? validation/gloss_settings_contract_gate.py
+?? validation/run_all_gloss_repair_gates.sh

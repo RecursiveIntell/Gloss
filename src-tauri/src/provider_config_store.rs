@@ -26,6 +26,7 @@ impl SecretStore {
     pub fn new(data_dir: &Path) -> Result<Self, GlossError> {
         let dir = data_dir.join("secrets");
         fs::create_dir_all(&dir)?;
+        set_owner_only_dir_permissions(&dir)?;
         Ok(Self { dir })
     }
 
@@ -56,6 +57,7 @@ impl SecretStore {
         if !data_path.exists() {
             return Ok(HashMap::new());
         }
+        set_owner_only_permissions(&data_path)?;
 
         let encrypted: EncryptedSecrets =
             serde_json::from_slice(&fs::read(&data_path)?).map_err(GlossError::JsonParse)?;
@@ -101,14 +103,16 @@ impl SecretStore {
         };
 
         let tmp_path = self.dir.join(format!("{SECRET_DATA_FILENAME}.tmp"));
-        fs::write(&tmp_path, serde_json::to_vec(&payload)?)?;
+        write_owner_only_file(&tmp_path, &serde_json::to_vec(&payload)?)?;
         fs::rename(tmp_path, self.data_path())?;
+        set_owner_only_permissions(&self.data_path())?;
         Ok(())
     }
 
     fn load_or_create_key(&self) -> Result<[u8; 32], GlossError> {
         let key_path = self.key_path();
         if key_path.exists() {
+            set_owner_only_permissions(&key_path)?;
             let bytes = fs::read(&key_path)?;
             return bytes
                 .try_into()
@@ -118,11 +122,9 @@ impl SecretStore {
         let mut key = [0u8; 32];
         aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut OsRng, &mut key);
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&key_path)?;
+        let mut file = open_owner_only_create_new(&key_path)?;
         file.write_all(&key)?;
+        file.sync_all()?;
         set_owner_only_permissions(&key_path)?;
 
         Ok(key)
@@ -138,17 +140,100 @@ impl SecretStore {
 }
 
 #[cfg(unix)]
+fn set_owner_only_dir_permissions(path: &Path) -> Result<(), GlossError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_dir_permissions(path: &Path) -> Result<(), GlossError> {
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    // Remove inherited permissions and grant current user only
+    let username = std::env::var("USERNAME").unwrap_or_else(|_| "*S-1-1-0".to_string());
+    let output = std::process::Command::new("icacls")
+        .arg(path_str)
+        .arg("/inheritance:r")
+        .arg(format!("/grant:r:{}:(R)", username))
+        .output();
+    match output {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            tracing::warn!(
+                "Failed to set restrictive permissions on {:?}: icacls exit {:?}, stderr: {}",
+                path,
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!("Failed to run icacls on {:?}: {}", path, e);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
 fn set_owner_only_permissions(path: &Path) -> Result<(), GlossError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let permissions = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(path, permissions)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn set_owner_only_permissions(_path: &Path) -> Result<(), GlossError> {
     Ok(())
+}
+
+fn write_owner_only_file(path: &Path, bytes: &[u8]) -> Result<(), GlossError> {
+    let mut file = open_owner_only_truncate(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    set_owner_only_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_owner_only_create_new(path: &Path) -> Result<std::fs::File, GlossError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    Ok(OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?)
+}
+
+#[cfg(not(unix))]
+fn open_owner_only_create_new(path: &Path) -> Result<std::fs::File, GlossError> {
+    Ok(OpenOptions::new().write(true).create_new(true).open(path)?)
+}
+
+#[cfg(unix)]
+fn open_owner_only_truncate(path: &Path) -> Result<std::fs::File, GlossError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    Ok(OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?)
+}
+
+#[cfg(not(unix))]
+fn open_owner_only_truncate(path: &Path) -> Result<std::fs::File, GlossError> {
+    Ok(OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?)
 }
 
 #[cfg(test)]
@@ -169,5 +254,50 @@ mod tests {
 
         store.set("openai_api_key", Some("")).unwrap();
         assert_eq!(store.get("openai_api_key").unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_store_repairs_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let store = SecretStore::new(dir.path()).unwrap();
+        store.set("openai_api_key", Some("sk-test")).unwrap();
+
+        let secret_dir = dir.path().join("secrets");
+        let key_path = secret_dir.join("secret-store.key");
+        let data_path = secret_dir.join("secret-store.enc");
+        assert_eq!(
+            std::fs::metadata(&secret_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&data_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&data_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            store.get("openai_api_key").unwrap().as_deref(),
+            Some("sk-test")
+        );
+        store
+            .set("anthropic_api_key", Some("sk-anthropic"))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&data_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

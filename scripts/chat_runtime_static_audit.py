@@ -23,17 +23,36 @@ def read(repo: Path, rel: str) -> str:
         return ""
     return p.read_text(encoding="utf-8", errors="replace")
 
-@check("frontend_active_notebook_chat_event_filter")
+@check("frontend_chat_events_forward_to_store")
 def _(repo: Path):
     text = read(repo, "src/App.tsx")
-    bad = len(re.findall(r"payload\.notebook_id\s*!==\s*activeNotebookId", text))
-    return bad == 0, f"activeNotebookId chat-event filters found: {bad}"
+    failures = []
+    import re as _re
+    for event in ["onChatToken", "onChatStatus", "onChatError", "onChatEvidence"]:
+        # Real shape is `unlisteners.push(onChatToken((payload) => { ... }))`
+        # inside the listen-all call. Match the call-site (not the import)
+        # via `event((payload` so we know we are looking at the handler.
+        m = _re.search(rf"{_re.escape(event)}\s*\(\s*\(payload", text)
+        if not m:
+            failures.append(f"missing {event}")
+            continue
+        block = text[m.start() : m.start() + 900]
+        filter_idx = block.find("activeNotebookId")
+        store_idx = block.find("useChatStore.getState()")
+        if filter_idx != -1 and (store_idx == -1 or filter_idx < store_idx):
+            failures.append(f"{event} filters activeNotebookId before chatStore")
+    return not failures, "chat lifecycle events forward to chatStore" if not failures else "; ".join(failures)
 
 @check("frontend_has_stream_identity_state")
 def _(repo: Path):
     text = read(repo, "src/stores/chatStore.ts")
-    ok = "streamingNotebookId" in text and "streamingMessageId" in text
-    return ok, "streamingNotebookId/streamingMessageId present" if ok else "missing stream identity state"
+    ok = (
+        "streamingNotebookId" in text
+        and "streamingMessageId" in text
+        and "streamingNotebookId !== notebookId" in text
+        and "streamingMessageId !== messageId" in text
+    )
+    return ok, "streamingNotebookId/streamingMessageId filters present" if ok else "missing stream identity filtering"
 
 @check("provider_config_uses_provider_rows")
 def _(repo: Path):

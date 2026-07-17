@@ -1,0 +1,3 @@
+Preparing worktree (detached HEAD 9386483)
+HEAD is now at 9386483 docs: hostile-auditor handoff for perf-slowdown-fix-20260610 close-out
+PATCH_CHECK_PASS

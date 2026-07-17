@@ -1,0 +1,111 @@
+     1	use super::{provider_http_error, ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
+     2	use crate::error::GlossError;
+     3	use async_trait::async_trait;
+     4	use futures::stream::{self, Stream};
+     5	use std::pin::Pin;
+     6	
+     7	/// Ollama LLM provider implementation.
+     8	pub struct OllamaProvider {
+     9	    base_url: String,
+    10	    client: reqwest::Client,
+    11	}
+    12	
+    13	impl OllamaProvider {
+    14	    pub fn new(base_url: &str) -> Self {
+    15	        Self {
+    16	            base_url: base_url.trim_end_matches('/').to_string(),
+    17	            client: reqwest::Client::builder()
+    18	                .connect_timeout(std::time::Duration::from_secs(10))
+    19	                .timeout(std::time::Duration::from_secs(300))
+    20	                .build()
+    21	                .unwrap_or_else(|_| reqwest::Client::new()),
+    22	        }
+    23	    }
+    24	}
+    25	
+    26	fn ollama_chat_token_from_value(val: &serde_json::Value) -> Result<ChatToken, GlossError> {
+    27	    if let Some(error) = val.get("error").and_then(|error| error.as_str()) {
+    28	        return Err(GlossError::Provider {
+    29	            provider: "ollama".into(),
+    30	            source: anyhow::anyhow!("Ollama stream error: {error}"),
+    31	        });
+    32	    }
+    33	
+    34	    let done = val.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+    35	    let token = val
+    36	        .get("message")
+    37	        .and_then(|m| m.get("content"))
+    38	        .and_then(|c| c.as_str())
+    39	        .unwrap_or("")
+    40	        .to_string();
+    41	    Ok(ChatToken { token, done })
+    42	}
+    43	
+    44	fn build_ollama_chat_body(request: &ChatRequest) -> serde_json::Value {
+    45	    let mut messages = Vec::new();
+    46	    if let Some(ref system) = request.system_prompt {
+    47	        messages.push(serde_json::json!({
+    48	            "role": "system",
+    49	            "content": system,
+    50	        }));
+    51	    }
+    52	    for msg in &request.messages {
+    53	        let mut msg_json = serde_json::json!({
+    54	            "role": msg.role,
+    55	            "content": msg.content,
+    56	        });
+    57	        if let Some(ref images) = msg.images {
+    58	            msg_json["images"] = serde_json::json!(images);
+    59	        }
+    60	        messages.push(msg_json);
+    61	    }
+    62	
+    63	    let mut options = serde_json::json!({
+    64	        "temperature": request.temperature,
+    65	        "num_predict": request.max_tokens,
+    66	    });
+    67	    if let Some(top_p) = request.top_p {
+    68	        options["top_p"] = serde_json::json!(top_p);
+    69	    }
+    70	    if let Some(top_k) = request.top_k {
+    71	        options["top_k"] = serde_json::json!(top_k);
+    72	    }
+    73	    if let Some(min_p) = request.min_p {
+    74	        options["min_p"] = serde_json::json!(min_p);
+    75	    }
+    76	    if let Some(repeat_penalty) = request.repeat_penalty {
+    77	        options["repeat_penalty"] = serde_json::json!(repeat_penalty);
+    78	    }
+    79	    if let Some(num_ctx) = request.num_ctx {
+    80	        options["num_ctx"] = serde_json::json!(num_ctx);
+   300	        );
+   301	        assert_eq!(
+   302	            body.get("messages")
+   303	                .and_then(|messages| messages.as_array())
+   304	                .map(Vec::len),
+   305	            Some(2)
+   306	        );
+   307	    }
+   308	
+   309	    #[test]
+   310	    fn ollama_stream_error_frame_becomes_provider_error() {
+   311	        let value = serde_json::json!({
+   312	            "error": "model not found"
+   313	        });
+   314	        let err = ollama_chat_token_from_value(&value).expect_err("error frame must fail");
+   315	        assert!(err
+   316	            .to_string()
+   317	            .contains("Ollama stream error: model not found"));
+   318	    }
+   319	
+   320	    #[test]
+   321	    fn ollama_normal_frame_extracts_content_and_done() {
+   322	        let value = serde_json::json!({
+   323	            "message": {"content": "gloss smoke ok"},
+   324	            "done": true
+   325	        });
+   326	        let token = ollama_chat_token_from_value(&value).expect("normal frame should parse");
+   327	        assert_eq!(token.token, "gloss smoke ok");
+   328	        assert!(token.done);
+   329	    }
+   330	}

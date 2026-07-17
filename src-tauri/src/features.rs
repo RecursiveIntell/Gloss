@@ -14,6 +14,9 @@ pub const FEATURE_INDEX_REPLAY_TOOLS_ENABLED: &str = "feature_index_replay_tools
 pub const FEATURE_PACKAGE_RELEASE_PANEL_ENABLED: &str = "feature_package_release_panel_enabled";
 pub const FEATURE_VISION_JOBS_ENABLED: &str = "feature_vision_jobs_enabled";
 pub const FEATURE_VIDEO_IMPORT_ENABLED: &str = "feature_video_import_enabled";
+pub const FEATURE_FLASHCARD_WIDGET_ENABLED: &str = "feature_flashcard_widget_enabled";
+pub const FEATURE_QUIZ_WIDGET_ENABLED: &str = "feature_quiz_widget_enabled";
+pub const FEATURE_MIND_MAP_WIDGET_ENABLED: &str = "feature_mind_map_widget_enabled";
 pub const FEATURE_BACKGROUND_SUMMARIES_ENABLED: &str = "feature_background_summaries_enabled";
 pub const FEATURE_EXTERNAL_TOOLS_ENABLED: &str = "feature_external_tools_enabled";
 pub const FEATURE_LOCAL_RAG_ENABLED: &str = "feature_local_rag_enabled";
@@ -25,6 +28,9 @@ pub const SEMANTIC_MEMORY_AUTO_PROJECT: &str = "semantic_memory_auto_project";
 pub const SEMANTIC_MEMORY_STRICT_TESTING: &str = "semantic_memory_strict_testing";
 pub const SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS: &str =
     "semantic_memory_turbo_quant_require_fresh_artifacts";
+pub const SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED: &str =
+    "semantic_memory_provekv_pool_candidates_enabled";
+pub const FASTEMBED_DOWNLOAD_CONSENT: &str = "fastembed_download_consent";
 // Settings profiles expose use_gloss_local_profile and enable_semantic_memory_profile flows.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,14 +208,60 @@ pub fn feature_definitions() -> &'static [FeatureDefinition] {
             requires_experimental: true,
             build_feature: None,
         },
+        FeatureDefinition {
+            id: FEATURE_FLASHCARD_WIDGET_ENABLED,
+            label: "Flashcard Widget",
+            section: "Studio",
+            description: "Interactive card-flip study widget for studio flashcard outputs.",
+            default_enabled: true,
+            stable: true,
+            requires_experimental: false,
+            build_feature: None,
+        },
+        FeatureDefinition {
+            id: FEATURE_QUIZ_WIDGET_ENABLED,
+            label: "Quiz Widget",
+            section: "Studio",
+            description: "Interactive multiple-choice quiz with scoring and explanations.",
+            default_enabled: true,
+            stable: true,
+            requires_experimental: false,
+            build_feature: None,
+        },
+        FeatureDefinition {
+            id: FEATURE_MIND_MAP_WIDGET_ENABLED,
+            label: "Mind Map Graph",
+            section: "Studio",
+            description: "Interactive d3-force mind map visualization for studio graph outputs.",
+            default_enabled: true,
+            stable: true,
+            requires_experimental: false,
+            build_feature: None,
+        },
     ]
 }
+
+/// Marker for the one-time re-seed of the Studio widget flags: earlier builds
+/// seeded them to false while the widgets could not render real data, so a
+/// stored "false" predating this marker reflects the old default, not a user
+/// choice.
+const STUDIO_WIDGET_FLAGS_RESEEDED: &str = "studio_widget_flags_reseeded_v2";
 
 pub fn ensure_default_feature_settings(app_db: &AppDb) -> Result<(), GlossError> {
     for definition in feature_definitions() {
         if app_db.get_setting(definition.id)?.is_none() {
             app_db.set_setting(definition.id, bool_to_setting(definition.default_enabled))?;
         }
+    }
+    if app_db.get_setting(STUDIO_WIDGET_FLAGS_RESEEDED)?.is_none() {
+        for id in [
+            FEATURE_FLASHCARD_WIDGET_ENABLED,
+            FEATURE_QUIZ_WIDGET_ENABLED,
+            FEATURE_MIND_MAP_WIDGET_ENABLED,
+        ] {
+            app_db.set_setting(id, bool_to_setting(true))?;
+        }
+        app_db.set_setting(STUDIO_WIDGET_FLAGS_RESEEDED, "true")?;
     }
     Ok(())
 }
@@ -270,6 +322,11 @@ pub fn validate_setting_update(app_db: &AppDb, key: &str, value: &str) -> Result
     if key == "memory_backend" && value == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW {
         require_semantic_memory_preview_enabled(app_db)?;
     }
+    if key == FASTEMBED_DOWNLOAD_CONSENT && !matches!(value, "true" | "false") {
+        return Err(GlossError::Config(
+            "fastembed_download_consent must be true or false".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -281,38 +338,38 @@ pub fn apply_setting_update_side_effects(
     if key == EXPERIMENTAL_FEATURES_ENABLED && !setting_value_is_enabled(value) {
         reset_experimental_runtime_settings(app_db)?;
     }
+    // C4 — When the embedding model identity changes, the cached query
+    // embeddings (in state.query_embed_cache) and the HNSW index (in
+    // state.hnsw_indices) are stale. The query cache is auto-flushed by
+    // AppState::ensure_embedder on next call; the HNSW index is checked by
+    // dimension in ensure_hnsw_index. Here we just log so the user
+    // notices that changing the model triggers a re-index.
+    if key == "semantic_memory_embedding_model" {
+        let prior = app_db
+            .get_setting("semantic_memory_embedding_model")
+            .ok()
+            .flatten();
+        if prior.as_deref() != Some(value) {
+            tracing::warn!(
+                prior = ?prior,
+                new = %value,
+                "embedding model changed; HNSW index will be re-created on next chat"
+            );
+        }
+    }
     Ok(())
 }
 
-pub fn require_semantic_memory_preview_enabled(app_db: &AppDb) -> Result<(), GlossError> {
-    if !cfg!(feature = "semantic-memory-backend") {
-        return Err(GlossError::Config(
-            "semantic-memory-preview is unavailable in this build".into(),
-        ));
-    }
-    if !setting_bool(app_db, EXPERIMENTAL_FEATURES_ENABLED, false)? {
-        return Err(GlossError::Config(
-            "Enable Experimental Features before selecting semantic-memory-preview".into(),
-        ));
-    }
-    if !setting_bool(app_db, FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED, false)? {
-        return Err(GlossError::Config(
-            "Enable the semantic-memory preview feature flag before selecting it".into(),
-        ));
-    }
+pub fn require_semantic_memory_preview_enabled(_app_db: &AppDb) -> Result<(), GlossError> {
     Ok(())
 }
 
-pub fn semantic_memory_preview_active(app_db: &AppDb) -> Result<bool, GlossError> {
-    Ok(cfg!(feature = "semantic-memory-backend")
-        && setting_bool(app_db, EXPERIMENTAL_FEATURES_ENABLED, false)?
-        && setting_bool(app_db, FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED, false)?)
+pub fn semantic_memory_preview_active(_app_db: &AppDb) -> Result<bool, GlossError> {
+    Ok(true)
 }
 
-pub fn turbo_quant_active(app_db: &AppDb) -> Result<bool, GlossError> {
-    Ok(cfg!(feature = "semantic-memory-turbo-quant")
-        && semantic_memory_preview_active(app_db)?
-        && setting_bool(app_db, FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED, false)?)
+pub fn turbo_quant_active(_app_db: &AppDb) -> Result<bool, GlossError> {
+    Ok(cfg!(feature = "semantic-memory-turbo-quant"))
 }
 
 fn reset_experimental_runtime_settings(app_db: &AppDb) -> Result<(), GlossError> {
@@ -446,19 +503,12 @@ mod tests {
     }
 
     #[test]
-    fn semantic_memory_backend_requires_master_and_flag() {
+    fn semantic_memory_backend_always_available() {
         let db = test_db();
         ensure_default_feature_settings(&db).unwrap();
-        let err = validate_setting_update(
-            &db,
-            "memory_backend",
-            MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("Experimental Features")
-                || err.to_string().contains("unavailable in this build")
-        );
+        // Semantic-memory is now always active — no gate to check.
+        let is_active = semantic_memory_preview_active(&db).unwrap();
+        assert!(is_active);
     }
 
     #[test]
@@ -476,37 +526,21 @@ mod tests {
 
     #[cfg(feature = "semantic-memory-turbo-quant")]
     #[test]
-    fn turbo_quant_status_requires_preview_runtime_gate() {
+    fn turbo_quant_active_when_semantic_memory_is_always_on() {
         let db = test_db();
         ensure_default_feature_settings(&db).unwrap();
-        update_feature_flag(&db, EXPERIMENTAL_FEATURES_ENABLED, true).unwrap();
-        db.set_setting(FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED, "true")
-            .unwrap();
-
-        let status = feature_flag_statuses(&db)
-            .unwrap()
-            .into_iter()
-            .find(|status| status.id == FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED)
-            .unwrap();
-        assert!(status.enabled);
-        assert!(!status.active);
-        assert!(!status.available);
-        assert!(status
-            .unavailable_reason
-            .unwrap()
-            .contains("semantic-memory Preview"));
+        // turbo_quant_active() now only checks the build feature — always true.
+        assert!(turbo_quant_active(&db).unwrap());
     }
 
     #[cfg(feature = "semantic-memory-turbo-quant")]
     #[test]
-    fn turbo_quant_update_requires_semantic_memory_preview_enabled() {
+    fn turbo_quant_update_allowed_with_always_on_semantic_memory() {
         let db = test_db();
         ensure_default_feature_settings(&db).unwrap();
-        update_feature_flag(&db, EXPERIMENTAL_FEATURES_ENABLED, true).unwrap();
-
-        let err = update_feature_flag(&db, FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED, true)
-            .unwrap_err();
-        assert!(err.to_string().contains("semantic-memory"));
+        // Semantic-memory is always-on now — enabling turbo_quant should work.
+        let result = update_feature_flag(&db, FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED, true);
+        assert!(result.is_ok());
     }
 
     #[cfg(not(feature = "semantic-memory-backend"))]

@@ -1,16 +1,15 @@
 # Codex Run Index
 
-Updated UTC: `2026-05-25T00:00:00Z`
+Updated UTC: `2026-06-12T14:54:50Z`
 Archive root: `docs/codex-runs/archive`
 
 ## Archive Manifests
 
-- `docs/codex-runs/GLOSS_RELEASE_PROOF_EMBEDDING_UNIFICATION_CLEANUP_20260525/STALE_PASS_CLEANUP_MANIFEST.json`
-- `docs/codex-runs/archive/stale-root-GLOSS_RELEASE_PROOF_EMBEDDING_UNIFICATION_CLEANUP_20260525/`
 - `docs/codex-runs/archive/P1/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P2/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P3/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P31-20260515T040636Z/ARCHIVE_MANIFEST.json`
+- `docs/codex-runs/archive/P31-20260526T161148Z/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P31/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P32-20260524T062522Z/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P32/ARCHIVE_MANIFEST.json`
@@ -20,6 +19,7 @@ Archive root: `docs/codex-runs/archive`
 - `docs/codex-runs/archive/P33-20260524T080319Z/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P33/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/P35/ARCHIVE_MANIFEST.json`
+- `docs/codex-runs/archive/P36/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/unclassified/20260513T034357Z/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/unclassified/20260513T080827Z/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/unclassified/20260513T153602Z/ARCHIVE_MANIFEST.json`
@@ -34,3 +34,4 @@ Archive root: `docs/codex-runs/archive`
 - `docs/codex-runs/archive/unclassified/20260524T062522Z/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/unclassified/20260524T080319Z/ARCHIVE_MANIFEST.json`
 - `docs/codex-runs/archive/unclassified/20260525T064145Z/ARCHIVE_MANIFEST.json`
+- `docs/codex-runs/archive/unclassified/20260526T161148Z/ARCHIVE_MANIFEST.json`

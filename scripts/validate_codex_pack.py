@@ -7,69 +7,57 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-RUN_ID = "GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519"
+REQUIRED_RUN_ID = "GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526"
 
-REQUIRED_ROOT_FILES = [
-    "AGENTS.md",
-    "CODEX_MASTER_PROMPT.md",
-    "PHASE_PROMPTS",
-    f"codex/schemas/{RUN_ID}/final_receipt.schema.json",
-    f"docs/codex-runs/{RUN_ID}/PHASE_ORDER.md",
-    f"docs/codex-runs/{RUN_ID}/ACCEPTANCE_GATES.md",
-]
 
-EXPECTED_PHASE_IDS = [
-    "PHASE_00",
-    "PHASE_01",
-    "PHASE_02",
-    "PHASE_03",
-    "PHASE_04",
-    "PHASE_05",
-    "PHASE_06",
-    "PHASE_07",
-    "PHASE_08",
-    "PHASE_09",
-    "PHASE_10",
-    "PHASE_11",
-    "PHASE_12",
-]
+def read(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
 
-PHASE_PROMPT_RE = re.compile(r"^PHASE_(\d{2})(?:_|$).*\.md$")
+
+def current_run() -> str | None:
+    match = re.search(
+        r"Current run:\s*`?([^`\n]+)`?",
+        read(ROOT / "docs/codex-runs/CURRENT_RUN.md"),
+    )
+    return match.group(1).strip() if match else None
 
 
 def validate() -> list[str]:
     errors: list[str] = []
+    run_id = current_run()
+    if run_id != REQUIRED_RUN_ID:
+        errors.append(f"current run is {run_id!r}, expected {REQUIRED_RUN_ID}")
 
-    missing = [path for path in REQUIRED_ROOT_FILES if not (ROOT / path).exists()]
-    if missing:
-        errors.extend(f"missing required file: {path}" for path in missing)
-
-    prompt_dir = ROOT / "PHASE_PROMPTS"
-    phase_prompt_ids = sorted(
-        {f"PHASE_{match.group(1)}"
-        for path in prompt_dir.glob("PHASE_*.md")
-        if (match := PHASE_PROMPT_RE.match(path.name))
-        }
-    )
-    if phase_prompt_ids != EXPECTED_PHASE_IDS:
-        errors.append(
-            f"unexpected P33 phase prompt ordering or membership: {phase_prompt_ids}"
-        )
-
-    phase_order_path = ROOT / "docs" / "codex-runs" / RUN_ID / "PHASE_ORDER.md"
-    if phase_order_path.exists():
-        phase_order = phase_order_path.read_text(encoding="utf-8", errors="replace")
-        for phase_id in EXPECTED_PHASE_IDS:
-            if phase_id not in phase_order:
-                errors.append(f"PHASE_ORDER.md missing {phase_id}")
+    pack_manifest = ROOT / "docs" / "PACK_MANIFEST.json"
+    if not pack_manifest.exists():
+        # Fall back to repo root for older layouts.
+        pack_manifest = ROOT / "PACK_MANIFEST.json"
+    try:
+        manifest = json.loads(read(pack_manifest) or "{}")
+    except Exception as exc:
+        errors.append(f"PACK_MANIFEST.json invalid JSON: {exc}")
+        manifest = {}
+    if manifest.get("run_id") != REQUIRED_RUN_ID:
+        errors.append("PACK_MANIFEST.json run_id does not match active run")
 
     for path in [
-        "scripts/validate_codex_pack.py",
-        "scripts/assert_codex_active_pack.py",
-        "scripts/run_completion_checks.sh",
+        "AGENTS.md",
+        "README.md",
+        "docs/codex-runs/CURRENT_RUN.md",
+        f"docs/codex-runs/{REQUIRED_RUN_ID}/startup_preflight.md",
+        f"docs/codex-runs/{REQUIRED_RUN_ID}/subagent_findings.md",
+        f"docs/codex-runs/{REQUIRED_RUN_ID}/STALE_PASS_CLEANUP_MANIFEST.json",
+        f"docs/codex-runs/{REQUIRED_RUN_ID}/LIVE_SEMANTIC_MEMORY_SMOKE_RECEIPT.json",
+        f"docs/codex-runs/{REQUIRED_RUN_ID}/TURBOQUANT_RUNTIME_RECEIPT.json",
+        f"docs/codex-runs/{REQUIRED_RUN_ID}/TIMEOUT_CHANGE_RECEIPT.json",
+        f"docs/codex-runs/{REQUIRED_RUN_ID}/RELEASE_CANDIDATE_GATE_RESULTS.json",
     ]:
         if not (ROOT / path).exists():
-            errors.append(f"missing required repository command/script: {path}")
+            errors.append(f"missing required active pack file: {path}")
+
+    for path in ["AGENTS.md", "README.md"]:
+        if REQUIRED_RUN_ID not in read(ROOT / path):
+            errors.append(f"{path} does not reference {REQUIRED_RUN_ID}")
 
     return errors
 
@@ -78,19 +66,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
-
     errors = validate()
-    if not errors and not args.quiet:
-        print("OK: codex pack validation passed")
-        return 0
-
     if errors:
         if not args.quiet:
             print("Codex pack validation failed:")
             for error in errors:
                 print(f"- {error}")
         return 1
-
+    if not args.quiet:
+        print("OK: active Codex pack validation passed")
     return 0
 
 

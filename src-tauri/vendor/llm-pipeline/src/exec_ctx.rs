@@ -208,9 +208,12 @@ impl ExecCtxBuilder {
         self
     }
 
-    /// Set the request timeout. Default: 60 seconds.
+    /// Set the client-level connection timeout. Default: 5 minutes (safety net).
     ///
-    /// If no custom `Client` is provided, the built client will use this timeout.
+    /// This is a coarse safety net on the `reqwest::Client`. Per-request timeouts
+    /// are applied individually via [`PipelineLimits::request_timeout`] or
+    /// [`LlmCall::with_timeout`](crate::llm_call::LlmCall::with_timeout).
+    ///
     /// If a custom `Client` is provided via `.client()`, this setting is ignored
     /// (the custom client's own timeout applies).
     pub fn timeout(mut self, timeout: Duration) -> Self {
@@ -264,10 +267,13 @@ impl ExecCtxBuilder {
     /// `trace_ctx` is present. This ensures a single source of truth for trace identity.
     pub fn build(self) -> ExecCtx {
         let limits = self.limits.unwrap_or_default();
-        let timeout = self.timeout.unwrap_or(limits.request_timeout);
+        // Use a high safety-net timeout on the Client itself (5 minutes).
+        // Actual per-request timeouts are applied at the RequestBuilder level
+        // by each backend, driven by LlmCall.timeout or PipelineLimits.request_timeout.
+        let client_timeout = self.timeout.unwrap_or(Duration::from_secs(300));
         let client = self.client.unwrap_or_else(|| {
             Client::builder()
-                .timeout(timeout)
+                .timeout(client_timeout)
                 .build()
                 .expect("Failed to build HTTP client")
         });

@@ -4,12 +4,12 @@ import * as api from '../lib/tauri';
 import { useChatStore } from './chatStore';
 import { useToastStore } from './toastStore';
 import { refreshNotebookList } from './notebookRefresh';
+import { useNotebookStore } from './notebookStore';
 
-const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
 const SELECTION_PERSIST_DEBOUNCE_MS = 350;
-let persistSelectedSourcesTimer: ReturnType<typeof setTimeout> | null = null;
-let persistSelectedSourcesInFlight = false;
-let persistSelectedSourcesPending: { notebookId: string; ids: string[] } | null = null;
+const persistSelectedSourcesTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const persistSelectedSourcesInFlight = new Set<string>();
+const persistSelectedSourcesPending = new Map<string, string[]>();
 export type SourceListStatus = 'idle' | 'loading' | 'partial' | 'ready' | 'empty' | 'error';
 export type SourceScopeMode = 'none' | 'all' | 'explicit';
 
@@ -20,12 +20,21 @@ function buildSourceScope(
   sourceListStatus: SourceListStatus,
   stats: NotebookStats | null
 ): SourceScope {
-  if (
-    sourceListStatus === 'loading' ||
-    sourceListStatus === 'partial' ||
-    sourceListStatus === 'error' ||
-    sourceListStatus === 'idle'
-  ) {
+  // When user explicitly selects no-retrieval, honour it regardless of source
+  // list status so chat always works without retrieval.
+  if (sourceScopeMode === 'none') {
+    return { kind: 'none' };
+  }
+  if (sourceScopeMode === 'explicit') {
+    // Preserve explicit intent even while the source list is loading or
+    // partial; silently converting it to none would change retrieval policy.
+    return { kind: 'explicit', ids: Array.from(selectedSourceIds) };
+  }
+  // When source list is degraded, do NOT silently downgrade an explicit
+  // retrieval request — pass it through so the backend can decide how to
+  // handle incomplete source data. Only fall back to 'none' when we have
+  // no source information at all (idle).
+  if (sourceListStatus === 'idle') {
     return { kind: 'none' };
   }
   if (sources.length === 0) {
@@ -34,18 +43,13 @@ function buildSourceScope(
     }
     return { kind: 'none' };
   }
-  if (sourceScopeMode === 'none') {
-    return { kind: 'none' };
-  }
   if (sourceScopeMode === 'all') {
-    if (stats?.source_count && stats.source_count !== sources.length) {
-      return { kind: 'none' };
-    }
     return { kind: 'all' };
   }
-  const validIds = new Set(sources.map((source) => source.id));
-  const ids = Array.from(selectedSourceIds).filter((id) => validIds.has(id));
-  return ids.length > 0 ? { kind: 'explicit', ids } : { kind: 'none' };
+  // Keep explicit intent intact. Filtering stale ids here would silently
+  // change an explicit retrieval request into no-retrieval.
+  const ids = Array.from(selectedSourceIds);
+  return { kind: 'explicit', ids };
 }
 
 function clearSuggestedQuestions() {
@@ -53,30 +57,31 @@ function clearSuggestedQuestions() {
 }
 
 function persistSelectedSources(selectedSourceIds: Set<string>) {
-  const notebookId = localStorage.getItem(ACTIVE_NB_KEY);
+  const notebookId = useNotebookStore.getState().activeNotebookId;
   if (!notebookId) return;
-  persistSelectedSourcesPending = { notebookId, ids: Array.from(selectedSourceIds) };
-  if (persistSelectedSourcesTimer) {
-    clearTimeout(persistSelectedSourcesTimer);
-  }
-  persistSelectedSourcesTimer = setTimeout(() => {
-    void flushSelectedSources();
-  }, SELECTION_PERSIST_DEBOUNCE_MS);
+  persistSelectedSourcesPending.set(notebookId, Array.from(selectedSourceIds));
+  const previous = persistSelectedSourcesTimers.get(notebookId);
+  if (previous) clearTimeout(previous);
+  persistSelectedSourcesTimers.set(notebookId, setTimeout(() => {
+    void flushSelectedSources(notebookId);
+  }, SELECTION_PERSIST_DEBOUNCE_MS));
 }
 
-async function flushSelectedSources(): Promise<void> {
-  if (persistSelectedSourcesInFlight || !persistSelectedSourcesPending) return;
-  persistSelectedSourcesInFlight = true;
-  const snapshot = persistSelectedSourcesPending;
-  persistSelectedSourcesPending = null;
+async function flushSelectedSources(notebookId: string): Promise<void> {
+  if (persistSelectedSourcesInFlight.has(notebookId)) return;
+  const ids = persistSelectedSourcesPending.get(notebookId);
+  if (!ids) return;
+  persistSelectedSourcesInFlight.add(notebookId);
+  persistSelectedSourcesPending.delete(notebookId);
   try {
-    await api.setSelectedSources(snapshot.notebookId, snapshot.ids);
+    await api.setSelectedSources(notebookId, ids);
   } catch (e) {
-    console.error('Failed to persist selected sources:', e);
+    console.warn('Failed to persist selected sources:', e);
+    useToastStore.getState().addToast({ type: 'error', title: 'Save Failed', message: 'Failed to persist selected sources', duration: 5000 });
   } finally {
-    persistSelectedSourcesInFlight = false;
-    if (persistSelectedSourcesPending) {
-      void flushSelectedSources();
+    persistSelectedSourcesInFlight.delete(notebookId);
+    if (persistSelectedSourcesPending.has(notebookId)) {
+      void flushSelectedSources(notebookId);
     }
   }
 }
@@ -89,12 +94,17 @@ interface SourceStore {
   sourceListStatus: SourceListStatus;
   sourceListError?: string | null;
   stats: NotebookStats | null;
+  loadedNotebookId: string | null;
   loadSources: (notebookId: string) => Promise<void>;
   addSourceFile: (notebookId: string, path: string) => Promise<void>;
   addSourceFiles: (notebookId: string, paths: string[]) => Promise<void>;
   addSourceFolder: (notebookId: string, path: string) => Promise<void>;
   addSourcePaste: (notebookId: string, title: string, text: string) => Promise<void>;
+  addSourceUrl: (notebookId: string, url: string, networkConsent: boolean) => Promise<void>;
+  addSourceYouTubeTranscript: (notebookId: string, url: string, language: string | null, networkConsent: boolean) => Promise<void>;
   deleteSource: (notebookId: string, sourceId: string) => Promise<void>;
+  quarantineFailedImports: (notebookId: string) => Promise<void>;
+  deleteFailedImports: (notebookId: string) => Promise<void>;
   retrySource: (notebookId: string, sourceId: string) => Promise<void>;
   reindexSource: (notebookId: string, sourceId: string) => Promise<void>;
   reindexNotebook: (notebookId: string) => Promise<void>;
@@ -119,12 +129,13 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   sourceListStatus: 'idle',
   sourceListError: null,
   stats: null,
+  loadedNotebookId: null,
 
   loadSources: async (notebookId) => {
-    set({ loading: true, sourceListStatus: 'loading', sourceListError: null });
+    set({ loadedNotebookId: notebookId, loading: true, sourceListStatus: 'loading', sourceListError: null });
     try {
       const sources = await api.listSources(notebookId);
-      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      if (get().loadedNotebookId !== notebookId || useNotebookStore.getState().activeNotebookId !== notebookId) {
         return;
       }
       const selectedIds = new Set(sources.filter(s => s.selected).map(s => s.id));
@@ -145,10 +156,10 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         sourceListError: null,
       });
     } catch (e) {
-      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      if (get().loadedNotebookId !== notebookId || useNotebookStore.getState().activeNotebookId !== notebookId) {
         return;
       }
-      console.error('Failed to load sources:', e);
+      console.warn('Failed to load sources:', e);
       set({
         loading: false,
         sourceListStatus: 'error',
@@ -236,6 +247,52 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
     }
   },
 
+  addSourceUrl: async (notebookId, url, networkConsent) => {
+    try {
+      clearSuggestedQuestions();
+      await api.addSourceUrl(notebookId, url, networkConsent);
+      await refreshNotebookList();
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'URL Import Started',
+        message: 'Fetched URL text is queued for indexing.',
+        duration: 3000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'URL Import Failed',
+        message: String(e),
+        duration: 6000,
+      });
+    }
+  },
+
+  addSourceYouTubeTranscript: async (notebookId, url, language, networkConsent) => {
+    try {
+      clearSuggestedQuestions();
+      await api.addSourceYouTubeTranscript(notebookId, url, language, networkConsent);
+      await refreshNotebookList();
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'YouTube Transcript Import Started',
+        message: 'Fetched transcript text with timestamps is queued for indexing.',
+        duration: 3000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'YouTube Transcript Import Failed',
+        message: String(e),
+        duration: 6000,
+      });
+    }
+  },
+
   deleteSource: async (notebookId, sourceId) => {
     try {
       clearSuggestedQuestions();
@@ -249,6 +306,51 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         title: 'Delete Failed',
         message: String(e),
         duration: 5000,
+      });
+    }
+  },
+
+  quarantineFailedImports: async (notebookId) => {
+    try {
+      clearSuggestedQuestions();
+      const receipt = await api.quarantineFailedImports(notebookId);
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'Failed Imports Quarantined',
+        message: `${receipt.quarantined_sources} failed sources quarantined; ${receipt.cancelled_queue_jobs} queued jobs cancelled.`,
+        duration: 5000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Quarantine Failed',
+        message: String(e),
+        duration: 6000,
+      });
+    }
+  },
+
+  deleteFailedImports: async (notebookId) => {
+    try {
+      clearSuggestedQuestions();
+      const receipt = await api.deleteFailedImports(notebookId);
+      await refreshNotebookList();
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'success',
+        title: 'Failed Imports Deleted',
+        message: `${receipt.deleted_sources} failed sources deleted; ${receipt.cancelled_queue_jobs} queued jobs cancelled.`,
+        duration: 5000,
+      });
+    } catch (e) {
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Delete Failed Imports Failed',
+        message: String(e),
+        duration: 6000,
       });
     }
   },
@@ -416,7 +518,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   loadStats: async (notebookId) => {
     try {
       const stats = await api.getNotebookStats(notebookId);
-      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      if (get().loadedNotebookId !== notebookId || useNotebookStore.getState().activeNotebookId !== notebookId) {
         return;
       }
       set((state) => ({
@@ -444,6 +546,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       selectedSourceIds: new Set<string>(),
       sourceScopeMode: 'none',
       stats: null,
+      loadedNotebookId: null,
       loading: false,
       sourceListStatus: 'idle',
       sourceListError: null,

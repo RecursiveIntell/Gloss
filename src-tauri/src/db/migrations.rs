@@ -1,15 +1,30 @@
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-const APP_SCHEMA_VERSION: i32 = 2;
-const NOTEBOOK_SCHEMA_VERSION: i32 = 6;
+const APP_SCHEMA_VERSION: i32 = 3;
+const NOTEBOOK_SCHEMA_VERSION: i32 = 7;
 
 /// Apply pragmas for performance and correctness.
+///
+/// Four issues fixed from hostile audit:
+/// 1. `synchronous=NORMAL` was missing — required for WAL mode to avoid
+///    unnecessary fsync on every commit while still protecting against
+///    database corruption (WAL + NORMAL is safe; FULL is only needed
+///    for rollback-journal mode).
+/// 2. `cache_size` was missing — set a reasonable negative value (KiB)
+///    to allow the page cache to grow beyond the tiny default.
+/// 3. `mmap_size` was missing — enable memory-mapped I/O for read-heavy
+///    workloads (FTS5, HNSW lookups).
+/// 4. `temp_store=MEMORY` was missing — keep temp tables/indexes in RAM.
 pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA foreign_keys=ON;
-         PRAGMA busy_timeout=5000;",
+         PRAGMA busy_timeout=5000;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA cache_size=-65536;
+         PRAGMA mmap_size=67108864;
+         PRAGMA temp_store=MEMORY;",
     )
 }
 
@@ -70,19 +85,24 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
         // Insert default settings
         conn.execute_batch(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('default_provider', 'ollama');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('default_model', 'qwen3:8b');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('default_model', 'qwen3.5:4b');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('default_embedding_model', 'NomicEmbedTextV15');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('summary_mode', 'manual');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend', 'gloss-local');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend', 'semantic-memory-preview');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend_fallback', 'true');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_auto_project', 'false');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_auto_project', 'true');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_strict_testing', 'false');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_provider', 'fastembed');
+             -- v1/v2 default; v3 migration above flips this on upgrade.
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_url', 'http://localhost:11434');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_model', 'nomic-embed-text');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_model', 'bge-m3');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_timeout_secs', '10');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_search_timeout_ms', '8000');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_temperature', '0.7');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_p', '');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_k', '');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_min_p', '');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_repeat_penalty', '');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('ollama_url', 'http://localhost:11434');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('theme', 'system');",
         )?;
@@ -109,12 +129,57 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
         if !table_has_column(conn, "models", "last_error")? {
             conn.execute("ALTER TABLE models ADD COLUMN last_error TEXT", [])?;
         }
+        set_schema_version(conn, 2)?;
+    }
+
+    // v3: Stop shipping FastEmbed as the default. In-process ONNX has caused
+    // crashes during batch imports (per hostile audit / user memory: "ONNX
+    // heap corruption kills Gloss during batch imports" + "user forbids
+    // band-aids — only out-of-process embedding acceptable"). We flip any
+    // existing user that still has 'fastembed' selected to 'ollama' on first
+    // run of this migration, and change the new-install default to 'ollama'
+    // so fresh installs never touch the dangerous path.
+    if version < 3 {
+        let flipped = conn.execute(
+            "UPDATE settings
+                SET value = 'ollama'
+              WHERE key = 'semantic_memory_embedding_provider'
+                AND lower(value) = 'fastembed'",
+            [],
+        )?;
+        if flipped > 0 {
+            eprintln!(
+                "[gloss] migration v3: flipped {} setting(s) from \
+                 'fastembed' to 'ollama' for crash-isolated embeddings. \
+                 Use Settings → Embedding to change.",
+                flipped
+            );
+        }
+        // The new-install default below replaces the v1/v2 INSERT for the
+        // embedding provider key. Existing users with a different value are
+        // untouched.
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) \
+             VALUES ('semantic_memory_embedding_provider', 'ollama')",
+            [],
+        )?;
         set_schema_version(conn, APP_SCHEMA_VERSION)?;
     }
 
     conn.execute_batch(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_strict_testing', 'false');
-         INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');",
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_temperature', '0.7');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_p', '');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_k', '');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_min_p', '');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_repeat_penalty', '');
+         INSERT OR IGNORE INTO settings (key, value) VALUES ('chunk_target_tokens', '1100');",
+    )?;
+
+    conn.execute(
+        "UPDATE settings SET value = 'bge-m3' WHERE key = 'semantic_memory_embedding_model' AND value = 'all-minilm'",
+        [],
     )?;
 
     ensure_provider_rows(conn)?;
@@ -224,6 +289,26 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
                 created_at          TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS chat_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                notebook_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                assistant_message_id TEXT NOT NULL,
+                user_message_id TEXT,
+                provider TEXT,
+                model TEXT,
+                status TEXT NOT NULL,
+                phase TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                request_digest TEXT,
+                response_digest TEXT,
+                partial_policy TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                terminal_at TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS notes (
                 id          TEXT PRIMARY KEY,
                 title       TEXT,
@@ -293,6 +378,10 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
                 sm_document_id TEXT,
                 sm_chunk_id TEXT,
                 sm_episode_id TEXT,
+                gloss_chunk_id TEXT,
+                projection_unit_id TEXT,
+                projection_unit_kind TEXT,
+                projection_unit_ordinal INTEGER,
                 content_digest TEXT NOT NULL,
                 backend_version TEXT NOT NULL,
                 sync_status TEXT NOT NULL,
@@ -321,13 +410,23 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
         set_schema_version(conn, NOTEBOOK_SCHEMA_VERSION)?;
     }
 
+    if version < 7 {
+        ensure_embedding_index_metadata(conn)?;
+        set_schema_version(conn, NOTEBOOK_SCHEMA_VERSION)?;
+    }
+
     ensure_notebook_fts(conn)?;
     ensure_source_processing_state(conn)?;
+    ensure_embedding_index_metadata(conn)?;
     ensure_semantic_memory_links(conn)?;
     ensure_semantic_memory_projection_status(conn)?;
     ensure_semantic_memory_vector_artifact_receipts(conn)?;
     ensure_semantic_memory_retrieval_probe_receipts(conn)?;
+    ensure_prompt_generation_receipts(conn)?;
+    ensure_chat_attempts(conn)?;
     ensure_provenance_receipts(conn)?;
+    ensure_studio_outputs(conn)?;
+    ensure_studio_outputs_prose_column(conn)?;
 
     Ok(())
 }
@@ -341,6 +440,10 @@ fn ensure_semantic_memory_links(conn: &Connection) -> rusqlite::Result<()> {
             sm_document_id TEXT,
             sm_chunk_id TEXT,
             sm_episode_id TEXT,
+            gloss_chunk_id TEXT,
+            projection_unit_id TEXT,
+            projection_unit_kind TEXT,
+            projection_unit_ordinal INTEGER,
             content_digest TEXT,
             backend_version TEXT,
             sync_status TEXT,
@@ -358,6 +461,10 @@ fn ensure_semantic_memory_links(conn: &Connection) -> rusqlite::Result<()> {
         ("sm_document_id", "TEXT"),
         ("sm_chunk_id", "TEXT"),
         ("sm_episode_id", "TEXT"),
+        ("gloss_chunk_id", "TEXT"),
+        ("projection_unit_id", "TEXT"),
+        ("projection_unit_kind", "TEXT"),
+        ("projection_unit_ordinal", "INTEGER"),
         ("content_digest", "TEXT"),
         ("backend_version", "TEXT"),
         ("sync_status", "TEXT"),
@@ -375,6 +482,16 @@ fn ensure_semantic_memory_links(conn: &Connection) -> rusqlite::Result<()> {
     backfill_semantic_memory_content_digests(conn)?;
     conn.execute(
         "UPDATE semantic_memory_links
+         SET gloss_chunk_id = COALESCE(gloss_chunk_id, chunk_id),
+             projection_unit_id = COALESCE(projection_unit_id, chunk_id),
+             projection_unit_kind = COALESCE(projection_unit_kind, 'chunk')
+         WHERE gloss_chunk_id IS NULL
+            OR projection_unit_id IS NULL
+            OR projection_unit_kind IS NULL",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE semantic_memory_links
          SET sync_status = 'degraded-missing-exact-backpointer',
              sync_error = COALESCE(sync_error, 'missing exact semantic chunk identity'),
              synced_at = COALESCE(synced_at, datetime('now'))
@@ -382,6 +499,48 @@ fn ensure_semantic_memory_links(conn: &Connection) -> rusqlite::Result<()> {
            AND (sm_chunk_id IS NULL OR trim(sm_chunk_id) = '')",
         [],
     )?;
+
+    Ok(())
+}
+
+fn ensure_embedding_index_metadata(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS embedding_index_metadata (
+            index_id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            model_digest TEXT,
+            dimensions INTEGER,
+            schema_version INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            status_reason TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            validated_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_embedding_index_metadata_status
+        ON embedding_index_metadata (status);",
+    )?;
+
+    for (column, definition) in [
+        ("index_id", "TEXT"),
+        ("provider", "TEXT NOT NULL DEFAULT ''"),
+        ("model", "TEXT NOT NULL DEFAULT ''"),
+        ("model_digest", "TEXT"),
+        ("dimensions", "INTEGER"),
+        ("schema_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("status_reason", "TEXT"),
+        ("created_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+        ("validated_at", "TEXT"),
+    ] {
+        if !table_has_column(conn, "embedding_index_metadata", column)? {
+            conn.execute(
+                &format!("ALTER TABLE embedding_index_metadata ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
 
     Ok(())
 }
@@ -504,6 +663,71 @@ fn ensure_provenance_receipts(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_provenance_receipts_subject
         ON provenance_receipts (subject_kind, subject_id, recorded_time DESC);",
+    )
+}
+
+fn ensure_prompt_generation_receipts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS prompt_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            prompt_digest TEXT NOT NULL,
+            context_payload_digest TEXT NOT NULL,
+            raw_receipt_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_prompt_receipts_message
+        ON prompt_receipts (message_id, recorded_at DESC);
+
+        CREATE TABLE IF NOT EXISTS generation_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            provider_request_digest TEXT NOT NULL,
+            response_digest TEXT,
+            status TEXT NOT NULL,
+            raw_receipt_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_generation_receipts_message
+        ON generation_receipts (message_id, recorded_at DESC);",
+    )
+}
+
+fn ensure_chat_attempts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS chat_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            notebook_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            assistant_message_id TEXT NOT NULL,
+            user_message_id TEXT,
+            provider TEXT,
+            model TEXT,
+            status TEXT NOT NULL,
+            phase TEXT,
+            error_code TEXT,
+            error_message TEXT,
+            request_digest TEXT,
+            response_digest TEXT,
+            partial_policy TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            terminal_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_attempts_conversation
+        ON chat_attempts (conversation_id, updated_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_chat_attempts_assistant_message
+        ON chat_attempts (assistant_message_id);",
     )
 }
 
@@ -678,6 +902,38 @@ fn set_schema_version(conn: &Connection, version: i32) -> rusqlite::Result<()> {
         "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?1)",
         [version.to_string()],
     )?;
+    Ok(())
+}
+
+fn ensure_studio_outputs(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS studio_outputs (
+            id            TEXT PRIMARY KEY,
+            output_type   TEXT NOT NULL,
+            title         TEXT,
+            prompt_used   TEXT NOT NULL,
+            raw_content   TEXT,
+            config        TEXT,
+            source_ids    TEXT,
+            file_path     TEXT,
+            status        TEXT DEFAULT 'pending',
+            error_message TEXT,
+            prose_content TEXT,
+            created_at    TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_studio_type ON studio_outputs(output_type, created_at DESC);",
+    )?;
+    Ok(())
+}
+
+fn ensure_studio_outputs_prose_column(conn: &Connection) -> rusqlite::Result<()> {
+    if !table_has_column(conn, "studio_outputs", "prose_content")? {
+        conn.execute(
+            "ALTER TABLE studio_outputs ADD COLUMN prose_content TEXT",
+            [],
+        )?;
+    }
     Ok(())
 }
 

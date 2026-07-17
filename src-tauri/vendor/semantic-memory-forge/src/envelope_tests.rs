@@ -103,9 +103,7 @@ fn valid_envelope_passes_validation() {
 
 #[test]
 fn empty_envelope_id_rejected() {
-    let mut env = make_test_envelope();
-    env.envelope_id = EnvelopeId::new("");
-    assert!(env.validate().is_err());
+    assert!(EnvelopeId::try_new("").is_err());
 }
 
 #[test]
@@ -421,7 +419,7 @@ fn v2_digest_matches_pinned_golden_fixture() {
 
     assert_eq!(
         digest.hex(),
-        "540585eb2fb643b349a1726e6d7820527b5c50797eb2c4c4899bf3aab20a2b7c"
+        "1ba7068f34d138d76eae89eaca3f3a98940b7314ea3f0e1ab4e518a539082680"
     );
 }
 
@@ -448,7 +446,7 @@ fn v3_digest_matches_pinned_golden_fixture() {
 
     assert_eq!(
         digest.hex(),
-        "78f0c45bcbb4b2e3b2a445eabaad775ebdcc976c76ac113085dcc7741d51779a"
+        "6e44bd7d6ccafd2046f51c826899f09b81f29feb621c46c0781d67b0bee58fea"
     );
 }
 
@@ -634,11 +632,11 @@ fn enrich_to_v3_lifts_existing_kernel_metadata_without_invention() {
     let semantics = v3.records[0].semantics.as_ref().expect("rich semantics");
     assert_eq!(
         semantics.claim_family_id.as_ref().map(|id| id.as_str()),
-        Some("family-1")
+        Some("claim-family:family-1")
     );
     assert_eq!(
         semantics.assertion_group_id.as_ref().map(|id| id.as_str()),
-        Some("assertion-1")
+        Some("assertion-group:assertion-1")
     );
     assert_eq!(
         semantics.comparability_snapshot_version.as_deref(),

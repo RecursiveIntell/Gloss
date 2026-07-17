@@ -1,6 +1,5 @@
 use crate::retrieval::context::ContextPassage;
 use crate::retrieval::hybrid_search::SearchResult;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -53,8 +52,10 @@ pub fn citation_anchors_for_context(source_context: &[ContextPassage]) -> Vec<Ci
         .collect()
 }
 
+static CITATION_REF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
 pub fn count_unique_citation_refs(response: &str) -> usize {
-    let re = Regex::new(r"\[(\d+)\]").unwrap();
+    let re = CITATION_REF_RE.get_or_init(|| regex::Regex::new(r"\[(\d+)\]").expect("static regex"));
     re.captures_iter(response)
         .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
         .collect::<std::collections::HashSet<_>>()
@@ -69,7 +70,7 @@ pub fn extract_citations(
     search_results: &[SearchResult],
     source_titles: &std::collections::HashMap<String, String>,
 ) -> Vec<Citation> {
-    let re = Regex::new(r"\[(\d+)\]").unwrap();
+    let re = CITATION_REF_RE.get_or_init(|| regex::Regex::new(r"\[(\d+)\]").expect("static regex"));
     let mut citations = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -121,7 +122,7 @@ pub fn extract_citations_from_context_with_reasons(
     response: &str,
     source_context: &[ContextPassage],
 ) -> (Vec<Citation>, Vec<CitationFilterReasonV1>) {
-    let re = Regex::new(r"\[(\d+)\]").unwrap();
+    let re = CITATION_REF_RE.get_or_init(|| regex::Regex::new(r"\[(\d+)\]").expect("static regex"));
     let mut citations = Vec::new();
     let mut filtered = Vec::new();
     let mut seen = std::collections::HashSet::new();

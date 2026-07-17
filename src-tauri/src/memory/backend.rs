@@ -3,7 +3,7 @@ use crate::error::GlossError;
 use crate::memory::types::{
     IndexSourceReceipt, IndexSourceRequest, MemoryBackendComparison, MemoryBackendStatus,
     MemoryScopeEcho, MemorySearchCandidate, MemorySearchRequest, MemorySearchResponse,
-    SemanticCandidateEnvelope, SemanticLinkRow, MEMORY_BACKEND_GLOSS_LOCAL,
+    RetrievalReasonCode, SemanticCandidateEnvelope, SemanticLinkRow, MEMORY_BACKEND_GLOSS_LOCAL,
     MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
 };
 use crate::retrieval::source_scope::{ResolvedSourceScope, ResolvedSourceScopeKind};
@@ -315,6 +315,7 @@ async fn semantic_memory_comparison_result(
             all_sources,
             request.clone(),
             semantic_runtime_config,
+            None,
         )
         .await
         {
@@ -377,6 +378,7 @@ fn semantic_memory_unavailable_response(
             "source_scope_preserved": source_scope_preserved
         }),
         fallback_reason: Some(reason),
+        fallback_reason_code: Some(RetrievalReasonCode::SemanticMemoryBuildFeatureMissing),
         degradation_markers: vec!["semantic-memory-unavailable".to_string()],
         source_scope_preserved,
         fallback_used: false,
@@ -488,8 +490,10 @@ pub fn unavailable_status(active_backend: String, diagnostic: String) -> MemoryB
         last_retrieval_receipt_id: None,
         last_receipt_ref: None,
         fallback_reason: Some(diagnostic.clone()),
+        fallback_reason_code: Some(RetrievalReasonCode::SemanticMemoryBuildFeatureMissing),
         degradation_markers: vec!["semantic-memory-unavailable".to_string()],
         backend_version_or_digest: None,
+        embedding_index_metadata: Vec::new(),
         degraded: true,
         diagnostic: Some(diagnostic),
     }
@@ -605,6 +609,7 @@ mod tests {
             receipt_id: "local-feature-receipt".to_string(),
             provenance: serde_json::json!({"backend": MEMORY_BACKEND_GLOSS_LOCAL}),
             fallback_reason: None,
+            fallback_reason_code: None,
             degradation_markers: Vec::new(),
             source_scope_preserved: true,
             fallback_used: false,
@@ -1076,6 +1081,7 @@ mod tests {
             receipt_id: "shared-request-receipt".to_string(),
             provenance: serde_json::json!({}),
             fallback_reason: None,
+            fallback_reason_code: None,
             degradation_markers: Vec::new(),
             source_scope_preserved: true,
             fallback_used: false,
@@ -1098,6 +1104,7 @@ mod tests {
                 }
             }),
             fallback_reason: None,
+            fallback_reason_code: None,
             degradation_markers: Vec::new(),
             source_scope_preserved: true,
             fallback_used: false,

@@ -77,14 +77,22 @@ def main() -> int:
     parser.add_argument("--latest", action="store_true", help="audit the latest matching retrieval/evidence receipt")
     args = parser.parse_args()
     repo = pathlib.Path(args.repo).resolve()
-    target = pathlib.Path(args.receipt or args.payload).resolve() if (args.receipt or args.payload) else None
-    if args.latest:
+    positional_target = pathlib.Path(args.payload).resolve() if args.payload else None
+    # If positional arg is a directory, treat it as --repo and use --latest
+    if positional_target and positional_target.is_dir():
+        repo = positional_target
+        positional_target = None
+    target = pathlib.Path(args.receipt).resolve() if args.receipt else positional_target
+    if args.latest or target is None:
         target = latest_receipt(repo)
     if target is None:
         print(json.dumps({"checked": 0, "errors": [], "decision": "no_receipts", "warnings": ["no retrieval disclosure receipt found"]}, indent=2))
         return 0
     if not target.exists():
         print(json.dumps({"checked": 0, "errors": [f"missing receipt: {target}"], "decision": "blocked"}, indent=2))
+        return 1
+    if target.is_dir():
+        print(json.dumps({"checked": 0, "errors": [f"target is a directory, not a file: {target}"], "decision": "blocked"}, indent=2))
         return 1
     payload = json.loads(target.read_text())
     result = audit_payload(payload)

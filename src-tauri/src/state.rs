@@ -1,24 +1,151 @@
 use crate::db::app_db::AppDb;
-use crate::db::notebook_db::NotebookDb;
+use crate::db::notebook_db::{
+    EmbeddingIndexMetadata, EmbeddingIndexMetadataStatus, NotebookDb, NATIVE_HNSW_INDEX_ID,
+};
+use crate::db::notebook_pool::NotebookDbPools;
 use crate::error::GlossError;
 use crate::features;
 use crate::ingestion::embed::{EmbeddingService, HnswIndex};
-use crate::memory::types::RetrievalOutcome;
+use crate::memory::types::{RetrievalOutcome, RetrievalReasonCode};
 use crate::provider_config_store::SecretStore;
 use crate::providers::ModelRegistry;
+use crate::redaction::redact_path;
 use crate::retrieval::hybrid_search;
 use crate::retrieval::source_scope::ResolvedSourceScope;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+
+const CHAT_STREAM_REPLAY_CAPACITY: usize = 4096;
 
 /// Release builds keep native dense indexing enabled. Ingestion still runs
 /// through bounded single-source work and the GPU gate so fallback/degradation
 /// is visible instead of silently skipping dense vectors.
 pub const NATIVE_SEMANTIC_INDEXING_ENABLED: bool = true;
+/// LRU cache of (query_text, model_id) -> embedding vector. Bounded.
+/// Backing store: HashMap of text -> (Vec<f32>, generation). On insert,
+/// the oldest generation is evicted. This is O(1) amortized and bounded
+/// to `MAX_ENTRIES` (~384KB at 256 entries * 384 dims * 4 bytes).
+#[derive(Debug)]
+pub struct QueryEmbedCache {
+    entries: HashMap<String, (Vec<f32>, u64)>,
+    generation: u64,
+    max_entries: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl Default for QueryEmbedCache {
+    fn default() -> Self {
+        Self::new(256)
+    }
+}
+
+impl QueryEmbedCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            generation: 0,
+            max_entries: max_entries.max(1),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    pub fn get(&mut self, key: &str) -> Option<Vec<f32>> {
+        match self.entries.get(key) {
+            Some((vec, _gen)) => {
+                self.hits += 1;
+                Some(vec.clone())
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    pub fn insert(&mut self, key: String, vec: Vec<f32>) {
+        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
+            // Evict all entries from the oldest generation. A new generation
+            // is bumped; everything before it is stale. This is the simplest
+            // bounded-LRU that doesn't require a linked list.
+            self.generation += 1;
+            let keep = self.generation;
+            self.entries.retain(|_, (_, gen)| *gen == keep);
+            // If we still somehow overflowed (all entries were fresh), keep
+            // half to be safe.
+            if self.entries.len() >= self.max_entries {
+                let drop = self.entries.len() - self.max_entries / 2;
+                let keys: Vec<String> = self.entries.keys().take(drop).cloned().collect();
+                for k in keys {
+                    self.entries.remove(&k);
+                }
+            }
+        }
+        let gen = self.generation;
+        self.entries.insert(key, (vec, gen));
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.generation = 0;
+    }
+
+    #[cfg(test)]
+    pub fn stats(&self) -> (u64, u64, usize) {
+        (self.hits, self.misses, self.entries.len())
+    }
+}
+
+#[cfg(test)]
+mod query_embed_cache_tests {
+    use super::*;
+
+    #[test]
+    fn lru_evicts_oldest_generation() {
+        let mut c = QueryEmbedCache::new(2);
+        c.insert("a".into(), vec![1.0]);
+        c.insert("b".into(), vec![2.0]);
+        assert_eq!(c.entries.len(), 2);
+        // Force eviction
+        c.insert("c".into(), vec![3.0]);
+        assert!(c.entries.len() <= 2);
+        // At least one of the originals should be gone
+        let has_a = c.entries.contains_key("a");
+        let has_b = c.entries.contains_key("b");
+        assert!(
+            !has_a || !has_b,
+            "expected at least one original to be evicted"
+        );
+    }
+
+    #[test]
+    fn hits_and_misses_count() {
+        let mut c = QueryEmbedCache::new(4);
+        c.insert("x".into(), vec![0.5]);
+        assert!(c.get("x").is_some());
+        assert!(c.get("x").is_some());
+        assert!(c.get("missing").is_none());
+        let (hits, misses, _) = c.stats();
+        assert_eq!(hits, 2);
+        assert_eq!(misses, 1);
+    }
+
+    #[test]
+    fn clear_resets_state() {
+        let mut c = QueryEmbedCache::new(4);
+        c.insert("k".into(), vec![0.1]);
+        c.clear();
+        assert!(c.get("k").is_none());
+        assert_eq!(c.entries.len(), 0);
+    }
+}
+
 pub const SUMMARY_MODE_AUTO: &str = "auto";
 pub const SUMMARY_MODE_MANUAL: &str = "manual";
 
@@ -30,25 +157,106 @@ pub struct RuntimeGateOwner {
     pub since_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ActiveChatAttempt {
+    pub notebook_id: String,
+    pub conversation_id: String,
+    pub attempt_id: String,
+    pub message_id: String,
+    pub cancellation: CancellationToken,
+}
+
+/// Holds an active chat registration during synchronous request preparation.
+/// Dropping an unclaimed lease removes the registration, so setup/retrieval
+/// failures cannot leave a conversation permanently single-flight blocked.
+pub struct ActiveChatAttemptLease<'a> {
+    state: &'a AppState,
+    attempt: Option<ActiveChatAttempt>,
+}
+
+impl ActiveChatAttemptLease<'_> {
+    pub fn cancellation(&self) -> Result<CancellationToken, GlossError> {
+        self.attempt
+            .as_ref()
+            .map(|attempt| attempt.cancellation.clone())
+            .ok_or_else(|| GlossError::Other("active chat attempt lease has no attempt".into()))
+    }
+
+    /// Transfers cleanup responsibility to the spawned stream task.
+    pub fn activate(mut self) -> Result<ActiveChatAttempt, GlossError> {
+        self.attempt
+            .take()
+            .ok_or_else(|| GlossError::Other("active chat attempt lease has no attempt".into()))
+    }
+}
+
+impl Drop for ActiveChatAttemptLease<'_> {
+    fn drop(&mut self) {
+        if let Some(attempt) = self.attempt.take() {
+            self.state.finish_active_chat_attempt(
+                &attempt.notebook_id,
+                &attempt.conversation_id,
+                &attempt.attempt_id,
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveStudioAttempt {
+    pub notebook_id: String,
+    pub attempt_id: String,
+    pub cancellation: CancellationToken,
+}
+
+pub struct RuntimeGateOwnerGuard<'a> {
+    state: &'a AppState,
+    gate: String,
+    owner: String,
+    active: bool,
+}
+
+impl Drop for RuntimeGateOwnerGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.state.clear_gate_owner(&self.gate, &self.owner);
+        }
+    }
+}
+
 /// Global application state managed by Tauri
 pub struct AppState {
     /// App-level database (gloss.db)
     pub app_db: Mutex<AppDb>,
     /// Encrypted local secret storage for provider API keys.
     pub secret_store: SecretStore,
-    /// Cached notebook database paths keyed by notebook ID.
-    /// Each DB access opens its own SQLite connection so long-running ingestion
-    /// work in one notebook does not serialize every other read for that same
-    /// notebook at the application mutex layer.
-    pub notebook_dbs: Mutex<HashMap<String, PathBuf>>,
+    /// Cached notebook database connection pools keyed by notebook ID.
+    /// Each pool manages read/write connections so concurrent access to a
+    /// single notebook DB is efficient (WAL mode allows concurrent readers).
+    pub notebook_pools: NotebookDbPools,
     /// LLM provider registry
     pub model_registry: Mutex<ModelRegistry>,
     /// Application data directory
     pub data_dir: PathBuf,
     /// Embedding model (lazy-initialized on first use)
-    pub embedder: Mutex<Option<EmbeddingService>>,
+    pub embedder: std::sync::RwLock<Option<Arc<EmbeddingService>>>,
+    /// LRU cache of (query_text, model_id) → embedding vector. The hostile
+    /// audit identified that the user query is re-embedded on EVERY chat
+    /// turn (80-400ms per turn) even when identical to the previous turn
+    /// ("yes", "explain more", retry of a failed message). Bounded to 256
+    /// entries to bound memory at ~256 * 384 * 4 = 384KB. Invalidate on
+    /// embedding model change by clearing the cache (see reset below).
+    pub query_embed_cache: Mutex<QueryEmbedCache>,
+    /// Cached model identity that the query_embed_cache was built against.
+    /// When this changes (e.g. user switches `semantic_memory_embedding_model`),
+    /// the cache is flushed in `ensure_embedder`.
+    pub query_embed_cache_model: Mutex<Option<String>>,
     /// Per-notebook HNSW vector indices keyed by notebook ID
     pub hnsw_indices: Mutex<HashMap<String, HnswIndex>>,
+    /// Cached dims per notebook HNSW index, used by ensure_hnsw_index
+    /// to detect dim mismatches when the embedding model changes (C5-FIX).
+    /// We need this because HnswIndex doesn't expose its dims publicly.
+    pub hnsw_index_dims: Mutex<HashMap<String, usize>>,
     /// Whether summary generation is manually paused by the user
     pub summary_paused: AtomicBool,
     /// Number of sources currently being ingested (extract/chunk/embed).
@@ -64,6 +272,10 @@ pub struct AppState {
     pub gpu_gate: Semaphore,
     /// Current runtime gate owners for user-visible contention diagnostics.
     pub gate_owners: Mutex<HashMap<String, RuntimeGateOwner>>,
+    /// Attempt-scoped active chat cancellations keyed by notebook/conversation.
+    pub active_chat_attempts: Mutex<HashMap<String, ActiveChatAttempt>>,
+    /// Attempt-scoped active Studio generation keyed by notebook.
+    pub active_studio_attempts: Mutex<HashMap<String, ActiveStudioAttempt>>,
     /// Currently active notebook ID. Summary worker idles when None.
     pub active_notebook_id: Mutex<Option<String>>,
     /// Epoch counter incremented on notebook switch. Used for soft-cancel of
@@ -75,6 +287,11 @@ pub struct AppState {
     /// Last user-initiated action (epoch millis). Used to detect idle state
     /// for auto-summarization. Bumped by send_message, set_active_notebook, etc.
     pub last_user_activity: Mutex<u64>,
+    /// Bounded replay buffer for chat transport events. The database remains
+    /// the source of truth for messages; this buffer only lets the frontend
+    /// recover recent missed stream/status/terminal events after listener loss.
+    pub chat_stream_events: Mutex<VecDeque<crate::commands::chat::ChatStreamEventV1>>,
+    pub chat_stream_next_seq: AtomicU64,
 }
 
 impl AppState {
@@ -135,7 +352,7 @@ impl AppState {
             if !notebook_db_path.exists() {
                 tracing::warn!(
                     notebook_id = %notebook.id,
-                    path = %notebook_db_path.display(),
+                    path = %redact_path(&notebook_db_path),
                     "Skipping source-count reconcile for missing notebook DB"
                 );
                 continue;
@@ -147,7 +364,7 @@ impl AppState {
                     Err(e) => {
                         tracing::warn!(
                             notebook_id = %notebook.id,
-                            path = %notebook_db_path.display(),
+                            path = %redact_path(&notebook_db_path),
                             error = %e,
                             "Failed to reconcile notebook source count"
                         );
@@ -191,7 +408,7 @@ impl AppState {
             .get_setting("semantic_memory_auto_project")?
             .is_none()
         {
-            app_db.set_setting("semantic_memory_auto_project", "false")?;
+            app_db.set_setting("semantic_memory_auto_project", "true")?;
         }
         if app_db
             .get_setting("semantic_memory_turbo_quant_require_fresh_artifacts")?
@@ -203,10 +420,19 @@ impl AppState {
             )?;
         }
         if app_db
+            .get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?
+            .is_none()
+        {
+            app_db.set_setting(
+                features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED,
+                "false",
+            )?;
+        }
+        if app_db
             .get_setting("semantic_memory_embedding_provider")?
             .is_none()
         {
-            app_db.set_setting("semantic_memory_embedding_provider", "fastembed")?;
+            app_db.set_setting("semantic_memory_embedding_provider", "ollama")?;
         }
         if app_db
             .get_setting("semantic_memory_embedding_url")?
@@ -218,7 +444,10 @@ impl AppState {
             .get_setting("semantic_memory_embedding_model")?
             .is_none()
         {
-            app_db.set_setting("semantic_memory_embedding_model", "nomic-embed-text")?;
+            app_db.set_setting("semantic_memory_embedding_model", "bge-m3")?;
+        }
+        if app_db.get_setting("chunk_target_tokens")?.is_none() {
+            app_db.set_setting("chunk_target_tokens", "1100")?;
         }
         if app_db
             .get_setting("semantic_memory_embedding_timeout_secs")?
@@ -232,6 +461,12 @@ impl AppState {
         {
             app_db.set_setting("semantic_memory_search_timeout_ms", "8000")?;
         }
+        if app_db
+            .get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?
+            .is_none()
+        {
+            app_db.set_setting(features::FASTEMBED_DOWNLOAD_CONSENT, "false")?;
+        }
         features::ensure_default_feature_settings(&app_db)?;
         let secret_store = SecretStore::new(&data_dir)?;
         Self::migrate_legacy_secrets(&app_db, &secret_store)?;
@@ -240,21 +475,26 @@ impl AppState {
         let model_registry = ModelRegistry::new(&app_db, &secret_store)?;
         let summary_starts_paused = Self::summary_mode_starts_paused(&app_db)?;
 
-        tracing::info!(data_dir = %data_dir.display(), "Gloss initialized");
+        tracing::info!(data_dir = %redact_path(&data_dir), "Gloss initialized");
 
         Ok(Self {
             app_db: Mutex::new(app_db),
             secret_store,
-            notebook_dbs: Mutex::new(HashMap::new()),
+            notebook_pools: NotebookDbPools::new(&data_dir),
             model_registry: Mutex::new(model_registry),
             data_dir,
-            embedder: Mutex::new(None),
+            embedder: std::sync::RwLock::new(None),
+            query_embed_cache: Mutex::new(QueryEmbedCache::default()),
+            query_embed_cache_model: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
+            hnsw_index_dims: Mutex::new(HashMap::new()),
             summary_paused: AtomicBool::new(summary_starts_paused),
             ingestion_active: Arc::new(AtomicU32::new(0)),
             llm_gate: Semaphore::new(1),
             gpu_gate: Semaphore::new(1),
             gate_owners: Mutex::new(HashMap::new()),
+            active_chat_attempts: Mutex::new(HashMap::new()),
+            active_studio_attempts: Mutex::new(HashMap::new()),
             active_notebook_id: Mutex::new(None),
             active_epoch: AtomicU64::new(0),
             chat_grace_until: Mutex::new(0),
@@ -264,38 +504,88 @@ impl AppState {
                     .unwrap_or_default()
                     .as_millis() as u64,
             ),
+            chat_stream_events: Mutex::new(VecDeque::new()),
+            chat_stream_next_seq: AtomicU64::new(1),
         })
     }
 
-    /// Ensure the embedding model is initialized. Returns an error message on failure.
-    /// Emits status events for UI feedback (Fix 8).
+    pub fn record_chat_stream_event(
+        &self,
+        attempt_id: &str,
+        kind: &str,
+        notebook_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        payload: serde_json::Value,
+    ) -> crate::commands::chat::ChatStreamEventV1 {
+        let seq = self.chat_stream_next_seq.fetch_add(1, Ordering::SeqCst);
+        let event = crate::commands::chat::ChatStreamEventV1 {
+            seq,
+            attempt_id: attempt_id.to_string(),
+            kind: kind.to_string(),
+            notebook_id: notebook_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            payload,
+            recorded_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Ok(mut events) = self.chat_stream_events.lock() {
+            events.push_back(event.clone());
+            while events.len() > CHAT_STREAM_REPLAY_CAPACITY {
+                events.pop_front();
+            }
+        }
+        event
+    }
+
+    pub fn chat_events_since(
+        &self,
+        notebook_id: &str,
+        conversation_id: &str,
+        after_seq: Option<u64>,
+    ) -> Vec<crate::commands::chat::ChatStreamEventV1> {
+        let Ok(events) = self.chat_stream_events.lock() else {
+            return Vec::new();
+        };
+        filter_chat_events_since(&events, notebook_id, conversation_id, after_seq)
+    }
+
+    /// Ensure the embedding model is initialized. Reads the configured provider
+    /// from settings: "ollama" uses the external Ollama /api/embed endpoint
+    /// (crash-isolated, preferred); anything else falls back to in-process
+    /// FastEmbed (Nomic v2 MoE via candle, 768d).
     pub fn ensure_embedder(&self, app_handle: Option<&tauri::AppHandle>) -> Result<(), GlossError> {
-        let mut embedder = self
-            .embedder
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let mut embedder = self.embedder.write().unwrap_or_else(|e| e.into_inner());
 
         if embedder.is_some() {
             return Ok(());
         }
 
-        // Notify frontend
-        if let Some(handle) = app_handle {
-            use tauri::Emitter;
-            let _ = handle.emit(
-                "status:embedding_model",
-                serde_json::json!({
-                    "state": "downloading",
-                    "message": "Loading embedding model (first time may download ~100MB)…"
-                }),
-            );
-        }
-
-        tracing::info!("Initializing embedding model…");
-        let cache_dir = self.data_dir.join("models");
-        std::fs::create_dir_all(&cache_dir)?;
-        let service = EmbeddingService::new(&cache_dir)?;
-        *embedder = Some(service);
+        let service = {
+            tracing::info!("Initializing FastEmbed embedding backend (Nomic v1.5 MoE, 768d)");
+            if let Some(handle) = app_handle {
+                use tauri::Emitter;
+                let _ = handle.emit(
+                    "status:embedding_model",
+                    serde_json::json!({
+                        "state": "downloading",
+                        "message": "Loading embedding model (first time may download ~100MB)…"
+                    }),
+                );
+            }
+            let cache_dir = self.data_dir.join("models");
+            std::fs::create_dir_all(&cache_dir)?;
+            let download_consent = {
+                let app_db = self
+                    .app_db
+                    .lock()
+                    .map_err(|e| GlossError::Other(e.to_string()))?;
+                crate::commands::chat::setting_is_enabled(
+                    app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
+                )
+            };
+            EmbeddingService::new_with_download_policy(&cache_dir, false, download_consent)?
+        };
 
         if let Some(handle) = app_handle {
             use tauri::Emitter;
@@ -303,12 +593,34 @@ impl AppState {
                 "status:embedding_model",
                 serde_json::json!({
                     "state": "ready",
-                    "message": "Embedding model loaded"
+                    "message": "Embedding backend loaded"
                 }),
             );
         }
 
-        tracing::info!("Embedding model ready");
+        let provider_id = service.provider_id();
+        let model_id = service.model_id().to_string();
+
+        tracing::info!("Embedding backend ready");
+        *embedder = Some(Arc::new(service));
+
+        // Now that we know the real model identity, flush the query-embed
+        // cache if it was built against a different model. This is the
+        // only place the cache is invalidated on model change.
+        {
+            let mut cache_model = self
+                .query_embed_cache_model
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            let cache_key = format!("{}:{}", provider_id, model_id);
+            if cache_model.as_deref() != Some(cache_key.as_str()) {
+                if let Ok(mut cache) = self.query_embed_cache.lock() {
+                    cache.clear();
+                }
+                *cache_model = Some(cache_key.clone());
+                tracing::info!(model = %cache_key, "Flushed query-embed cache on model change");
+            }
+        }
         Ok(())
     }
 
@@ -321,14 +633,102 @@ impl AppState {
     /// second contains_key guard to prevent the race where two threads both
     /// create a usearch Index and one is immediately dropped (corrupts C++ heap).
     pub fn ensure_hnsw_index(&self, notebook_id: &str) -> Result<(), GlossError> {
-        // Quick check — avoids unnecessary work if index already loaded
+        let expected_metadata: Option<EmbeddingIndexMetadata> = {
+            let guard = self
+                .embedder
+                .read()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            guard.as_ref().map(|embedder| {
+                EmbeddingIndexMetadata::ready(
+                    NATIVE_HNSW_INDEX_ID,
+                    embedder.provider_id(),
+                    embedder.model_id(),
+                    embedder.model_digest(),
+                    embedder.dims(),
+                )
+            })
+        };
+        let embedder_dim = expected_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.dimensions);
+        let stored_metadata = self.with_notebook_db(notebook_id, |db| {
+            db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
+        })?;
+        // Quick check — avoids unnecessary work if index already loaded.
+        // If the active model identity differs, mark the durable row stale and
+        // drop the cached index instead of querying a wrong-dimension HNSW.
         {
-            let indices = self
+            let mut indices = self
                 .hnsw_indices
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
+            let mut dims = self
+                .hnsw_index_dims
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
             if indices.contains_key(notebook_id) {
-                return Ok(());
+                if let Some(expected) = expected_metadata.as_ref() {
+                    let metadata_matches = stored_metadata.as_ref().is_some_and(|stored| {
+                        stored.provider == expected.provider
+                            && stored.model == expected.model
+                            && stored.model_digest == expected.model_digest
+                            && stored.dimensions == expected.dimensions
+                            && stored.schema_version == expected.schema_version
+                            && matches!(stored.status.as_str(), "ready" | "building")
+                    });
+                    if !metadata_matches {
+                        let reason = match stored_metadata.as_ref() {
+                            Some(stored) => format!(
+                                "embedding-index-stale: cached HNSW metadata {}/{}/{:?}/{} does not match active {}/{}/{:?}/{}",
+                                stored.provider,
+                                stored.model,
+                                stored.dimensions,
+                                stored.status,
+                                expected.provider,
+                                expected.model,
+                                expected.dimensions,
+                                expected.status
+                            ),
+                            None => "embedding-index-stale: cached native dense index has no durable metadata".to_string(),
+                        };
+                        indices.remove(notebook_id);
+                        dims.remove(notebook_id);
+                        let _ = self.with_notebook_db_write(notebook_id, |db| {
+                            db.mark_embedding_index_status(
+                                NATIVE_HNSW_INDEX_ID,
+                                EmbeddingIndexMetadataStatus::Stale,
+                                Some(&reason),
+                            )
+                        });
+                        return Err(GlossError::Embedding(reason));
+                    }
+                }
+                let cached = dims.get(notebook_id).copied();
+                if embedder_dim.is_some() && cached != embedder_dim {
+                    let reason = format!(
+                        "embedding-index-stale: cached HNSW dimensions {:?} do not match active embedder dimensions {:?}",
+                        cached, embedder_dim
+                    );
+                    tracing::warn!(
+                        notebook_id,
+                        cached_dims = ?cached,
+                        embedder_dims = ?embedder_dim,
+                        "HNSW dim mismatch; dropping cached index"
+                    );
+                    indices.remove(notebook_id);
+                    dims.remove(notebook_id);
+                    let _ = self.with_notebook_db_write(notebook_id, |db| {
+                        db.mark_embedding_index_status(
+                            NATIVE_HNSW_INDEX_ID,
+                            EmbeddingIndexMetadataStatus::Stale,
+                            Some(&reason),
+                        )
+                    });
+                    return Err(GlossError::Embedding(reason));
+                }
+                if indices.contains_key(notebook_id) {
+                    return Ok(());
+                }
             }
         }
         // hnsw_indices released here — safe to gather notebook metadata without
@@ -359,26 +759,107 @@ impl AppState {
             return Ok(()); // Another thread beat us — nothing to drop
         }
 
-        let index_path = nb_dir.join("embeddings").join("chunks.usearch");
+        let index_path = crate::ingestion::embed::native_dense_artifact_path(&nb_dir);
+        let Some(expected_metadata) = expected_metadata else {
+            let reason = "embedding-index-blocked: native dense index cannot open without an initialized embedder".to_string();
+            self.with_notebook_db_write(notebook_id, |db| {
+                db.mark_embedding_index_status(
+                    NATIVE_HNSW_INDEX_ID,
+                    EmbeddingIndexMetadataStatus::Blocked,
+                    Some(&reason),
+                )
+            })?;
+            return Err(GlossError::Embedding(reason));
+        };
+        let Some(dim) = expected_metadata.dimensions else {
+            let reason = "embedding-index-blocked: native dense index cannot open without probed embedding dimensions".to_string();
+            self.with_notebook_db_write(notebook_id, |db| {
+                db.mark_embedding_index_status(
+                    NATIVE_HNSW_INDEX_ID,
+                    EmbeddingIndexMetadataStatus::Blocked,
+                    Some(&reason),
+                )
+            })?;
+            return Err(GlossError::Embedding(reason));
+        };
+        if index_path.exists() || max_embedding_id.is_some() {
+            let stale_reason = match stored_metadata.as_ref() {
+                Some(stored) if stored.identity_matches(&expected_metadata) => None,
+                Some(stored) => Some(format!(
+                    "embedding-index-stale: stored provider/model/dim metadata {}/{}/{:?} does not match active {}/{}/{:?}",
+                    stored.provider,
+                    stored.model,
+                    stored.dimensions,
+                    expected_metadata.provider,
+                    expected_metadata.model,
+                    expected_metadata.dimensions
+                )),
+                None => Some(
+                    "embedding-index-stale: existing native dense index has no durable metadata"
+                        .to_string(),
+                ),
+            };
+            if let Some(reason) = stale_reason {
+                self.with_notebook_db_write(notebook_id, |db| {
+                    db.mark_embedding_index_status(
+                        NATIVE_HNSW_INDEX_ID,
+                        EmbeddingIndexMetadataStatus::Stale,
+                        Some(&reason),
+                    )
+                })?;
+                return Err(GlossError::Embedding(reason));
+            }
+        }
         let index = if index_path.exists() {
             tracing::debug!(
                 notebook_id,
                 ?max_embedding_id,
+                dim,
                 "Loading existing HNSW index"
             );
-            HnswIndex::load_with_hwm(&index_path, max_embedding_id)?
+            HnswIndex::load_with_hwm(&index_path, max_embedding_id.unwrap_or(0), dim)?
         } else {
             std::fs::create_dir_all(nb_dir.join("embeddings"))?;
-            tracing::debug!(notebook_id, "Creating new HNSW index");
-            HnswIndex::new()?
+            tracing::debug!(notebook_id, dim, "Creating new HNSW index");
+            HnswIndex::new(dim)?
         };
 
         indices.insert(notebook_id.to_string(), index);
+        let mut building_metadata = expected_metadata.clone();
+        building_metadata.status = EmbeddingIndexMetadataStatus::Building.as_str().to_string();
+        building_metadata.status_reason = Some(
+            "native dense artifact will become ready after atomic save and reload verification"
+                .to_string(),
+        );
+        self.with_notebook_db_write(notebook_id, |db| {
+            db.upsert_embedding_index_metadata(&building_metadata)
+        })?;
+        // Track the dim so future ensure_hnsw_index calls can detect mismatches.
+        let mut dims = self
+            .hnsw_index_dims
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        dims.insert(notebook_id.to_string(), dim);
         Ok(())
     }
 
     /// Save the HNSW index for a notebook to disk.
     pub fn save_hnsw_index(&self, notebook_id: &str) -> Result<(), GlossError> {
+        let expected_metadata: Option<EmbeddingIndexMetadata> = {
+            let guard = self
+                .embedder
+                .read()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            guard.as_ref().map(|embedder| {
+                EmbeddingIndexMetadata::ready(
+                    NATIVE_HNSW_INDEX_ID,
+                    embedder.provider_id(),
+                    embedder.model_id(),
+                    embedder.model_digest(),
+                    embedder.dims(),
+                )
+            })
+        };
         let indices = self
             .hnsw_indices
             .lock()
@@ -393,8 +874,16 @@ impl AppState {
                 let nb = app_db.get_notebook(notebook_id)?;
                 PathBuf::from(nb.directory)
             };
-            let index_path = nb_dir.join("embeddings").join("chunks.usearch");
-            index.save(&index_path)?;
+            let index_path = crate::ingestion::embed::native_dense_artifact_path(&nb_dir);
+            let hwm = self
+                .with_notebook_db(notebook_id, |db| db.max_embedding_id())?
+                .unwrap_or(0);
+            index.save_atomic_verified(&index_path, hwm)?;
+            if let Some(metadata) = expected_metadata {
+                self.with_notebook_db_write(notebook_id, |db| {
+                    db.upsert_embedding_index_metadata(&metadata)
+                })?;
+            }
         }
         Ok(())
     }
@@ -486,12 +975,107 @@ impl AppState {
         }
     }
 
+    pub fn gate_owner_guard<'a>(
+        &'a self,
+        gate: &str,
+        owner: &str,
+        detail: &str,
+    ) -> RuntimeGateOwnerGuard<'a> {
+        self.set_gate_owner(gate, owner, detail);
+        RuntimeGateOwnerGuard {
+            state: self,
+            gate: gate.to_string(),
+            owner: owner.to_string(),
+            active: true,
+        }
+    }
+
     pub fn gate_owners_snapshot(&self) -> Vec<RuntimeGateOwner> {
         self.gate_owners
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .cloned()
+            .collect()
+    }
+
+    fn active_chat_key(notebook_id: &str, conversation_id: &str) -> String {
+        format!("{notebook_id}:{conversation_id}")
+    }
+
+    pub fn register_active_chat_attempt(
+        &self,
+        notebook_id: &str,
+        conversation_id: &str,
+        attempt_id: &str,
+        message_id: &str,
+    ) -> Result<ActiveChatAttempt, ActiveChatAttempt> {
+        let key = Self::active_chat_key(notebook_id, conversation_id);
+        let mut active = self
+            .active_chat_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = active.get(&key) {
+            if !existing.cancellation.is_cancelled() {
+                return Err(existing.clone());
+            }
+        }
+
+        let attempt = ActiveChatAttempt {
+            notebook_id: notebook_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            message_id: message_id.to_string(),
+            cancellation: CancellationToken::new(),
+        };
+        active.insert(key, attempt.clone());
+        Ok(attempt)
+    }
+
+    pub fn lease_active_chat_attempt(
+        &self,
+        notebook_id: &str,
+        conversation_id: &str,
+        attempt_id: &str,
+        message_id: &str,
+    ) -> Result<ActiveChatAttemptLease<'_>, ActiveChatAttempt> {
+        self.register_active_chat_attempt(notebook_id, conversation_id, attempt_id, message_id)
+            .map(|attempt| ActiveChatAttemptLease {
+                state: self,
+                attempt: Some(attempt),
+            })
+    }
+
+    pub fn finish_active_chat_attempt(
+        &self,
+        notebook_id: &str,
+        conversation_id: &str,
+        attempt_id: &str,
+    ) {
+        let key = Self::active_chat_key(notebook_id, conversation_id);
+        let mut active = self
+            .active_chat_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if active
+            .get(&key)
+            .map(|attempt| attempt.attempt_id == attempt_id)
+            .unwrap_or(false)
+        {
+            active.remove(&key);
+        }
+    }
+
+    pub fn cancel_active_chats_for_notebook(&self, notebook_id: &str) -> Vec<ActiveChatAttempt> {
+        let active = self
+            .active_chat_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        active
+            .values()
+            .filter(|attempt| attempt.notebook_id == notebook_id)
+            .cloned()
+            .inspect(|attempt| attempt.cancellation.cancel())
             .collect()
     }
 
@@ -549,44 +1133,92 @@ impl AppState {
     }
 
     pub(crate) fn notebook_db_path(&self, notebook_id: &str) -> Result<PathBuf, GlossError> {
-        {
-            let dbs = self
-                .notebook_dbs
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            if let Some(path) = dbs.get(notebook_id) {
-                return Ok(path.clone());
-            }
-        }
-
-        let db_path = {
+        let pool = self.notebook_pools.get_or_create(notebook_id, || {
             let app_db = self
                 .app_db
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
             let notebook = app_db.get_notebook(notebook_id)?;
-            PathBuf::from(notebook.directory).join("notebook.db")
-        };
-
-        let mut dbs = self
-            .notebook_dbs
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        dbs.entry(notebook_id.to_string())
-            .or_insert_with(|| db_path.clone());
-        Ok(db_path)
+            Ok(PathBuf::from(notebook.directory).join("notebook.db"))
+        })?;
+        Ok(pool.db_path().to_path_buf())
     }
 
     /// Execute a function with a notebook database connection.
-    /// A fresh SQLite connection is opened per call so readers are not blocked
-    /// behind long-running work on a shared application mutex.
+    /// Uses the connection pool: read operations use pooled read connections
+    /// (concurrent readers via WAL mode), write operations use the single
+    /// exclusive write connection.
     pub fn with_notebook_db<F, T>(&self, notebook_id: &str, f: F) -> Result<T, GlossError>
     where
         F: FnOnce(&NotebookDb) -> Result<T, GlossError>,
     {
-        let db_path = self.notebook_db_path(notebook_id)?;
-        let db = NotebookDb::connect(&db_path)?;
-        f(&db)
+        let pool = self.notebook_pools.get_or_create(notebook_id, || {
+            let app_db = self
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            let notebook = app_db.get_notebook(notebook_id)?;
+            Ok(PathBuf::from(notebook.directory).join("notebook.db"))
+        })?;
+        pool.read(f)
+    }
+
+    /// Execute a write operation against the notebook database.
+    #[allow(dead_code)]
+    /// Uses the pool's exclusive write connection (only one writer at a time).
+    pub fn with_notebook_db_write<F, T>(&self, notebook_id: &str, f: F) -> Result<T, GlossError>
+    where
+        F: FnOnce(&NotebookDb) -> Result<T, GlossError>,
+    {
+        let pool = self.notebook_pools.get_or_create(notebook_id, || {
+            let app_db = self
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            let notebook = app_db.get_notebook(notebook_id)?;
+            Ok(PathBuf::from(notebook.directory).join("notebook.db"))
+        })?;
+        pool.write(f)
+    }
+
+    /// Get a cached embedding for the query, or embed it fresh and store it.
+    /// This is the LRU cache wrapper used by the chat hot path to avoid
+    /// re-embedding identical follow-up questions ("yes", "explain more",
+    /// retry of a failed message) on every chat turn.
+    ///
+    /// Returns the embedding vector; the caller is responsible for the HNSW
+    /// search and chunk lookup. On embed error, returns the error unchanged
+    /// (the caller decides whether to silently degrade to BM25 or surface
+    /// a toast).
+    pub fn get_or_embed_query(&self, query: &str) -> Result<Vec<f32>, GlossError> {
+        // Cache lookup
+        {
+            let mut cache = self
+                .query_embed_cache
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            if let Some(vec) = cache.get(query) {
+                return Ok(vec);
+            }
+        }
+
+        // Cache miss: embed fresh
+        let embedding = {
+            let embedder_arc: Arc<EmbeddingService> = {
+                let guard = self.embedder.read().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .as_ref()
+                    .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?
+                    .clone()
+            };
+            embedder_arc.embed_one(query)?
+        };
+
+        // Store
+        if let Ok(mut cache) = self.query_embed_cache.lock() {
+            cache.insert(query.to_string(), embedding.clone());
+        }
+        Ok(embedding)
     }
 
     /// Build a truthful local retrieval outcome. BM25/FTS5 always remains the
@@ -599,25 +1231,72 @@ impl AppState {
         top_k: usize,
         trace_ref: String,
     ) -> Result<RetrievalOutcome, GlossError> {
-        let db_path = self.notebook_db_path(notebook_id)?;
-        let nb_db = NotebookDb::connect(&db_path)?;
-        let embedder_guard = self.embedder.try_lock().ok();
-        let embedder = embedder_guard.as_ref().and_then(|guard| guard.as_ref());
-        let indices_guard = self.hnsw_indices.try_lock().ok();
-        let index = indices_guard
-            .as_ref()
-            .and_then(|indices| indices.get(notebook_id));
-        hybrid_search::local_retrieval_outcome(
-            query,
-            &nb_db,
-            embedder,
-            index,
-            NATIVE_SEMANTIC_INDEXING_ENABLED,
-            scope,
-            top_k,
-            trace_ref,
-        )
+        let dense_block_reason = self.with_notebook_db(notebook_id, |nb_db| {
+            let metadata = nb_db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)?;
+            Ok(match metadata.as_ref().map(|m| m.status.as_str()) {
+                Some("ready") => None,
+                Some("stale") | Some("blocked") => {
+                    Some(RetrievalReasonCode::EmbeddingIndexMetadataStale)
+                }
+                Some(_) | None => Some(RetrievalReasonCode::EmbeddingIndexMetadataUnknown),
+            })
+        })?;
+        self.with_notebook_db(notebook_id, |nb_db| {
+            // TODO(B1-followup): move this blocking call to spawn_blocking in the
+            // commands/chat caller once we validate perf gains.
+            let embedder = {
+                let embedder_guard = self.embedder.read().unwrap_or_else(|e| e.into_inner());
+                embedder_guard.clone()
+            };
+            let indices_guard = self.hnsw_indices.lock().unwrap_or_else(|e| e.into_inner());
+            let index = indices_guard.get(notebook_id);
+            // Pre-compute the query embedding through the LRU cache so that
+            // repeated identical queries ("yes", "explain more", a regenerated
+            // message) don't re-hit Ollama / FastEmbed. The cache miss path
+            // (which actually calls embed_one) is what gets the timeout / error
+            // surfaced to the user. (See hostile audit B4.)
+            let cached_query_embedding = match embedder.as_deref() {
+                Some(_emb) => match self.get_or_embed_query(query) {
+                    Ok(vec) => Some(vec),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "query embedding failed; dense retrieval will be skipped");
+                        None
+                    }
+                },
+                None => None,
+            };
+            hybrid_search::local_retrieval_outcome_with_query(
+                query,
+                nb_db,
+                embedder.as_deref(),
+                index,
+                cached_query_embedding.as_deref(),
+                dense_block_reason.clone(),
+                NATIVE_SEMANTIC_INDEXING_ENABLED,
+                scope,
+                top_k,
+                trace_ref,
+            )
+        })
     }
+}
+
+fn filter_chat_events_since(
+    events: &VecDeque<crate::commands::chat::ChatStreamEventV1>,
+    notebook_id: &str,
+    conversation_id: &str,
+    after_seq: Option<u64>,
+) -> Vec<crate::commands::chat::ChatStreamEventV1> {
+    let after_seq = after_seq.unwrap_or(0);
+    events
+        .iter()
+        .filter(|event| {
+            event.seq > after_seq
+                && event.notebook_id == notebook_id
+                && event.conversation_id == conversation_id
+        })
+        .cloned()
+        .collect()
 }
 
 /// RAII guard for background activity counters that must not remain elevated
@@ -756,11 +1435,11 @@ mod tests {
 
         app_db.set_setting("openai_api_key", "sk-settings").unwrap();
         app_db
-            .conn
+            .conn()
             .execute("ALTER TABLE providers ADD COLUMN api_key TEXT", [])
             .unwrap();
         app_db
-            .conn
+            .conn()
             .execute(
                 "INSERT OR REPLACE INTO providers (id, enabled, base_url, api_key) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params!["anthropic", 1, "https://api.anthropic.com/v1", "sk-provider"],
@@ -801,5 +1480,36 @@ mod tests {
             .set_setting("summary_mode", SUMMARY_MODE_MANUAL)
             .unwrap();
         assert!(AppState::summary_mode_starts_paused(&app_db).unwrap());
+    }
+
+    #[test]
+    fn chat_replay_buffer_returns_ordered_events_after_listener_gap() {
+        let mut events = VecDeque::new();
+        for (seq, conversation_id, kind) in [
+            (1, "conv-1", "status"),
+            (2, "conv-2", "token"),
+            (3, "conv-1", "token"),
+            (4, "conv-1", "done"),
+        ] {
+            events.push_back(crate::commands::chat::ChatStreamEventV1 {
+                seq,
+                attempt_id: "attempt-1".to_string(),
+                kind: kind.to_string(),
+                notebook_id: "nb-1".to_string(),
+                conversation_id: conversation_id.to_string(),
+                message_id: "msg-1".to_string(),
+                payload: serde_json::json!({ "kind": kind }),
+                recorded_at: "2026-06-12T00:00:00Z".to_string(),
+            });
+        }
+
+        let replay = filter_chat_events_since(&events, "nb-1", "conv-1", Some(1));
+        assert_eq!(
+            replay
+                .iter()
+                .map(|event| (event.seq, event.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "token"), (4, "done")]
+        );
     }
 }

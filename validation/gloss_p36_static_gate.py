@@ -11,7 +11,18 @@ import re
 import sys
 from pathlib import Path
 
-RUN_ID = "GLOSS_P36_RELEASE_COMPLETION_DENSE_TQ_RELEASE_20260525"
+def current_run(repo: Path) -> str | None:
+    text = (repo / "docs/codex-runs/CURRENT_RUN.md").read_text(errors="ignore")
+    match = re.search(r"Current run:\s*`?([^`\n]+)`?", text)
+    return match.group(1).strip() if match else None
+
+
+# fallback — overridden inside main() once --repo is parsed
+_RUN_ID = "GLOSS_P36_RELEASE_COMPLETION_DENSE_TQ_RELEASE_20260525"
+
+
+def resolve_run_id(repo: Path) -> str:
+    return current_run(repo) or _RUN_ID
 
 
 def read(path: Path) -> str:
@@ -27,6 +38,7 @@ def main() -> int:
     parser.add_argument("--repo", default=".")
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
+    run_id = resolve_run_id(repo)
     failures: list[str] = []
     warnings: list[str] = []
 
@@ -46,7 +58,9 @@ def main() -> int:
     state = read(repo / "src-tauri" / "src" / "state.rs")
     if "NATIVE_SEMANTIC_INDEXING_ENABLED: bool = false" in state:
         fail("Native dense indexing is still hard-disabled in state.rs", failures)
-    if "NATIVE_SEMANTIC_INDEXING_ENABLED" in state and "false" in state.split("NATIVE_SEMANTIC_INDEXING_ENABLED", 1)[1][:120]:
+    # Robust check: find the actual constant assignment, not just "false" in nearby text
+    idx_match = re.search(r'NATIVE_SEMANTIC_INDEXING_ENABLED\s*:\s*bool\s*=\s*(true|false)', state)
+    if idx_match and idx_match.group(1) == "false":
         fail("Native dense indexing constant still appears false/disabled", failures)
 
     sources_mod = read(repo / "src-tauri" / "src" / "commands" / "sources" / "mod.rs")
@@ -82,7 +96,7 @@ def main() -> int:
     if "source_processing_state" not in migrations:
         fail("DB migration for source_processing_state missing", failures)
 
-    if RUN_ID not in "\n".join([read(p) for p in [repo / "AGENTS.md", repo / "README.md"] if p.exists()]):
+    if run_id not in "\n".join([read(p) for p in [repo / "AGENTS.md", repo / "README.md"] if p.exists()]):
         warnings.append("Run ID not visible in AGENTS.md/README.md; acceptable only if docs/codex-runs/CURRENT_RUN.md owns it")
 
     result = {"gate": "gloss_p36_static_gate", "failures": failures, "warnings": warnings}

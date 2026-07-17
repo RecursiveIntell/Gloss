@@ -4,8 +4,9 @@
   "description": "Capability for the main window",
   "windows": ["main"],
   "permissions": [
-    "core:event:allow-listen",
-    "core:event:allow-unlisten",
-    "dialog:allow-open"
+  "core:event:allow-listen",
+  "core:event:allow-unlisten",
+  "dialog:allow-open",
+  "dialog:allow-save"
   ]
 }

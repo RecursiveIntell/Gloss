@@ -1,0 +1,18 @@
+{
+  "active_stale_after": [],
+  "archive_only": false,
+  "archive_root": "/home/sikmindz/Coding/Gloss/docs/codex-runs/archive",
+  "collisions": [],
+  "current_run": "P30",
+  "dry_run": false,
+  "enabled": true,
+  "errors": [],
+  "manifest_paths": [],
+  "moved": [],
+  "planned": [],
+  "report_path": "/home/sikmindz/Coding/Gloss/Gloss-generic-rust-next-codex-context-20260529T161549Z.codex-archive.json",
+  "skipped_existing": [],
+  "stale_active_before": [],
+  "unclassified": [],
+  "verify_only": false
+}

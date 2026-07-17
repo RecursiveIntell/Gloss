@@ -1,0 +1,22 @@
+{
+  "queries": [
+    {
+      "mode": "retrieval",
+      "prompt": "What is the verification phrase from the Alpha smoke source? Cite the source.",
+      "must_include_any": [
+        "cedar lantern protocol",
+        "cedar",
+        "lantern"
+      ],
+      "must_have_citation": true
+    },
+    {
+      "mode": "no_retrieval",
+      "prompt": "Say exactly: no retrieval smoke ok",
+      "must_include_any": [
+        "no retrieval smoke ok"
+      ],
+      "must_have_citation": false
+    }
+  ]
+}

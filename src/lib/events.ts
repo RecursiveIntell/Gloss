@@ -3,6 +3,7 @@ import type {
   ChatTokenPayload,
   ChatStatusPayload,
   ChatErrorPayload,
+  ChatCancelledPayload,
   SourceStatusPayload,
   SourcesBatchCreatedPayload,
   BatchIngestionCompletePayload,
@@ -23,6 +24,14 @@ export function onChatError(
   callback: (payload: ChatErrorPayload) => void
 ): Promise<() => void> {
   return listen<ChatErrorPayload>("chat:error", (event) => {
+    callback(event.payload);
+  }).then((unlisten) => unlisten);
+}
+
+export function onChatCancelled(
+  callback: (payload: ChatCancelledPayload) => void
+): Promise<() => void> {
+  return listen<ChatCancelledPayload>("chat:cancelled", (event) => {
     callback(event.payload);
   }).then((unlisten) => unlisten);
 }

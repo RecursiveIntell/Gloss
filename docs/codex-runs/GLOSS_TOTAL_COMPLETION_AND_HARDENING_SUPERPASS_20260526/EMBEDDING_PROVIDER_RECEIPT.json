@@ -1,0 +1,10 @@
+{
+  "schema": "EmbeddingProviderReceiptV1",
+  "run_id": "GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526",
+  "recorded_utc": "2026-05-29T12:00:00Z",
+  "release_default_provider": "fastembed",
+  "dimension": 768,
+  "exercised": false,
+  "claim_decision": "not_exercised",
+  "blocker": "Headless environment — embedding provider requires live application."
+}

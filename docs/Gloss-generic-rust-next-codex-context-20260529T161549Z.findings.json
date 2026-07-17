@@ -1,0 +1,452 @@
+{
+  "created_utc": "2026-05-29T16:16:56Z",
+  "error_count": 0,
+  "findings": [
+    {
+      "code": "script-ref-not-archived",
+      "detail": "Script reference exists but is not included: validation/gloss_secret_store_permissions_gate.py",
+      "path": "Gloss/scripts/run_all_checks.sh",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-content-named-secret-assignment",
+      "detail": "Potential secret-like content detected at line 1309; value intentionally not printed.",
+      "path": "AGENT-SYSTEM.md",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-content-named-secret-assignment",
+      "detail": "Potential secret-like content detected at line 26; value intentionally not printed.",
+      "path": "Gloss/.hermes/plans/2026-05-28-release-grade-hardening.md",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-content-named-secret-assignment",
+      "detail": "Potential secret-like content detected at line 107; value intentionally not printed.",
+      "path": "Gloss/ollama_relevant_lines.txt",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-content-named-secret-assignment",
+      "detail": "Potential secret-like content detected at line 327; value intentionally not printed.",
+      "path": "Gloss/src-tauri/src/providers/ollama.rs",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/docs/codex-runs/GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526/SECRET_STORE_PERMISSION_RECEIPT.json",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/gio/src/auto/credentials.rs",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/gio/src/auto/unix_credentials_message.rs",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/hyper-rustls/examples/sample.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/aia_test_cert.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/alt_name_cert.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/authority_key_identifier.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/cert.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/certs.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/certv3.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/cms.p12",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/corrupted-rsa.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/csr.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/dhparams.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/dsa.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/dsaparam.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/identity.p12",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/intermediate-ca.key",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/intermediate-ca.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/key.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/keystore-empty-chain.p12",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/leaf.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/nid_test_cert.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/nid_uid_test_cert.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/root-ca.key",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/root-ca.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/rsa-encrypted.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/openssl/test/rsa.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/ring/src/ec/suite_b/private_key.rs",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/ring/src/rsa/signature_rsa_example_private_key.der",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/ring/tests/ecdsa_test_private_key_p256.p8",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/ring/tests/ed25519_test_private_key.bin",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/ring/tests/ed25519_test_private_key.p8",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/ring/tests/rsa_test_private_key_2048.p8",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/schannel/test/cert.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/schannel/test/identity.p12",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/schannel/test/key.key",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/schannel/test/key.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/schannel/test/key_invalid_header.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/schannel/test/key_no_end_header.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/schannel/test/key_no_headers.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/schannel/test/key_wrong_header.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/tokio-native-tls/examples/identity.p12",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/tokio-native-tls/tests/identity.p12",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/tokio-rustls/tests/certs/chain.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/tokio-rustls/tests/certs/end.key",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/tokio-rustls/tests/certs/root.pem",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/tower-http/src/cors/allow_credentials.rs",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/tower-http/src/follow_redirect/policy/filter_credentials.rs",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/untrusted/mk/llvm-snapshot.gpg.key",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/web-sys/src/features/gen_Credential.rs",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/webkit2gtk/src/auto/credential.rs",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/webkit2gtk/src/credential.rs",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/winapi-i686-pc-windows-gnu/lib/libwinapi_mincore-api-ms-win-security-credentials-l1-1-0.a",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/winapi-i686-pc-windows-gnu/lib/libwinapi_onecore-api-ms-win-security-credentials-l1-1-0.a",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/winapi-i686-pc-windows-gnu/lib/libwinapi_onecoreuap-api-ms-win-security-credentials-l1-1-0.a",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/winapi-x86_64-pc-windows-gnu/lib/libwinapi_mincore-api-ms-win-security-credentials-l1-1-0.a",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/winapi-x86_64-pc-windows-gnu/lib/libwinapi_onecore-api-ms-win-security-credentials-l1-1-0.a",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/src-tauri/vendor/crates/winapi-x86_64-pc-windows-gnu/lib/libwinapi_onecoreuap-api-ms-win-security-credentials-l1-1-0.a",
+      "severity": "warning"
+    },
+    {
+      "code": "secret-like-filename",
+      "detail": "File excluded because of secret-like-filename.",
+      "path": "Gloss/validation/gloss_secret_store_permissions_gate.py",
+      "severity": "warning"
+    },
+    {
+      "code": "rust-expected-file-not-packaged",
+      "detail": "rust adapter expected this existing file to be included.",
+      "path": "Cargo.lock",
+      "severity": "warning"
+    },
+    {
+      "code": "rust-expected-file-not-packaged",
+      "detail": "rust adapter expected this existing file to be included.",
+      "path": "Cargo.toml",
+      "severity": "warning"
+    },
+    {
+      "code": "rust-expected-file-not-packaged",
+      "detail": "rust adapter expected this existing file to be included.",
+      "path": "LICENSE",
+      "severity": "warning"
+    },
+    {
+      "code": "rust-expected-file-not-packaged",
+      "detail": "rust adapter expected this existing file to be included.",
+      "path": "README.md",
+      "severity": "warning"
+    },
+    {
+      "code": "node-expected-file-not-packaged",
+      "detail": "node adapter expected this existing file to be included.",
+      "path": "LICENSE",
+      "severity": "warning"
+    },
+    {
+      "code": "node-expected-file-not-packaged",
+      "detail": "node adapter expected this existing file to be included.",
+      "path": "README.md",
+      "severity": "warning"
+    },
+    {
+      "code": "node-expected-file-not-packaged",
+      "detail": "node adapter expected this existing file to be included.",
+      "path": "package.json",
+      "severity": "warning"
+    },
+    {
+      "code": "git-expected-file-not-packaged",
+      "detail": "git adapter expected this existing file to be included.",
+      "path": ".gitignore",
+      "severity": "warning"
+    },
+    {
+      "code": "git-metadata-excluded",
+      "detail": "Git metadata detected and intentionally excluded from transferable package contents.",
+      "path": ".git/",
+      "severity": "info"
+    }
+  ],
+  "root": "/home/sikmindz/Coding/Gloss",
+  "warning_count": 73
+}

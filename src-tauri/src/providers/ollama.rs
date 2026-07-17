@@ -1,4 +1,7 @@
-use super::{ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
+use super::{
+    provider_cancelled_error, provider_http_error, ChatRequest, ChatToken, LlmExecutionContext,
+    LlmProvider, ModelInfo, ProviderType,
+};
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
@@ -11,14 +14,10 @@ pub struct OllamaProvider {
 }
 
 impl OllamaProvider {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, client: reqwest::Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client,
         }
     }
 }
@@ -64,6 +63,18 @@ fn build_ollama_chat_body(request: &ChatRequest) -> serde_json::Value {
         "temperature": request.temperature,
         "num_predict": request.max_tokens,
     });
+    if let Some(top_p) = request.top_p {
+        options["top_p"] = serde_json::json!(top_p);
+    }
+    if let Some(top_k) = request.top_k {
+        options["top_k"] = serde_json::json!(top_k);
+    }
+    if let Some(min_p) = request.min_p {
+        options["min_p"] = serde_json::json!(min_p);
+    }
+    if let Some(repeat_penalty) = request.repeat_penalty {
+        options["repeat_penalty"] = serde_json::json!(repeat_penalty);
+    }
     if let Some(num_ctx) = request.num_ctx {
         options["num_ctx"] = serde_json::json!(num_ctx);
     }
@@ -138,28 +149,36 @@ impl LlmProvider for OllamaProvider {
     async fn chat(
         &self,
         request: ChatRequest,
+        ctx: LlmExecutionContext,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatToken, GlossError>> + Send>>, GlossError> {
+        ctx.check_cancelled("ollama", "before_request_build")?;
         let url = format!("{}/api/chat", self.base_url);
         let body = build_ollama_chat_body(&request);
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| GlossError::Provider {
+        ctx.check_cancelled("ollama", "before_http_send")?;
+        let send = self.client.post(&url).json(&body).send();
+        let resp = tokio::select! {
+            _ = ctx.cancellation.cancelled() => {
+                return Err(provider_cancelled_error("ollama", "waiting_for_response_headers", ctx.attempt_id.as_deref()));
+            }
+            result = send => result.map_err(|e| GlossError::Provider {
                 provider: "ollama".into(),
                 source: e.into(),
-            })?;
+            })?
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(GlossError::Provider {
-                provider: "ollama".into(),
-                source: anyhow::anyhow!("HTTP {}: {}", status, text),
-            });
+            // F3: bound the error body to ~1KB so a hostile / misconfigured
+            // server can't fill the logs with megabytes of HTML or stack
+            // traces. Use bytes (cheap) instead of text (allocates).
+            let text = {
+                match resp.bytes().await {
+                    Ok(b) => String::from_utf8_lossy(&b[..b.len().min(1024)]).to_string(),
+                    Err(_) => String::new(),
+                }
+            };
+            return Err(provider_http_error("ollama", status, &text));
         }
 
         if request.stream {
@@ -169,27 +188,54 @@ impl LlmProvider for OllamaProvider {
             use llm_pipeline::StreamingDecoder;
 
             let stream = stream::unfold(
-                (byte_stream, StreamingDecoder::new()),
-                |(mut byte_stream, mut decoder)| async move {
+                (byte_stream, StreamingDecoder::new(), ctx.clone()),
+                |(mut byte_stream, mut decoder, ctx)| async move {
                     use futures::TryStreamExt;
                     loop {
-                        match byte_stream.try_next().await {
+                        let next = tokio::select! {
+                            _ = ctx.cancellation.cancelled() => {
+                                return Some((
+                                    stream::iter(vec![Err(provider_cancelled_error("ollama", "reading_stream_chunk", ctx.attempt_id.as_deref()))]),
+                                    (byte_stream, decoder, ctx),
+                                ));
+                            }
+                            next = byte_stream.try_next() => next,
+                        };
+                        match next {
                             Ok(Some(bytes)) => {
+                                if ctx.is_cancelled() {
+                                    return Some((
+                                        stream::iter(vec![Err(provider_cancelled_error("ollama", "before_yield_token", ctx.attempt_id.as_deref()))]),
+                                        (byte_stream, decoder, ctx),
+                                    ));
+                                }
                                 let values = decoder.decode(&bytes);
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
                                 for val in values {
                                     tokens.push(ollama_chat_token_from_value(&val));
                                 }
                                 if !tokens.is_empty() {
-                                    return Some((stream::iter(tokens), (byte_stream, decoder)));
+                                    if ctx.is_cancelled() {
+                                        return Some((
+                                            stream::iter(vec![Err(provider_cancelled_error("ollama", "before_yield_token", ctx.attempt_id.as_deref()))]),
+                                            (byte_stream, decoder, ctx),
+                                        ));
+                                    }
+                                    return Some((stream::iter(tokens), (byte_stream, decoder, ctx)));
                                 }
                             }
                             Ok(None) => {
                                 // Stream ended — flush decoder
                                 if let Some(val) = decoder.flush() {
+                                    if ctx.is_cancelled() {
+                                        return Some((
+                                            stream::iter(vec![Err(provider_cancelled_error("ollama", "before_terminal_frame", ctx.attempt_id.as_deref()))]),
+                                            (byte_stream, decoder, ctx),
+                                        ));
+                                    }
                                     return Some((
                                         stream::iter(vec![ollama_chat_token_from_value(&val)]),
-                                        (byte_stream, decoder),
+                                        (byte_stream, decoder, ctx),
                                     ));
                                 }
                                 return None;
@@ -200,7 +246,7 @@ impl LlmProvider for OllamaProvider {
                                         provider: "ollama".into(),
                                         source: e.into(),
                                     })]),
-                                    (byte_stream, decoder),
+                                    (byte_stream, decoder, ctx),
                                 ));
                             }
                         }
@@ -212,10 +258,16 @@ impl LlmProvider for OllamaProvider {
             Ok(Box::pin(stream))
         } else {
             // Non-streaming: parse single response
-            let body: serde_json::Value = resp.json().await.map_err(|e| GlossError::Provider {
+            let body: serde_json::Value = tokio::select! {
+                _ = ctx.cancellation.cancelled() => {
+                    return Err(provider_cancelled_error("ollama", "reading_non_stream_response", ctx.attempt_id.as_deref()));
+                }
+                result = resp.json() => result.map_err(|e| GlossError::Provider {
                 provider: "ollama".into(),
                 source: e.into(),
-            })?;
+                })?
+            };
+            ctx.check_cancelled("ollama", "before_terminal_frame")?;
 
             if let Some(error) = body.get("error").and_then(|error| error.as_str()) {
                 return Err(GlossError::Provider {
@@ -239,7 +291,9 @@ impl LlmProvider for OllamaProvider {
     }
 
     async fn health_check(&self) -> Result<bool, GlossError> {
-        let url = format!("{}/", self.base_url);
+        // Hit /api/tags instead of root — verifies Ollama can list models,
+        // which is the meaningful availability check for chat.
+        let url = format!("{}/api/tags", self.base_url);
         match self.client.get(&url).send().await {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
@@ -267,6 +321,10 @@ mod tests {
             }],
             max_tokens: 64,
             temperature: 0.0,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
             stream: true,
             num_ctx: Some(8192),
         }

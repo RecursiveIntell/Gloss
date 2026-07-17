@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DecodingSettingsReceiptV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "receipt_id",
+    "provider",
+    "model",
+    "effective",
+    "sources"
+  ],
+  "properties": {
+    "schema": {
+      "const": "DecodingSettingsReceiptV1"
+    },
+    "receipt_id": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "effective": {
+      "type": "object"
+    },
+    "sources": {
+      "type": "object"
+    },
+    "unsupported": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "opaque": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

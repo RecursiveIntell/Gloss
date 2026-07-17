@@ -1,4 +1,7 @@
-use super::{ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
+use super::{
+    provider_cancelled_error, provider_http_error, ChatRequest, ChatToken, LlmExecutionContext,
+    LlmProvider, ModelInfo, ProviderType,
+};
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
@@ -12,14 +15,10 @@ pub struct LlamaCppProvider {
 }
 
 impl LlamaCppProvider {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, client: reqwest::Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client,
         }
     }
 }
@@ -74,7 +73,9 @@ impl LlmProvider for LlamaCppProvider {
     async fn chat(
         &self,
         request: ChatRequest,
+        ctx: LlmExecutionContext,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatToken, GlossError>> + Send>>, GlossError> {
+        ctx.check_cancelled("llamacpp", "before_request_build")?;
         // llama.cpp uses OpenAI-compatible /chat/completions endpoint
         let url = format!("{}/chat/completions", self.base_url);
 
@@ -98,27 +99,38 @@ impl LlmProvider for LlamaCppProvider {
             "stream": request.stream,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
+            "top_p": request.top_p,
         });
 
-        let resp = self
+        ctx.check_cancelled("llamacpp", "before_http_send")?;
+        let send = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&body)
-            .send()
-            .await
-            .map_err(|e| GlossError::Provider {
+            .send();
+        let resp = tokio::select! {
+            _ = ctx.cancellation.cancelled() => {
+                return Err(provider_cancelled_error("llamacpp", "waiting_for_response_headers", ctx.attempt_id.as_deref()));
+            }
+            result = send => result.map_err(|e| GlossError::Provider {
                 provider: "llamacpp".into(),
                 source: e.into(),
-            })?;
+            })?
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(GlossError::Provider {
-                provider: "llamacpp".into(),
-                source: anyhow::anyhow!("HTTP {}: {}", status, text),
-            });
+            // F3: bound the error body to ~1KB so a hostile / misconfigured
+            // server can't fill the logs with megabytes of HTML or stack
+            // traces. Use bytes (cheap) instead of text (allocates).
+            let text = {
+                match resp.bytes().await {
+                    Ok(b) => String::from_utf8_lossy(&b[..b.len().min(1024)]).to_string(),
+                    Err(_) => String::new(),
+                }
+            };
+            return Err(provider_http_error("llamacpp", status, &text));
         }
 
         if request.stream {
@@ -126,11 +138,26 @@ impl LlmProvider for LlamaCppProvider {
             let byte_stream = resp.bytes_stream();
 
             let stream = stream::unfold(
-                (byte_stream, String::new()),
-                |(mut byte_stream, mut buffer)| async move {
+                (byte_stream, String::new(), ctx.clone()),
+                |(mut byte_stream, mut buffer, ctx)| async move {
                     loop {
-                        match byte_stream.next().await {
+                        let next = tokio::select! {
+                            _ = ctx.cancellation.cancelled() => {
+                                return Some((
+                                    stream::iter(vec![Err(provider_cancelled_error("llamacpp", "reading_stream_chunk", ctx.attempt_id.as_deref()))]),
+                                    (byte_stream, buffer, ctx),
+                                ));
+                            }
+                            next = byte_stream.next() => next,
+                        };
+                        match next {
                             Some(Ok(bytes)) => {
+                                if ctx.is_cancelled() {
+                                    return Some((
+                                        stream::iter(vec![Err(provider_cancelled_error("llamacpp", "before_yield_token", ctx.attempt_id.as_deref()))]),
+                                        (byte_stream, buffer, ctx),
+                                    ));
+                                }
                                 buffer.push_str(&String::from_utf8_lossy(&bytes));
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
 
@@ -176,7 +203,13 @@ impl LlmProvider for LlamaCppProvider {
                                 }
 
                                 if !tokens.is_empty() {
-                                    return Some((stream::iter(tokens), (byte_stream, buffer)));
+                                    if ctx.is_cancelled() {
+                                        return Some((
+                                            stream::iter(vec![Err(provider_cancelled_error("llamacpp", "before_yield_token", ctx.attempt_id.as_deref()))]),
+                                            (byte_stream, buffer, ctx),
+                                        ));
+                                    }
+                                    return Some((stream::iter(tokens), (byte_stream, buffer, ctx)));
                                 }
                             }
                             Some(Err(e)) => {
@@ -185,7 +218,7 @@ impl LlmProvider for LlamaCppProvider {
                                         provider: "llamacpp".into(),
                                         source: e.into(),
                                     })]),
-                                    (byte_stream, buffer),
+                                    (byte_stream, buffer, ctx),
                                 ));
                             }
                             None => {
@@ -199,10 +232,16 @@ impl LlmProvider for LlamaCppProvider {
 
             Ok(Box::pin(stream))
         } else {
-            let body: serde_json::Value = resp.json().await.map_err(|e| GlossError::Provider {
+            let body: serde_json::Value = tokio::select! {
+                _ = ctx.cancellation.cancelled() => {
+                    return Err(provider_cancelled_error("llamacpp", "reading_non_stream_response", ctx.attempt_id.as_deref()));
+                }
+                result = resp.json() => result.map_err(|e| GlossError::Provider {
                 provider: "llamacpp".into(),
                 source: e.into(),
-            })?;
+                })?
+            };
+            ctx.check_cancelled("llamacpp", "before_terminal_frame")?;
 
             let content = body
                 .get("choices")

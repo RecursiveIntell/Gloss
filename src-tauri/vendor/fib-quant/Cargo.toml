@@ -1,0 +1,104 @@
+[package]
+name = "fib-quant"
+version = "0.1.0-beta.4"
+edition = "2021"
+rust-version = "1.75"
+description = "Experimental Rust implementation of the FibQuant radial-angular vector quantization core"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/RecursiveIntell/Libraries"
+homepage = "https://github.com/RecursiveIntell/Libraries"
+documentation = "https://docs.rs/fib-quant"
+keywords = ['quantization', 'vector', 'fibonacci', 'codebook', 'kv-cache']
+categories = ["compression", "science", "algorithms"]
+include = [
+    "Cargo.toml",
+    "build.rs",
+    "README.md",
+    "LICENSE",
+    "CITATION.cff",
+    "CHANGELOG.md",
+    "RELEASE_CHECKLIST.md",
+    "src/**",
+    "c-kernels/**",
+    "tests/**",
+    "benches/**",
+    "deny.toml",
+    "examples/**",
+    "docs/compression/**",
+    "docs/kv/**",
+]
+
+[features]
+default = ["parallel"]
+kv = []
+gpu = ["gpu-backend/gpu"]
+# The Rayon-parallel finish_batch_encode path. ON by default — the
+# per-batch dispatch overhead is negligible and the multi-core win
+# dominates on 4+ core machines. Disable to pin to a single thread
+# (e.g., for embedded use).
+parallel = ["rayon"]
+# Enables the GPU codebook_lookup path inside encode_batch. Off by default
+# because the per-call H2D/D2H overhead is currently higher than the tight
+# CPU loop for the (n, d) sizes we benchmark. Will be re-enabled once a
+# device-side pipeline keeps the rotated data resident on GPU.
+gpu_codebook_lookup = []
+# quant-codec-core trait implementations (VectorCodec, CodecProfile, KvCacheCodec).
+# Additive — does not change any existing API. Enables poly-kv and quant-governor
+# to route to fib-quant through the shared codec trait boundary.
+compat = ["quant-codec-core", "kv"]
+# Enables zero-copy mmap access for the persistence module (load_mmap,
+# MmapSidecarIndex). Off by default because memmap2 is an extra dependency.
+mmap = ["dep:memmap2"]
+
+[dependencies]
+blake3 = "1.8.3"
+half = "2"
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
+rand = "0.8"
+rand_chacha = "0.3"
+rand_distr = "0.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+statrs = "0.17"
+thiserror = "2.0.18"
+gpu-backend = "{ path = "../gpu-backend" }
+rayon = { version = "1.10", optional = true }
+quant-codec-core = "{ path = "../poly-kv/crates/quant-codec-core", optional = true }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+memmap2 = { version = "0.9", optional = true }
+
+[build-dependencies]
+cc = "1.0"
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+proptest = "1"
+rand = "0.8"
+rand_chacha = "0.3"
+tempfile = "3"
+
+[[bench]]
+name = "encode_decode"
+harness = false
+
+[[bench]]
+name = "codebook_build"
+harness = false
+
+[[bench]]
+name = "kv_encode_decode"
+harness = false
+required-features = ["kv"]
+
+[[bench]]
+name = "kv_attention_ref"
+harness = false
+required-features = ["kv"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unsafe_code = "allow"  # FFI to C kernels requires unsafe

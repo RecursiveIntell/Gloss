@@ -4,8 +4,9 @@ use crate::memory::backend::{excluded_source_count, invalid_requested_source_ids
 use crate::memory::backend::{requested_source_ids, scope_echo, MemorySearchBackend};
 use crate::memory::types::{
     IndexSourceReceipt, IndexSourceRequest, MemoryBackendStatus, MemorySearchCandidate,
-    MemorySearchRequest, MemorySearchResponse, MEMORY_BACKEND_GLOSS_LOCAL,
+    MemorySearchRequest, MemorySearchResponse, RetrievalReasonCode, MEMORY_BACKEND_GLOSS_LOCAL,
 };
+use crate::retrieval::hybrid_search::{local_intent_rerank_boost, sanitize_fts_query};
 use std::collections::HashMap;
 
 pub struct GlossLocalMemoryBackend<'a> {
@@ -22,33 +23,6 @@ impl<'a> GlossLocalMemoryBackend<'a> {
             all_sources,
         }
     }
-}
-
-fn sanitize_fts_query(query: &str) -> String {
-    query
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .filter_map(|word| {
-            let sanitized = word
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
-                .collect::<String>();
-            if sanitized.is_empty() {
-                None
-            } else {
-                Some(sanitized)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
@@ -73,8 +47,10 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
             last_retrieval_receipt_id: None,
             last_receipt_ref: None,
             fallback_reason: None,
+            fallback_reason_code: None,
             degradation_markers: Vec::new(),
             backend_version_or_digest: None,
+            embedding_index_metadata: Vec::new(),
             degraded: false,
             diagnostic: None,
         }
@@ -107,6 +83,7 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
             .collect::<HashMap<_, _>>();
         let mut candidates = Vec::new();
         let mut fallback_reason = None;
+        let mut fallback_reason_code = None;
         let mut degradation_markers = Vec::new();
         let mut fallback_used = false;
         let mut retrieval_mode = "gloss-local-fts5-bm25";
@@ -115,6 +92,7 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
             let fts_query = sanitize_fts_query(&request.query);
             if fts_query.is_empty() {
                 fallback_reason = Some("local FTS5 query sanitized to empty".to_string());
+                fallback_reason_code = Some(RetrievalReasonCode::Bm25QuerySanitizedEmpty);
             } else {
                 match self.nb_db.fts_search_chunks_in_sources(
                     &fts_query,
@@ -129,8 +107,9 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
                                 notebook_id: Some(self.notebook_id.clone()),
                                 source_title: title_map.get(&chunk.source_id).cloned(),
                                 citation_anchor: Some(format!("{}#{}", chunk.source_id, chunk.id)),
-                                content: chunk.content,
-                                score: -rank,
+                                content: chunk.content.clone(),
+                                score: -rank
+                                    + local_intent_rerank_boost(&request.query, &chunk.content),
                                 backend: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
                                 receipt_ref: None,
                                 degradation: Vec::new(),
@@ -139,10 +118,12 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
                         if candidates.is_empty() {
                             fallback_reason =
                                 Some("local FTS5/BM25 returned no matching chunks".to_string());
+                            fallback_reason_code = Some(RetrievalReasonCode::Bm25NoMatches);
                         }
                     }
                     Err(err) => {
                         fallback_reason = Some(format!("local FTS5/BM25 failed: {err}"));
+                        fallback_reason_code = Some(RetrievalReasonCode::IndexMissing);
                     }
                 }
             }
@@ -178,6 +159,15 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
             }
         }
 
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.source_id.cmp(&b.source_id))
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
+        candidates.truncate(request.limit);
+
         let receipt_id = request
             .trace_id
             .clone()
@@ -208,10 +198,12 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
                 "retrieval_mode": retrieval_mode,
                 "fallback_used": fallback_used,
                 "fallback_reason": fallback_reason.clone(),
+                "fallback_reason_code": fallback_reason_code.as_ref().map(RetrievalReasonCode::as_str),
                 "degradation_markers": degradation_markers.clone(),
                 "source_scope_preserved": source_scope_preserved
             }),
             fallback_reason,
+            fallback_reason_code,
             degradation_markers,
             source_scope_preserved,
             fallback_used,
@@ -321,6 +313,53 @@ mod tests {
             .candidates
             .iter()
             .all(|candidate| candidate.source_id == "s1"));
+    }
+
+    #[test]
+    fn local_search_prefers_actionable_later_source_over_first_source_noise() {
+        let db = test_db();
+        let sources = vec![
+            source("aaa-first", "First Source"),
+            source("zzz-actionable", "Actionable Source"),
+        ];
+        for source in &sources {
+            db.insert_source(source).unwrap();
+        }
+        for idx in 0..25 {
+            db.insert_chunk(&chunk(
+                &format!("first-{idx}"),
+                "aaa-first",
+                idx,
+                &format!(
+                    "General improve background note {idx}. This is descriptive historical context only."
+                ),
+            ))
+            .unwrap();
+        }
+        db.insert_chunk(&chunk(
+            "later-action",
+            "zzz-actionable",
+            0,
+            "Actionable improvement plan: fix retrieval ranking, implement fair source candidate pooling, and verify with a regression test.",
+        ))
+        .unwrap();
+
+        let backend = GlossLocalMemoryBackend::new("nb".to_string(), &db, &sources);
+        let response = backend
+            .search(MemorySearchRequest {
+                notebook_id: "nb".to_string(),
+                source_scope: SourceScope::All,
+                query: "How should I improve this?".to_string(),
+                limit: 4,
+                trace_id: Some("trace-actionable-local".to_string()),
+                allow_fallback: true,
+            })
+            .unwrap();
+
+        assert_eq!(response.backend_used, MEMORY_BACKEND_GLOSS_LOCAL);
+        assert!(!response.fallback_used);
+        assert_eq!(response.candidates[0].chunk_id, "later-action");
+        assert_eq!(response.candidates[0].source_id, "zzz-actionable");
     }
 
     #[test]

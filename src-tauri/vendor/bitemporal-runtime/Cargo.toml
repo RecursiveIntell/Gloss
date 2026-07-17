@@ -1,0 +1,43 @@
+[package]
+name = "bitemporal-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Bitemporal truth primitives — valid_time/recorded_time tracking, append-supersede, as-of queries, temporal snapshots."
+license = "MIT OR Apache-2.0"
+authors = ["Josh Stevenson <j.stevenson.cs@gmail.com>"]
+readme = "README.md"
+repository = "https://github.com/RecursiveIntell/bitemporal-runtime"
+homepage = "https://github.com/RecursiveIntell/bitemporal-runtime"
+documentation = "https://docs.rs/bitemporal-runtime"
+keywords = ['bitemporal', 'temporal', 'versioning', 'audit', 'as-of']
+categories = ['data-structures', 'database']
+
+[dependencies]
+chrono = { version = "0.4.44", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0.18"
+schemars = { version = "0.8.22", features = ["chrono"], optional = true }
+rusqlite = { workspace = true, optional = true }
+boundary-compiler = { path = "../boundary-compiler" }
+
+[features]
+# Generate JSON Schema for the public types. Off by default to keep
+# the dep graph small for non-schema consumers.
+default = []
+schema = ["dep:schemars"]
+# Persistent bitemporal store backed by SQLite. Off by default.
+sqlite = ["dep:rusqlite"]
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+todo = "deny"
+dbg_macro = "deny"
+unimplemented = "deny"

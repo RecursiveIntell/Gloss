@@ -1,0 +1,29 @@
+[package]
+name = "gpu-backend"
+version = "0.1.0-alpha.2"
+edition = "2021"
+description = "Shared CUDA GPU backend for fib-quant and turbo-quant vector quantization (Hadamard rotation kernel, codebook lookup kernel, parity-verified)"
+license = "MIT"
+authors = ["sikmindz"]
+readme = "README.md"
+repository = "https://github.com/RecursiveIntell/Libraries"
+homepage = "https://github.com/RecursiveIntell/Libraries/tree/main/gpu-backend"
+documentation = "https://docs.rs/gpu-backend"
+keywords = ['gpu', 'cuda', 'hadamard', 'vector-quantization', 'kv-cache']
+rust-version = "1.75"
+
+[dependencies]
+cudarc = { version = "0.19", features = ["cuda-13010", "dynamic-loading"], optional = true }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[features]
+default = []
+gpu = ["cudarc"]
+precompiled-ptx = []
+
+[dev-dependencies]
+tempfile = "3"
+rand = "0.8"
+rand_chacha = "0.3"

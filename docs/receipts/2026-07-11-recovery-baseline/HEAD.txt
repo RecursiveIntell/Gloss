@@ -1,0 +1,4 @@
+branch=perf-slowdown-fix-20260610
+head=93864835b21a52d4e504cb97c650d90abfc2f082
+timestamp=2026-07-11T19:15:07-05:00
+tree=17ef60ff8b621d38bcc8b42a38aecbc7c383d4be

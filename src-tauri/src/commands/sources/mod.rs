@@ -3,31 +3,51 @@ use crate::db::notebook_db::{Chunk, NotebookStats, SemanticMemoryProjectionSumma
 use crate::error::GlossError;
 use crate::features;
 use crate::ingestion::chunk::chunk_text_with_title;
-use crate::ingestion::extract::extract_text;
+use crate::ingestion::extract::extract_text_with_metadata;
+use crate::ingestion::import_capability::{
+    classify_import_extension, import_capability_matrix, ImportCapability,
+};
 use crate::jobs::{self, GlossJob};
 use crate::memory::backend::MemorySearchBackend;
 use crate::memory::gloss_local::GlossLocalMemoryBackend;
 #[cfg(feature = "semantic-memory-backend")]
 use crate::memory::semantic_memory_adapter;
 use crate::memory::{
-    compare_memory_backends_for_notebook, MemoryBackendComparison, MemoryBackendStatus,
-    MemorySearchRequest, RetrievalCoverage, SemanticMemoryLinkStatus, MEMORY_BACKEND_GLOSS_LOCAL,
+    compare_memory_backends_for_notebook, EmbeddingIndexStatusView, MemoryBackendComparison,
+    MemoryBackendStatus, MemorySearchRequest, RetrievalCoverage, RetrievalReasonCode,
+    SemanticMemoryLinkStatus, MEMORY_BACKEND_GLOSS_LOCAL,
 };
+use crate::redaction::redact_path;
 use crate::retrieval::source_scope::SourceScope;
 use crate::state::{ActiveCounterGuard, AppState, SUMMARY_MODE_AUTO, SUMMARY_MODE_MANUAL};
+use futures::StreamExt;
+use regex;
+use reqwest::Url;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 use tauri_queue::{QueueJob, QueueManager, QueuePriority};
 
 // Profile status is owned by settings.rs through get_semantic_memory_profile_status.
+
+/// Read the configured chunk target tokens from app_db settings.
+fn read_chunk_target_tokens(state: &AppState) -> usize {
+    state
+        .app_db
+        .lock()
+        .ok()
+        .and_then(|db| db.get_setting("chunk_target_tokens").ok().flatten())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1100)
+}
 
 #[derive(Debug, Serialize)]
 pub struct SourceContent {
@@ -118,148 +138,44 @@ pub struct RetrievalProbeReceipt {
     pub degradation_markers: Vec<String>,
 }
 
-/// Classify a file extension into (source_type, optional language).
-fn classify_extension(ext: &str) -> (&'static str, Option<&'static str>) {
-    match ext {
-        "txt" => ("text", None),
-        "md" | "markdown" | "rst" => ("markdown", None),
-
-        // Code files
-        "py" => ("code", Some("python")),
-        "js" => ("code", Some("javascript")),
-        "jsx" => ("code", Some("jsx")),
-        "ts" => ("code", Some("typescript")),
-        "tsx" => ("code", Some("tsx")),
-        "rs" => ("code", Some("rust")),
-        "go" => ("code", Some("go")),
-        "java" => ("code", Some("java")),
-        "c" => ("code", Some("c")),
-        "cpp" | "cc" | "cxx" => ("code", Some("cpp")),
-        "h" | "hpp" => ("code", Some("c_header")),
-        "cs" => ("code", Some("csharp")),
-        "rb" => ("code", Some("ruby")),
-        "php" => ("code", Some("php")),
-        "swift" => ("code", Some("swift")),
-        "kt" | "kts" => ("code", Some("kotlin")),
-        "scala" => ("code", Some("scala")),
-        "lua" => ("code", Some("lua")),
-        "r" => ("code", Some("r")),
-        "sql" => ("code", Some("sql")),
-        "sh" | "bash" | "zsh" => ("code", Some("shell")),
-        "css" => ("code", Some("css")),
-        "scss" | "sass" => ("code", Some("scss")),
-        "html" | "htm" => ("code", Some("html")),
-        "xml" => ("code", Some("xml")),
-        "json" => ("code", Some("json")),
-        "yaml" | "yml" => ("code", Some("yaml")),
-        "toml" => ("code", Some("toml")),
-        "ini" | "cfg" | "conf" => ("code", Some("config")),
-        "vue" => ("code", Some("vue")),
-        "svelte" => ("code", Some("svelte")),
-        "dart" => ("code", Some("dart")),
-        "ex" | "exs" => ("code", Some("elixir")),
-        "zig" => ("code", Some("zig")),
-        "nim" => ("code", Some("nim")),
-        "pl" | "pm" => ("code", Some("perl")),
-        "proto" => ("code", Some("protobuf")),
-        "graphql" | "gql" => ("code", Some("graphql")),
-        "tf" | "hcl" => ("code", Some("terraform")),
-        "dockerfile" => ("code", Some("dockerfile")),
-        "makefile" => ("code", Some("makefile")),
-
-        // SVG is text-based XML — treat as code
-        "svg" => ("code", Some("xml")),
-
-        // Images (vision pipeline)
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" => ("image", None),
-
-        // Video (Phase 3+)
-        "mp4" | "webm" | "mov" | "avi" | "mkv" => ("video", None),
-
-        // Treat unknown extensions as plain text
-        _ => ("text", None),
+/// Classify a file extension into (source_type, optional language) after the
+/// strict import capability boundary has accepted it.
+fn classify_extension(ext: &str) -> Result<(&'static str, Option<&'static str>), GlossError> {
+    let capability = classify_import_extension(ext);
+    if !capability.is_importable() {
+        return Err(GlossError::Ingestion {
+            source_id: String::new(),
+            message: format!(
+                "Unsupported import format '{}': {}",
+                if ext.is_empty() { "(none)" } else { ext },
+                capability.reason
+            ),
+        });
     }
+    let source_type = capability
+        .source_type
+        .ok_or_else(|| GlossError::Ingestion {
+            source_id: String::new(),
+            message: format!(
+                "Unsupported import format '{}': {}",
+                if ext.is_empty() { "(none)" } else { ext },
+                capability.reason
+            ),
+        })?;
+    Ok((source_type, capability.language))
 }
 
-/// Binary/non-text extensions that should never be imported.
-const BINARY_EXTENSIONS: &[&str] = &[
-    // Compiled / object code
-    "o",
-    "obj",
-    "so",
-    "dll",
-    "dylib",
-    "a",
-    "lib",
-    "exe",
-    "bin",
-    "elf",
-    "class",
-    "pyc",
-    "pyo",
-    "wasm",
-    // Archives
-    "zip",
-    "tar",
-    "gz",
-    "bz2",
-    "xz",
-    "7z",
-    "rar",
-    "zst",
-    // Images: ico only (other image formats handled by vision pipeline)
-    "ico",
-    // Audio (not yet supported)
-    "mp3",
-    "wav",
-    "ogg",
-    "flac",
-    "m4a",
-    "aac",
-    "wma",
-    // Fonts
-    "ttf",
-    "otf",
-    "woff",
-    "woff2",
-    "eot",
-    // Documents (Phase 2+)
-    "pdf",
-    "docx",
-    "doc",
-    "xlsx",
-    "xls",
-    "pptx",
-    "ppt",
-    // Database / data
-    "db",
-    "sqlite",
-    "sqlite3",
-    "mdb",
-    // OS / misc binary
-    "DS_Store",
-    "swp",
-    "swo",
-    // ONNX / ML models
-    "onnx",
-    "pt",
-    "pth",
-    "safetensors",
-    "gguf",
-    "ggml",
-    // Usearch index
-    "usearch",
-    // Lock files (often huge, not useful as source content)
-    "lock",
-];
-
-/// Check if a file extension is supported for import.
-fn is_supported_extension(ext: &str) -> bool {
-    if ext.is_empty() {
-        // Files without extensions (Makefile, Dockerfile, LICENSE, etc.)
-        return true;
-    }
-    !BINARY_EXTENSIONS.contains(&ext)
+fn merge_source_metadata(
+    existing_metadata: Option<&str>,
+    key: &str,
+    value: serde_json::Value,
+) -> serde_json::Value {
+    let mut metadata = existing_metadata
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    metadata[key] = value;
+    metadata
 }
 
 fn hash_file(path: &Path) -> Result<String, GlossError> {
@@ -321,7 +237,7 @@ fn create_file_source(
         .unwrap_or("")
         .to_lowercase();
 
-    let (source_type, language) = classify_extension(&extension);
+    let (source_type, language) = classify_extension(&extension)?;
 
     // Stream the file through the hasher so large media files do not allocate
     // their full contents in memory during folder import.
@@ -330,7 +246,7 @@ fn create_file_source(
     // Check for existing source with same hash (dedup on re-import)
     let existing = state.with_notebook_db(notebook_id, |db| db.source_exists_by_hash(&hash))?;
     if existing {
-        tracing::debug!(file = %source_path.display(), "Skipping duplicate (hash match)");
+        tracing::debug!(file = %redact_path(source_path), "Skipping duplicate (hash match)");
         return Err(GlossError::Ingestion {
             source_id: String::new(),
             message: "duplicate".to_string(),
@@ -385,7 +301,7 @@ fn create_file_source(
         processing_state: None,
     };
 
-    state.with_notebook_db(notebook_id, |db| db.insert_source(&source))?;
+    state.with_notebook_db_write(notebook_id, |db| db.insert_source(&source))?;
     sync_notebook_source_count(state, notebook_id)?;
 
     Ok((source_id, source_type.to_string()))
@@ -405,7 +321,7 @@ pub async fn set_selected_sources(
     selected_source_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
-    state.with_notebook_db(&notebook_id, |db| {
+    state.with_notebook_db_write(&notebook_id, |db| {
         db.set_selected_sources(&selected_source_ids)
     })?;
     invalidate_suggested_questions(&state, &notebook_id);
@@ -452,6 +368,54 @@ impl IngestionTerminalCounts {
             IngestionTerminalState::DeletedDuringIngestion => self.cancelled_superseded += 1,
             IngestionTerminalState::SkippedUnsupported => self.skipped_unsupported += 1,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ImportBatchPerformanceReceipt {
+    schema: &'static str,
+    elapsed_ms: u128,
+    scan_ms: u128,
+    source_create_ms: u128,
+    ingestion_ms: u128,
+    index_save_ms: u128,
+    found_per_second: f64,
+    created_per_second: f64,
+    ingested_ready_per_second: f64,
+}
+
+struct ImportBatchPerformanceInput {
+    elapsed_ms: u128,
+    scan_ms: u128,
+    source_create_ms: u128,
+    ingestion_ms: u128,
+    index_save_ms: u128,
+    found: usize,
+    created: usize,
+    ingested_ready: usize,
+}
+
+fn import_batch_performance_receipt(
+    input: ImportBatchPerformanceInput,
+) -> ImportBatchPerformanceReceipt {
+    ImportBatchPerformanceReceipt {
+        schema: "ImportBatchPerformanceReceiptV1",
+        elapsed_ms: input.elapsed_ms,
+        scan_ms: input.scan_ms,
+        source_create_ms: input.source_create_ms,
+        ingestion_ms: input.ingestion_ms,
+        index_save_ms: input.index_save_ms,
+        found_per_second: per_second(input.found, input.elapsed_ms),
+        created_per_second: per_second(input.created, input.elapsed_ms),
+        ingested_ready_per_second: per_second(input.ingested_ready, input.elapsed_ms),
+    }
+}
+
+fn per_second(count: usize, elapsed_ms: u128) -> f64 {
+    if elapsed_ms == 0 {
+        count as f64
+    } else {
+        (count as f64 * 1000.0) / elapsed_ms as f64
     }
 }
 
@@ -509,21 +473,45 @@ fn run_ingestion_inner(
             PathBuf::from(nb.directory)
         };
 
+        let target_tokens = {
+            let app_db = state
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            app_db
+                .get_setting("chunk_target_tokens")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1100)
+        };
+
         let source = state.with_notebook_db(notebook_id, |db| db.get_source(source_id))?;
 
         // 1. Extract text
         if opts.emit_progress {
             emit_status(app_handle, notebook_id, source_id, "extracting", None);
         }
-        let text = extract_text(&source, &nb_dir)?;
+        let extracted = extract_text_with_metadata(&source, &nb_dir)?;
+        let text = extracted.text;
         let word_count = text.split_whitespace().count() as i32;
-        state.with_notebook_db(notebook_id, |db| {
+        state.with_notebook_db_write(notebook_id, |db| {
             db.update_source_content(source_id, &text, word_count)
         })?;
+        if let Some(extraction_metadata) = extracted.metadata {
+            let metadata = merge_source_metadata(
+                source.metadata.as_deref(),
+                "document_extraction",
+                extraction_metadata,
+            );
+            state.with_notebook_db_write(notebook_id, |db| {
+                db.update_source_metadata(source_id, Some(&metadata.to_string()))
+            })?;
+        }
 
         // Skip chunking/embedding for non-text content (images, videos)
         if matches!(source.source_type.as_str(), "image" | "video") {
-            state.with_notebook_db(notebook_id, |db| {
+            state.with_notebook_db_write(notebook_id, |db| {
                 db.update_source_status(source_id, "ready", None)
             })?;
             return Ok(IngestionTerminalState::SkippedUnsupported);
@@ -533,7 +521,7 @@ fn run_ingestion_inner(
         if opts.emit_progress {
             emit_status(app_handle, notebook_id, source_id, "chunking", None);
         }
-        let chunks = chunk_text_with_title(&text, source_id, &source.title);
+        let chunks = chunk_text_with_title(&text, source_id, &source.title, Some(target_tokens));
         tracing::debug!(source_id, chunks = chunks.len(), "Chunking complete");
 
         // 3. Insert chunks into DB
@@ -552,27 +540,9 @@ fn run_ingestion_inner(
                 embedding_model: None,
             })
             .collect::<Vec<_>>();
-        state.with_notebook_db(notebook_id, |db| db.insert_chunks(&db_chunks))?;
+        state.with_notebook_db_write(notebook_id, |db| db.insert_chunks(&db_chunks))?;
 
         if opts.embed_chunks {
-            // Acquire GPU gate to prevent ONNX + Ollama VRAM contention
-            if opts.emit_progress {
-                emit_status(app_handle, notebook_id, source_id, "waiting_for_gpu", None);
-            }
-            let _gpu_permit = loop {
-                match state.gpu_gate.try_acquire() {
-                    Ok(permit) => break permit,
-                    Err(tokio::sync::TryAcquireError::NoPermits) => {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    Err(tokio::sync::TryAcquireError::Closed) => {
-                        return Err(GlossError::Other(
-                            "GPU gate closed — app shutting down".into(),
-                        ));
-                    }
-                }
-            };
-
             // 4. Embed chunks + add to HNSW
             if opts.emit_progress {
                 emit_status(app_handle, notebook_id, source_id, "embedding", None);
@@ -582,13 +552,16 @@ fn run_ingestion_inner(
 
             let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
             let embeddings = {
-                let embedder = state
-                    .embedder
-                    .lock()
-                    .map_err(|e| GlossError::Other(e.to_string()))?;
-                let embedder = embedder
-                    .as_ref()
-                    .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
+                let embedder = {
+                    let embedder = state
+                        .embedder
+                        .read()
+                        .map_err(|e| GlossError::Other(e.to_string()))?;
+                    let embedder = embedder
+                        .as_ref()
+                        .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
+                    embedder.clone()
+                };
                 embedder.embed_batch(&chunk_texts)?
             };
 
@@ -602,15 +575,11 @@ fn run_ingestion_inner(
                     .get_mut(notebook_id)
                     .ok_or_else(|| GlossError::Embedding("HNSW index not found".into()))?;
 
-                state.with_notebook_db(notebook_id, |db| {
+                state.with_notebook_db_write(notebook_id, |db| {
                     for (i, chunk_data) in chunks.iter().enumerate() {
                         if let Some(embedding) = embeddings.get(i) {
                             let label = index.add(embedding)?;
-                            db.update_chunk_embedding(
-                                &chunk_data.id,
-                                label as i64,
-                                "NomicEmbedTextV15",
-                            )?;
+                            db.update_chunk_embedding(&chunk_data.id, label as i64, "local")?;
                         }
                     }
                     Ok(())
@@ -621,10 +590,24 @@ fn run_ingestion_inner(
             if opts.save_index {
                 state.save_hnsw_index(notebook_id)?;
             }
+        } else if crate::state::NATIVE_SEMANTIC_INDEXING_ENABLED {
+            // Deferred indexing is a real queue lane, not a dormant job enum:
+            // callers that intentionally skip synchronous embeddings enqueue
+            // the same canonical dense artifact work for later execution.
+            let job = QueueJob::new(GlossJob::IndexChunks {
+                epoch: queue_epoch_for_notebook(state, notebook_id),
+                notebook_id: notebook_id.to_string(),
+                source_id: source_id.to_string(),
+                data_dir: state.data_dir.to_string_lossy().to_string(),
+            })
+            .with_priority(QueuePriority::Low);
+            queue.add(job).map_err(|error| {
+                GlossError::Other(format!("Failed to queue deferred chunk indexing: {error}"))
+            })?;
         }
 
         // Mark ready
-        state.with_notebook_db(notebook_id, |db| {
+        state.with_notebook_db_write(notebook_id, |db| {
             db.update_source_status(source_id, "ready", None)
         })?;
 
@@ -688,7 +671,7 @@ fn run_ingestion_inner(
 
     if let Some(ref msg) = error_msg {
         tracing::warn!(source_id, error = %msg, "Ingestion failed");
-        let _ = state.with_notebook_db(notebook_id, |db| {
+        let _ = state.with_notebook_db_write(notebook_id, |db| {
             db.update_source_status(source_id, "error", Some(msg))
         });
     }
@@ -724,14 +707,36 @@ fn semantic_memory_runtime_config_from_state(
 fn semantic_memory_runtime_config_from_app_db(
     app_db: &crate::db::app_db::AppDb,
 ) -> Result<semantic_memory_adapter::SemanticMemoryRuntimeConfig, GlossError> {
+    let embedding_url = app_db.get_setting("semantic_memory_embedding_url")?;
+    // Mirror provider LAN policy for embedding endpoints.
+    // Embedding URL must be loopback (or LAN with opt-in); public/cloud rejected.
+    let embedding_provider = app_db.get_setting("semantic_memory_embedding_provider")?;
+    if embedding_provider
+        .as_deref()
+        .map(|p| p != "fastembed")
+        .unwrap_or(true)
+    {
+        if let Some(ref url) = embedding_url {
+            if !url.trim().is_empty() {
+                let allow_lan = crate::providers::lan_local_providers_allowed(app_db);
+                let _receipt = crate::providers::validate_embedding_url(url, allow_lan)?;
+            }
+        }
+    }
     let config = semantic_memory_adapter::runtime_config_from_settings(
-        app_db.get_setting("semantic_memory_embedding_provider")?,
-        app_db.get_setting("semantic_memory_embedding_url")?,
+        embedding_provider,
+        embedding_url,
         app_db.get_setting("semantic_memory_embedding_model")?,
         app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+        crate::commands::chat::setting_is_enabled(
+            app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
+        ),
         features::turbo_quant_active(app_db)?,
         crate::commands::chat::setting_is_enabled(
             app_db.get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
+        ),
+        crate::commands::chat::setting_is_enabled(
+            app_db.get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?,
         ),
     );
     semantic_memory_adapter::validate_embedding_model_role(&config)?;
@@ -859,6 +864,20 @@ pub struct QueueSummariesResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct FailedImportQuarantineReceipt {
+    pub schema: &'static str,
+    pub receipt_id: String,
+    pub notebook_id: String,
+    pub action: String,
+    pub failed_sources_before: usize,
+    pub affected_sources: usize,
+    pub quarantined_sources: usize,
+    pub deleted_sources: usize,
+    pub cancelled_queue_jobs: u32,
+    pub recorded_utc: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct BackgroundBackendStatus {
     pub ready: bool,
     pub provider_id: Option<String>,
@@ -896,6 +915,8 @@ fn has_vision_capability(model: &ModelRecord) -> bool {
         "qwen-vl",
         "qwen2-vl",
         "qwen2.5-vl",
+        "gemma3",
+        "gemma4",
         "vision",
         "vl",
     ]
@@ -936,8 +957,8 @@ fn record_vector_artifact_receipt(
         .unwrap_or("ok");
     let raw_receipt_json =
         serde_json::to_string(receipt).map_err(|error| GlossError::Other(error.to_string()))?;
-    state.with_notebook_db(notebook_id, |db| {
-        db.conn.execute(
+    state.with_notebook_db_write(notebook_id, |db| {
+        db.conn().execute(
             "INSERT OR REPLACE INTO semantic_memory_vector_artifact_receipts
              (receipt_id, notebook_id, generation_id, artifact_manifest_digest, raw_receipt_json, status, recorded_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
@@ -989,8 +1010,8 @@ fn record_retrieval_probe_receipt(
         .map_err(|error| GlossError::Other(error.to_string()))?;
     let raw_receipt_json =
         serde_json::to_string(raw_receipt).map_err(|error| GlossError::Other(error.to_string()))?;
-    state.with_notebook_db(&receipt.notebook_id, |db| {
-        db.conn.execute(
+    state.with_notebook_db_write(&receipt.notebook_id, |db| {
+        db.conn().execute(
             "INSERT OR REPLACE INTO semantic_memory_retrieval_probe_receipts
              (receipt_id, notebook_id, query_digest, source_scope_kind, scoped_sources, scoped_chunks,
               backend_requested, backend_used, bm25_candidates, vector_candidates, tq_candidates,
@@ -1039,7 +1060,7 @@ fn latest_retrieval_probe_turbo_proof(
     notebook_id: &str,
 ) -> Result<Option<LatestRetrievalProbeTurboProof>, GlossError> {
     state.with_notebook_db(notebook_id, |db| {
-        db.conn
+        db.conn()
             .query_row(
                 "SELECT receipt_id, exact_rerank, exact_rerank_count, candidate_backend,
                         artifact_generation_id, vector_artifact_manifest_digest
@@ -1211,7 +1232,7 @@ fn queue_describe_image_job(
         Ok(config) => config,
         Err(msg) => {
             tracing::warn!(source_id, "{msg}");
-            let _ = state.with_notebook_db(notebook_id, |db| {
+            let _ = state.with_notebook_db_write(notebook_id, |db| {
                 db.update_source_status(source_id, "error", Some(&msg))
             });
             return Err(msg);
@@ -1230,6 +1251,7 @@ fn queue_describe_image_job(
         data_dir: state.data_dir.to_string_lossy().to_string(),
         ollama_url: config.base_url,
         model: config.model,
+        chunk_target_tokens: read_chunk_target_tokens(state),
     })
     .with_priority(QueuePriority::Low);
 
@@ -1241,7 +1263,7 @@ fn queue_describe_image_job(
         Err(e) => {
             let msg = format!("Failed to queue image description job: {e}");
             tracing::warn!(source_id, error = %e, "Failed to queue describe-image job");
-            let _ = state.with_notebook_db(notebook_id, |db| {
+            let _ = state.with_notebook_db_write(notebook_id, |db| {
                 db.update_source_status(source_id, "error", Some(&msg))
             });
             Err(msg)
@@ -1261,7 +1283,7 @@ fn queue_describe_video_job(
         Ok(config) => config,
         Err(msg) => {
             tracing::warn!(source_id, "{msg}");
-            let _ = state.with_notebook_db(notebook_id, |db| {
+            let _ = state.with_notebook_db_write(notebook_id, |db| {
                 db.update_source_status(source_id, "error", Some(&msg))
             });
             return Err(msg);
@@ -1280,6 +1302,7 @@ fn queue_describe_video_job(
         data_dir: state.data_dir.to_string_lossy().to_string(),
         ollama_url: config.base_url,
         model: config.model,
+        chunk_target_tokens: read_chunk_target_tokens(state),
     })
     .with_priority(QueuePriority::Low);
 
@@ -1291,7 +1314,45 @@ fn queue_describe_video_job(
         Err(e) => {
             let msg = format!("Failed to queue video description job: {e}");
             tracing::warn!(source_id, error = %e, "Failed to queue describe-video job");
-            let _ = state.with_notebook_db(notebook_id, |db| {
+            let _ = state.with_notebook_db_write(notebook_id, |db| {
+                db.update_source_status(source_id, "error", Some(&msg))
+            });
+            Err(msg)
+        }
+    }
+}
+
+/// Queue an audio metadata extraction job. This uses ffprobe only and does not
+/// claim speech transcription.
+fn queue_audio_metadata_job(
+    queue: &Arc<QueueManager>,
+    state: &AppState,
+    notebook_id: &str,
+    source_id: &str,
+) -> Result<(), String> {
+    let source_title = state
+        .with_notebook_db(notebook_id, |db| db.get_source(source_id).map(|s| s.title))
+        .unwrap_or_else(|_| source_id.to_string());
+
+    let job = QueueJob::new(GlossJob::ExtractAudioMetadata {
+        epoch: queue_epoch_for_notebook(state, notebook_id),
+        notebook_id: notebook_id.to_string(),
+        source_id: source_id.to_string(),
+        source_title,
+        data_dir: state.data_dir.to_string_lossy().to_string(),
+        chunk_target_tokens: read_chunk_target_tokens(state),
+    })
+    .with_priority(QueuePriority::Low);
+
+    match queue.add(job) {
+        Ok(job_id) => {
+            tracing::info!(source_id, job_id, "Queued audio metadata job");
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!("Failed to queue audio metadata job: {e}");
+            tracing::warn!(source_id, error = %e, "Failed to queue audio metadata job");
+            let _ = state.with_notebook_db_write(notebook_id, |db| {
                 db.update_source_status(source_id, "error", Some(&msg))
             });
             Err(msg)
@@ -1311,7 +1372,7 @@ pub(crate) fn finalize_described_source(
     let result = (|| -> Result<(), GlossError> {
         let chunks: Vec<crate::db::notebook_db::Chunk> =
             state.with_notebook_db(notebook_id, |db| db.get_chunks_for_source(source_id))?;
-        state.with_notebook_db(notebook_id, |db| {
+        state.with_notebook_db_write(notebook_id, |db| {
             db.update_source_status(source_id, "ready", None)
         })?;
 
@@ -1334,7 +1395,7 @@ pub(crate) fn finalize_described_source(
     let finalize_error_msg = if let Err(ref e) = result {
         tracing::warn!(source_id, error = %e, "Finalization failed for described source");
         let msg = e.to_string();
-        let _ = state.with_notebook_db(notebook_id, |db| {
+        let _ = state.with_notebook_db_write(notebook_id, |db| {
             db.update_source_status(source_id, "error", Some(&msg))
         });
         Some(msg)
@@ -1407,10 +1468,12 @@ fn emit_import_batch_receipt(
     skipped_unsupported: usize,
     cancelled_superseded: usize,
     message: Option<&str>,
+    performance: Option<ImportBatchPerformanceReceipt>,
 ) {
     let _ = app_handle.emit(
         "sources:batch_ingestion_complete",
         serde_json::json!({
+            "schema": "ImportBatchReceiptV1",
             "notebook_id": notebook_id,
             "import_batch_id": import_batch_id,
             "notebook_epoch": notebook_epoch,
@@ -1424,6 +1487,7 @@ fn emit_import_batch_receipt(
             "cancelled_superseded": cancelled_superseded,
             "count": ingested_ready,
             "message": message,
+            "performance": performance,
         }),
     );
 }
@@ -1448,7 +1512,7 @@ fn validate_import_batch_notebook(
 
 fn invalidate_suggested_questions(state: &AppState, notebook_id: &str) {
     if let Err(e) =
-        state.with_notebook_db(notebook_id, |db| db.set_config("suggested_questions", ""))
+        state.with_notebook_db_write(notebook_id, |db| db.set_config("suggested_questions", ""))
     {
         tracing::warn!(notebook_id, error = %e, "Failed to invalidate suggested questions cache");
     }
@@ -1470,11 +1534,22 @@ fn validate_import_size(source_path: &Path) -> Result<(), GlossError> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    let (pre_source_type, _) = classify_extension(&ext);
+    let capability = classify_import_extension(&ext);
+    if !capability.is_importable() {
+        return Err(GlossError::Ingestion {
+            source_id: String::new(),
+            message: format!(
+                "Unsupported import format '{}': {}",
+                if ext.is_empty() { "(none)" } else { &ext },
+                capability.reason
+            ),
+        });
+    }
     if let Ok(meta) = source_path.metadata() {
-        let limit = match pre_source_type {
-            "image" => MAX_IMAGE_FILE_SIZE,
-            "video" => MAX_VIDEO_FILE_SIZE,
+        let limit = match capability.source_type {
+            Some("image") => MAX_IMAGE_FILE_SIZE,
+            Some("video") => MAX_VIDEO_FILE_SIZE,
+            Some("audio") => MAX_AUDIO_FILE_SIZE,
             _ => MAX_IMPORT_FILE_SIZE,
         };
         if meta.len() > limit {
@@ -1489,6 +1564,921 @@ fn validate_import_size(source_path: &Path) -> Result<(), GlossError> {
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn get_import_capability_matrix() -> Result<Vec<ImportCapability>, GlossError> {
+    Ok(import_capability_matrix())
+}
+
+#[derive(Default)]
+struct FolderWalkReport {
+    files: Vec<PathBuf>,
+    skipped_unsupported: usize,
+}
+
+/// Maximum file size (10 MB) for folder imports. Files larger than this are
+/// skipped to prevent OOM from reading/hashing/embedding huge files.
+const MAX_IMPORT_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Maximum image file size (10 MB) for vision pipeline.
+const MAX_IMAGE_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Maximum video file size (100 MB) for frame analysis pipeline.
+const MAX_VIDEO_FILE_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Maximum audio file size (100 MB) for metadata extraction.
+const MAX_AUDIO_FILE_SIZE: u64 = 100 * 1024 * 1024;
+const MAX_URL_IMPORT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_URL_IMPORT_REDIRECTS: usize = 3;
+const URL_IMPORT_TIMEOUT_SECS: u64 = 15;
+const MAX_URL_TEXT_CHARS: usize = 1_000_000;
+const MAX_YOUTUBE_WATCH_BYTES: usize = 2 * 1024 * 1024;
+const MAX_YOUTUBE_TRANSCRIPT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_YOUTUBE_TRANSCRIPT_CHARS: usize = 1_000_000;
+const MAX_YOUTUBE_TRANSCRIPT_SEGMENTS: usize = 20_000;
+
+/// Directories to skip when walking folders.
+const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".git",
+    "dist",
+    "build",
+    "vendor",
+    ".venv",
+    "venv",
+    ".next",
+    ".nuxt",
+    ".cache",
+];
+
+/// Maximum directory depth to traverse.
+const MAX_WALK_DEPTH: usize = 20;
+/// Maximum number of files to collect from a single folder import.
+const MAX_WALK_FILES: usize = 5000;
+/// Number of source records to create per batch before emitting a refresh
+/// signal during long folder imports.
+const SOURCE_CREATION_BATCH_SIZE: usize = 25;
+
+#[derive(Debug, Clone, Serialize)]
+struct UrlImportReceipt {
+    schema: &'static str,
+    receipt_id: String,
+    original_url_digest: String,
+    final_url_digest: String,
+    final_url_host: String,
+    status_code: u16,
+    content_type: String,
+    bytes_read: usize,
+    redirects_followed: usize,
+    elapsed_ms: u128,
+    network_consent: bool,
+    extraction_mode: &'static str,
+    max_bytes: usize,
+    max_redirects: usize,
+}
+
+struct UrlFetchResult {
+    final_url: String,
+    title: String,
+    text: String,
+    body_sha256: String,
+    receipt: UrlImportReceipt,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct YouTubeTranscriptSpan {
+    start_ms: u64,
+    end_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct YouTubeTranscriptReceipt {
+    schema: &'static str,
+    receipt_id: String,
+    original_url_digest: String,
+    watch_url_digest: String,
+    video_id_digest: String,
+    language: String,
+    transcript_source: &'static str,
+    transcript_url_host: String,
+    segment_count: usize,
+    timestamp_spans: Vec<YouTubeTranscriptSpan>,
+    bytes_read: usize,
+    elapsed_ms: u128,
+    network_consent: bool,
+    max_bytes: usize,
+    max_segments: usize,
+}
+
+struct YouTubeTranscriptResult {
+    watch_url: String,
+    title: String,
+    text: String,
+    transcript_sha256: String,
+    receipt: YouTubeTranscriptReceipt,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptSegment {
+    start_ms: u64,
+    duration_ms: u64,
+    text: String,
+}
+
+fn sha256_string(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn url_import_error(message: impl Into<String>) -> GlossError {
+    GlossError::Ingestion {
+        source_id: String::new(),
+        message: message.into(),
+    }
+}
+
+fn youtube_import_error(message: impl Into<String>) -> GlossError {
+    GlossError::Ingestion {
+        source_id: String::new(),
+        message: message.into(),
+    }
+}
+
+fn canonical_url_for_fetch(raw_url: &str, network_consent: bool) -> Result<Url, GlossError> {
+    if !network_consent {
+        return Err(url_import_error(
+            "URL import requires explicit per-import network consent.",
+        ));
+    }
+    let mut parsed = Url::parse(raw_url.trim())
+        .map_err(|e| url_import_error(format!("Invalid URL import input: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(url_import_error(
+            "URL import only supports explicit http:// or https:// URLs.",
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(url_import_error(
+            "URL import rejects URLs with embedded credentials.",
+        ));
+    }
+    parsed.set_fragment(None);
+    validate_url_host_boundary(&parsed)?;
+    Ok(parsed)
+}
+
+fn validate_url_host_boundary(url: &Url) -> Result<(), GlossError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| url_import_error("URL import requires a host."))?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || !host.contains('.')
+    {
+        return Err(url_import_error(
+            "URL import rejects localhost, intranet, and single-label hosts.",
+        ));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_disallowed_url_import_ip(ip) {
+            return Err(url_import_error(
+                "URL import rejects private, local, multicast, and reserved IP hosts.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_url_dns_boundary(url: &Url) -> Result<(), GlossError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| url_import_error("URL import requires a host."))?
+        .trim_end_matches('.')
+        .to_string();
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| url_import_error("URL import requires a known port for http or https."))?;
+    let addrs = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| url_import_error(format!("URL import DNS lookup failed: {e}")))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(url_import_error(
+            "URL import DNS lookup returned no addresses.",
+        ));
+    }
+    if addrs
+        .iter()
+        .any(|addr| is_disallowed_url_import_ip(addr.ip()))
+    {
+        return Err(url_import_error(
+            "URL import DNS resolved to a private, local, multicast, or reserved address.",
+        ));
+    }
+    Ok(())
+}
+
+fn is_disallowed_url_import_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => is_disallowed_url_import_ipv4(addr),
+        IpAddr::V6(addr) => is_disallowed_url_import_ipv6(addr),
+    }
+}
+
+fn is_disallowed_url_import_ipv4(addr: Ipv4Addr) -> bool {
+    let [a, b, c, d] = addr.octets();
+    addr.is_private()
+        || addr.is_loopback()
+        || addr.is_link_local()
+        || addr.is_broadcast()
+        || addr.is_multicast()
+        || addr.is_unspecified()
+        || a == 0
+        || a >= 224
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 198 && b == 18)
+        || (a == 198 && b == 19)
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || (a == 255 && b == 255 && c == 255 && d == 255)
+}
+
+fn is_disallowed_url_import_ipv6(addr: Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xff00) == 0xff00
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+}
+
+fn url_host_for_receipt(url: &Url) -> String {
+    url.host_str()
+        .unwrap_or("unknown")
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn content_type_is_textual(content_type: &str) -> bool {
+    let lowered = content_type.to_ascii_lowercase();
+    lowered.starts_with("text/")
+        || lowered.contains("application/xhtml+xml")
+        || lowered.contains("application/xml")
+        || lowered.contains("application/json")
+        || lowered.contains("application/rss+xml")
+        || lowered.contains("application/atom+xml")
+}
+
+static HTML_TITLE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+fn html_title(raw: &str) -> Option<String> {
+    let re = HTML_TITLE_RE
+        .get_or_init(|| regex::Regex::new("(?is)<title[^>]*>(.*?)</title>").expect("static regex"));
+    let title = re
+        .captures(raw)
+        .and_then(|captures| captures.get(1))
+        .map(|m| html_entity_decode(m.as_str()).trim().to_string())
+        .filter(|title| !title.is_empty())?;
+    Some(title.chars().take(160).collect())
+}
+
+static SCRIPT_STYLE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static TAGS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static WHITESPACE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+fn html_to_readable_text(raw: &str) -> String {
+    let script_style = SCRIPT_STYLE_RE.get_or_init(|| {
+        regex::Regex::new(
+            "(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>",
+        )
+        .expect("static regex")
+    });
+    let tags = TAGS_RE.get_or_init(|| regex::Regex::new("(?is)<[^>]+>").expect("static regex"));
+    let whitespace = WHITESPACE_RE.get_or_init(|| regex::Regex::new(r"\s+").expect("static regex"));
+    let without_hidden = script_style.replace_all(raw, " ");
+    let without_tags = tags.replace_all(&without_hidden, " ");
+    whitespace
+        .replace_all(&html_entity_decode(&without_tags), " ")
+        .trim()
+        .chars()
+        .take(MAX_URL_TEXT_CHARS)
+        .collect()
+}
+
+fn html_entity_decode(value: &str) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+fn canonical_youtube_watch_url(
+    raw_url: &str,
+    network_consent: bool,
+) -> Result<(Url, String), GlossError> {
+    let parsed = canonical_url_for_fetch(raw_url, network_consent)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| youtube_import_error("YouTube transcript import requires a host."))?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let video_id = youtube_video_id(&parsed, &host)?;
+    let watch_url = Url::parse(&format!("https://www.youtube.com/watch?v={video_id}"))
+        .map_err(|e| youtube_import_error(format!("failed to build YouTube watch URL: {e}")))?;
+    Ok((watch_url, video_id))
+}
+
+fn youtube_video_id(url: &Url, host: &str) -> Result<String, GlossError> {
+    let candidate = if host == "youtu.be" || host.ends_with(".youtu.be") {
+        url.path_segments()
+            .and_then(|mut segments| segments.next())
+            .map(str::to_string)
+    } else if matches!(
+        host,
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com"
+    ) || host.ends_with(".youtube-nocookie.com")
+    {
+        if url.path() == "/watch" {
+            url.query_pairs()
+                .find(|(key, _)| key == "v")
+                .map(|(_, value)| value.into_owned())
+        } else {
+            let mut segments = url.path_segments().into_iter().flatten();
+            match segments.next() {
+                Some("shorts" | "embed" | "live") => segments.next().map(str::to_string),
+                _ => None,
+            }
+        }
+    } else {
+        return Err(youtube_import_error(
+            "YouTube transcript import only accepts youtube.com, youtube-nocookie.com, or youtu.be URLs.",
+        ));
+    };
+    let video_id = candidate.ok_or_else(|| {
+        youtube_import_error("YouTube transcript import could not find a video id in the URL.")
+    })?;
+    if video_id.len() != 11
+        || !video_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(youtube_import_error(
+            "YouTube transcript import rejected an invalid video id.",
+        ));
+    }
+    Ok(video_id)
+}
+
+async fn fetch_bounded_textual_url(
+    url: Url,
+    max_bytes: usize,
+    user_agent: &'static str,
+) -> Result<(Url, String, String, u16, usize, usize, u128), GlossError> {
+    let started = Instant::now();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(URL_IMPORT_TIMEOUT_SECS))
+        .user_agent(user_agent)
+        .build()
+        .map_err(|e| url_import_error(format!("Failed to build bounded fetch client: {e}")))?;
+    let mut current = url;
+    let mut redirects_followed = 0usize;
+
+    loop {
+        validate_url_host_boundary(&current)?;
+        validate_url_dns_boundary(&current).await?;
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| url_import_error(format!("Bounded text fetch failed: {e}")))?;
+        let status = response.status();
+        if status.is_redirection() {
+            if redirects_followed >= MAX_URL_IMPORT_REDIRECTS {
+                return Err(url_import_error(
+                    "Bounded text fetch exceeded redirect limit.",
+                ));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    url_import_error("Bounded text fetch redirect did not include Location.")
+                })?;
+            current = current.join(location).map_err(|e| {
+                url_import_error(format!("Bounded text fetch redirect was invalid: {e}"))
+            })?;
+            current = canonical_url_for_fetch(current.as_str(), true)?;
+            redirects_followed += 1;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(url_import_error(format!(
+                "Bounded text fetch failed with HTTP status {}.",
+                status.as_u16()
+            )));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        if !content_type_is_textual(&content_type) {
+            return Err(url_import_error(format!(
+                "Bounded text fetch rejected non-text content type '{content_type}'."
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len as usize > max_bytes)
+        {
+            return Err(url_import_error(
+                "Bounded text fetch content-length exceeds byte limit.",
+            ));
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|e| url_import_error(format!("Bounded text body read failed: {e}")))?;
+            if body.len() + chunk.len() > max_bytes {
+                return Err(url_import_error("Bounded text body exceeded byte limit."));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let bytes_read = body.len();
+        let raw = String::from_utf8_lossy(&body).to_string();
+        return Ok((
+            current,
+            raw,
+            content_type,
+            status.as_u16(),
+            bytes_read,
+            redirects_followed,
+            started.elapsed().as_millis(),
+        ));
+    }
+}
+
+fn extract_json_array_after_key(raw: &str, key: &str) -> Option<String> {
+    let key_index = raw.find(key)?;
+    let after_key = &raw[key_index + key.len()..];
+    let start_rel = after_key.find('[')?;
+    let start = key_index + key.len() + start_rel;
+    let bytes = raw.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for index in start..bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(raw[start..=index].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn youtube_caption_base_url(
+    watch_html: &str,
+    preferred_language: &str,
+) -> Result<(String, String), GlossError> {
+    let array = extract_json_array_after_key(watch_html, "\"captionTracks\"")
+        .ok_or_else(|| youtube_import_error("YouTube watch page did not expose caption tracks."))?;
+    let tracks: serde_json::Value = serde_json::from_str(&array).map_err(|e| {
+        youtube_import_error(format!("failed to parse YouTube caption tracks: {e}"))
+    })?;
+    let tracks = tracks
+        .as_array()
+        .ok_or_else(|| youtube_import_error("YouTube captionTracks payload was not an array."))?;
+    if tracks.is_empty() {
+        return Err(youtube_import_error(
+            "YouTube video has no public transcript tracks.",
+        ));
+    }
+    let preferred = preferred_language.trim().to_ascii_lowercase();
+    let selected = tracks
+        .iter()
+        .find(|track| {
+            track
+                .get("languageCode")
+                .and_then(|value| value.as_str())
+                .is_some_and(|lang| lang.eq_ignore_ascii_case(&preferred))
+        })
+        .or_else(|| tracks.iter().find(|track| track.get("baseUrl").is_some()))
+        .ok_or_else(|| youtube_import_error("No usable YouTube transcript track was found."))?;
+    let base_url = selected
+        .get("baseUrl")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| youtube_import_error("Selected YouTube transcript track has no baseUrl."))?;
+    let language = selected
+        .get("languageCode")
+        .and_then(|value| value.as_str())
+        .unwrap_or(preferred_language)
+        .to_string();
+    Ok((base_url.to_string(), language))
+}
+
+fn json3_transcript_segments(raw: &str) -> Result<Vec<TranscriptSegment>, GlossError> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        youtube_import_error(format!("failed to parse YouTube transcript JSON: {e}"))
+    })?;
+    let events = value
+        .get("events")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| youtube_import_error("YouTube transcript JSON has no events array."))?;
+    let mut segments = Vec::new();
+    for event in events {
+        if segments.len() >= MAX_YOUTUBE_TRANSCRIPT_SEGMENTS {
+            return Err(youtube_import_error(
+                "YouTube transcript exceeded segment limit.",
+            ));
+        }
+        let start_ms = event
+            .get("tStartMs")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let duration_ms = event
+            .get("dDurationMs")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let text = event
+            .get("segs")
+            .and_then(|value| value.as_array())
+            .map(|segs| {
+                segs.iter()
+                    .filter_map(|seg| seg.get("utf8").and_then(|value| value.as_str()))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        let text = html_entity_decode(&text).trim().to_string();
+        if !text.is_empty() {
+            segments.push(TranscriptSegment {
+                start_ms,
+                duration_ms,
+                text,
+            });
+        }
+    }
+    if segments.is_empty() {
+        return Err(youtube_import_error(
+            "YouTube transcript contained no readable text segments.",
+        ));
+    }
+    Ok(segments)
+}
+
+fn format_timestamp_ms(ms: u64) -> String {
+    let total_seconds = ms / 1000;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+fn transcript_text_and_spans(
+    title: &str,
+    language: &str,
+    segments: &[TranscriptSegment],
+) -> Result<(String, Vec<YouTubeTranscriptSpan>), GlossError> {
+    let mut out = format!("YouTube transcript: {title}\nLanguage: {language}\n\n");
+    let mut spans = Vec::with_capacity(segments.len());
+    for segment in segments {
+        if out.len() > MAX_YOUTUBE_TRANSCRIPT_CHARS {
+            return Err(youtube_import_error(
+                "YouTube transcript exceeded text output limit.",
+            ));
+        }
+        let end_ms = segment.start_ms.saturating_add(segment.duration_ms);
+        spans.push(YouTubeTranscriptSpan {
+            start_ms: segment.start_ms,
+            end_ms,
+        });
+        out.push_str(&format!(
+            "[{}] {}\n",
+            format_timestamp_ms(segment.start_ms),
+            segment.text
+        ));
+    }
+    Ok((out, spans))
+}
+
+async fn fetch_youtube_transcript_source(
+    raw_url: &str,
+    language: Option<&str>,
+    network_consent: bool,
+) -> Result<YouTubeTranscriptResult, GlossError> {
+    let preferred_language = language
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("en");
+    let (watch_url, video_id) = canonical_youtube_watch_url(raw_url, network_consent)?;
+    let started = Instant::now();
+    let (final_watch_url, watch_html, _, _, _, _, _) = fetch_bounded_textual_url(
+        watch_url.clone(),
+        MAX_YOUTUBE_WATCH_BYTES,
+        "GlossYouTubeTranscriptImport/1.0",
+    )
+    .await?;
+    let title = html_title(&watch_html).unwrap_or_else(|| "YouTube transcript".to_string());
+    let (caption_base_url, resolved_language) =
+        youtube_caption_base_url(&watch_html, preferred_language)?;
+    let mut transcript_url = Url::parse(&caption_base_url)
+        .map_err(|e| youtube_import_error(format!("invalid YouTube transcript URL: {e}")))?;
+    if transcript_url
+        .query_pairs()
+        .all(|(key, _)| key.as_ref() != "fmt")
+    {
+        transcript_url.query_pairs_mut().append_pair("fmt", "json3");
+    }
+    let (final_transcript_url, transcript_raw, _, _, bytes_read, _, _) = fetch_bounded_textual_url(
+        transcript_url,
+        MAX_YOUTUBE_TRANSCRIPT_BYTES,
+        "GlossYouTubeTranscriptImport/1.0",
+    )
+    .await?;
+    let segments = json3_transcript_segments(&transcript_raw)?;
+    let (text, spans) = transcript_text_and_spans(&title, &resolved_language, &segments)?;
+    let transcript_sha256 = sha256_string(&text);
+    let receipt = YouTubeTranscriptReceipt {
+        schema: "YouTubeTranscriptReceiptV1",
+        receipt_id: uuid::Uuid::new_v4().to_string(),
+        original_url_digest: sha256_string(raw_url.trim()),
+        watch_url_digest: sha256_string(final_watch_url.as_str()),
+        video_id_digest: sha256_string(&video_id),
+        language: resolved_language,
+        transcript_source: "youtube_caption_track_json3",
+        transcript_url_host: url_host_for_receipt(&final_transcript_url),
+        segment_count: spans.len(),
+        timestamp_spans: spans,
+        bytes_read,
+        elapsed_ms: started.elapsed().as_millis(),
+        network_consent,
+        max_bytes: MAX_YOUTUBE_TRANSCRIPT_BYTES,
+        max_segments: MAX_YOUTUBE_TRANSCRIPT_SEGMENTS,
+    };
+    Ok(YouTubeTranscriptResult {
+        watch_url: final_watch_url.to_string(),
+        title,
+        text,
+        transcript_sha256,
+        receipt,
+    })
+}
+
+async fn fetch_url_source(
+    raw_url: &str,
+    network_consent: bool,
+) -> Result<UrlFetchResult, GlossError> {
+    let original_url = canonical_url_for_fetch(raw_url, network_consent)?;
+    let started = Instant::now();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(URL_IMPORT_TIMEOUT_SECS))
+        .user_agent("GlossUrlImport/1.0")
+        .build()
+        .map_err(|e| url_import_error(format!("Failed to build URL import client: {e}")))?;
+    let mut current = original_url.clone();
+    let mut redirects_followed = 0usize;
+
+    loop {
+        validate_url_host_boundary(&current)?;
+        validate_url_dns_boundary(&current).await?;
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| url_import_error(format!("URL import fetch failed: {e}")))?;
+        let status = response.status();
+        if status.is_redirection() {
+            if redirects_followed >= MAX_URL_IMPORT_REDIRECTS {
+                return Err(url_import_error("URL import exceeded redirect limit."));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    url_import_error("URL import redirect response did not include Location.")
+                })?;
+            current = current
+                .join(location)
+                .map_err(|e| url_import_error(format!("URL import redirect was invalid: {e}")))?;
+            current = canonical_url_for_fetch(current.as_str(), true)?;
+            redirects_followed += 1;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(url_import_error(format!(
+                "URL import failed with HTTP status {}.",
+                status.as_u16()
+            )));
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        if !content_type_is_textual(&content_type) {
+            return Err(url_import_error(format!(
+                "URL import rejected non-text content type '{content_type}'."
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len as usize > MAX_URL_IMPORT_BYTES)
+        {
+            return Err(url_import_error(
+                "URL import content-length exceeds byte limit.",
+            ));
+        }
+
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|e| url_import_error(format!("URL import body read failed: {e}")))?;
+            if body.len() + chunk.len() > MAX_URL_IMPORT_BYTES {
+                return Err(url_import_error("URL import body exceeded byte limit."));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body_sha256 = format!("sha256:{:x}", Sha256::digest(&body));
+        let raw = String::from_utf8_lossy(&body).to_string();
+        let extraction_mode = if content_type.to_ascii_lowercase().contains("html")
+            || raw.trim_start().starts_with("<!DOCTYPE")
+            || raw.trim_start().starts_with("<html")
+        {
+            "bounded_html_text"
+        } else {
+            "bounded_plain_text"
+        };
+        let text = if extraction_mode == "bounded_html_text" {
+            html_to_readable_text(&raw)
+        } else {
+            raw.chars().take(MAX_URL_TEXT_CHARS).collect::<String>()
+        };
+        if text.split_whitespace().next().is_none() {
+            return Err(url_import_error("URL import produced no readable text."));
+        }
+        let title = html_title(&raw).unwrap_or_else(|| url_host_for_receipt(&current));
+        let receipt = UrlImportReceipt {
+            schema: "UrlImportReceiptV1",
+            receipt_id: uuid::Uuid::new_v4().to_string(),
+            original_url_digest: sha256_string(original_url.as_str()),
+            final_url_digest: sha256_string(current.as_str()),
+            final_url_host: url_host_for_receipt(&current),
+            status_code: status.as_u16(),
+            content_type,
+            bytes_read: body.len(),
+            redirects_followed,
+            elapsed_ms: started.elapsed().as_millis(),
+            network_consent,
+            extraction_mode,
+            max_bytes: MAX_URL_IMPORT_BYTES,
+            max_redirects: MAX_URL_IMPORT_REDIRECTS,
+        };
+        return Ok(UrlFetchResult {
+            final_url: current.to_string(),
+            title,
+            text,
+            body_sha256,
+            receipt,
+        });
+    }
+}
+
+/// Recursively walk a directory and collect importable file paths.
+/// Skips symlinks, hidden files, and known junk directories.
+/// Stops early if depth or file count limits are reached.
+fn walk_directory(dir: &Path) -> FolderWalkReport {
+    let mut report = FolderWalkReport::default();
+    walk_directory_inner(dir, &mut report, 0);
+    report
+}
+
+fn walk_directory_inner(dir: &Path, report: &mut FolderWalkReport, depth: usize) {
+    if depth > MAX_WALK_DEPTH || report.files.len() >= MAX_WALK_FILES {
+        return;
+    }
+
+    let mut entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(dir = %redact_path(dir), error = %e, "Cannot read directory, skipping");
+            return;
+        }
+    };
+    entries.sort_by_key(|a| a.path());
+
+    for entry in entries {
+        if report.files.len() >= MAX_WALK_FILES {
+            tracing::warn!("File limit ({}) reached during folder walk", MAX_WALK_FILES);
+            return;
+        }
+
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Skip hidden files/dirs
+        if name_str.starts_with('.') {
+            continue;
+        }
+
+        // Use symlink_metadata to detect symlinks without following them
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Skip symlinks entirely to avoid loops
+        if meta.file_type().is_symlink() {
+            tracing::debug!(path = %redact_path(&path), "Skipping symlink");
+            continue;
+        }
+
+        if meta.is_dir() {
+            if SKIP_DIRS.contains(&name_str.as_ref()) {
+                tracing::debug!(dir = %name_str, "Skipping excluded directory");
+                continue;
+            }
+            walk_directory_inner(&path, report, depth + 1);
+        } else if meta.is_file() {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let capability = classify_import_extension(&ext);
+            if capability.is_importable() {
+                report.files.push(path);
+            } else {
+                report.skipped_unsupported += 1;
+                tracing::debug!(
+                    file = %redact_path(&path),
+                    ext = %ext,
+                    support = ?capability.support,
+                    reason = %capability.reason,
+                    "Skipping unsupported/deferred import format"
+                );
+            }
+        }
+    }
+}
+
+fn import_size_limit_for_source_type(source_type: Option<&str>) -> u64 {
+    match source_type {
+        Some("image") => MAX_IMAGE_FILE_SIZE,
+        Some("video") => MAX_VIDEO_FILE_SIZE,
+        Some("audio") => MAX_AUDIO_FILE_SIZE,
+        _ => MAX_IMPORT_FILE_SIZE,
+    }
 }
 
 #[tauri::command]
@@ -1514,6 +2504,10 @@ pub async fn add_source_file(
             }
         }
         "video" => match queue_describe_video_job(&queue, &state, &notebook_id, &source_id) {
+            Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
+            Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
+        },
+        "audio" => match queue_audio_metadata_job(&queue, &state, &notebook_id, &source_id) {
             Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
             Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
         },
@@ -1571,6 +2565,10 @@ pub async fn add_source_files(
                 Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
                 Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
             },
+            "audio" => match queue_audio_metadata_job(&queue, &state, &notebook_id, &source_id) {
+                Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
+                Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
+            },
             _ => {
                 ingestion_sources.push(source_id.clone());
             }
@@ -1609,109 +2607,6 @@ pub async fn add_source_files(
     }
 
     Ok(created)
-}
-
-/// Maximum file size (10 MB) for folder imports. Files larger than this are
-/// skipped to prevent OOM from reading/hashing/embedding huge files.
-const MAX_IMPORT_FILE_SIZE: u64 = 10 * 1024 * 1024;
-
-/// Maximum image file size (10 MB) for vision pipeline.
-const MAX_IMAGE_FILE_SIZE: u64 = 10 * 1024 * 1024;
-
-/// Maximum video file size (100 MB) for frame analysis pipeline.
-const MAX_VIDEO_FILE_SIZE: u64 = 100 * 1024 * 1024;
-
-/// Directories to skip when walking folders.
-const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".git",
-    "dist",
-    "build",
-    "vendor",
-    ".venv",
-    "venv",
-    ".next",
-    ".nuxt",
-    ".cache",
-];
-
-/// Maximum directory depth to traverse.
-const MAX_WALK_DEPTH: usize = 20;
-/// Maximum number of files to collect from a single folder import.
-const MAX_WALK_FILES: usize = 5000;
-/// Number of source records to create per batch before emitting a refresh
-/// signal during long folder imports.
-const SOURCE_CREATION_BATCH_SIZE: usize = 25;
-
-/// Recursively walk a directory and collect supported file paths.
-/// Skips symlinks, hidden files, and known junk directories.
-/// Stops early if depth or file count limits are reached.
-fn walk_directory(dir: &Path, out: &mut Vec<PathBuf>) {
-    walk_directory_inner(dir, out, 0);
-}
-
-fn walk_directory_inner(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > MAX_WALK_DEPTH || out.len() >= MAX_WALK_FILES {
-        return;
-    }
-
-    let mut entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
-        Err(e) => {
-            tracing::warn!(dir = %dir.display(), error = %e, "Cannot read directory, skipping");
-            return;
-        }
-    };
-    entries.sort_by_key(|a| a.path());
-
-    for entry in entries {
-        if out.len() >= MAX_WALK_FILES {
-            tracing::warn!("File limit ({}) reached during folder walk", MAX_WALK_FILES);
-            return;
-        }
-
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Skip hidden files/dirs
-        if name_str.starts_with('.') {
-            continue;
-        }
-
-        // Use symlink_metadata to detect symlinks without following them
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        // Skip symlinks entirely to avoid loops
-        if meta.file_type().is_symlink() {
-            tracing::debug!(path = %path.display(), "Skipping symlink");
-            continue;
-        }
-
-        if meta.is_dir() {
-            if SKIP_DIRS.contains(&name_str.as_ref()) {
-                tracing::debug!(dir = %name_str, "Skipping excluded directory");
-                continue;
-            }
-            walk_directory_inner(&path, out, depth + 1);
-        } else if meta.is_file() {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if is_supported_extension(&ext) {
-                out.push(path);
-            } else {
-                tracing::debug!(file = %path.display(), ext = %ext, "Skipping unsupported file type");
-            }
-        }
-    }
 }
 
 #[tauri::command]
@@ -1761,6 +2656,7 @@ pub async fn add_source_folder(
     let import_path = path.clone();
     let import_batch_id = uuid::Uuid::new_v4().to_string();
     tauri::async_runtime::spawn(async move {
+        let import_started = Instant::now();
         emit_folder_scan_event(&handle, &nb_id, "scan_started", &import_path, 0, None);
         let batch_ingestion_guard = {
             let state = handle.state::<AppState>();
@@ -1781,6 +2677,7 @@ pub async fn add_source_folder(
                 0,
                 1,
                 Some(&reason),
+                None,
             );
             emit_folder_scan_event(
                 &handle,
@@ -1794,47 +2691,47 @@ pub async fn add_source_folder(
         }
 
         // Keep the IPC command fast: scan the folder entirely in the background.
-        let files = match tokio::task::spawn_blocking(move || {
-            let mut files = Vec::new();
-            walk_directory(&folder_walk, &mut files);
-            files
-        })
-        .await
-        {
-            Ok(files) => files,
-            Err(e) => {
-                tracing::error!(
-                    folder = %import_path,
-                    error = %e,
-                    "Directory walk failed during background folder import"
-                );
-                emit_folder_scan_event(
-                    &handle,
-                    &nb_id,
-                    "scan_failed",
-                    &import_path,
-                    0,
-                    Some(&e.to_string()),
-                );
-                emit_import_batch_receipt(
-                    &handle,
-                    &nb_id,
-                    &import_batch_id,
-                    notebook_epoch,
-                    "failed",
-                    0,
-                    0,
-                    0,
-                    1,
-                    0,
-                    0,
-                    0,
-                    Some(&e.to_string()),
-                );
-                return;
-            }
-        };
+        let scan_started = Instant::now();
+        let walk_report =
+            match tokio::task::spawn_blocking(move || walk_directory(&folder_walk)).await {
+                Ok(report) => report,
+                Err(e) => {
+                    tracing::error!(
+                        folder = %import_path,
+                        error = %e,
+                        "Directory walk failed during background folder import"
+                    );
+                    emit_folder_scan_event(
+                        &handle,
+                        &nb_id,
+                        "scan_failed",
+                        &import_path,
+                        0,
+                        Some(&e.to_string()),
+                    );
+                    emit_import_batch_receipt(
+                        &handle,
+                        &nb_id,
+                        &import_batch_id,
+                        notebook_epoch,
+                        "failed",
+                        0,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        Some(&e.to_string()),
+                        None,
+                    );
+                    return;
+                }
+            };
+        let scan_ms = scan_started.elapsed().as_millis();
 
+        let files = walk_report.files;
+        let skipped_unsupported_scan = walk_report.skipped_unsupported;
         if files.len() >= MAX_WALK_FILES {
             tracing::warn!(
                 folder = %import_path,
@@ -1852,10 +2749,11 @@ pub async fn add_source_folder(
         }
 
         let file_count = files.len();
-        let found = file_count;
+        let found = file_count + skipped_unsupported_scan;
         tracing::info!(
             folder = %import_path,
             files_found = file_count,
+            skipped_unsupported = skipped_unsupported_scan,
             "Directory walk complete"
         );
         if let Err(reason) = validate_import_batch_notebook(&handle, &nb_id, notebook_epoch) {
@@ -1870,9 +2768,10 @@ pub async fn add_source_folder(
                 0,
                 0,
                 0,
-                0,
+                skipped_unsupported_scan,
                 found,
                 Some(&reason),
+                None,
             );
             emit_folder_scan_event(
                 &handle,
@@ -1892,7 +2791,7 @@ pub async fn add_source_folder(
                 "scan_empty",
                 &import_path,
                 0,
-                Some("No supported files found"),
+                Some("No importable files found"),
             );
             emit_import_batch_receipt(
                 &handle,
@@ -1900,14 +2799,26 @@ pub async fn add_source_folder(
                 &import_batch_id,
                 notebook_epoch,
                 "empty",
+                found,
                 0,
                 0,
                 0,
                 0,
+                skipped_unsupported_scan,
                 0,
-                0,
-                0,
-                Some("No supported files found"),
+                Some("No importable files found"),
+                Some(import_batch_performance_receipt(
+                    ImportBatchPerformanceInput {
+                        elapsed_ms: import_started.elapsed().as_millis(),
+                        scan_ms,
+                        source_create_ms: 0,
+                        ingestion_ms: 0,
+                        index_save_ms: 0,
+                        found,
+                        created: 0,
+                        ingested_ready: 0,
+                    },
+                )),
             );
             return;
         }
@@ -1916,6 +2827,7 @@ pub async fn add_source_folder(
         let mut sources: Vec<(String, String)> = Vec::new();
         let mut failed = 0usize;
         let mut skipped_duplicate = 0usize;
+        let source_create_started = Instant::now();
         for batch in files.chunks(SOURCE_CREATION_BATCH_SIZE) {
             if let Err(reason) = validate_import_batch_notebook(&handle, &nb_id, notebook_epoch) {
                 emit_import_batch_receipt(
@@ -1929,9 +2841,10 @@ pub async fn add_source_folder(
                     0,
                     failed,
                     skipped_duplicate,
-                    0,
-                    found.saturating_sub(sources.len() + skipped_duplicate + failed),
+                    skipped_unsupported_scan,
+                    file_count.saturating_sub(sources.len() + skipped_duplicate + failed),
                     Some(&reason),
+                    None,
                 );
                 emit_folder_scan_event(
                     &handle,
@@ -1968,15 +2881,11 @@ pub async fn add_source_folder(
                             .and_then(|e| e.to_str())
                             .unwrap_or("")
                             .to_lowercase();
-                        let (stype, _) = classify_extension(&ext);
-                        let limit = match stype {
-                            "image" => MAX_IMAGE_FILE_SIZE,
-                            "video" => MAX_VIDEO_FILE_SIZE,
-                            _ => MAX_IMPORT_FILE_SIZE,
-                        };
+                        let capability = classify_import_extension(&ext);
+                        let limit = import_size_limit_for_source_type(capability.source_type);
                         if meta.len() > limit {
                             tracing::warn!(
-                                file = %file_path.display(),
+                                file = %redact_path(&file_path),
                                 size_mb = meta.len() / (1024 * 1024),
                                 "Skipping oversized file (>{} MB)",
                                 limit / (1024 * 1024)
@@ -1994,7 +2903,7 @@ pub async fn add_source_folder(
                         Err(e) => {
                             failed += 1;
                             tracing::warn!(
-                                file = %file_path.display(),
+                                file = %redact_path(&file_path),
                                 error = %e,
                                 "Skipping file during folder import"
                             );
@@ -2028,6 +2937,7 @@ pub async fn add_source_folder(
 
             tokio::task::yield_now().await;
         }
+        let source_create_ms = source_create_started.elapsed().as_millis();
 
         let total = sources.len();
         if total == 0 {
@@ -2050,9 +2960,21 @@ pub async fn add_source_folder(
                 0,
                 failed,
                 skipped_duplicate,
-                0,
+                skipped_unsupported_scan,
                 0,
                 Some("No new sources created"),
+                Some(import_batch_performance_receipt(
+                    ImportBatchPerformanceInput {
+                        elapsed_ms: import_started.elapsed().as_millis(),
+                        scan_ms,
+                        source_create_ms,
+                        ingestion_ms: 0,
+                        index_save_ms: 0,
+                        found,
+                        created: 0,
+                        ingested_ready: 0,
+                    },
+                )),
             );
             return;
         }
@@ -2062,6 +2984,7 @@ pub async fn add_source_folder(
         // the same release evidence as individual file imports.
         // Images are routed to the vision pipeline (queued jobs) instead.
         let mut terminal_counts = IngestionTerminalCounts::default();
+        let ingestion_started = Instant::now();
         for (i, (source_id, source_type)) in sources.into_iter().enumerate() {
             if let Err(reason) = validate_import_batch_notebook(&handle, &nb_id, notebook_epoch) {
                 terminal_counts.cancelled_superseded += total.saturating_sub(i);
@@ -2076,9 +2999,10 @@ pub async fn add_source_folder(
                     i,
                     failed + terminal_counts.failed,
                     skipped_duplicate,
-                    terminal_counts.skipped_unsupported,
+                    skipped_unsupported_scan + terminal_counts.skipped_unsupported,
                     terminal_counts.cancelled_superseded,
                     Some(&reason),
+                    None,
                 );
                 emit_folder_scan_event(
                     &handle,
@@ -2103,6 +3027,10 @@ pub async fn add_source_folder(
                     }
                     "video" => {
                         let _ = queue_describe_video_job(&q, &state, &nb_id, &source_id);
+                        IngestionTerminalState::SkippedUnsupported
+                    }
+                    "audio" => {
+                        let _ = queue_audio_metadata_job(&q, &state, &nb_id, &source_id);
                         IngestionTerminalState::SkippedUnsupported
                     }
                     _ => run_ingestion_inner(
@@ -2136,14 +3064,19 @@ pub async fn add_source_folder(
                 }
             }
 
-            // Brief pause between sources to let GPU memory settle
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // (Removed: 50ms "let GPU memory settle" sleep — that was a
+            //  periodic-reset band-aid around in-process FastEmbed. With
+            //  the v3 migration defaulting to Ollama, the embedder is
+            //  out-of-process and there is nothing to settle. Real
+            //  backpressure is provided by the queue / GPU gate.)
         }
+        let ingestion_ms = ingestion_started.elapsed().as_millis();
 
         // Release the batch-level ingestion hold before post-processing.
         drop(batch_ingestion_guard);
 
         // Save HNSW index once after all sources are ingested
+        let index_save_started = Instant::now();
         {
             let handle_save = handle.clone();
             let nb_save = nb_id.clone();
@@ -2155,31 +3088,39 @@ pub async fn add_source_folder(
             })
             .await;
         }
+        let index_save_ms = index_save_started.elapsed().as_millis();
 
         // Notify frontend that batch ingestion is complete
-        let _ = handle.emit(
-            "sources:batch_ingestion_complete",
-            serde_json::json!({
-                "notebook_id": &nb_id,
-                "import_batch_id": &import_batch_id,
-                "notebook_epoch": notebook_epoch,
-                "status": "completed",
-                "found": found,
-                "created": total,
-                "ingested_ready": total
-                    .saturating_sub(failed + terminal_counts.failed)
-                    .saturating_sub(terminal_counts.skipped_unsupported)
-                    .saturating_sub(terminal_counts.cancelled_superseded),
-                "failed": failed + terminal_counts.failed,
-                "skipped_duplicate": skipped_duplicate,
-                "skipped_unsupported": terminal_counts.skipped_unsupported,
-                "cancelled_superseded": terminal_counts.cancelled_superseded,
-                "count": total
-                    .saturating_sub(failed + terminal_counts.failed)
-                    .saturating_sub(terminal_counts.skipped_unsupported)
-                    .saturating_sub(terminal_counts.cancelled_superseded),
-                "message": null,
-            }),
+        let ingested_ready = total
+            .saturating_sub(failed + terminal_counts.failed)
+            .saturating_sub(terminal_counts.skipped_unsupported)
+            .saturating_sub(terminal_counts.cancelled_superseded);
+        emit_import_batch_receipt(
+            &handle,
+            &nb_id,
+            &import_batch_id,
+            notebook_epoch,
+            "completed",
+            found,
+            total,
+            ingested_ready,
+            failed + terminal_counts.failed,
+            skipped_duplicate,
+            skipped_unsupported_scan + terminal_counts.skipped_unsupported,
+            terminal_counts.cancelled_superseded,
+            None,
+            Some(import_batch_performance_receipt(
+                ImportBatchPerformanceInput {
+                    elapsed_ms: import_started.elapsed().as_millis(),
+                    scan_ms,
+                    source_create_ms,
+                    ingestion_ms,
+                    index_save_ms,
+                    found,
+                    created: total,
+                    ingested_ready,
+                },
+            )),
         );
         emit_folder_scan_event(
             &handle,
@@ -2234,11 +3175,165 @@ pub async fn add_source_paste(
         processing_state: None,
     };
 
-    state.with_notebook_db(&notebook_id, |db| db.insert_source(&source))?;
+    state.with_notebook_db_write(&notebook_id, |db| db.insert_source(&source))?;
     sync_notebook_source_count(&state, &notebook_id)?;
     invalidate_suggested_questions(&state, &notebook_id);
 
     // Spawn chunking + embedding + summary in background
+    let nb = notebook_id.clone();
+    let src = source_id.clone();
+    let q = Arc::clone(&queue);
+    let handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let state = handle.state::<AppState>();
+            run_ingestion(&nb, &src, &state, &handle, &q);
+        })
+        .await;
+    });
+
+    Ok(source_id)
+}
+
+#[tauri::command]
+pub async fn add_source_url(
+    notebook_id: String,
+    url: String,
+    network_consent: bool,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, GlossError> {
+    {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let _ = app_db.get_notebook(&notebook_id)?;
+    }
+
+    let fetched = fetch_url_source(&url, network_consent).await?;
+    let word_count = fetched.text.split_whitespace().count() as i32;
+    let source_id = uuid::Uuid::new_v4().to_string();
+    let metadata = serde_json::json!({
+        "schema": "UrlImportMetadataV1",
+        "receipt": fetched.receipt,
+    })
+    .to_string();
+
+    let existing = state.with_notebook_db(&notebook_id, |db| {
+        db.source_exists_by_hash(&fetched.body_sha256)
+    })?;
+    if existing {
+        return Err(GlossError::Ingestion {
+            source_id: String::new(),
+            message: "duplicate".to_string(),
+        });
+    }
+
+    let source = Source {
+        id: source_id.clone(),
+        source_type: "url".to_string(),
+        title: fetched.title,
+        original_filename: None,
+        file_hash: Some(fetched.body_sha256),
+        url: Some(fetched.final_url),
+        file_path: None,
+        content_text: Some(fetched.text),
+        word_count: Some(word_count),
+        metadata: Some(metadata),
+        summary: None,
+        summary_model: None,
+        status: "pending".to_string(),
+        error_message: None,
+        selected: true,
+        created_at: String::new(),
+        updated_at: String::new(),
+        processing_state: None,
+    };
+
+    state.with_notebook_db_write(&notebook_id, |db| db.insert_source(&source))?;
+    sync_notebook_source_count(&state, &notebook_id)?;
+    invalidate_suggested_questions(&state, &notebook_id);
+
+    let nb = notebook_id.clone();
+    let src = source_id.clone();
+    let q = Arc::clone(&queue);
+    let handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let state = handle.state::<AppState>();
+            run_ingestion(&nb, &src, &state, &handle, &q);
+        })
+        .await;
+    });
+
+    Ok(source_id)
+}
+
+#[tauri::command]
+pub async fn add_source_youtube_transcript(
+    notebook_id: String,
+    url: String,
+    language: Option<String>,
+    network_consent: bool,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, GlossError> {
+    {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let _ = app_db.get_notebook(&notebook_id)?;
+    }
+
+    let fetched =
+        fetch_youtube_transcript_source(&url, language.as_deref(), network_consent).await?;
+    let word_count = fetched.text.split_whitespace().count() as i32;
+    let source_id = uuid::Uuid::new_v4().to_string();
+    let metadata = serde_json::json!({
+        "schema": "YouTubeTranscriptMetadataV1",
+        "receipt": fetched.receipt,
+    })
+    .to_string();
+
+    let existing = state.with_notebook_db(&notebook_id, |db| {
+        db.source_exists_by_hash(&fetched.transcript_sha256)
+    })?;
+    if existing {
+        return Err(GlossError::Ingestion {
+            source_id: String::new(),
+            message: "duplicate".to_string(),
+        });
+    }
+
+    let source = Source {
+        id: source_id.clone(),
+        source_type: "youtube".to_string(),
+        title: fetched.title,
+        original_filename: None,
+        file_hash: Some(fetched.transcript_sha256),
+        url: Some(fetched.watch_url),
+        file_path: None,
+        content_text: Some(fetched.text),
+        word_count: Some(word_count),
+        metadata: Some(metadata),
+        summary: None,
+        summary_model: None,
+        status: "pending".to_string(),
+        error_message: None,
+        selected: true,
+        created_at: String::new(),
+        updated_at: String::new(),
+        processing_state: None,
+    };
+
+    state.with_notebook_db_write(&notebook_id, |db| db.insert_source(&source))?;
+    sync_notebook_source_count(&state, &notebook_id)?;
+    invalidate_suggested_questions(&state, &notebook_id);
+
     let nb = notebook_id.clone();
     let src = source_id.clone();
     let q = Arc::clone(&queue);
@@ -2296,7 +3391,7 @@ pub async fn delete_source(
                 let mut removed = 0usize;
                 for embedding_id in &old_embedding_ids {
                     match index.remove(*embedding_id) {
-                        Ok(()) => removed += 1,
+                        Ok(_) => removed += 1,
                         Err(e) => tracing::warn!(
                             notebook_id,
                             source_id,
@@ -2324,8 +3419,8 @@ pub async fn delete_source(
         }
     }
 
-    state.with_notebook_db(&notebook_id, |db| {
-        db.conn.execute(
+    state.with_notebook_db_write(&notebook_id, |db| {
+        db.conn().execute(
             "UPDATE semantic_memory_links
              SET sync_status = 'stale',
                  sync_error = 'Gloss source deleted',
@@ -2339,48 +3434,105 @@ pub async fn delete_source(
     invalidate_suggested_questions(&state, &notebook_id);
 
     if let Some(file_path) = source.file_path.as_deref() {
-        let source_file = notebook_dir.join("sources").join(file_path);
-        if source_file.exists() {
-            if let Err(e) = std::fs::remove_file(&source_file) {
+        let sources_dir = notebook_dir.join("sources");
+        match crate::redaction::safe_join_under(&sources_dir, file_path) {
+            Ok(source_file) if source_file.exists() => {
+                if let Err(e) = std::fs::remove_file(&source_file) {
+                    tracing::warn!(
+                        notebook_id,
+                        source_id,
+                        path = %redact_path(&source_file),
+                        error = %e,
+                        "Failed to remove deleted source file from disk"
+                    );
+                }
+            }
+            // Path is malicious (escapes sources dir) — log and skip.
+            Err(e) => {
                 tracing::warn!(
                     notebook_id,
                     source_id,
-                    path = %source_file.display(),
+                    file_path = %file_path,
                     error = %e,
-                    "Failed to remove deleted source file from disk"
+                    "Skipping unlink: file_path fails sources-dir safety check"
                 );
             }
+            // File not present on disk — nothing to clean up.
+            Ok(_) => {}
         }
     }
 
     Ok(())
 }
 
-#[tauri::command]
-pub async fn delete_sources(
-    notebook_id: String,
-    source_ids: Vec<String>,
-    state: State<'_, AppState>,
-    queue: State<'_, Arc<QueueManager>>,
-) -> Result<(), GlossError> {
+fn failed_import_source_ids(
+    state: &AppState,
+    notebook_id: &str,
+) -> Result<Vec<String>, GlossError> {
+    state.with_notebook_db(notebook_id, |db| {
+        let mut stmt = db.conn().prepare(
+            "SELECT id FROM sources WHERE status = 'error' ORDER BY updated_at DESC, id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(GlossError::Database)
+    })
+}
+
+fn quarantine_failed_import_source_rows(
+    state: &AppState,
+    notebook_id: &str,
+) -> Result<usize, GlossError> {
+    state.with_notebook_db_write(notebook_id, |db| {
+        let updated = db.conn().execute(
+            "UPDATE sources
+             SET selected = 0,
+                 updated_at = datetime('now')
+             WHERE status = 'error' AND selected = 1",
+            [],
+        )?;
+        db.conn().execute(
+            "INSERT INTO source_processing_state (
+                source_id, lifecycle_status, last_error, updated_at
+             )
+             SELECT id, 'quarantined_failed_import', error_message, datetime('now')
+             FROM sources
+             WHERE status = 'error'
+             ON CONFLICT(source_id) DO UPDATE SET
+                lifecycle_status = excluded.lifecycle_status,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at",
+            [],
+        )?;
+        Ok(updated)
+    })
+}
+
+fn delete_source_ids_for_notebook(
+    notebook_id: &str,
+    source_ids: &[String],
+    state: &AppState,
+    queue: &Arc<QueueManager>,
+) -> Result<u32, GlossError> {
     let notebook_dir = {
         let app_db = state
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        let notebook = app_db.get_notebook(&notebook_id)?;
+        let notebook = app_db.get_notebook(notebook_id)?;
         PathBuf::from(notebook.directory)
     };
 
-    for source_id in &source_ids {
-        let source = state.with_notebook_db(&notebook_id, |db| db.get_source(source_id))?;
-        let old_embedding_ids = state.with_notebook_db(&notebook_id, |db| {
-            db.get_embedding_ids_for_source(source_id)
-        })?;
+    let mut cancelled_jobs = 0u32;
+    for source_id in source_ids {
+        let source = state.with_notebook_db(notebook_id, |db| db.get_source(source_id))?;
+        let old_embedding_ids =
+            state.with_notebook_db(notebook_id, |db| db.get_embedding_ids_for_source(source_id))?;
 
-        let cancelled = jobs::cancel_jobs_matching(&queue, |job, _status| {
+        let cancelled = jobs::cancel_jobs_matching(queue, |job, _status| {
             job.notebook_id() == notebook_id && job.source_id() == source_id
         });
+        cancelled_jobs += cancelled;
         if cancelled > 0 {
             tracing::info!(
                 notebook_id,
@@ -2395,7 +3547,7 @@ pub async fn delete_sources(
                 .hnsw_indices
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
-            if let Some(index) = indices.get_mut(&notebook_id) {
+            if let Some(index) = indices.get_mut(notebook_id) {
                 for embedding_id in &old_embedding_ids {
                     if let Err(e) = index.remove(*embedding_id) {
                         tracing::warn!(
@@ -2410,8 +3562,8 @@ pub async fn delete_sources(
             }
         }
 
-        state.with_notebook_db(&notebook_id, |db| {
-            db.conn.execute(
+        state.with_notebook_db_write(notebook_id, |db| {
+            db.conn().execute(
                 "UPDATE semantic_memory_links
                  SET sync_status = 'stale',
                      sync_error = 'Gloss source deleted',
@@ -2423,34 +3575,107 @@ pub async fn delete_sources(
         })?;
 
         if let Some(file_path) = source.file_path.as_deref() {
-            let source_file = notebook_dir.join("sources").join(file_path);
-            if source_file.exists() {
-                if let Err(e) = std::fs::remove_file(&source_file) {
+            let sources_dir = notebook_dir.join("sources");
+            match crate::redaction::safe_join_under(&sources_dir, file_path) {
+                Ok(source_file) if source_file.exists() => {
+                    if let Err(e) = std::fs::remove_file(&source_file) {
+                        tracing::warn!(
+                            notebook_id,
+                            source_id,
+                            path = %redact_path(&source_file),
+                            error = %e,
+                            "Failed to remove deleted source file from disk"
+                        );
+                    }
+                }
+                // Path is malicious (escapes sources dir) — log and skip.
+                Err(e) => {
                     tracing::warn!(
                         notebook_id,
                         source_id,
-                        path = %source_file.display(),
+                        file_path = %file_path,
                         error = %e,
-                        "Failed to remove deleted source file from disk"
+                        "Skipping unlink: file_path fails sources-dir safety check"
                     );
                 }
+                // File not present on disk — nothing to clean up.
+                Ok(_) => {}
             }
         }
     }
 
     if !source_ids.is_empty() {
-        if let Err(e) = state.save_hnsw_index(&notebook_id) {
+        if let Err(e) = state.save_hnsw_index(notebook_id) {
             tracing::warn!(
                 notebook_id,
                 error = %e,
                 "Failed to persist HNSW index after bulk source deletion"
             );
         }
-        sync_notebook_source_count(&state, &notebook_id)?;
-        invalidate_suggested_questions(&state, &notebook_id);
+        sync_notebook_source_count(state, notebook_id)?;
+        invalidate_suggested_questions(state, notebook_id);
     }
 
+    Ok(cancelled_jobs)
+}
+
+#[tauri::command]
+pub async fn delete_sources(
+    notebook_id: String,
+    source_ids: Vec<String>,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+) -> Result<(), GlossError> {
+    delete_source_ids_for_notebook(&notebook_id, &source_ids, &state, &queue)?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn quarantine_failed_imports(
+    notebook_id: String,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+) -> Result<FailedImportQuarantineReceipt, GlossError> {
+    let failed_ids = failed_import_source_ids(&state, &notebook_id)?;
+    let cancelled = jobs::cancel_jobs_matching(&queue, |job, _status| {
+        job.notebook_id() == notebook_id && failed_ids.iter().any(|id| id == job.source_id())
+    });
+    let quarantined = quarantine_failed_import_source_rows(&state, &notebook_id)?;
+    invalidate_suggested_questions(&state, &notebook_id);
+    Ok(FailedImportQuarantineReceipt {
+        schema: "FailedImportQuarantineReceiptV1",
+        receipt_id: uuid::Uuid::new_v4().to_string(),
+        notebook_id,
+        action: "quarantine".to_string(),
+        failed_sources_before: failed_ids.len(),
+        affected_sources: failed_ids.len(),
+        quarantined_sources: quarantined,
+        deleted_sources: 0,
+        cancelled_queue_jobs: cancelled,
+        recorded_utc: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+#[tauri::command]
+pub async fn delete_failed_imports(
+    notebook_id: String,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+) -> Result<FailedImportQuarantineReceipt, GlossError> {
+    let failed_ids = failed_import_source_ids(&state, &notebook_id)?;
+    let cancelled = delete_source_ids_for_notebook(&notebook_id, &failed_ids, &state, &queue)?;
+    Ok(FailedImportQuarantineReceipt {
+        schema: "FailedImportQuarantineReceiptV1",
+        receipt_id: uuid::Uuid::new_v4().to_string(),
+        notebook_id,
+        action: "delete".to_string(),
+        failed_sources_before: failed_ids.len(),
+        affected_sources: failed_ids.len(),
+        quarantined_sources: 0,
+        deleted_sources: failed_ids.len(),
+        cancelled_queue_jobs: cancelled,
+        recorded_utc: chrono::Utc::now().to_rfc3339(),
+    })
 }
 
 #[tauri::command]
@@ -2493,7 +3718,7 @@ pub async fn retry_source_ingestion(
                 let mut removed = 0usize;
                 for eid in &old_embedding_ids {
                     match index.remove(*eid) {
-                        Ok(()) => removed += 1,
+                        Ok(_) => removed += 1,
                         Err(e) => tracing::warn!(
                             notebook_id,
                             source_id,
@@ -2524,7 +3749,7 @@ pub async fn retry_source_ingestion(
 
     // Reset status and delete old chunks
     let source_type = state.with_notebook_db(&notebook_id, |db| {
-        db.conn.execute(
+        db.conn().execute(
             "UPDATE semantic_memory_links
              SET sync_status = 'stale',
                  sync_error = 'Gloss source reingestion requested',
@@ -2548,6 +3773,10 @@ pub async fn retry_source_ingestion(
             }
         }
         "video" => match queue_describe_video_job(&queue, &state, &notebook_id, &source_id) {
+            Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
+            Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
+        },
+        "audio" => match queue_audio_metadata_job(&queue, &state, &notebook_id, &source_id) {
             Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
             Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
         },
@@ -2906,6 +4135,21 @@ fn link_status_for_notebook(
     notebook_id: &str,
 ) -> Result<SemanticMemoryLinkStatus, GlossError> {
     state.with_notebook_db(notebook_id, |db| {
+        // Guard: if the semantic_memory_links table doesn't exist (fresh DB, no SM config),
+        // return a safe empty status instead of crashing on the query.
+        if !db.table_exists("semantic_memory_links")? {
+            return Ok(SemanticMemoryLinkStatus {
+                notebook_id: notebook_id.to_string(),
+                total_links: 0,
+                synced_links: 0,
+                stale_links: 0,
+                failed_links: 0,
+                missing_document_links: 0,
+                degraded_links: 0,
+                reason_codes: vec!["semantic_memory_links_table_missing".to_string()],
+                last_sync_error: None,
+            });
+        }
         let (total, synced, stale, failed, missing_docs, last_error): (
             i64,
             i64,
@@ -2913,7 +4157,7 @@ fn link_status_for_notebook(
             i64,
             i64,
             Option<String>,
-        ) = db.conn.query_row(
+        ) = db.conn().query_row(
             "SELECT
                 COUNT(*),
                 SUM(CASE WHEN sync_status = 'synced' THEN 1 ELSE 0 END),
@@ -2984,6 +4228,29 @@ pub async fn memory_backend_status(
         .as_deref()
         .map(|id| link_status_for_notebook(&state, id))
         .transpose()?;
+    let embedding_index_metadata = notebook_id
+        .as_deref()
+        .map(|id| {
+            state.with_notebook_db(id, |db| {
+                db.list_embedding_index_metadata().map(|rows| {
+                    rows.into_iter()
+                        .map(|row| EmbeddingIndexStatusView {
+                            index_id: row.index_id,
+                            provider: row.provider,
+                            model: row.model,
+                            model_digest: row.model_digest,
+                            dimensions: row.dimensions,
+                            schema_version: row.schema_version,
+                            status: row.status,
+                            status_reason: row.status_reason,
+                            validated_at: row.validated_at,
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     let index_sync_status = link_status
         .as_ref()
@@ -3002,14 +4269,36 @@ pub async fn memory_backend_status(
         .to_string();
     let mut degradation_markers = Vec::new();
     let mut fallback_reason = None;
+    let mut fallback_reason_code = None;
     if requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
         && !semantic_memory_available
     {
         fallback_reason = Some("semantic-memory-flag-off".to_string());
+        fallback_reason_code = Some(RetrievalReasonCode::SemanticMemoryFeatureDisabled);
         degradation_markers.push("semantic_memory_feature_disabled".to_string());
     }
     if index_sync_status == "failed" || index_sync_status == "degraded" {
         degradation_markers.push(format!("semantic-memory-sync-{index_sync_status}"));
+    }
+    for metadata in &embedding_index_metadata {
+        if matches!(metadata.status.as_str(), "stale" | "blocked" | "unknown") {
+            degradation_markers.push(format!(
+                "embedding-index-{}-{}",
+                metadata.index_id, metadata.status
+            ));
+            fallback_reason.get_or_insert_with(|| {
+                metadata.status_reason.clone().unwrap_or_else(|| {
+                    format!(
+                        "embedding index {} is {}",
+                        metadata.index_id, metadata.status
+                    )
+                })
+            });
+            fallback_reason_code.get_or_insert(match metadata.status.as_str() {
+                "stale" => RetrievalReasonCode::EmbeddingIndexMetadataStale,
+                _ => RetrievalReasonCode::EmbeddingIndexMetadataUnknown,
+            });
+        }
     }
 
     let degraded = fallback_reason.is_some() || !degradation_markers.is_empty();
@@ -3034,8 +4323,10 @@ pub async fn memory_backend_status(
         last_retrieval_receipt_id: None,
         last_receipt_ref: None,
         fallback_reason: fallback_reason.clone(),
+        fallback_reason_code,
         degradation_markers,
         backend_version_or_digest: None,
+        embedding_index_metadata,
         degraded,
         diagnostic: fallback_reason,
     })
@@ -3291,8 +4582,7 @@ pub async fn semantic_memory_vector_artifact_status(
     })
 }
 
-#[tauri::command]
-pub async fn compare_memory_backends(
+async fn compare_memory_backends(
     notebook_id: String,
     query: String,
     source_scope: SourceScope,
@@ -3321,10 +4611,16 @@ pub async fn compare_memory_backends(
             app_db.get_setting("semantic_memory_embedding_url")?,
             app_db.get_setting("semantic_memory_embedding_model")?,
             app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+            crate::commands::chat::setting_is_enabled(
+                app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
+            ),
             features::turbo_quant_active(&app_db)?,
             crate::commands::chat::setting_is_enabled(
                 app_db
                     .get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
+            ),
+            crate::commands::chat::setting_is_enabled(
+                app_db.get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?,
             ),
         )
     };
@@ -3368,7 +4664,7 @@ mod tests {
     use crate::db::notebook_db::NotebookDb;
     use crate::provider_config_store::SecretStore;
     use crate::providers::ModelRegistry;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -3399,20 +4695,27 @@ mod tests {
         let state = AppState {
             app_db: Mutex::new(app_db),
             secret_store,
-            notebook_dbs: Mutex::new(HashMap::new()),
+            notebook_pools: crate::db::notebook_pool::NotebookDbPools::new(&data_dir),
             model_registry: Mutex::new(model_registry),
             data_dir,
-            embedder: Mutex::new(None),
+            embedder: std::sync::RwLock::new(None),
+            query_embed_cache: Mutex::new(crate::state::QueryEmbedCache::default()),
+            query_embed_cache_model: Mutex::new(None),
             hnsw_indices: Mutex::new(HashMap::new()),
+            hnsw_index_dims: Mutex::new(HashMap::new()),
             summary_paused: AtomicBool::new(true),
             ingestion_active: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             llm_gate: tokio::sync::Semaphore::new(1),
             gpu_gate: tokio::sync::Semaphore::new(1),
             gate_owners: Mutex::new(HashMap::new()),
+            active_chat_attempts: Mutex::new(HashMap::new()),
+            active_studio_attempts: Mutex::new(HashMap::new()),
             active_notebook_id: Mutex::new(Some(notebook_id.clone())),
             active_epoch: AtomicU64::new(1),
             chat_grace_until: Mutex::new(0),
             last_user_activity: Mutex::new(0),
+            chat_stream_events: Mutex::new(VecDeque::new()),
+            chat_stream_next_seq: AtomicU64::new(1),
         };
 
         (dir, state, notebook_id)
@@ -3460,7 +4763,7 @@ mod tests {
         app_db.set_setting("default_model", "gpt-4o-mini").unwrap();
         app_db.set_setting("default_provider", "openai").unwrap();
         app_db
-            .update_provider("openai", true, Some("https://api.openai.com/v1"), None)
+            .update_provider("openai", true, Some("https://api.openai.com/v1"))
             .unwrap();
         app_db
             .replace_models(
@@ -3516,7 +4819,7 @@ mod tests {
     fn auto_queue_reports_zero_when_background_config_is_invalid() {
         let (dir, state, notebook_id) = build_state();
         state
-            .with_notebook_db(&notebook_id, |db| db.insert_source(&ready_source("s1")))
+            .with_notebook_db_write(&notebook_id, |db| db.insert_source(&ready_source("s1")))
             .unwrap();
 
         {
@@ -3524,7 +4827,7 @@ mod tests {
             app_db.set_setting("default_model", "gpt-4o-mini").unwrap();
             app_db.set_setting("default_provider", "openai").unwrap();
             app_db
-                .update_provider("openai", true, Some("https://api.openai.com/v1"), None)
+                .update_provider("openai", true, Some("https://api.openai.com/v1"))
                 .unwrap();
             app_db
                 .replace_models(
@@ -3586,6 +4889,163 @@ mod tests {
                 cancelled_superseded: 1,
             }
         );
+    }
+
+    #[test]
+    fn import_batch_timing_receipt_records_throughput() {
+        let receipt = import_batch_performance_receipt(ImportBatchPerformanceInput {
+            elapsed_ms: 2_000,
+            scan_ms: 100,
+            source_create_ms: 300,
+            ingestion_ms: 1_500,
+            index_save_ms: 100,
+            found: 10,
+            created: 8,
+            ingested_ready: 6,
+        });
+
+        assert_eq!(receipt.schema, "ImportBatchPerformanceReceiptV1");
+        assert_eq!(receipt.elapsed_ms, 2_000);
+        assert_eq!(receipt.scan_ms, 100);
+        assert_eq!(receipt.source_create_ms, 300);
+        assert_eq!(receipt.ingestion_ms, 1_500);
+        assert_eq!(receipt.index_save_ms, 100);
+        assert_eq!(receipt.found_per_second, 5.0);
+        assert_eq!(receipt.created_per_second, 4.0);
+        assert_eq!(receipt.ingested_ready_per_second, 3.0);
+    }
+
+    #[test]
+    fn failed_import_quarantine_receipt_shape_is_stable() {
+        let receipt = FailedImportQuarantineReceipt {
+            schema: "FailedImportQuarantineReceiptV1",
+            receipt_id: "r1".to_string(),
+            notebook_id: "nb1".to_string(),
+            action: "quarantine".to_string(),
+            failed_sources_before: 2,
+            affected_sources: 2,
+            quarantined_sources: 2,
+            deleted_sources: 0,
+            cancelled_queue_jobs: 1,
+            recorded_utc: "2026-05-26T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(receipt.schema, "FailedImportQuarantineReceiptV1");
+        assert_eq!(receipt.action, "quarantine");
+        assert_eq!(receipt.quarantined_sources, 2);
+        assert_eq!(receipt.cancelled_queue_jobs, 1);
+    }
+
+    #[test]
+    fn failed_import_quarantine_updates_source_selection_and_lifecycle() {
+        let (_dir, state, notebook_id) = build_state();
+        let mut failed = ready_source("failed");
+        failed.status = "error".to_string();
+        failed.error_message = Some("strict boundary failed".to_string());
+        state
+            .with_notebook_db_write(&notebook_id, |db| db.insert_source(&failed))
+            .unwrap();
+
+        let failed_ids = failed_import_source_ids(&state, &notebook_id).unwrap();
+        assert_eq!(failed_ids, vec!["failed".to_string()]);
+        let quarantined = quarantine_failed_import_source_rows(&state, &notebook_id).unwrap();
+        assert_eq!(quarantined, 1);
+
+        let source = state
+            .with_notebook_db(&notebook_id, |db| db.get_source("failed"))
+            .unwrap();
+        assert_eq!(source.status, "error");
+        assert!(!source.selected);
+        assert_eq!(
+            source.processing_state.unwrap().lifecycle_status,
+            "quarantined_failed_import"
+        );
+    }
+
+    #[test]
+    fn url_import_requires_consent_and_public_http_boundary() {
+        let no_consent = canonical_url_for_fetch("https://example.com/article", false).unwrap_err();
+        assert!(no_consent
+            .to_string()
+            .contains("explicit per-import network consent"));
+
+        let embedded_secret =
+            canonical_url_for_fetch("https://user:pass@example.com/article", true).unwrap_err();
+        assert!(embedded_secret.to_string().contains("embedded credentials"));
+
+        let localhost = canonical_url_for_fetch("http://localhost:8080/article", true).unwrap_err();
+        assert!(localhost.to_string().contains("localhost"));
+
+        let private_ip = canonical_url_for_fetch("http://192.168.1.5/article", true).unwrap_err();
+        assert!(private_ip.to_string().contains("private"));
+
+        let parsed = canonical_url_for_fetch("https://example.com/article#frag", true).unwrap();
+        assert_eq!(parsed.as_str(), "https://example.com/article");
+    }
+
+    #[test]
+    fn url_import_extracts_bounded_readable_html_text() {
+        let html = r#"
+            <html>
+              <head><title>Alpha &amp; Beta</title><style>.x{display:none}</style></head>
+              <body><h1>Visible title</h1><script>secret()</script><p>Gamma&nbsp;text</p></body>
+            </html>
+        "#;
+        let text = html_to_readable_text(html);
+        assert_eq!(html_title(html).as_deref(), Some("Alpha & Beta"));
+        assert!(text.contains("Visible title"));
+        assert!(text.contains("Gamma text"));
+        assert!(!text.contains("secret"));
+        assert!(content_type_is_textual("text/html; charset=utf-8"));
+        assert!(!content_type_is_textual("image/png"));
+    }
+
+    #[test]
+    fn youtube_transcript_parses_strict_url_and_caption_track() {
+        let (watch, video_id) =
+            canonical_youtube_watch_url("https://youtu.be/abcDEF123_4?t=9", true).unwrap();
+        assert_eq!(video_id, "abcDEF123_4");
+        assert_eq!(
+            watch.as_str(),
+            "https://www.youtube.com/watch?v=abcDEF123_4"
+        );
+
+        let invalid_host =
+            canonical_youtube_watch_url("https://example.com/watch?v=abcDEF123_4", true)
+                .unwrap_err();
+        assert!(invalid_host.to_string().contains("only accepts"));
+
+        let html = r#"
+          <html><head><title>Clip &amp; Notes</title></head><body>
+          <script>
+          var ytInitialPlayerResponse = {"captions":{"playerCaptionsTracklistRenderer":{"captionTracks":[
+            {"baseUrl":"https://www.youtube.com/api/timedtext?v=abcDEF123_4&lang=es","languageCode":"es"},
+            {"baseUrl":"https://www.youtube.com/api/timedtext?v=abcDEF123_4&lang=en","languageCode":"en"}
+          ]}}};
+          </script></body></html>
+        "#;
+        let (base_url, language) = youtube_caption_base_url(html, "en").unwrap();
+        assert_eq!(language, "en");
+        assert!(base_url.contains("lang=en"));
+        assert_eq!(html_title(html).as_deref(), Some("Clip & Notes"));
+    }
+
+    #[test]
+    fn youtube_transcript_json3_formats_timestamped_text_and_spans() {
+        let raw = r#"{
+          "events": [
+            {"tStartMs": 12000, "dDurationMs": 2100, "segs": [{"utf8": "Hello "}, {"utf8": "world"}]},
+            {"tStartMs": 65000, "dDurationMs": 1000, "segs": [{"utf8": "Second &amp; line"}]},
+            {"tStartMs": 90000, "dDurationMs": 1000}
+          ]
+        }"#;
+        let segments = json3_transcript_segments(raw).unwrap();
+        assert_eq!(segments.len(), 2);
+        let (text, spans) = transcript_text_and_spans("Example", "en", &segments).unwrap();
+        assert!(text.contains("[00:12] Hello world"));
+        assert!(text.contains("[01:05] Second & line"));
+        assert_eq!(spans[0].start_ms, 12000);
+        assert_eq!(spans[0].end_ms, 14100);
     }
 
     #[test]

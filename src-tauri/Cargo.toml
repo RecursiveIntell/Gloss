@@ -11,10 +11,8 @@ name = "gloss_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-# Release/default builds compile semantic-memory and TurboQuant candidate
-# artifacts. Runtime settings still keep Gloss local as the default unless the
-# user enables the preview profile.
-default = ["semantic-memory-turbo-quant"]
+# semantic-memory is always compiled and is the only backend. No preview toggle.
+default = ["semantic-memory-backend", "semantic-memory-turbo-quant"]
 semantic-memory-backend = ["dep:semantic-memory"]
 semantic-memory-turbo-quant = [
     "semantic-memory-backend",
@@ -25,20 +23,24 @@ semantic-memory-turbo-quant = [
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+log = "0.4"
 # === Canonical Libraries crates ===
-llm-pipeline = { path = "../../Libraries/llm-pipeline" }
-tauri-queue = { path = "../../Libraries/tauri-queue" }
+# llm-pipeline 0.2.0 is published on crates.io, but vendored source is kept
+# for controlled updates and offline builds. llm-output-parser and
+# llm-tool-runtime are also vendored.
+llm-pipeline = { path = "vendor/llm-pipeline" }
+tauri-queue = "=0.3.0"
 
 # === Tauri ===
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
-tauri-plugin-clipboard-manager = "2"
 tauri-plugin-opener = "2"
 
 # === Async ===
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 futures = "0.3"
 
 # === Serialization ===
@@ -47,24 +49,31 @@ serde_json = "1"
 toml = "0.8"
 
 # === HTTP (for Ollama provider) ===
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "blocking"] }
 
 # === Embeddings + Reranking ===
-fastembed = "4"
+fastembed = { version = "5", default-features = false, features = ["hf-hub-native-tls", "nomic-v2-moe", "ort-download-binaries-native-tls"] }
+candle-core = "0.10"
 
 # === Vector search ===
-usearch = "2"
-semantic-memory = { path = "../../Libraries/semantic-memory", optional = true }
+usearch = "2.25"
+semantic-memory = { version = "=0.5.11", optional = true }
 
 # === Database ===
 rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
 
 # === Text processing ===
 unicode-segmentation = "1"
+quick-xml = "0.41"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+pdf-extract = "0.12"
+wait-timeout = "0.2"
 
 # === Utilities ===
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+flate2 = "1.1"
+tar = "0.4.45"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -75,6 +84,7 @@ async-trait = "0.1"
 regex = "1"
 base64 = "0.22"
 aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

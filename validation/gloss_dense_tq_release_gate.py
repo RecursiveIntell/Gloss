@@ -12,7 +12,15 @@ import re
 import sys
 from pathlib import Path
 
-RUN_ID = "GLOSS_P36_RELEASE_COMPLETION_DENSE_TQ_RELEASE_20260525"
+def current_run(repo: Path) -> str | None:
+    try:
+        text = (repo / "docs/codex-runs/CURRENT_RUN.md").read_text(errors="ignore")
+        match = re.search(r"Current run:\s*`?([^`\n]+)`?", text)
+        return match.group(1).strip() if match else None
+    except Exception:
+        return None
+
+RUN_ID = current_run(Path(".").resolve()) or "GLOSS_P36_RELEASE_COMPLETION_DENSE_TQ_RELEASE_20260525"
 
 
 def read(path: Path) -> str:
@@ -27,9 +35,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=".")
     ap.add_argument("--require-live-evidence", action="store_true")
+    ap.add_argument("--run-id", default="CURRENT", help="Run ID or 'CURRENT' to use CURRENT_RUN.md")
     args = ap.parse_args()
     repo = Path(args.repo).resolve()
-    run_dir = repo / "docs" / "codex-runs" / RUN_ID
+    run_id = current_run(repo) if args.run_id == "CURRENT" else args.run_id
+    run_dir = repo / "docs" / "codex-runs" / (run_id or "__missing__")
     failures: list[str] = []
     warnings: list[str] = []
 

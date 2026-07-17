@@ -1,9 +1,13 @@
-use super::{ChatRequest, ChatToken, LlmProvider, ModelInfo, ProviderType};
+use super::{
+    provider_cancelled_error, provider_http_error, ChatRequest, ChatToken, LlmExecutionContext,
+    LlmProvider, ModelInfo, ProviderType,
+};
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
 use futures::StreamExt;
 use std::pin::Pin;
+use zeroize::Zeroize;
 
 /// OpenAI-compatible LLM provider (also works with OpenAI-compatible APIs).
 pub struct OpenAIProvider {
@@ -13,16 +17,18 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
-    pub fn new(base_url: &str, api_key: &str) -> Self {
+    pub fn new(base_url: &str, api_key: &str, client: reqwest::Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client,
         }
+    }
+}
+
+impl Drop for OpenAIProvider {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
     }
 }
 
@@ -78,7 +84,9 @@ impl LlmProvider for OpenAIProvider {
     async fn chat(
         &self,
         request: ChatRequest,
+        ctx: LlmExecutionContext,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatToken, GlossError>> + Send>>, GlossError> {
+        ctx.check_cancelled("openai", "before_request_build")?;
         let url = format!("{}/chat/completions", self.base_url);
 
         let mut messages = Vec::new();
@@ -101,46 +109,85 @@ impl LlmProvider for OpenAIProvider {
             "stream": request.stream,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
+            "top_p": request.top_p,
         });
 
-        let resp = self
+        ctx.check_cancelled("openai", "before_http_send")?;
+        let send = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
-            .send()
-            .await
-            .map_err(|e| GlossError::Provider {
+            .send();
+        let resp = tokio::select! {
+            _ = ctx.cancellation.cancelled() => {
+                return Err(provider_cancelled_error("openai", "waiting_for_response_headers", ctx.attempt_id.as_deref()));
+            }
+            result = send => result.map_err(|e| GlossError::Provider {
                 provider: "openai".into(),
                 source: e.into(),
-            })?;
+            })?
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(GlossError::Provider {
-                provider: "openai".into(),
-                source: anyhow::anyhow!("HTTP {}: {}", status, text),
-            });
+            // F3: bound the error body to ~1KB so a hostile / misconfigured
+            // server can't fill the logs with megabytes of HTML or stack
+            // traces. Use bytes (cheap) instead of text (allocates).
+            let text = {
+                match resp.bytes().await {
+                    Ok(b) => String::from_utf8_lossy(&b[..b.len().min(1024)]).to_string(),
+                    Err(_) => String::new(),
+                }
+            };
+            return Err(provider_http_error("openai", status, &text));
         }
 
         if request.stream {
             let byte_stream = resp.bytes_stream();
 
             let stream = stream::unfold(
-                (byte_stream, String::new()),
-                |(mut byte_stream, mut buffer)| async move {
+                (byte_stream, Vec::<u8>::new(), ctx.clone()),
+                |(mut byte_stream, mut buffer, ctx)| async move {
                     loop {
-                        match byte_stream.next().await {
+                        let next = tokio::select! {
+                            _ = ctx.cancellation.cancelled() => {
+                                return Some((
+                                    stream::iter(vec![Err(provider_cancelled_error("openai", "reading_stream_chunk", ctx.attempt_id.as_deref()))]),
+                                    (byte_stream, buffer, ctx),
+                                ));
+                            }
+                            next = byte_stream.next() => next,
+                        };
+                        match next {
                             Some(Ok(bytes)) => {
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                if ctx.is_cancelled() {
+                                    return Some((
+                                        stream::iter(vec![Err(provider_cancelled_error("openai", "before_yield_token", ctx.attempt_id.as_deref()))]),
+                                        (byte_stream, buffer, ctx),
+                                    ));
+                                }
+                                buffer.extend_from_slice(&bytes);
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
 
                                 // Process complete SSE lines
-                                while let Some(newline_pos) = buffer.find('\n') {
-                                    let line = buffer[..newline_pos].trim().to_string();
-                                    buffer = buffer[newline_pos + 1..].to_string();
+                                while let Some(newline_pos) =
+                                    buffer.iter().position(|&b| b == b'\n')
+                                {
+                                    // Copy the line out of the buffer first
+                                    // so we can drain the consumed bytes
+                                    // without holding an immutable borrow.
+                                    let owned: String =
+                                        match std::str::from_utf8(&buffer[..newline_pos]) {
+                                            Ok(s) => s.trim().to_string(),
+                                            Err(_) => {
+                                                buffer.drain(..=newline_pos);
+                                                continue;
+                                            }
+                                        };
+                                    buffer.drain(..=newline_pos);
+                                    let line = owned.as_str();
 
                                     if line.is_empty() || line.starts_with(':') {
                                         continue;
@@ -180,7 +227,13 @@ impl LlmProvider for OpenAIProvider {
                                 }
 
                                 if !tokens.is_empty() {
-                                    return Some((stream::iter(tokens), (byte_stream, buffer)));
+                                    if ctx.is_cancelled() {
+                                        return Some((
+                                            stream::iter(vec![Err(provider_cancelled_error("openai", "before_yield_token", ctx.attempt_id.as_deref()))]),
+                                            (byte_stream, buffer, ctx),
+                                        ));
+                                    }
+                                    return Some((stream::iter(tokens), (byte_stream, buffer, ctx)));
                                 }
                             }
                             Some(Err(e)) => {
@@ -189,7 +242,7 @@ impl LlmProvider for OpenAIProvider {
                                         provider: "openai".into(),
                                         source: e.into(),
                                     })]),
-                                    (byte_stream, buffer),
+                                    (byte_stream, buffer, ctx),
                                 ));
                             }
                             None => {
@@ -203,10 +256,16 @@ impl LlmProvider for OpenAIProvider {
 
             Ok(Box::pin(stream))
         } else {
-            let body: serde_json::Value = resp.json().await.map_err(|e| GlossError::Provider {
+            let body: serde_json::Value = tokio::select! {
+                _ = ctx.cancellation.cancelled() => {
+                    return Err(provider_cancelled_error("openai", "reading_non_stream_response", ctx.attempt_id.as_deref()));
+                }
+                result = resp.json() => result.map_err(|e| GlossError::Provider {
                 provider: "openai".into(),
                 source: e.into(),
-            })?;
+                })?
+            };
+            ctx.check_cancelled("openai", "before_terminal_frame")?;
 
             let content = body
                 .get("choices")
@@ -240,5 +299,19 @@ impl LlmProvider for OpenAIProvider {
 
     fn provider_type(&self) -> ProviderType {
         ProviderType::OpenAI
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenAIProvider;
+    use crate::providers::build_shared_client;
+
+    #[test]
+    fn shared_client_pool_reuses_connections() {
+        let client = build_shared_client();
+        let p1 = OpenAIProvider::new("http://x", "k", client.clone());
+        let p2 = OpenAIProvider::new("http://x", "k", client.clone());
+        let _ = (p1, p2);
     }
 }

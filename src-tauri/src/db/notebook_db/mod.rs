@@ -4,11 +4,12 @@ use crate::memory::types::RetrievalCoverage;
 use crate::retrieval::source_scope::ResolvedSourceScope;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Per-notebook database handle (notebook.db).
 pub struct NotebookDb {
-    pub conn: Connection,
+    conn: Connection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +70,80 @@ pub struct Chunk {
     pub embedding_model: Option<String>,
 }
 
+pub type ChunkSearchHit = (Chunk, f64);
+
+pub const EMBEDDING_INDEX_SCHEMA_VERSION: i32 = 1;
+pub const NATIVE_HNSW_INDEX_ID: &str = "native_hnsw";
+pub const SEMANTIC_MEMORY_INDEX_ID: &str = "semantic_memory";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingIndexMetadata {
+    pub index_id: String,
+    pub provider: String,
+    pub model: String,
+    pub model_digest: Option<String>,
+    pub dimensions: Option<usize>,
+    pub schema_version: i32,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub created_at: Option<String>,
+    pub validated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingIndexMetadataStatus {
+    Unknown,
+    Building,
+    Ready,
+    Stale,
+    Blocked,
+}
+
+impl EmbeddingIndexMetadataStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Building => "building",
+            Self::Ready => "ready",
+            Self::Stale => "stale",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+impl EmbeddingIndexMetadata {
+    pub fn ready(
+        index_id: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        model_digest: Option<String>,
+        dimensions: usize,
+    ) -> Self {
+        Self {
+            index_id: index_id.into(),
+            provider: provider.into(),
+            model: model.into(),
+            model_digest,
+            dimensions: Some(dimensions),
+            schema_version: EMBEDDING_INDEX_SCHEMA_VERSION,
+            status: EmbeddingIndexMetadataStatus::Ready.as_str().to_string(),
+            status_reason: None,
+            created_at: None,
+            validated_at: None,
+        }
+    }
+
+    pub fn identity_matches(&self, expected: &EmbeddingIndexMetadata) -> bool {
+        self.provider == expected.provider
+            && self.model == expected.model
+            && self.model_digest == expected.model_digest
+            && self.dimensions == expected.dimensions
+            && self.schema_version == expected.schema_version
+            && self.status == EmbeddingIndexMetadataStatus::Ready.as_str()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: String,
@@ -90,6 +165,25 @@ pub struct Message {
     pub tokens_prompt: Option<i32>,
     pub tokens_response: Option<i32>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatAttemptStatus {
+    pub attempt_id: String,
+    pub notebook_id: String,
+    pub conversation_id: String,
+    pub assistant_message_id: String,
+    pub user_message_id: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub status: String,
+    pub phase: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub request_digest: Option<String>,
+    pub response_digest: Option<String>,
+    pub partial_policy: Option<String>,
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +303,23 @@ fn source_processing_state_from_row(
     })
 }
 
+fn studio_output_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StudioOutput> {
+    Ok(StudioOutput {
+        id: row.get(0)?,
+        output_type: row.get(1)?,
+        title: row.get(2)?,
+        prompt_used: row.get(3)?,
+        raw_content: row.get(4)?,
+        config: row.get(5)?,
+        source_ids: row.get(6)?,
+        file_path: row.get(7)?,
+        status: row.get(8)?,
+        error_message: row.get(9)?,
+        prose_content: row.get(10)?,
+        created_at: row.get(11)?,
+    })
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudioOutput {
@@ -222,11 +333,40 @@ pub struct StudioOutput {
     pub file_path: Option<String>,
     pub status: String,
     pub error_message: Option<String>,
+    pub prose_content: Option<String>,
     pub created_at: String,
 }
 
 #[allow(dead_code)]
 impl NotebookDb {
+    /// Provide read-only access to the underlying connection.
+    ///
+    /// This is the only sanctioned way for callers outside `db::notebook_db`
+    /// to reach the `rusqlite::Connection`.  The field itself is private
+    /// to prevent accidental direct mutation or schema changes.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Wrap an already-opened `Connection` as a `NotebookDb` reference.
+    ///
+    /// Used by the connection pool to vend `NotebookDb` handles from
+    /// pooled connections without re-opening the file.
+    ///
+    /// # Safety
+    ///
+    /// `NotebookDb` is a single-field newtype around `Connection`.  The two
+    /// types have compatible layouts, so casting `&Connection` → `&NotebookDb`
+    /// is sound.  The returned reference borrows the input reference and
+    /// therefore cannot outlive it.
+    pub fn from_conn_ref(conn: &Connection) -> &Self {
+        // SAFETY: `NotebookDb` is `#[repr(C)]`-compatible with a single
+        // `Connection` field.  A reference to the field is therefore also a
+        // valid reference to the whole struct.  The lifetime is tied to the
+        // input reference, so no dangling can occur.
+        unsafe { &*(conn as *const Connection as *const NotebookDb) }
+    }
+
     /// Connect to an existing per-notebook database with runtime pragmas.
     pub fn connect(path: &Path) -> Result<Self, GlossError> {
         let conn = Connection::open(path)?;
@@ -237,7 +377,7 @@ impl NotebookDb {
     /// Open (or create) a per-notebook database and run migrations.
     pub fn open(path: &Path) -> Result<Self, GlossError> {
         let db = Self::connect(path)?;
-        migrations::migrate_notebook_db(&db.conn)?;
+        migrations::migrate_notebook_db(db.conn())?;
         Ok(db)
     }
 
@@ -371,6 +511,20 @@ impl NotebookDb {
         Ok(())
     }
 
+    /// Update source metadata after receipt-bearing enrichment.
+    pub fn update_source_metadata(
+        &self,
+        source_id: &str,
+        metadata: Option<&str>,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "UPDATE sources SET metadata = ?1, updated_at = datetime('now')
+             WHERE id = ?2",
+            rusqlite::params![metadata, source_id],
+        )?;
+        Ok(())
+    }
+
     /// Update source summary.
     pub fn update_source_summary(
         &self,
@@ -451,6 +605,73 @@ impl NotebookDb {
             })
     }
 
+    /// Batch fetch sources. Returns a map keyed by source id. Sources that are
+    /// missing from the DB are simply absent from the map (caller handles miss).
+    pub fn get_sources(&self, source_ids: &[&str]) -> Result<HashMap<String, Source>, GlossError> {
+        if source_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders: Vec<String> = (0..source_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT sources.id, sources.source_type, sources.title, sources.original_filename,
+                    sources.file_hash, sources.url, sources.file_path,
+                    sources.content_text, sources.word_count, sources.metadata,
+                    sources.summary, sources.summary_model,
+                    sources.status, sources.error_message, sources.selected,
+                    sources.created_at, sources.updated_at,
+                    COALESCE(ps.source_id, sources.id),
+                    COALESCE(ps.lifecycle_status, sources.status),
+                    COALESCE(ps.summary_status, CASE WHEN sources.summary IS NULL OR trim(sources.summary) = '' THEN 'missing' ELSE 'ready' END),
+                    COALESCE(ps.fts_index_status, 'missing'),
+                    COALESCE(ps.dense_index_status, 'missing'),
+                    COALESCE(ps.semantic_projection_status, 'disabled'),
+                    ps.last_summary_receipt_id,
+                    ps.last_dense_index_receipt_id,
+                    ps.last_projection_receipt_id,
+                    COALESCE(ps.last_error, sources.error_message),
+                    COALESCE(ps.updated_at, sources.updated_at)
+             FROM sources
+             LEFT JOIN source_processing_state ps ON ps.source_id = sources.id
+             WHERE sources.id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = source_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(Source {
+                id: row.get(0)?,
+                source_type: row.get(1)?,
+                title: row.get(2)?,
+                original_filename: row.get(3)?,
+                file_hash: row.get(4)?,
+                url: row.get(5)?,
+                file_path: row.get(6)?,
+                content_text: row.get(7)?,
+                word_count: row.get(8)?,
+                metadata: row.get(9)?,
+                summary: row.get(10)?,
+                summary_model: row.get(11)?,
+                status: row.get(12)?,
+                error_message: row.get(13)?,
+                selected: row.get(14)?,
+                created_at: row.get(15)?,
+                updated_at: row.get(16)?,
+                processing_state: Some(source_processing_state_from_row(row, 17)?),
+            })
+        })?;
+        let mut sources = HashMap::new();
+        for row in rows {
+            let source = row?;
+            sources.insert(source.id.clone(), source);
+        }
+        Ok(sources)
+    }
+
     /// Delete a source and its chunks (cascade).
     pub fn delete_source(&self, source_id: &str) -> Result<(), GlossError> {
         self.conn
@@ -459,10 +680,14 @@ impl NotebookDb {
     }
 
     /// Persist the exact set of selected sources for this notebook.
+    /// Wrapped in a transaction so a crash between unselect-all and re-select
+    /// cannot leave all sources unselected.
     pub fn set_selected_sources(&self, selected_ids: &[String]) -> Result<(), GlossError> {
-        self.conn.execute("UPDATE sources SET selected = 0", [])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE sources SET selected = 0", [])?;
 
         if selected_ids.is_empty() {
+            tx.commit()?;
             return Ok(());
         }
 
@@ -477,7 +702,8 @@ impl NotebookDb {
             .iter()
             .map(|id| id as &dyn rusqlite::types::ToSql)
             .collect();
-        self.conn.execute(&sql, params.as_slice())?;
+        tx.execute(&sql, params.as_slice())?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -649,6 +875,58 @@ impl NotebookDb {
         Ok(chunks)
     }
 
+    /// Batch fetch chunks for multiple sources. Returns a map keyed by source id to
+    /// `Vec<Chunk>`, with empty vectors when a source has no chunks.
+    pub fn get_chunks_for_sources(
+        &self,
+        source_ids: &[&str],
+    ) -> Result<HashMap<String, Vec<Chunk>>, GlossError> {
+        let mut chunks_by_source: HashMap<String, Vec<Chunk>> = source_ids
+            .iter()
+            .map(|source_id| (source_id.to_string(), Vec::new()))
+            .collect();
+        if source_ids.is_empty() {
+            return Ok(chunks_by_source);
+        }
+
+        let placeholders: Vec<String> = (0..source_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT id, source_id, chunk_index, content, token_count, start_offset, end_offset,
+                    metadata, embedding_id, embedding_model
+             FROM chunks WHERE source_id IN ({}) ORDER BY source_id, chunk_index",
+            placeholders.join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = source_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(Chunk {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                chunk_index: row.get(2)?,
+                content: row.get(3)?,
+                token_count: row.get(4)?,
+                start_offset: row.get(5)?,
+                end_offset: row.get(6)?,
+                metadata: row.get(7)?,
+                embedding_id: row.get(8)?,
+                embedding_model: row.get(9)?,
+            })
+        })?;
+        for row in rows {
+            let chunk = row?;
+            chunks_by_source
+                .entry(chunk.source_id.clone())
+                .or_default()
+                .push(chunk);
+        }
+        Ok(chunks_by_source)
+    }
+
     /// Get a chunk by ID.
     pub fn get_chunk(&self, chunk_id: &str) -> Result<Chunk, GlossError> {
         self.conn
@@ -720,6 +998,34 @@ impl NotebookDb {
         Ok(chunks)
     }
 
+    /// Get chunks for a source that don't yet have embeddings.
+    pub fn get_chunks_without_embedding(&self, source_id: &str) -> Result<Vec<Chunk>, GlossError> {
+        let sql =
+            "SELECT id, source_id, chunk_index, content, token_count, start_offset, end_offset,
+                    metadata, embedding_id, embedding_model
+                 FROM chunks WHERE source_id = ?1 AND embedding_id IS NULL ORDER BY chunk_index";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([source_id], |row| {
+            Ok(Chunk {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                chunk_index: row.get(2)?,
+                content: row.get(3)?,
+                token_count: row.get(4)?,
+                start_offset: row.get(5)?,
+                end_offset: row.get(6)?,
+                metadata: row.get(7)?,
+                embedding_id: row.get(8)?,
+                embedding_model: row.get(9)?,
+            })
+        })?;
+        let mut chunks = Vec::new();
+        for row in rows {
+            chunks.push(row?);
+        }
+        Ok(chunks)
+    }
+
     /// Returns true when every chunk in the selected scope has an embedding and
     /// there is at least one embedded chunk available for hybrid search.
     pub fn can_run_hybrid_search(&self, scoped_ids: &[String]) -> Result<bool, GlossError> {
@@ -751,7 +1057,6 @@ impl NotebookDb {
                         .collect(),
                 )
         };
-
         let embedded: i64 = self
             .conn
             .query_row(&embedded_sql, params.as_slice(), |row| row.get(0))?;
@@ -874,6 +1179,17 @@ impl NotebookDb {
                     link_scope.1.as_slice(),
                     |row| row.get(0),
                 )?;
+            let projection_unit_count: i64 = self.conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM semantic_memory_links{}{}",
+                    link_scope.0,
+                    " AND projection_unit_kind IS NOT NULL AND projection_unit_kind != 'chunk'"
+                ),
+                link_scope.1.as_slice(),
+                |row| row.get(0),
+            )?;
+            let healthy_parent_link_count = healthy.saturating_sub(projection_unit_count).max(0);
+            let _projection_unit_summary = (projection_unit_count, healthy_parent_link_count);
             (
                 total.max(0) as usize,
                 healthy.max(0) as usize,
@@ -971,6 +1287,9 @@ impl NotebookDb {
         notebook_id: &str,
         source_id: &str,
     ) -> Result<Option<SemanticMemoryProjectionStatus>, GlossError> {
+        if !self.table_exists("semantic_memory_projection_status")? {
+            return Ok(None);
+        }
         self.conn
             .query_row(
                 "SELECT notebook_id, source_id, status, chunk_count, projected_chunk_count,
@@ -989,6 +1308,9 @@ impl NotebookDb {
         &self,
         notebook_id: &str,
     ) -> Result<Vec<SemanticMemoryProjectionStatus>, GlossError> {
+        if !self.table_exists("semantic_memory_projection_status")? {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare(
             "SELECT notebook_id, source_id, status, chunk_count, projected_chunk_count,
                     healthy_link_count, degraded_link_count, last_receipt_id, last_error,
@@ -1064,6 +1386,26 @@ impl NotebookDb {
         }
         let scoped_ids = scope.source_ids();
         if scoped_ids.is_empty() {
+            return Ok(SemanticMemoryProjectionSummary {
+                notebook_id: notebook_id.to_string(),
+                total_sources: 0,
+                chunk_bearing_sources: 0,
+                zero_chunk_sources: 0,
+                projected_sources: 0,
+                failed_sources: 0,
+                skipped_no_chunks: 0,
+                stale_sources: 0,
+                partial_sources: 0,
+                projecting_sources: 0,
+                healthy_links: 0,
+                degraded_links: 0,
+                missing_links: 0,
+                total_chunks: 0,
+                projected_chunks: 0,
+                projection_required: false,
+            });
+        }
+        if !self.table_exists("semantic_memory_projection_status")? {
             return Ok(SemanticMemoryProjectionSummary {
                 notebook_id: notebook_id.to_string(),
                 total_sources: 0,
@@ -1206,7 +1548,7 @@ impl NotebookDb {
         })
     }
 
-    fn table_exists(&self, table: &str) -> Result<bool, GlossError> {
+    pub fn table_exists(&self, table: &str) -> Result<bool, GlossError> {
         let exists: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
             [table],
@@ -1246,6 +1588,53 @@ impl NotebookDb {
             })
     }
 
+    /// Batch fetch chunks by embedding IDs. Returns a map keyed by embedding ID.
+    pub fn get_chunks_by_embedding_ids(
+        &self,
+        embedding_ids: &[i64],
+    ) -> Result<HashMap<i64, Chunk>, GlossError> {
+        if embedding_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders: Vec<String> = (0..embedding_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT id, source_id, chunk_index, content, token_count, start_offset, end_offset,
+                    metadata, embedding_id, embedding_model
+             FROM chunks WHERE embedding_id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = embedding_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(8)?,
+                Chunk {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    chunk_index: row.get(2)?,
+                    content: row.get(3)?,
+                    token_count: row.get(4)?,
+                    start_offset: row.get(5)?,
+                    end_offset: row.get(6)?,
+                    metadata: row.get(7)?,
+                    embedding_id: row.get(8)?,
+                    embedding_model: row.get(9)?,
+                },
+            ))
+        })?;
+        let mut chunks = HashMap::new();
+        for row in rows {
+            let (embedding_id, chunk) = row?;
+            chunks.insert(embedding_id, chunk);
+        }
+        Ok(chunks)
+    }
+
     /// FTS5 search for chunks.
     pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<(i64, f64)>, GlossError> {
         let mut stmt = self.conn.prepare(
@@ -1268,39 +1657,54 @@ impl NotebookDb {
         query: &str,
         scope: &ResolvedSourceScope,
         limit: usize,
-    ) -> Result<Vec<(Chunk, f64)>, GlossError> {
+    ) -> Result<Vec<ChunkSearchHit>, GlossError> {
         if limit == 0 || scope.is_none() || scope.source_ids().is_empty() {
             return Ok(Vec::new());
         }
-        let scoped_ids = scope.source_ids();
+        let source_ids: Vec<&str> = scope.source_ids().iter().map(String::as_str).collect();
+        self.fts_search_chunks_in_sources_batched(query, &source_ids, limit)
+    }
 
-        let mut sql = String::from(
+    pub fn fts_search_chunks_in_sources_batched(
+        &self,
+        query: &str,
+        source_ids: &[&str],
+        limit: usize,
+    ) -> Result<Vec<ChunkSearchHit>, GlossError> {
+        if limit == 0 || source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let capped_ids: Vec<&str> = source_ids.iter().copied().take(256).collect();
+        if capped_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: Vec<String> = (0..capped_ids.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect();
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(capped_ids.len() + 2);
+        params.push(&query);
+        for source_id in &capped_ids {
+            params.push(source_id);
+        }
+        let limit = limit as i64;
+        let limit_placeholder = capped_ids.len() + 2;
+        let sql = format!(
             "SELECT c.id, c.source_id, c.chunk_index, c.content, c.token_count,
                     c.start_offset, c.end_offset, c.metadata, c.embedding_id,
                     c.embedding_model, chunks_fts.rank
              FROM chunks_fts
              JOIN chunks c ON c.rowid = chunks_fts.rowid
-             WHERE chunks_fts MATCH ?1",
+             WHERE chunks_fts MATCH ?1 AND c.source_id IN ({})
+             ORDER BY chunks_fts.rank ASC
+             LIMIT ?{}",
+            placeholders.join(", "),
+            limit_placeholder
         );
-        let placeholders = (0..scoped_ids.len())
-            .map(|idx| format!("?{}", idx + 3))
-            .collect::<Vec<_>>()
-            .join(", ");
-        sql.push_str(" AND c.source_id IN (");
-        sql.push_str(&placeholders);
-        sql.push(')');
-        sql.push_str(
-            " ORDER BY chunks_fts.rank ASC, c.source_id ASC, c.chunk_index ASC, c.id ASC LIMIT ?2",
-        );
-
-        let limit_i64 = limit as i64;
-        let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&query, &limit_i64];
-        for source_id in scoped_ids {
-            params.push(source_id);
-        }
-
+        params.push(&limit);
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+        let rows = stmt.query_map(params.as_slice(), |row| {
             Ok((
                 Chunk {
                     id: row.get(0)?,
@@ -1317,11 +1721,18 @@ impl NotebookDb {
                 row.get::<_, f64>(10)?,
             ))
         })?;
-
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
         }
+        results.sort_by(|(a_chunk, a_score), (b_chunk, b_score)| {
+            a_score
+                .partial_cmp(b_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a_chunk.source_id.cmp(&b_chunk.source_id))
+                .then_with(|| a_chunk.chunk_index.cmp(&b_chunk.chunk_index))
+                .then_with(|| a_chunk.id.cmp(&b_chunk.id))
+        });
         Ok(results)
     }
 
@@ -1458,6 +1869,122 @@ impl NotebookDb {
         Ok(())
     }
 
+    pub fn upsert_chat_attempt_status(
+        &self,
+        attempt: &ChatAttemptStatus,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT INTO chat_attempts (
+                attempt_id, notebook_id, conversation_id, assistant_message_id,
+                user_message_id, provider, model, status, phase, error_code,
+                error_message, request_digest, response_digest, partial_policy,
+                created_at, updated_at, terminal_at
+             )
+             VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                datetime('now'), datetime('now'), CASE WHEN ?15 THEN datetime('now') ELSE NULL END
+             )
+             ON CONFLICT(attempt_id) DO UPDATE SET
+                notebook_id = excluded.notebook_id,
+                conversation_id = excluded.conversation_id,
+                assistant_message_id = excluded.assistant_message_id,
+                user_message_id = COALESCE(excluded.user_message_id, chat_attempts.user_message_id),
+                provider = COALESCE(excluded.provider, chat_attempts.provider),
+                model = COALESCE(excluded.model, chat_attempts.model),
+                status = excluded.status,
+                phase = excluded.phase,
+                error_code = excluded.error_code,
+                error_message = excluded.error_message,
+                request_digest = COALESCE(excluded.request_digest, chat_attempts.request_digest),
+                response_digest = COALESCE(excluded.response_digest, chat_attempts.response_digest),
+                partial_policy = COALESCE(excluded.partial_policy, chat_attempts.partial_policy),
+                updated_at = datetime('now'),
+                terminal_at = CASE WHEN ?15 THEN datetime('now') ELSE chat_attempts.terminal_at END",
+            rusqlite::params![
+                attempt.attempt_id,
+                attempt.notebook_id,
+                attempt.conversation_id,
+                attempt.assistant_message_id,
+                attempt.user_message_id,
+                attempt.provider,
+                attempt.model,
+                attempt.status,
+                attempt.phase,
+                attempt.error_code,
+                attempt.error_message,
+                attempt.request_digest,
+                attempt.response_digest,
+                attempt.partial_policy,
+                attempt.terminal,
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_prompt_receipt(
+        &self,
+        receipt_id: &str,
+        notebook_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        prompt_digest: &str,
+        context_payload_digest: &str,
+        raw_receipt_json: &str,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO prompt_receipts
+             (receipt_id, notebook_id, conversation_id, message_id, prompt_digest,
+              context_payload_digest, raw_receipt_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                receipt_id,
+                notebook_id,
+                conversation_id,
+                message_id,
+                prompt_digest,
+                context_payload_digest,
+                raw_receipt_json
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_generation_receipt(
+        &self,
+        receipt_id: &str,
+        notebook_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        provider: &str,
+        model: &str,
+        provider_request_digest: &str,
+        response_digest: Option<&str>,
+        status: &str,
+        raw_receipt_json: &str,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO generation_receipts
+             (receipt_id, notebook_id, conversation_id, message_id, provider, model,
+              provider_request_digest, response_digest, status, raw_receipt_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                receipt_id,
+                notebook_id,
+                conversation_id,
+                message_id,
+                provider,
+                model,
+                provider_request_digest,
+                response_digest,
+                status,
+                raw_receipt_json
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Get a message by ID.
     pub fn get_message(&self, message_id: &str) -> Result<Message, GlossError> {
         self.conn
@@ -1531,6 +2058,90 @@ impl NotebookDb {
                 note.pinned,
                 note.source_id,
             ],
+        )?;
+        Ok(())
+    }
+
+    // -- Studio outputs --
+
+    pub fn list_studio_outputs(&self) -> Result<Vec<StudioOutput>, GlossError> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT id, output_type, title, prompt_used, raw_content, config, source_ids,
+                    file_path, status, error_message, prose_content, created_at
+             FROM studio_outputs
+             ORDER BY created_at DESC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                if format!("{e}").contains("no such table") {
+                    tracing::warn!(
+                        "studio_outputs table missing — returning empty list (run ensure_studio_outputs)"
+                    );
+                    return Ok(Vec::new());
+                }
+                return Err(e.into());
+            }
+        };
+        let rows = match stmt.query_map([], studio_output_from_row) {
+            Ok(r) => r,
+            Err(e) => {
+                if format!("{e}").contains("no such table") {
+                    tracing::warn!("studio_outputs table missing on query_map");
+                    return Ok(Vec::new());
+                }
+                return Err(e.into());
+            }
+        };
+        let mut outputs = Vec::new();
+        for row in rows {
+            outputs.push(row?);
+        }
+        Ok(outputs)
+    }
+
+    pub fn get_studio_output(&self, output_id: &str) -> Result<StudioOutput, GlossError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, output_type, title, prompt_used, raw_content, config, source_ids,
+                    file_path, status, error_message, prose_content, created_at
+             FROM studio_outputs
+             WHERE id = ?1",
+        )?;
+        stmt.query_row([output_id], studio_output_from_row)
+            .map_err(GlossError::from)
+    }
+
+    pub fn insert_studio_output(&self, output: &StudioOutput) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT INTO studio_outputs (
+                id, output_type, title, prompt_used, raw_content, config,
+                source_ids, file_path, status, error_message, prose_content
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                output.id,
+                output.output_type,
+                output.title,
+                output.prompt_used,
+                output.raw_content,
+                output.config,
+                output.source_ids,
+                output.file_path,
+                output.status,
+                output.error_message,
+                output.prose_content,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_studio_output_file_path(
+        &self,
+        output_id: &str,
+        file_path: &str,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "UPDATE studio_outputs SET file_path = ?1 WHERE id = ?2",
+            rusqlite::params![file_path, output_id],
         )?;
         Ok(())
     }
@@ -1703,6 +2314,126 @@ impl NotebookDb {
         Ok(result)
     }
 
+    pub fn embedding_index_metadata(
+        &self,
+        index_id: &str,
+    ) -> Result<Option<EmbeddingIndexMetadata>, GlossError> {
+        self.conn
+            .query_row(
+                "SELECT index_id, provider, model, model_digest, dimensions, schema_version,
+                        status, status_reason, created_at, validated_at
+                 FROM embedding_index_metadata
+                 WHERE index_id = ?1",
+                rusqlite::params![index_id],
+                |row| {
+                    let dimensions: Option<i64> = row.get(4)?;
+                    Ok(EmbeddingIndexMetadata {
+                        index_id: row.get(0)?,
+                        provider: row.get(1)?,
+                        model: row.get(2)?,
+                        model_digest: row.get(3)?,
+                        dimensions: dimensions.and_then(|value| usize::try_from(value).ok()),
+                        schema_version: row.get(5)?,
+                        status: row.get(6)?,
+                        status_reason: row.get(7)?,
+                        created_at: row.get(8)?,
+                        validated_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(GlossError::from)
+    }
+
+    pub fn list_embedding_index_metadata(&self) -> Result<Vec<EmbeddingIndexMetadata>, GlossError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT index_id, provider, model, model_digest, dimensions, schema_version,
+                    status, status_reason, created_at, validated_at
+             FROM embedding_index_metadata
+             ORDER BY index_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let dimensions: Option<i64> = row.get(4)?;
+            Ok(EmbeddingIndexMetadata {
+                index_id: row.get(0)?,
+                provider: row.get(1)?,
+                model: row.get(2)?,
+                model_digest: row.get(3)?,
+                dimensions: dimensions.and_then(|value| usize::try_from(value).ok()),
+                schema_version: row.get(5)?,
+                status: row.get(6)?,
+                status_reason: row.get(7)?,
+                created_at: row.get(8)?,
+                validated_at: row.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_embedding_index_metadata(
+        &self,
+        metadata: &EmbeddingIndexMetadata,
+    ) -> Result<(), GlossError> {
+        let dimensions = metadata
+            .dimensions
+            .map(|value| i64::try_from(value).unwrap_or(i64::MAX));
+        self.conn.execute(
+            "INSERT INTO embedding_index_metadata
+             (index_id, provider, model, model_digest, dimensions, schema_version,
+              status, status_reason, created_at, validated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))
+             ON CONFLICT(index_id) DO UPDATE SET
+                provider = excluded.provider,
+                model = excluded.model,
+                model_digest = excluded.model_digest,
+                dimensions = excluded.dimensions,
+                schema_version = excluded.schema_version,
+                status = excluded.status,
+                status_reason = excluded.status_reason,
+                validated_at = datetime('now')",
+            rusqlite::params![
+                metadata.index_id,
+                metadata.provider,
+                metadata.model,
+                metadata.model_digest,
+                dimensions,
+                metadata.schema_version,
+                metadata.status,
+                metadata.status_reason,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_embedding_index_status(
+        &self,
+        index_id: &str,
+        status: EmbeddingIndexMetadataStatus,
+        reason: Option<&str>,
+    ) -> Result<(), GlossError> {
+        self.conn.execute(
+            "INSERT INTO embedding_index_metadata
+             (index_id, provider, model, model_digest, dimensions, schema_version,
+              status, status_reason, created_at, validated_at)
+             VALUES (?1, '', '', NULL, NULL, ?2, ?3, ?4, datetime('now'), datetime('now'))
+             ON CONFLICT(index_id) DO UPDATE SET
+                status = excluded.status,
+                status_reason = excluded.status_reason,
+                validated_at = datetime('now')",
+            rusqlite::params![
+                index_id,
+                EMBEDDING_INDEX_SCHEMA_VERSION,
+                status.as_str(),
+                reason
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Delete all chunks for a source.
     pub fn delete_chunks_for_source(&self, source_id: &str) -> Result<(), GlossError> {
         self.conn
@@ -1827,6 +2558,197 @@ mod tests {
         db.set_selected_sources(&["s2".to_string()]).unwrap();
         let selected = db.get_selected_source_ids().unwrap();
         assert_eq!(selected, vec!["s2".to_string()]);
+    }
+
+    #[test]
+    fn get_sources_batched_with_multiple_ids() {
+        let db = test_db();
+        for id in ["s1", "s2", "s3"] {
+            db.insert_source(&Source {
+                id: id.to_string(),
+                source_type: "text".to_string(),
+                title: format!("Source {id}"),
+                original_filename: None,
+                file_hash: None,
+                url: None,
+                file_path: None,
+                content_text: None,
+                word_count: Some(0),
+                metadata: None,
+                summary: None,
+                summary_model: None,
+                status: "ready".to_string(),
+                error_message: None,
+                selected: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+                processing_state: None,
+            })
+            .unwrap();
+        }
+
+        let source_ids = ["s1", "s3"];
+        let sources = db.get_sources(&source_ids).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert!(sources.contains_key("s1"));
+        assert!(sources.contains_key("s3"));
+        assert!(!sources.contains_key("s2"));
+    }
+
+    #[test]
+    fn get_chunks_by_embedding_ids_batched_with_multiple_ids() {
+        let db = test_db();
+        db.insert_source(&Source {
+            id: "s1".to_string(),
+            source_type: "text".to_string(),
+            title: "Source".to_string(),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: None,
+            word_count: Some(0),
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: "ready".to_string(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            processing_state: None,
+        })
+        .unwrap();
+
+        db.insert_chunk(&Chunk {
+            id: "c1".to_string(),
+            source_id: "s1".to_string(),
+            chunk_index: 0,
+            content: "first".to_string(),
+            token_count: None,
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: Some(11),
+            embedding_model: None,
+        })
+        .unwrap();
+        db.insert_chunk(&Chunk {
+            id: "c2".to_string(),
+            source_id: "s1".to_string(),
+            chunk_index: 1,
+            content: "second".to_string(),
+            token_count: None,
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: Some(22),
+            embedding_model: None,
+        })
+        .unwrap();
+
+        let chunks = db.get_chunks_by_embedding_ids(&[11, 22]).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.get(&11).map(|chunk| chunk.id.as_str()), Some("c1"));
+        assert_eq!(chunks.get(&22).map(|chunk| chunk.id.as_str()), Some("c2"));
+    }
+
+    #[test]
+    fn embedding_index_metadata_round_trips_and_marks_stale() {
+        let dir = tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let metadata = EmbeddingIndexMetadata::ready(
+            NATIVE_HNSW_INDEX_ID,
+            "ollama",
+            "all-minilm",
+            Some("digest-384".to_string()),
+            384,
+        );
+
+        db.upsert_embedding_index_metadata(&metadata).unwrap();
+        let stored = db
+            .embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
+            .unwrap()
+            .expect("metadata row should exist");
+        assert!(stored.identity_matches(&metadata));
+        assert_eq!(stored.dimensions, Some(384));
+
+        db.mark_embedding_index_status(
+            NATIVE_HNSW_INDEX_ID,
+            EmbeddingIndexMetadataStatus::Stale,
+            Some("model switched to 1024d"),
+        )
+        .unwrap();
+        let stale = db
+            .embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
+            .unwrap()
+            .expect("metadata row should still exist");
+        assert_eq!(stale.status, EmbeddingIndexMetadataStatus::Stale.as_str());
+        assert_eq!(
+            stale.status_reason.as_deref(),
+            Some("model switched to 1024d")
+        );
+    }
+
+    #[test]
+    fn get_chunks_for_sources_batched_with_empty_and_populated_sources() {
+        let db = test_db();
+        for id in ["s1", "s2", "s3"] {
+            db.insert_source(&Source {
+                id: id.to_string(),
+                source_type: "text".to_string(),
+                title: format!("Source {id}"),
+                original_filename: None,
+                file_hash: None,
+                url: None,
+                file_path: None,
+                content_text: None,
+                word_count: Some(0),
+                metadata: None,
+                summary: None,
+                summary_model: None,
+                status: "ready".to_string(),
+                error_message: None,
+                selected: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+                processing_state: None,
+            })
+            .unwrap();
+        }
+
+        db.insert_chunk(&Chunk {
+            id: "c1".to_string(),
+            source_id: "s1".to_string(),
+            chunk_index: 0,
+            content: "first".to_string(),
+            token_count: None,
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: None,
+            embedding_model: None,
+        })
+        .unwrap();
+        db.insert_chunk(&Chunk {
+            id: "c2".to_string(),
+            source_id: "s1".to_string(),
+            chunk_index: 1,
+            content: "second".to_string(),
+            token_count: None,
+            start_offset: None,
+            end_offset: None,
+            metadata: None,
+            embedding_id: None,
+            embedding_model: None,
+        })
+        .unwrap();
+
+        let chunks_by_source = db.get_chunks_for_sources(&["s1", "s2", "s3"]).unwrap();
+        assert_eq!(chunks_by_source.len(), 3);
+        assert_eq!(chunks_by_source["s1"].len(), 2);
+        assert_eq!(chunks_by_source["s2"].len(), 0);
+        assert_eq!(chunks_by_source["s3"].len(), 0);
     }
 
     #[test]
@@ -2290,5 +3212,85 @@ mod tests {
         assert_eq!(failed_summary.failed_sources, 1);
         assert!(failed_summary.projection_required);
         assert_eq!(db.get_source("failed").unwrap().status, "ready");
+    }
+
+    /// Verifies that set_selected_sources is atomic: the selection changes
+    /// from one consistent state to another with no intermediate "all deselected" state.
+    #[test]
+    fn test_set_selected_sources_atomic() {
+        let db = test_db();
+
+        // Insert 4 sources, all initially selected
+        for id in ["s1", "s2", "s3", "s4"] {
+            db.insert_source(&Source {
+                id: id.to_string(),
+                source_type: "text".to_string(),
+                title: id.to_string(),
+                original_filename: None,
+                file_hash: None,
+                url: None,
+                file_path: None,
+                content_text: Some("content".to_string()),
+                word_count: Some(1),
+                metadata: None,
+                summary: None,
+                summary_model: None,
+                status: "ready".to_string(),
+                error_message: None,
+                selected: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+                processing_state: None,
+            })
+            .unwrap();
+        }
+
+        // Verify initial state: all 4 selected
+        let selected = db.get_selected_source_ids().unwrap();
+        assert_eq!(selected.len(), 4);
+
+        // Change selection to only s2 and s4
+        db.set_selected_sources(&["s2".to_string(), "s4".to_string()])
+            .unwrap();
+
+        // After the call, exactly s2 and s4 must be selected — no intermediate
+        // state where all are deselected or only a subset of the old selection remains
+        let selected = db.get_selected_source_ids().unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&"s2".to_string()));
+        assert!(selected.contains(&"s4".to_string()));
+
+        // Also verify via list_sources that the other sources are NOT selected
+        let sources = db.list_sources().unwrap();
+        for source in &sources {
+            if source.id == "s2" || source.id == "s4" {
+                assert!(source.selected, "{} should be selected", source.id);
+            } else {
+                assert!(!source.selected, "{} should NOT be selected", source.id);
+            }
+        }
+
+        // Test emptying the selection entirely
+        db.set_selected_sources(&[]).unwrap();
+        let selected = db.get_selected_source_ids().unwrap();
+        assert!(
+            selected.is_empty(),
+            "no sources should be selected after clearing"
+        );
+
+        // Verify all sources are deselected via list_sources
+        let sources = db.list_sources().unwrap();
+        assert!(sources.iter().all(|s| !s.selected));
+
+        // Select all again
+        db.set_selected_sources(&[
+            "s1".to_string(),
+            "s2".to_string(),
+            "s3".to_string(),
+            "s4".to_string(),
+        ])
+        .unwrap();
+        let selected = db.get_selected_source_ids().unwrap();
+        assert_eq!(selected.len(), 4);
     }
 }

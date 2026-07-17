@@ -44,7 +44,11 @@ impl ContextAssembler {
                 );
             }
             "custom" => {
-                // Custom style uses the custom_goal as the primary instruction
+                // Custom style: the custom_goal text (injected below) is the primary instruction.
+                // We still add a base role so the model knows it's an assistant.
+                prompt.push_str(
+                    "You are a helpful assistant. Follow the user's custom instruction below.\\n\\n",
+                );
             }
             _ => {
                 prompt.push_str(

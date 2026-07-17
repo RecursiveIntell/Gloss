@@ -105,7 +105,8 @@ impl std::str::FromStr for Role {
 }
 
 /// Indicates whether a search result came from a fact, document chunk, message, or episode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchSourceType {
     /// Result is from the facts table.
     Facts,
@@ -115,6 +116,17 @@ pub enum SearchSourceType {
     Messages,
     /// Result is from the episodes table.
     Episodes,
+}
+
+/// Controls whether privacy-sensitive search inputs are retained for replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayMode {
+    /// Keep only receipt digests; callers must supply inputs to replay.
+    #[default]
+    NoReplay,
+    /// Persist query text and filters alongside the durable receipt.
+    StoreInputs,
 }
 
 /// Controls whether search receipt metadata is produced.
@@ -150,6 +162,9 @@ pub struct SearchContext {
     pub evaluation_time: DateTime<Utc>,
     /// Receipt metadata mode.
     pub receipt_mode: ReceiptMode,
+    /// Opt-in policy for storing privacy-sensitive inputs for complete replay.
+    #[serde(default)]
+    pub replay_mode: ReplayMode,
     /// Exactness policy for vector candidate generation.
     pub exactness_profile: ExactnessProfile,
     /// Optional caller-provided request/receipt correlation ID.
@@ -192,6 +207,7 @@ impl SearchContext {
         Self {
             evaluation_time: Utc::now(),
             receipt_mode: ReceiptMode::Disabled,
+            replay_mode: ReplayMode::NoReplay,
             exactness_profile: ExactnessProfile::Default,
             request_id: None,
             trace_id: None,
@@ -328,6 +344,9 @@ pub struct VectorSearchReceiptV1 {
     /// Explicit fallback reason, mirrored from fallback for evidence readers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// Structured receipt for derived candidate backends such as proveKV pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_candidate: Option<DerivedCandidateReceiptV1>,
     /// Whether approximate codec/index scoring contributed to candidate generation.
     pub approximate: bool,
     /// Number of vector candidates requested from the backend.
@@ -336,6 +355,24 @@ pub struct VectorSearchReceiptV1 {
     pub returned_candidates: usize,
     /// Number of vector candidates remaining after SQL filters and exact rerank.
     pub post_filter_candidates: usize,
+    /// Whether a genuine sparse retrieval lane participated in fusion.
+    #[serde(default)]
+    pub sparse_enabled: bool,
+    /// Configured sparse RRF weight when the lane was enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_weight: Option<f64>,
+    /// Number of sparse query entries used for dot-product retrieval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_query_nonzero_count: Option<usize>,
+    /// Number of filtered sparse candidates admitted to fusion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_candidate_count: Option<usize>,
+    /// Sparse representation labels observed among admitted candidates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sparse_representations: Vec<String>,
+    /// Per-result sparse ranks, allowing the third signal to be audited.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sparse_result_ranks: Vec<SparseRankReceiptV1>,
     /// Fallback path, if approximate retrieval degraded or was bypassed.
     pub fallback: Option<String>,
     /// Whether exact f32 rerank/reference scoring was used.
@@ -344,6 +381,15 @@ pub struct VectorSearchReceiptV1 {
     pub result_ids: Vec<String>,
     /// Degradation notes visible to explain/audit paths.
     pub degradations: Vec<String>,
+}
+
+/// Inspectable sparse rank recorded in a durable search receipt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SparseRankReceiptV1 {
+    /// Canonical result ID.
+    pub result_id: String,
+    /// One-based sparse rank.
+    pub rank: usize,
 }
 
 /// Stable generation-level manifest for derived vector acceleration artifacts.
@@ -381,6 +427,89 @@ pub struct DerivedVectorArtifactGenerationV1 {
     pub degradations: Vec<String>,
 }
 
+/// Stable generation-level manifest for derived proveKV/poly-kv pool candidate artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProveKvPoolGenerationV1 {
+    pub schema_version: String,
+    pub generation_id: String,
+    pub embedding_snapshot_digest: String,
+    pub source_digest: String,
+    pub pool_manifest_digest: String,
+    pub codec_family: String,
+    pub codec_profile: String,
+    pub vector_dim: usize,
+    pub item_count: usize,
+    pub payload_bytes: u64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Durable item-to-pool-index mapping for a proveKV/poly-kv pool generation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProveKvPoolItemMapEntryV1 {
+    pub generation_id: String,
+    pub item_id: String,
+    pub source_type: String,
+    pub pool_index: usize,
+    pub embedding_digest: String,
+}
+
+/// Lifecycle status for a proveKV/poly-kv pool generation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProveKvPoolGenerationStatus {
+    Disabled,
+    Missing,
+    Building,
+    Ready,
+    Stale,
+    Failed,
+}
+
+/// Current proveKV/poly-kv pool artifact status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProveKvPoolArtifactStatusV1 {
+    pub status: ProveKvPoolGenerationStatus,
+    pub generation_id: Option<String>,
+    pub embedding_snapshot_digest: Option<String>,
+    pub pool_manifest_digest: Option<String>,
+    pub item_count: usize,
+    pub payload_bytes: u64,
+    pub reason: Option<String>,
+}
+
+/// Receipt-like summary for rebuilding proveKV/poly-kv pool artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProveKvPoolArtifactBuildReceiptV1 {
+    pub schema_version: String,
+    pub generation_id: String,
+    pub embedding_snapshot_digest: String,
+    pub source_digest: String,
+    pub pool_manifest_digest: String,
+    pub codec_family: String,
+    pub codec_profile: String,
+    pub vector_dim: usize,
+    pub item_count: usize,
+    pub payload_bytes: u64,
+    pub exact_rerank_required: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Structured search receipt for derived candidate generation followed by exact f32 rerank.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DerivedCandidateReceiptV1 {
+    pub candidate_backend: String,
+    pub codec_family: Option<String>,
+    pub generation_id: Option<String>,
+    pub embedding_snapshot_digest: Option<String>,
+    pub pool_manifest_digest: Option<String>,
+    pub exact_rerank: bool,
+    pub approximate: bool,
+    pub fallback: Option<String>,
+    pub raw_candidate_count: usize,
+    pub post_filter_count: usize,
+    pub final_result_count: usize,
+}
+
 /// Receipt-like summary for rebuilding derived vector acceleration artifacts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorArtifactBuildReceiptV1 {
@@ -403,6 +532,9 @@ pub struct VectorArtifactBuildReceiptV1 {
     /// Artifact manifest digest for this generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_manifest_digest: Option<String>,
+    /// ID of the build receipt itself (same value stored in the generation manifest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_receipt_id: Option<String>,
     /// Number of rows skipped because authoritative embeddings were invalid.
     pub skipped_row_count: usize,
     /// Wall-clock build duration in milliseconds.
@@ -476,6 +608,12 @@ impl VectorSearchReceiptV1 {
         ));
         if self.exact_rerank {
             why_results_appeared.push("final vector ordering used exact f32 scoring".to_string());
+        }
+        if self.sparse_enabled {
+            why_results_appeared.push(format!(
+                "sparse dot-product retrieval admitted {} candidates",
+                self.sparse_candidate_count.unwrap_or(0)
+            ));
         }
         if let Some(fallback) = &self.fallback {
             why_results_appeared.push(format!("fallback path '{}' was used", fallback));
@@ -1020,6 +1158,21 @@ pub struct EpisodeMeta {
     pub verification_status: VerificationStatus,
     /// Links to an EvidenceBundle.run_id (if experimentally verified).
     pub experiment_id: Option<String>,
+    /// Bitemporal valid time — when this episode fact was true in the domain.
+    pub valid_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// Content-addressed digest of the episode fact payload (for supersession chain).
+    pub fact_digest: Option<String>,
+}
+
+/// Receipt for an as-of bitemporal episode query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeAsOfReceiptV1 {
+    pub query_id: String,
+    pub as_of_valid: chrono::DateTime<chrono::Utc>,
+    pub as_of_recorded: chrono::DateTime<chrono::Utc>,
+    pub episode_count: usize,
+    pub episode_ids: Vec<String>,
+    pub excluded_superseded: usize,
 }
 
 /// Outcome of an episode's causal hypothesis.
@@ -1098,12 +1251,18 @@ pub struct ScoreBreakdown {
     pub bm25_score: Option<f64>,
     /// Raw vector similarity used for the final vector ordering.
     pub vector_score: Option<f64>,
+    /// Raw sparse dot-product score used for sparse ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_score: Option<f64>,
     /// Recency contribution added during fusion.
     pub recency_score: Option<f64>,
     /// BM25 rank (1-based).
     pub bm25_rank: Option<usize>,
     /// Vector rank (1-based).
     pub vector_rank: Option<usize>,
+    /// Sparse rank (1-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_rank: Option<usize>,
     /// Rank from the underlying vector retrieval source before any exact rerank.
     pub vector_source_rank: Option<usize>,
     /// Similarity score from the underlying vector retrieval source before rerank.
@@ -1112,12 +1271,18 @@ pub struct ScoreBreakdown {
     pub bm25_contribution: Option<f64>,
     /// Vector RRF contribution to the final score.
     pub vector_contribution: Option<f64>,
+    /// Sparse RRF contribution to the final score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_contribution: Option<f64>,
     /// Whether the vector ordering was reranked with exact f32 cosine similarity.
     pub vector_reranked_from_f32: bool,
     /// Configured BM25 fusion weight.
     pub bm25_weight: f64,
     /// Configured vector fusion weight.
     pub vector_weight: f64,
+    /// Configured sparse fusion weight.
+    #[serde(default)]
+    pub sparse_weight: f64,
     /// Configured recency weight when recency is enabled.
     pub recency_weight: Option<f64>,
     /// Configured RRF decay constant.
@@ -1169,6 +1334,9 @@ impl ExplainedResult {
         }
         if let Some(rank) = self.breakdown.vector_rank {
             why_this_result.push(format!("vector match rank {rank} contributed to fusion"));
+        }
+        if let Some(rank) = self.breakdown.sparse_rank {
+            why_this_result.push(format!("sparse match rank {rank} contributed to fusion"));
         }
         if recency_applied {
             why_this_result.push("recency contributed to the fused score".to_string());
@@ -1301,6 +1469,10 @@ pub struct MemoryStats {
     pub embedding_model: Option<String>,
     /// Currently configured embedding dimensions.
     pub embedding_dimensions: Option<usize>,
+    /// Compile-time selected vector candidate backend.
+    pub vector_backend: String,
+    /// Backend implementation generation bound into search cache identity.
+    pub vector_backend_generation: String,
 }
 
 /// Per-surface deletion counts for namespace removal.

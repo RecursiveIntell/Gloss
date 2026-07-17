@@ -126,8 +126,21 @@ impl OllamaBackend {
     }
 
     /// Send a non-streaming request and parse the response.
-    async fn send_request(client: &Client, url: &str, body: &Value) -> Result<(Value, u16)> {
-        let resp = client.post(url).json(body).send().await.map_err(|e| {
+    ///
+    /// If `request_timeout` is `Some`, it is applied at the `RequestBuilder`
+    /// level so this individual request can have a different timeout from the
+    /// client-wide default.
+    async fn send_request(
+        client: &Client,
+        url: &str,
+        body: &Value,
+        request_timeout: Option<std::time::Duration>,
+    ) -> Result<(Value, u16)> {
+        let mut req = client.post(url).json(body);
+        if let Some(timeout) = request_timeout {
+            req = req.timeout(timeout);
+        }
+        let resp = req.send().await.map_err(|e| {
             PipelineError::Other(format!("Failed to connect to LLM at {}: {}", url, e))
         })?;
 
@@ -191,7 +204,8 @@ impl Backend for OllamaBackend {
             // Chat endpoint
             let body = Self::build_chat_body(request, false);
             let url = format!("{}/api/chat", base);
-            let (json_resp, status) = Self::send_request(client, &url, &body).await?;
+            let (json_resp, status) =
+                Self::send_request(client, &url, &body, request.request_timeout).await?;
 
             let text = json_resp
                 .get("message")
@@ -209,7 +223,8 @@ impl Backend for OllamaBackend {
             // Generate endpoint
             let body = Self::build_generate_body(request, false);
             let url = format!("{}/api/generate", base);
-            let (json_resp, status) = Self::send_request(client, &url, &body).await?;
+            let (json_resp, status) =
+                Self::send_request(client, &url, &body, request.request_timeout).await?;
 
             let text = json_resp
                 .get("response")
@@ -247,7 +262,11 @@ impl Backend for OllamaBackend {
             )
         };
 
-        let resp = client.post(&url).json(&body).send().await.map_err(|e| {
+        let mut req = client.post(&url).json(&body);
+        if let Some(timeout) = request.request_timeout {
+            req = req.timeout(timeout);
+        }
+        let resp = req.send().await.map_err(|e| {
             PipelineError::Other(format!("Failed to connect to LLM at {}: {}", url, e))
         })?;
 
@@ -342,6 +361,7 @@ mod tests {
             messages: Vec::new(),
             config: LlmConfig::default(),
             stream: false,
+            request_timeout: None,
         }
     }
 

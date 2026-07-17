@@ -20,10 +20,16 @@ interface NotebookStore {
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
 
+function readActiveNotebookId(): string | null {
+  return typeof globalThis.localStorage === 'undefined'
+    ? null
+    : globalThis.localStorage.getItem(ACTIVE_NB_KEY);
+}
+
 export const useNotebookStore = create<NotebookStore>((set, get) => ({
   notebooks: [],
-  activeNotebookId: localStorage.getItem(ACTIVE_NB_KEY),
-  activationStatus: localStorage.getItem(ACTIVE_NB_KEY) ? 'pending' : 'idle',
+  activeNotebookId: readActiveNotebookId(),
+  activationStatus: readActiveNotebookId() ? 'pending' : 'idle',
   loading: false,
 
   loadNotebooks: async () => {
@@ -32,7 +38,7 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
       const notebooks = await api.listNotebooks();
       set({ notebooks, loading: false });
     } catch (e) {
-      console.error('Failed to load notebooks:', e);
+      console.warn('Failed to load notebooks:', e);
       set({ loading: false });
     }
   },
@@ -44,7 +50,7 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
       await get().setActive(id);
       return id;
     } catch (e) {
-      console.error('Failed to create notebook:', e);
+      console.warn('Failed to create notebook:', e);
       throw e;
     }
   },
@@ -82,7 +88,7 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
         set({ activeNotebookId: targetId, activationStatus: 'confirmed' });
         await get().loadNotebooks();
       } catch (e) {
-        console.error('Notebook activation failed:', e);
+        console.warn('Notebook activation failed:', e);
         set({ activationStatus: 'error' });
         throw e;
       }
@@ -95,7 +101,7 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
         localStorage.removeItem(ACTIVE_NB_KEY);
         set({ activeNotebookId: null, activationStatus: 'idle' });
       } catch (e) {
-        console.error('Failed to clear active notebook:', e);
+        console.warn('Failed to clear active notebook:', e);
         set({ activationStatus: 'error' });
         throw e;
       }

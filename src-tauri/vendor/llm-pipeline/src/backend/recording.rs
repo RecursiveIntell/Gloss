@@ -149,6 +149,7 @@ mod tests {
             messages: vec![],
             config: Default::default(),
             stream: false,
+            request_timeout: None,
         };
 
         let resp = recording
@@ -176,6 +177,7 @@ mod tests {
             messages: vec![],
             config: Default::default(),
             stream: false,
+            request_timeout: None,
         };
 
         recording
@@ -200,6 +202,7 @@ mod tests {
             messages: vec![],
             config: Default::default(),
             stream: true,
+            request_timeout: None,
         };
 
         let mut tokens = Vec::new();

@@ -1,7 +1,16 @@
 use crate::db::app_db::Notebook;
+use crate::db::doctor::{run_db_doctor, DbDoctorReceipt};
+use crate::db::portable::{
+    export_notebook_archive as export_notebook_archive_package, export_notebook_package,
+    import_notebook_archive as import_notebook_archive_package, import_notebook_package,
+    validate_notebook_archive, validate_notebook_package, NotebookExportReceipt,
+    NotebookImportReceipt, NotebookPortableManifest,
+};
 use crate::error::GlossError;
-use crate::jobs;
+use crate::jobs::{self, GlossJob};
 use crate::state::AppState;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{Manager, State};
 use tauri_queue::QueueManager;
@@ -13,6 +22,177 @@ pub async fn list_notebooks(state: State<'_, AppState>) -> Result<Vec<Notebook>,
         .lock()
         .map_err(|e| GlossError::Other(e.to_string()))?;
     app_db.list_notebooks()
+}
+
+#[tauri::command]
+pub async fn run_database_doctor(
+    repair: bool,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+) -> Result<DbDoctorReceipt, GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    let mut receipt = run_db_doctor(&app_db, repair)?;
+    let queue_report = inspect_queue_for_doctor(&app_db, &queue, repair)?;
+    receipt.queue_jobs_checked = queue_report.checked;
+    receipt.stale_queue_jobs = queue_report.stale;
+    receipt.repaired_stale_queue_jobs = queue_report.repaired;
+    Ok(receipt)
+}
+
+struct QueueDoctorReport {
+    checked: usize,
+    stale: usize,
+    repaired: usize,
+}
+
+fn inspect_queue_for_doctor(
+    app_db: &crate::db::app_db::AppDb,
+    queue: &Arc<QueueManager>,
+    repair: bool,
+) -> Result<QueueDoctorReport, GlossError> {
+    let notebooks = app_db.list_notebooks()?;
+    let notebook_dirs = notebooks
+        .iter()
+        .map(|notebook| (notebook.id.clone(), PathBuf::from(&notebook.directory)))
+        .collect::<HashMap<_, _>>();
+    let mut source_cache: HashMap<String, HashSet<String>> = HashMap::new();
+    let jobs = queue
+        .list_jobs_with_data()
+        .map_err(|e| GlossError::Other(format!("Failed to inspect queue jobs: {e}")))?;
+    let mut checked = 0usize;
+    let mut stale_job_ids = Vec::new();
+
+    for (job_id, status, data_json) in jobs {
+        if !matches!(status.as_str(), "pending" | "processing") {
+            continue;
+        }
+        checked += 1;
+        let Ok(job) = serde_json::from_str::<GlossJob>(&data_json) else {
+            stale_job_ids.push(job_id);
+            continue;
+        };
+        let Some(notebook_dir) = notebook_dirs.get(job.notebook_id()) else {
+            stale_job_ids.push(job_id);
+            continue;
+        };
+        let notebook_db_path = notebook_dir.join("notebook.db");
+        if !notebook_db_path.exists() {
+            stale_job_ids.push(job_id);
+            continue;
+        }
+        if !source_cache.contains_key(job.notebook_id()) {
+            let source_ids = crate::db::notebook_db::NotebookDb::open(&notebook_db_path)
+                .and_then(|db| db.list_sources())
+                .map(|sources| {
+                    sources
+                        .into_iter()
+                        .map(|source| source.id)
+                        .collect::<HashSet<_>>()
+                })?;
+            source_cache.insert(job.notebook_id().to_string(), source_ids);
+        }
+        if source_cache
+            .get(job.notebook_id())
+            .is_some_and(|sources| !sources.contains(job.source_id()))
+        {
+            stale_job_ids.push(job_id);
+        }
+    }
+
+    let stale = stale_job_ids.len();
+    let mut repaired = 0usize;
+    if repair {
+        for job_id in stale_job_ids {
+            if queue.cancel(&job_id).is_ok() {
+                repaired += 1;
+            }
+        }
+    }
+
+    Ok(QueueDoctorReport {
+        checked,
+        stale,
+        repaired,
+    })
+}
+
+#[tauri::command]
+pub async fn export_notebook(
+    notebook_id: String,
+    package_dir: String,
+    state: State<'_, AppState>,
+) -> Result<NotebookExportReceipt, GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    export_notebook_package(&app_db, &notebook_id, std::path::Path::new(&package_dir))
+}
+
+#[tauri::command]
+pub async fn export_notebook_archive(
+    notebook_id: String,
+    archive_path: String,
+    state: State<'_, AppState>,
+) -> Result<NotebookExportReceipt, GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    export_notebook_archive_package(&app_db, &notebook_id, std::path::Path::new(&archive_path))
+}
+
+#[tauri::command]
+pub async fn validate_notebook_import_package(
+    package_dir: String,
+) -> Result<NotebookPortableManifest, GlossError> {
+    validate_notebook_package(std::path::Path::new(&package_dir))
+}
+
+#[tauri::command]
+pub async fn validate_notebook_import_archive(
+    archive_path: String,
+) -> Result<NotebookPortableManifest, GlossError> {
+    validate_notebook_archive(std::path::Path::new(&archive_path))
+}
+
+#[tauri::command]
+pub async fn import_notebook(
+    package_dir: String,
+    name_override: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<NotebookImportReceipt, GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    import_notebook_package(
+        &app_db,
+        std::path::Path::new(&package_dir),
+        &state.data_dir.join("notebooks"),
+        name_override.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub async fn import_notebook_archive(
+    archive_path: String,
+    name_override: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<NotebookImportReceipt, GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    import_notebook_archive_package(
+        &app_db,
+        std::path::Path::new(&archive_path),
+        &state.data_dir.join("notebooks"),
+        name_override.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -94,13 +274,9 @@ pub async fn delete_notebook(
         nb.directory
     };
 
-    // Remove from open notebooks
+    // Remove from notebook pools
     {
-        let mut dbs = state
-            .notebook_dbs
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        dbs.remove(&id);
+        state.notebook_pools.remove(&id);
     }
 
     // Remove HNSW index from memory
@@ -189,4 +365,98 @@ pub async fn set_active_notebook(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inspect_queue_for_doctor;
+    use crate::db::app_db::AppDb;
+    use crate::db::notebook_db::{NotebookDb, Source};
+    use crate::jobs::GlossJob;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tauri_queue::{QueueConfig, QueueJob, QueueManager};
+    use tempfile::tempdir;
+
+    fn source(id: &str) -> Source {
+        Source {
+            id: id.to_string(),
+            source_type: "text".to_string(),
+            title: id.to_string(),
+            original_filename: None,
+            file_hash: None,
+            url: None,
+            file_path: None,
+            content_text: Some("content".to_string()),
+            word_count: Some(1),
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: "ready".to_string(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            processing_state: None,
+        }
+    }
+
+    fn queue(dir: &tempfile::TempDir) -> Arc<QueueManager> {
+        Arc::new(
+            QueueManager::new(
+                QueueConfig::builder()
+                    .with_db_path(dir.path().join("queue.db"))
+                    .with_poll_interval(Duration::from_secs(1))
+                    .build(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn db_doctor_cancels_stale_queue_jobs_for_missing_sources() {
+        let dir = tempdir().unwrap();
+        let app_db = AppDb::open(&dir.path().join("gloss.db")).unwrap();
+        let notebook_dir = dir.path().join("notebooks").join("nb1");
+        std::fs::create_dir_all(notebook_dir.join("sources")).unwrap();
+        app_db
+            .create_notebook("nb1", "Doctor", &notebook_dir.to_string_lossy())
+            .unwrap();
+        let notebook_db = NotebookDb::open(&notebook_dir.join("notebook.db")).unwrap();
+        notebook_db.insert_source(&source("present")).unwrap();
+
+        let queue = queue(&dir);
+        queue
+            .add(QueueJob::new(GlossJob::SummarizeSource {
+                epoch: 1,
+                notebook_id: "nb1".to_string(),
+                source_id: "missing".to_string(),
+                source_title: "Missing".to_string(),
+                data_dir: dir.path().to_string_lossy().to_string(),
+                ollama_url: "http://localhost:11434".to_string(),
+                model: "llama3".to_string(),
+            }))
+            .unwrap();
+        queue
+            .add(QueueJob::new(GlossJob::SummarizeSource {
+                epoch: 1,
+                notebook_id: "nb1".to_string(),
+                source_id: "present".to_string(),
+                source_title: "Present".to_string(),
+                data_dir: dir.path().to_string_lossy().to_string(),
+                ollama_url: "http://localhost:11434".to_string(),
+                model: "llama3".to_string(),
+            }))
+            .unwrap();
+
+        let check = inspect_queue_for_doctor(&app_db, &queue, false).unwrap();
+        assert_eq!(check.checked, 2);
+        assert_eq!(check.stale, 1);
+        assert_eq!(check.repaired, 0);
+
+        let repair = inspect_queue_for_doctor(&app_db, &queue, true).unwrap();
+        assert_eq!(repair.checked, 2);
+        assert_eq!(repair.stale, 1);
+        assert_eq!(repair.repaired, 1);
+    }
 }

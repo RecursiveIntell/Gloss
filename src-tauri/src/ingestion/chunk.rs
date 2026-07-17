@@ -1,5 +1,5 @@
-/// Configuration for the recursive character splitter.
-const TARGET_TOKENS: usize = 800;
+/// Configuration defaults for the recursive character splitter.
+const DEFAULT_TARGET_TOKENS: usize = 800;
 const MAX_TOKENS: usize = 1500;
 const OVERLAP_TOKENS: usize = 100;
 const MIN_CHUNK_TOKENS: usize = 50;
@@ -36,16 +36,23 @@ pub struct ChunkData {
 /// boundary detection to prefer splitting at structural boundaries.
 #[allow(dead_code)]
 pub fn chunk_text(text: &str, source_id: &str) -> Vec<ChunkData> {
-    chunk_text_with_title(text, source_id, "")
+    chunk_text_with_title(text, source_id, "", None)
 }
 
 /// Split text into chunks, using the source title for code-aware splitting.
-pub fn chunk_text_with_title(text: &str, source_id: &str, source_title: &str) -> Vec<ChunkData> {
+/// `target_tokens` overrides the default target chunk size.
+pub fn chunk_text_with_title(
+    text: &str,
+    source_id: &str,
+    source_title: &str,
+    target_tokens: Option<usize>,
+) -> Vec<ChunkData> {
     if text.is_empty() {
         return Vec::new();
     }
 
-    let target_chars = TARGET_TOKENS * 4;
+    let target = target_tokens.unwrap_or(DEFAULT_TARGET_TOKENS);
+    let target_chars = target * 4;
     let max_chars = MAX_TOKENS * 4;
     let overlap_chars = OVERLAP_TOKENS * 4;
     let min_chars = MIN_CHUNK_TOKENS * 4;
@@ -534,7 +541,7 @@ mod tests {
                 "    let x = 42;\n".repeat(40)
             ));
         }
-        let chunks = chunk_text_with_title(&code, "s1", "example.rs");
+        let chunks = chunk_text_with_title(&code, "s1", "example.rs", None);
         assert!(chunks.len() > 1, "Should split into multiple chunks");
         // Each chunk should tend to start at a function boundary
         for chunk in &chunks {

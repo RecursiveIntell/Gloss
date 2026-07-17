@@ -7,7 +7,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "node scripts/run_frontend_contract_tests.mjs",
+    "test": "npm run test:unit && npm run test:contracts",
+    "test:unit": "vitest run",
+    "test:contracts": "node scripts/run_frontend_contract_tests.mjs",
+    "test:gates": "bash validation/run_all_gloss_repair_gates.sh .",
+    "verify": "python3 scripts/verify_release.py",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev:sm": "tauri dev --features semantic-memory-backend",
@@ -15,33 +19,38 @@
     "tauri:dev:release": "tauri dev --features semantic-memory-turbo-quant",
     "tauri:build:sm": "tauri build --features semantic-memory-backend",
     "tauri:build:sm-tq": "tauri build --features semantic-memory-turbo-quant",
-    "tauri:build:release": "tauri build --features semantic-memory-turbo-quant",
+    "tauri:build:release": "bash scripts/build-appimage.sh --force",
     "check:sm-tq-profile": "python3 scripts/check_gloss_sm_tq_fix.py .",
     "test:tauri:sm": "cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-backend",
     "test:tauri:sm-tq": "cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant",
     "test:tauri:release": "cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant",
     "test:all:sm-tq": "npm run build && npm run check:sm-tq-profile && npm run test:tauri:sm && npm run test:tauri:sm-tq",
-    "desktop-smoke": "python3 scripts/gloss_desktop_smoke_harness.py --repo ."
+    "desktop-smoke": "python3 scripts/gloss_desktop_smoke_harness.py --repo .",
+    "installer-smoke": "python3 validation/gloss_installer_smoke_gate.py --repo . --build"
   },
   "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.1",
+    "@tauri-apps/plugin-fs": "2.5.1",
+    "@types/d3-force": "^3.0.10",
+    "cmdk": "^1.0.0",
+    "d3-force": "^3.0.0",
+    "lucide-react": "^0.564",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-dialog": "^2",
-    "@tauri-apps/plugin-fs": "^2",
-    "@tauri-apps/plugin-clipboard-manager": "^2",
-    "zustand": "^5",
     "react-markdown": "^9",
-    "lucide-react": "^0.564"
+    "react-virtuoso": "^4.7.0",
+    "zustand": "^5"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4",
+    "@tauri-apps/cli": "2.11.4",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
-    "typescript": "~5.8.3",
-    "vite": "^7.0.4",
-    "@tauri-apps/cli": "^2",
     "tailwindcss": "^4",
-    "@tailwindcss/vite": "^4"
+    "typescript": "~5.8.3",
+    "vite": "^7.3.6",
+    "vitest": "^4.1.7"
   }
 }

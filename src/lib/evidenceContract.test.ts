@@ -1,4 +1,5 @@
 import type { ChatEvidencePayload, Citation, Message, Note } from "./types";
+import { describe, expect, it } from "vitest";
 
 const citation: Citation = {
   chunk_id: "chunk-1",
@@ -14,6 +15,7 @@ const evidencePayload: ChatEvidencePayload = {
     retrieval_mode: "bm25_only",
     fallback_used: false,
     fallback_reason: null,
+    fallback_reason_code: null,
     degradation_markers: [],
     source_scope_mode: "explicit",
     requested_source_ids: ["source-1"],
@@ -46,6 +48,42 @@ const evidencePayload: ChatEvidencePayload = {
     approximate_candidate_count: null,
     semantic_memory_fallback_reason: null,
     retrieval_outcome: null,
+    retrieval_capability_decision: {
+      requested_backend: "gloss-local",
+      effective_backend: "gloss-local",
+      decision_reason: null,
+      decision_reason_code: null,
+      build_feature_available: true,
+      runtime_enabled: true,
+      projection_ready: true,
+      dense_ready: true,
+      fallback_allowed: true,
+      degraded: false,
+    },
+    semantic_memory_runtime_truth: {
+      schema: "SemanticMemoryRuntimeTruthV1",
+      receipt_id: "runtime-truth-1",
+      build: {},
+      settings: {},
+      projection: {},
+      turbo_quant: {},
+      decision: {
+        requested_backend: "gloss-local",
+        effective_backend: "gloss-local",
+        decision_reason: null,
+        decision_reason_code: null,
+        build_feature_available: true,
+        runtime_enabled: true,
+        projection_ready: true,
+        dense_ready: true,
+        fallback_allowed: true,
+        degraded: false,
+      },
+    },
+    decoding_settings_receipt: null,
+    prompt_receipt: null,
+    generation_receipt: null,
+    prompt_budget_receipt: null,
   },
 };
 
@@ -67,3 +105,11 @@ export const noteCitationContract: Note = {
   created_at: "2026-05-24T00:00:00Z",
   updated_at: "2026-05-24T00:00:00Z",
 };
+
+describe("evidence type contract", () => {
+  it("keeps assistant evidence envelopes and note citation arrays distinct", () => {
+    expect(assistantMessageContract.citations).toEqual(evidencePayload);
+    expect(noteCitationContract.citations).toEqual([citation]);
+    expect(evidencePayload.evidence.source_scope_preserved).toBe(true);
+  });
+});

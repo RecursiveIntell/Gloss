@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_ID="GLOSS_P36_RELEASE_COMPLETION_DENSE_TQ_RELEASE_20260525"
+RUN_ID="$(python3 - <<'PY'
+import re
+from pathlib import Path
+text = Path('docs/codex-runs/CURRENT_RUN.md').read_text(errors='ignore')
+match = re.search(r'Current run:\s*`?([^`\n]+)`?', text)
+print(match.group(1).strip() if match else 'UNKNOWN_RUN')
+PY
+)"
 RUN_DIR="docs/codex-runs/${RUN_ID}"
 mkdir -p "$RUN_DIR"
 LOG="$RUN_DIR/COMMANDS_RUN.log"
@@ -16,40 +23,35 @@ $ $*" | tee -a "$LOG"
 run npm ci
 run npm run build
 run npm test
-run npm run check:sm-tq-profile
 run python3 -m compileall -q scripts
-
-if [ -f validation/gloss_p36_static_gate.py ]; then
-  run python3 validation/gloss_p36_static_gate.py --repo .
-elif [ -f scripts/gloss_p36_static_gate.py ]; then
-  run python3 scripts/gloss_p36_static_gate.py --repo .
-else
-  echo "Missing gloss_p36_static_gate.py" | tee -a "$LOG"
-  exit 1
-fi
-
-if [ -f validation/gloss_dense_tq_release_gate.py ]; then
-  run python3 validation/gloss_dense_tq_release_gate.py --repo .
-elif [ -f scripts/gloss_dense_tq_release_gate.py ]; then
-  run python3 scripts/gloss_dense_tq_release_gate.py --repo .
-else
-  echo "Missing gloss_dense_tq_release_gate.py" | tee -a "$LOG"
-  exit 1
-fi
-
-run python3 scripts/gloss_current_run_truth_gate.py --repo .
-run python3 scripts/gloss_validator_path_gate.py --repo .
-run python3 scripts/gloss_receipt_integrity_gate.py --repo .
-run python3 scripts/gloss_feature_matrix_gate.py --repo .
-run python3 scripts/gloss_issue_ledger_gate.py --ledger ISSUE_LEDGER.csv
-run python3 scripts/gloss_retrieval_gate.py --repo .
-run python3 scripts/gloss_evidence_ui_gate.py --repo .
+run python3 validation/gloss_current_run_truth_gate.py --repo .
+run python3 validation/gloss_stale_pass_surface_gate.py --repo .
+run python3 validation/gloss_package_scope_gate.py --repo .
+run python3 validation/gloss_release_candidate_gate.py --repo . --run-id CURRENT
+run python3 validation/gloss_security_egress_gate.py --repo .
+run python3 validation/gloss_fastembed_download_consent_gate.py --repo .
+run python3 validation/gloss_secret_store_permissions_gate.py --repo .
+run python3 validation/gloss_tool_invocation_receipt_gate.py --repo .
+run python3 validation/gloss_path_redaction_gate.py --repo .
+run python3 validation/gloss_import_capability_gate.py --repo .
+run python3 validation/gloss_document_extractors_gate.py --repo .
+run python3 validation/gloss_legacy_office_extractors_gate.py --repo .
+run python3 validation/gloss_audio_metadata_gate.py --repo .
+run python3 validation/gloss_audio_transcription_gate.py --repo .
+run python3 validation/gloss_url_import_gate.py --repo .
+run python3 validation/gloss_youtube_transcript_gate.py --repo .
+run python3 validation/gloss_studio_artifacts_gate.py --repo .
+run python3 validation/gloss_db_doctor_gate.py --repo .
+run python3 validation/gloss_failed_import_quarantine_gate.py --repo .
+run python3 validation/gloss_import_performance_gate.py --repo .
+run python3 validation/gloss_notebook_portability_gate.py --repo .
+run npm run desktop-smoke
+run python3 validation/gloss_desktop_smoke_gate.py --repo .
+run python3 validation/gloss_fresh_unzip_replay_gate.py --repo .
 run cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 run cargo test --manifest-path src-tauri/Cargo.toml
 run cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-backend
 run cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant
 run cargo clippy --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant --all-targets -- -D warnings
-run npm run tauri:build:sm-tq
-run python3 scripts/gloss_desktop_smoke_harness.py --repo . --require-live-receipt
 
 echo "All validation commands completed" | tee -a "$LOG"

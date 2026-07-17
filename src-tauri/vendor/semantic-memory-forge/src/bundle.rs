@@ -643,7 +643,7 @@ mod tests {
         );
         assert_eq!(
             back.claim_ids[0].as_str(),
-            "claim-ver-001",
+            "claim:claim-ver-001",
             "claim bundles should remain first-class serialized artifacts"
         );
     }

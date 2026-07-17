@@ -1,0 +1,1368 @@
+{
+  "version": "tauri-contract-v1",
+  "commands": {
+    "add_source_file": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "addSourceFile",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "path"
+        ]
+      },
+      "response_family": "string"
+    },
+    "add_source_files": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "addSourceFiles",
+      "caller_count": 3,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "paths"
+        ]
+      },
+      "response_family": "string[]"
+    },
+    "add_source_folder": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "addSourceFolder",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "path"
+        ]
+      },
+      "response_family": "void"
+    },
+    "add_source_paste": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "addSourcePaste",
+      "caller_count": 3,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "title",
+          "text"
+        ]
+      },
+      "response_family": "string"
+    },
+    "add_source_url": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "addSourceUrl",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "url",
+          "networkConsent"
+        ]
+      },
+      "response_family": "string"
+    },
+    "add_source_youtube_transcript": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "addSourceYouTubeTranscript",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "url",
+          "language",
+          "networkConsent"
+        ]
+      },
+      "response_family": "string"
+    },
+    "cancel_studio_generation": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/studio.rs",
+      "error_family": "GlossError",
+      "wrapper": "cancelStudioGeneration",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "attemptId"
+        ]
+      },
+      "response_family": "boolean"
+    },
+    "check_external_tools": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "checkExternalTools",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "Record<string, ExternalToolAvailabilityReceipt>"
+    },
+    "create_conversation": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/chat/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "createConversation",
+      "caller_count": 3,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "string"
+    },
+    "create_note": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notes.rs",
+      "error_family": "GlossError",
+      "wrapper": "createNote",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "title",
+          "content"
+        ]
+      },
+      "response_family": "string"
+    },
+    "create_notebook": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": "createNotebook",
+      "caller_count": 3,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "name"
+        ]
+      },
+      "response_family": "string"
+    },
+    "debug_chat_provider_smoke": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/chat/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "debugChatProviderSmoke",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "providerId",
+          "model",
+          "prompt"
+        ]
+      },
+      "response_family": "ChatAttemptTraceV1"
+    },
+    "delete_conversation": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/chat/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "deleteConversation",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "conversationId"
+        ]
+      },
+      "response_family": "void"
+    },
+    "delete_failed_imports": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "deleteFailedImports",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "FailedImportQuarantineReceipt"
+    },
+    "delete_note": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notes.rs",
+      "error_family": "GlossError",
+      "wrapper": "deleteNote",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "noteId"
+        ]
+      },
+      "response_family": "void"
+    },
+    "delete_notebook": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": "deleteNotebook",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "id"
+        ]
+      },
+      "response_family": "void"
+    },
+    "delete_source": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "deleteSource",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "sourceId"
+        ]
+      },
+      "response_family": "void"
+    },
+    "delete_sources": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "deleteSources",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "sourceIds"
+        ]
+      },
+      "response_family": "void"
+    },
+    "diagnose_retrieval_coverage": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": null,
+      "caller_count": 0,
+      "operator_only": true,
+      "rationale": "Diagnostic coverage query has no product UI caller; retained for operator support.",
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "sourceScope"
+        ]
+      },
+      "response_family": "RetrievalCoverage"
+    },
+    "diagnose_retrieval_query": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": null,
+      "caller_count": 0,
+      "operator_only": true,
+      "rationale": "Diagnostic query inspection has no product UI caller; retained for operator support.",
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "query",
+          "sourceScope",
+          "limit"
+        ]
+      },
+      "response_family": "RetrievalDiagnostics"
+    },
+    "export_notebook": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": null,
+      "caller_count": 0,
+      "operator_only": true,
+      "rationale": "Directory-package export has no product UI caller; archive export is the shipped UI path.",
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "packageDir"
+        ]
+      },
+      "response_family": "NotebookExportReceipt"
+    },
+    "export_notebook_archive": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": "exportNotebookArchive",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "archivePath"
+        ]
+      },
+      "response_family": "NotebookExportReceipt"
+    },
+    "export_studio_output": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/studio.rs",
+      "error_family": "GlossError",
+      "wrapper": "exportStudioOutput",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "outputId"
+        ]
+      },
+      "response_family": "StudioExportReceipt"
+    },
+    "generate_studio_output": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/studio.rs",
+      "error_family": "GlossError",
+      "wrapper": "generateStudioOutput",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "outputType",
+          "sourceIds",
+          "title",
+          "maxItems",
+          "attemptId"
+        ]
+      },
+      "response_family": "StudioOutput"
+    },
+    "get_all_models": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "getAllModels",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "ModelRecord[]"
+    },
+    "get_chat_events_since": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/chat/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "getChatEventsSince",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "conversationId",
+          "afterSeq"
+        ]
+      },
+      "response_family": "ChatStreamEventV1[]"
+    },
+    "get_feature_flags": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "getFeatureFlags",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "FeatureFlagStatus[]"
+    },
+    "get_import_capability_matrix": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": null,
+      "caller_count": 0,
+      "operator_only": true,
+      "rationale": "Capability matrix is an operator diagnostic with no product UI caller.",
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "ImportCapability[]"
+    },
+    "get_last_chat_attempt_trace": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/chat/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "getLastChatAttemptTrace",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "ChatAttemptTraceV1 | null"
+    },
+    "get_notebook_stats": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "getNotebookStats",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "NotebookStats"
+    },
+    "get_providers": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "getProviders",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "Provider[]"
+    },
+    "get_queue_status": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "getQueueStatus",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "QueueStatus"
+    },
+    "get_semantic_memory_profile_status": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "getSemanticMemoryProfileStatus",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "sourceScope"
+        ]
+      },
+      "response_family": "SemanticMemoryProfileStatus"
+    },
+    "get_settings": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "getSettings",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "Record<string, string>"
+    },
+    "get_source_content": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "getSourceContent",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "sourceId"
+        ]
+      },
+      "response_family": "SourceContent"
+    },
+    "get_suggested_questions": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/chat/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "getSuggestedQuestions",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "string[]"
+    },
+    "import_notebook": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": null,
+      "caller_count": 0,
+      "operator_only": true,
+      "rationale": "Directory-package import has no product UI caller; archive import is the shipped UI path.",
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "packageDir",
+          "nameOverride"
+        ]
+      },
+      "response_family": "NotebookImportReceipt"
+    },
+    "import_notebook_archive": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": "importNotebookArchive",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "archivePath",
+          "nameOverride"
+        ]
+      },
+      "response_family": "NotebookImportReceipt"
+    },
+    "list_conversations": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/chat/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "listConversations",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "Conversation[]"
+    },
+    "list_notebooks": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": "listNotebooks",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "Notebook[]"
+    },
+    "list_notes": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notes.rs",
+      "error_family": "GlossError",
+      "wrapper": "listNotes",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "Note[]"
+    },
+    "list_sources": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "listSources",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "Source[]"
+    },
+    "list_studio_outputs": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/studio.rs",
+      "error_family": "GlossError",
+      "wrapper": "listStudioOutputs",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "StudioOutput[]"
+    },
+    "load_messages": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/chat/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "loadMessages",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "conversationId"
+        ]
+      },
+      "response_family": "Message[]"
+    },
+    "memory_backend_status": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "memoryBackendStatus",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "MemoryBackendStatus"
+    },
+    "pause_summaries": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "pauseSummaries",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "void"
+    },
+    "quarantine_failed_imports": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "quarantineFailedImports",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "FailedImportQuarantineReceipt"
+    },
+    "refresh_models": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "refreshModels",
+      "caller_count": 3,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "providerId"
+        ]
+      },
+      "response_family": "ModelInfo[]"
+    },
+    "regenerate_missing_summaries": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "regenerateMissingSummaries",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "QueueSummariesResult"
+    },
+    "rename_notebook": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": "renameNotebook",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "id",
+          "name"
+        ]
+      },
+      "response_family": "void"
+    },
+    "resume_summaries": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "resumeSummaries",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "void"
+    },
+    "retry_source_ingestion": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "retrySourceIngestion",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "sourceId"
+        ]
+      },
+      "response_family": "void"
+    },
+    "run_database_doctor": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": "runDatabaseDoctor",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "repair"
+        ]
+      },
+      "response_family": "DbDoctorReceipt"
+    },
+    "run_embedding_diagnostics": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "runEmbeddingDiagnostics",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "none",
+        "fields": []
+      },
+      "response_family": "EmbeddingDiagnosticsReceipt"
+    },
+    "run_retrieval_probe": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "runRetrievalProbe",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "query",
+          "sourceScope",
+          "limit"
+        ]
+      },
+      "response_family": "RetrievalProbeReceipt"
+    },
+    "save_response_as_note": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notes.rs",
+      "error_family": "GlossError",
+      "wrapper": "saveResponseAsNote",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "messageId"
+        ]
+      },
+      "response_family": "string"
+    },
+    "semantic_memory_backfill_notebook": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "semanticMemoryBackfillNotebook",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "SemanticMemoryBackfillReceipt"
+    },
+    "semantic_memory_link_status": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "semanticMemoryLinkStatus",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "SemanticMemoryLinkStatus"
+    },
+    "semantic_memory_rebuild_vector_artifacts": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "semanticMemoryRebuildVectorArtifacts",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "Record<string, unknown> | null"
+    },
+    "semantic_memory_reindex_notebook": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": null,
+      "caller_count": 0,
+      "operator_only": true,
+      "rationale": "Notebook-wide reindex has no product UI caller; source reindex/backfill cover the shipped flows.",
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "SemanticMemoryBackfillReceipt"
+    },
+    "semantic_memory_reindex_source": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "semanticMemoryReindexSource",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "sourceId",
+          "traceId"
+        ]
+      },
+      "response_family": "IndexSourceReceipt"
+    },
+    "semantic_memory_vector_artifact_status": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": null,
+      "caller_count": 0,
+      "operator_only": true,
+      "rationale": "Vector artifact status has no product UI caller; operator diagnostics retain the command.",
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "VectorArtifactStatus"
+    },
+    "send_message": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/chat/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "sendMessage",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "conversationId",
+          "query",
+          "sourceScope",
+          "model",
+          "messageId",
+          "style",
+          "customGoal",
+          "responseLength"
+        ]
+      },
+      "response_family": "string"
+    },
+    "set_active_notebook": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": "setActiveNotebook",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "void"
+    },
+    "set_memory_backend_profile": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "setMemoryBackendProfile",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "profile",
+          "notebookId"
+        ]
+      },
+      "response_family": "MemoryBackendProfileReceipt"
+    },
+    "set_selected_sources": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "setSelectedSources",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "selectedSourceIds"
+        ]
+      },
+      "response_family": "void"
+    },
+    "stop_chat": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/chat/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "stopChat",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "void"
+    },
+    "test_provider": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "testProvider",
+      "caller_count": 3,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "providerId"
+        ]
+      },
+      "response_family": "boolean"
+    },
+    "test_provider_model": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": null,
+      "caller_count": 0,
+      "operator_only": true,
+      "rationale": "Model-level provider probe has no product UI caller; provider smoke is the shipped diagnostic path.",
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "providerId",
+          "modelId"
+        ]
+      },
+      "response_family": "ProviderModelTestResult"
+    },
+    "toggle_pin": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notes.rs",
+      "error_family": "GlossError",
+      "wrapper": "togglePin",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "noteId"
+        ]
+      },
+      "response_family": "void"
+    },
+    "update_feature_flag": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "updateFeatureFlag",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "id",
+          "enabled"
+        ]
+      },
+      "response_family": "FeatureFlagStatus[]"
+    },
+    "update_note": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notes.rs",
+      "error_family": "GlossError",
+      "wrapper": "updateNote",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId",
+          "noteId",
+          "title",
+          "content"
+        ]
+      },
+      "response_family": "void"
+    },
+    "update_provider": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "updateProvider",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "id",
+          "enabled",
+          "baseUrl",
+          "apiKey"
+        ]
+      },
+      "response_family": "void"
+    },
+    "update_setting": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "updateSetting",
+      "caller_count": 2,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "key",
+          "value"
+        ]
+      },
+      "response_family": "void"
+    },
+    "validate_notebook_import_archive": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": "validateNotebookImportArchive",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "archivePath"
+        ]
+      },
+      "response_family": "NotebookPortableManifest"
+    },
+    "validate_notebook_import_package": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/notebooks.rs",
+      "error_family": "GlossError",
+      "wrapper": null,
+      "caller_count": 0,
+      "operator_only": true,
+      "rationale": "Directory-package validation has no product UI caller; archive validation is the shipped UI path.",
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "packageDir"
+        ]
+      },
+      "response_family": "NotebookPortableManifest"
+    }
+  },
+  "events": {
+    "chat:cancelled": {
+      "emitters": [
+        "src-tauri/src/commands/chat/emit.rs"
+      ],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
+      "payload_schema_ref": "ChatCancelledPayload",
+      "sequence_scope": "per-chat-attempt",
+      "terminal_status": "terminal"
+    },
+    "chat:error": {
+      "emitters": [
+        "src-tauri/src/commands/chat/emit.rs"
+      ],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
+      "payload_schema_ref": "ChatErrorPayload",
+      "sequence_scope": "per-chat-attempt",
+      "terminal_status": "terminal"
+    },
+    "chat:evidence": {
+      "emitters": [
+        "src-tauri/src/commands/chat/emit.rs"
+      ],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
+      "payload_schema_ref": "ChatEvidenceEventPayload",
+      "sequence_scope": "per-chat-attempt",
+      "terminal_status": "nonterminal"
+    },
+    "chat:status": {
+      "emitters": [
+        "src-tauri/src/commands/chat/emit.rs"
+      ],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
+      "payload_schema_ref": "ChatStatusPayload",
+      "sequence_scope": "per-chat-attempt",
+      "terminal_status": "nonterminal"
+    },
+    "chat:stream_event": {
+      "emitters": [
+        "src-tauri/src/commands/chat/emit.rs"
+      ],
+      "listeners": [],
+      "payload_schema_ref": "ChatStreamEventV1",
+      "sequence_scope": "per-chat-attempt monotonic seq",
+      "terminal_status": "conditional",
+      "rationale": "Replay transport; consumed through get_chat_events_since rather than a live listener."
+    },
+    "chat:token": {
+      "emitters": [
+        "src-tauri/src/commands/chat/emit.rs"
+      ],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
+      "payload_schema_ref": "ChatTokenPayload",
+      "sequence_scope": "per-chat-attempt",
+      "terminal_status": "conditional"
+    },
+    "queue:job_cancelled": {
+      "emitters": [
+        "src-tauri/vendor/tauri-queue/src/lib.rs"
+      ],
+      "listeners": [],
+      "payload_schema_ref": "JobCancelledEvent",
+      "sequence_scope": "per-queue-job",
+      "terminal_status": "terminal",
+      "rationale": "Tauri queue bridge exposes lifecycle events; Gloss currently listens only for completion."
+    },
+    "queue:job_completed": {
+      "emitters": [
+        "src-tauri/vendor/tauri-queue/src/lib.rs"
+      ],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
+      "payload_schema_ref": "JobCompletedPayload",
+      "sequence_scope": "per-queue-job",
+      "terminal_status": "terminal"
+    },
+    "queue:job_failed": {
+      "emitters": [
+        "src-tauri/vendor/tauri-queue/src/lib.rs"
+      ],
+      "listeners": [],
+      "payload_schema_ref": "JobFailedEvent",
+      "sequence_scope": "per-queue-job",
+      "terminal_status": "terminal",
+      "rationale": "Tauri queue bridge exposes lifecycle events; Gloss currently listens only for completion."
+    },
+    "queue:job_progress": {
+      "emitters": [
+        "src-tauri/vendor/tauri-queue/src/lib.rs"
+      ],
+      "listeners": [],
+      "payload_schema_ref": "JobProgressEvent",
+      "sequence_scope": "per-queue-job",
+      "terminal_status": "nonterminal",
+      "rationale": "Tauri queue bridge exposes lifecycle events; Gloss currently listens only for completion."
+    },
+    "queue:job_started": {
+      "emitters": [
+        "src-tauri/vendor/tauri-queue/src/lib.rs"
+      ],
+      "listeners": [],
+      "payload_schema_ref": "JobStartedEvent",
+      "sequence_scope": "per-queue-job",
+      "terminal_status": "nonterminal",
+      "rationale": "Tauri queue bridge exposes lifecycle events; Gloss currently listens only for completion."
+    },
+    "source:status": {
+      "emitters": [
+        "src-tauri/src/commands/sources/mod.rs"
+      ],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
+      "payload_schema_ref": "SourceStatusPayload",
+      "sequence_scope": "per-notebook-source",
+      "terminal_status": "nonterminal"
+    },
+    "sources:batch_created": {
+      "emitters": [
+        "src-tauri/src/commands/sources/mod.rs"
+      ],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
+      "payload_schema_ref": "SourcesBatchCreatedPayload",
+      "sequence_scope": "per-import-batch",
+      "terminal_status": "nonterminal"
+    },
+    "sources:batch_ingestion_complete": {
+      "emitters": [
+        "src-tauri/src/commands/sources/mod.rs"
+      ],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
+      "payload_schema_ref": "BatchIngestionCompletePayload",
+      "sequence_scope": "per-import-batch",
+      "terminal_status": "terminal"
+    },
+    "sources:folder_scan": {
+      "emitters": [
+        "src-tauri/src/commands/sources/mod.rs"
+      ],
+      "listeners": [],
+      "payload_schema_ref": "SourcesFolderScanPayloadV1",
+      "sequence_scope": "per-folder-import",
+      "terminal_status": "conditional",
+      "rationale": "Folder scan is an operator-progress signal; product UI consumes batch-created and batch-complete receipts."
+    },
+    "status:embedding_model": {
+      "emitters": [
+        "src-tauri/src/state.rs"
+      ],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
+      "payload_schema_ref": "EmbeddingModelPayload",
+      "sequence_scope": "per-embedder-lifecycle",
+      "terminal_status": "nonterminal"
+    }
+  }
+}

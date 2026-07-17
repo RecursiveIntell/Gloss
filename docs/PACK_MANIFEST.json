@@ -1,0 +1,155 @@
+{
+  "schema": "GlossSuperpassBundleV1",
+  "run_id": "GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526",
+  "generated_at": "2026-05-26T00:00:00-05:00",
+  "repo_root_inspected": "/mnt/data/gloss_repo/Gloss",
+  "source_archives": [
+    "/mnt/data/a653b55f-f5fb-48ae-9775-6f307657c248.7z",
+    "/mnt/data/Full Provenance+ Research 5\u204423\u204426.zip",
+    "/mnt/data/recursiveintell_stage2_dossier.zip"
+  ],
+  "issue_count": 210,
+  "severity_counts": {
+    "S0": 36,
+    "S1": 51,
+    "S2": 111,
+    "S3": 12
+  },
+  "files": [
+    {
+      "path": "00_AUDIT_SUMMARY.md",
+      "sha256": "c06487f1fe4c754dabb9b205100cf7d27d6c60214cc6d46f00a301a4a75bc33c",
+      "bytes": 5092
+    },
+    {
+      "path": "01_ISSUE_LEDGER_EXPANDED.csv",
+      "sha256": "b248be3748e80309407dbcf6eedccfc24b2e50347994dabed36812bae3b62119",
+      "bytes": 111860
+    },
+    {
+      "path": "02_COMMAND_RESULTS.md",
+      "sha256": "156760595e5f4b23611de28a3c2f188cb8ee014ced777fbe4ff2c86c5e4cc268",
+      "bytes": 2621
+    },
+    {
+      "path": "03_AGENTS.md",
+      "sha256": "b0386a247b1b247327231cb8cd91d42ae795345ef97bdeeeb3d8f88acdb1b9ef",
+      "bytes": 2424
+    },
+    {
+      "path": "04_CODEX_MASTER_PROMPT.md",
+      "sha256": "dc8667728586154a93b48d45796d2fd7156c5abb376662180dc061e868094752",
+      "bytes": 4879
+    },
+    {
+      "path": "05_PHASE_PLAN.md",
+      "sha256": "526d3ffb4924fc05c97011856614d72139b9b12712d02fbfc501310aafce13de",
+      "bytes": 3217
+    },
+    {
+      "path": "08_VALIDATION_COMMANDS.md",
+      "sha256": "9697a5882175ba4332a3621223d7ae7ccd80035389837718e0e8c496841a6532",
+      "bytes": 2567
+    },
+    {
+      "path": "09_ACCEPTANCE_GATES.md",
+      "sha256": "d4ccf3f6e490b93ee1f38b62cae21ca2c4decc2f6484c4167c7d2f8e6e2c0be4",
+      "bytes": 1740
+    },
+    {
+      "path": "10_ROLLBACK_AND_QUARANTINE.md",
+      "sha256": "fb012a693db435815c9a31d39b729844f5b9cb467d6038e639b59ac59bc5f1cb",
+      "bytes": 892
+    },
+    {
+      "path": "11_PUBLIC_CLAIM_BOUNDARY.md",
+      "sha256": "d9b4a1f0ea6c715f12280af4f84157aadaee98e556490a165461f7c32702fea9",
+      "bytes": 719
+    },
+    {
+      "path": "12_HOSTILE_AUDITOR_HANDOFF_TEMPLATE.md",
+      "sha256": "d522a1cf659bcde0561a188d3ed9a9261b2d81280aa367ae5cbb90e38e4fb9ea",
+      "bytes": 714
+    },
+    {
+      "path": "13_SOURCE_OF_TRUTH_MAP.md",
+      "sha256": "e19ed8e7eacb8d8eef25c602edae5bb1487b00e458978f046620df57f3133b7f",
+      "bytes": 1523
+    },
+    {
+      "path": "phase_prompts/P00_PREFLIGHT_SOURCE_INVENTORY.md",
+      "sha256": "e10a2910d95a3e7ad37bf08bfd48d0ea7763da5bb47e3da8e9b71f41234f829f",
+      "bytes": 717
+    },
+    {
+      "path": "phase_prompts/P01_RUN_TRUTH_PACKAGE_SCOPE.md",
+      "sha256": "13ec4126fd80d4362ff5e49eb39cc814dfb1aad609c7f186e7dc670306f55c33",
+      "bytes": 641
+    },
+    {
+      "path": "phase_prompts/P02_SOURCE_OF_TRUTH_ALIGNMENT.md",
+      "sha256": "61681cdb0b5fd933133344d7503798c255193952aa551c9b8ecd259965417abc",
+      "bytes": 638
+    },
+    {
+      "path": "phase_prompts/P03_RECEIPT_ARTIFACT_MODEL.md",
+      "sha256": "296af6dd8b215950d1e4fed5becf060fce0610556221881dbabe173ee5ed4b2d",
+      "bytes": 683
+    },
+    {
+      "path": "phase_prompts/P04_IMPORT_FORMATS.md",
+      "sha256": "a4ba956eddec38237346ab4f5bccc1121116589ba3a346119f9e979c5f1daeee",
+      "bytes": 639
+    },
+    {
+      "path": "phase_prompts/P05_WEB_MEDIA_OCR.md",
+      "sha256": "76c636010005cc43a3aca24f40c5c032f01704a0c4abadfdfbcf308796b705c4",
+      "bytes": 774
+    },
+    {
+      "path": "phase_prompts/P06_SEMANTIC_CLAIMLEDGER_TQ.md",
+      "sha256": "cd3225651f4d7e383e4e395b745b91fb23d963ff261ccb298a503cb9e0c6b249",
+      "bytes": 707
+    },
+    {
+      "path": "phase_prompts/P07_RETRIEVAL_CITATIONS_GRAPH.md",
+      "sha256": "ac7183f8702c7b7dacdf2bacc8fcdc863683518b5f07dbde6dc463a43c7d1f4c",
+      "bytes": 685
+    },
+    {
+      "path": "phase_prompts/P08_CHAT_GENERATION_RELIABILITY.md",
+      "sha256": "ae63c2538228a3b38c542d6e0beda68a289c42ef0f298fc7f1feeaad16bcb4a6",
+      "bytes": 723
+    },
+    {
+      "path": "phase_prompts/P09_STUDIO_OUTPUTS.md",
+      "sha256": "dd597c772f174fa7151bc650640fe009bed4c9eff6880de67477bdd73253ae27",
+      "bytes": 527
+    },
+    {
+      "path": "phase_prompts/P10_EXPORT_IMPORT_DB_DOCTOR_REPAIR.md",
+      "sha256": "8523cd7ebbe7cd495555ac6e5a1705f9a44c4ef26db6de04cfa3af8bd1a4799a",
+      "bytes": 587
+    },
+    {
+      "path": "phase_prompts/P11_UI_API_A11Y.md",
+      "sha256": "9757a54ebcec51392497e8b493dc9b6589cf06dc7f83900fa9d0766466bdd5cd",
+      "bytes": 541
+    },
+    {
+      "path": "phase_prompts/P12_SECURITY_PRIVACY_EGRESS.md",
+      "sha256": "b537358cbae9664af87e6bc6326bdcb01533e5601d7cdeeeceed6c0acf30dc3a",
+      "bytes": 533
+    },
+    {
+      "path": "phase_prompts/P13_PERFORMANCE_PACKAGING_REPLAY.md",
+      "sha256": "fafd32f5429fd4799f1390196fe07a35df2c858a029d35155f4ef1e89ba6b65c",
+      "bytes": 522
+    },
+    {
+      "path": "phase_prompts/P14_FINAL_VALIDATION_HANDOFF.md",
+      "sha256": "4b956755e36c773fa7e882409737bd358a24029013dfafd58b48dbdc03d38d23",
+      "bytes": 558
+    }
+  ]
+}

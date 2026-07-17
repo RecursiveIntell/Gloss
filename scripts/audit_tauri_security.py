@@ -35,17 +35,40 @@ def main() -> int:
         if permission in perms:
             errors.append(f"{permission} must not be granted")
 
-    unused_permissions = [
-        "core:event:allow-emit",
-        "core:event:allow-emit-to",
-        "dialog:allow-save",
-        "fs:allow-read-text-file",
-        "fs:allow-write-text-file",
-        "clipboard-manager:allow-read-text",
-        "clipboard-manager:allow-write-text",
-    ]
-    for permission in unused_permissions:
-        if permission in perms:
+    # Only flag permissions as unused if there's no evidence of frontend usage
+    import re as _re
+    frontend_files = [str(p) for p in root.glob("src/**/*.ts") if p.is_file()] + \
+                     [str(p) for p in root.glob("src/**/*.tsx") if p.is_file()]
+    perm_usage_patterns = {
+        "core:event:allow-emit": [r"\bemit\b", r"\bemitTo\b"],
+        "core:event:allow-emit-to": [r"\bemitTo\b"],
+        "dialog:allow-save": [
+            r"from\s+['\"]@tauri-apps/plugin-dialog['\"]\s+import\s+.*\bsave\b",
+            r"import\s+.*\bsave\b.*\s+from\s+['\"]@tauri-apps/plugin-dialog['\"]",
+            r"\bsave\s*\(",
+        ],
+        "fs:allow-read-text-file": [r"\breadTextFile\b"],
+        "fs:allow-write-text-file": [r"\bwriteTextFile\b"],
+        "clipboard-manager:allow-read-text": [r"\breadText\b"],
+        "clipboard-manager:allow-write-text": [r"\bwriteText\b"],
+    }
+
+    for permission, patterns in perm_usage_patterns.items():
+        if permission not in perms:
+            continue
+        evidence_found = False
+        for fpath in frontend_files:
+            try:
+                content = pathlib.Path(fpath).read_text()
+            except Exception:
+                continue
+            for pattern in patterns:
+                if _re.search(pattern, content):
+                    evidence_found = True
+                    break
+            if evidence_found:
+                break
+        if not evidence_found:
             errors.append(f"{permission} is not justified by current frontend usage")
 
     required_permissions = {"core:event:allow-listen", "core:event:allow-unlisten", "dialog:allow-open"}

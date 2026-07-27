@@ -721,6 +721,65 @@ pub fn provider_config_from_db(
     })
 }
 
+/// Resolved LLM configuration for making provider calls.
+pub struct ResolvedLlmConfig {
+    pub config: ProviderConfig,
+    pub model: String,
+    pub model_context_window: Option<i32>,
+}
+
+/// Resolve provider config and model for LLM calls, shared between chat and studio paths.
+///
+/// When `model_registry` and `model_override` are both available, resolves through the
+/// registry (which validates the model exists in a cached provider list). Falls back to
+/// direct DB lookup via `default_provider` when the registry is unavailable.
+///
+/// `model_override` takes priority; when `None`, reads `default_model` from settings.
+/// This function never uses a hardcoded model fallback — if no model is configured,
+/// it returns an error.
+pub fn resolve_llm_config(
+    app_db: &AppDb,
+    secret_store: &SecretStore,
+    model_registry: Option<&ModelRegistry>,
+    model_override: Option<&str>,
+) -> Result<ResolvedLlmConfig, GlossError> {
+    let model = if let Some(m) = model_override {
+        m.to_string()
+    } else {
+        app_db
+            .get_setting("default_model")?
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                GlossError::Config(
+                    "No model configured — set a default model in Settings".to_string(),
+                )
+            })?
+    };
+
+    let (config, context_window) = if let Some(registry) = model_registry {
+        let config = registry.get_provider_config_for_model(&model, app_db, secret_store)?;
+        let context_window = app_db
+            .get_all_models()?
+            .into_iter()
+            .find(|record| record.id == model)
+            .and_then(|record| record.context_window);
+        (config, context_window)
+    } else {
+        let selected_provider = app_db
+            .get_setting("default_provider")?
+            .and_then(|p| ProviderType::from_str(p.trim()))
+            .unwrap_or(ProviderType::Ollama);
+        let config = provider_config_from_db(app_db, secret_store, selected_provider)?;
+        (config, None)
+    };
+
+    Ok(ResolvedLlmConfig {
+        config,
+        model,
+        model_context_window: context_window,
+    })
+}
+
 /// Registry of all configured LLM providers and cached models.
 #[allow(dead_code)]
 pub struct ModelRegistry {

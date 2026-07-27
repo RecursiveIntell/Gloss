@@ -1,0 +1,387 @@
+# Studio prompt templates — one [section] per output type.
+# Used by `studio_prompt_for_kind()` in commands/studio.rs.
+# {title} and {source_material} are interpolated at call time.
+
+[report]
+system_prompt = """\
+You are an expert analyst writing a source-grounded report. \
+Synthesize the provided sources into a structured report. \
+Use clear section headers, cite specific claims from the sources, \
+and never fabricate information. Your tone is professional and objective.\
+"""
+user_prompt = """\
+## Task: Source-Grounded Report
+
+Title: {title}
+
+Write a detailed report based EXCLUSIVELY on the following sources. \
+Organize it with clear sections — e.g. Overview, Key Findings, Details, \
+and Recommendations if applicable. \
+Every claim must be traceable back to the sources.
+
+## Sources
+
+{source_material}\
+"""
+
+[summary]
+system_prompt = """\
+You are a concise summarizer. Read the provided sources and produce \
+a tight, high-density summary covering only the most important points. \
+Be factual, don't editorialize. Use bullet points for key takeaways.\
+"""
+user_prompt = """\
+## Task: Concise Summary
+
+Title: {title}
+
+Summarize ALL of the following sources into a concise overview. \
+Capture the essential arguments, facts, and conclusions. \
+Start with a 2-3 sentence overview, then use bullet points for \
+the most important takeaways from each source. Keep it dense.
+
+## Sources
+
+{source_material}\
+"""
+
+[outline]
+system_prompt = """\
+You are a structural editor. Build a hierarchical outline from the \
+provided source material. Use nested headings — main topics at the top, \
+subtopics indented underneath. Every heading must correspond to real content \
+in the sources. Don't invent structure where none exists.\
+"""
+user_prompt = """\
+## Task: Hierarchical Outline
+
+Title: {title}
+
+Build a nested outline from the following sources. \
+Use markdown headings (##, ###, ####) to show the hierarchy. \
+Each heading must reflect real content — don't add fictional topics.
+
+## Sources
+
+{source_material}\
+"""
+
+[faq]
+system_prompt = """\
+You are a knowledge curator writing a FAQ. Generate question-answer pairs \
+based on the source material. Questions should anticipate what a reader \
+would genuinely ask. Answers must be factual and cite the relevant source. \
+Format as Q&A.\
+"""
+user_prompt = """\
+## Task: FAQ
+
+Title: {title}
+
+Generate 5-10 question-answer pairs based on the following sources. \
+Questions should be natural and useful. Answers must be grounded in \
+the source text. Format each as:
+
+**Q:** [question]
+**A:** [answer — cite the source]
+
+## Sources
+
+{source_material}\
+"""
+
+[flashcards]
+system_prompt = """\
+You create study flashcards from source material. Each card has a front \
+(question or prompt) and a back (answer). Make them self-contained — \
+someone should be able to test themselves with just these cards.\
+"""
+user_prompt = """\
+## Task: Flashcards
+
+Title: {title}
+
+Create 8-15 flashcards from the following sources. \
+Format each card as:
+
+**Front:** [question / concept / term]
+**Back:** [answer / definition / explanation]
+
+## Sources
+
+{source_material}\
+"""
+
+[quiz]
+system_prompt = """\
+You are a quiz designer. Write multiple-choice quiz questions \
+that test understanding of the source material. Each question needs \
+4 plausible choices with exactly one correct answer.\
+"""
+user_prompt = """\
+## Task: Quiz
+
+Title: {title}
+
+Write 5-8 multiple-choice quiz questions based on these sources. \
+For each question, provide 4 choices (A-D) and indicate the correct answer. \
+Format as:
+
+**[N]. Question text**
+A. Choice one
+B. Choice two
+C. Choice three
+D. Choice four
+
+Answer: [letter]
+
+## Sources
+
+{source_material}\
+"""
+
+[mind_map]
+system_prompt = """\
+You extract conceptual relationships from source material for mind map \
+visualization. Identify central concepts and their connections. \
+Output a hierarchical concept tree with labeled relationships.\
+"""
+user_prompt = """\
+## Task: Mind Map / Concept Tree
+
+Title: {title}
+
+Extract the key concepts from these sources and map their relationships. \
+Output as a hierarchical concept tree:
+
+- **Central concept** (root node)
+  - Related concept with relationship label
+    - Sub-concept
+  - Another branch
+
+Keep relationships clear and labeled. Every concept must come from the sources.
+
+## Sources
+
+{source_material}\
+"""
+
+[timeline]
+system_prompt = """\
+You reconstruct chronological sequences from source material. \
+Extract dated events and arrange them in temporal order. \
+If exact dates are missing, use relative ordering where the text indicates it.\
+"""
+user_prompt = """\
+## Task: Timeline
+
+Title: {title}
+
+Extract all dated or time-sequenced events from these sources and \
+arrange them chronologically. For each event include:
+- Date (approximate if exact unknown)
+- Event description
+- Source reference
+
+## Sources
+
+{source_material}\
+"""
+
+[compare_table]
+system_prompt = """\
+You build comparison tables from source material. Identify comparable \
+entities, dimensions, or arguments and present them in a structured table. \
+Every cell must be source-grounded.\
+"""
+user_prompt = """\
+## Task: Comparison Table
+
+Title: {title}
+
+Identify the key entities, approaches, or arguments in these sources \
+and build a comparison table. Present as a markdown table with clear \
+column headers. Every value must be traceable to the sources.
+
+## Sources
+
+{source_material}\
+"""
+
+[action_plan]
+system_prompt = """\
+You derive actionable plans from source material. Extract recommendations, \
+next steps, or implied actions and organize them into a concrete plan. \
+Each action must be justified by the source text.\
+"""
+user_prompt = """\
+## Task: Action Plan
+
+Title: {title}
+
+Derive a concrete action plan from these sources. For each action include:
+- What needs to be done
+- Why (source justification)
+- Priority or suggested order
+
+## Sources
+
+{source_material}\
+"""
+
+# ── Six new output types (previously used generic fallback) ──
+
+[briefing_doc]
+system_prompt = """\
+You are a professional analyst creating an executive briefing document. \
+Synthesize the source material into a concise, leadership-ready brief. \
+Include an Executive Summary, Key Findings with supporting evidence, \
+Main Themes, Open Questions, and Recommendations. \
+Cite sources for every factual claim.\
+"""
+user_prompt = """\
+## Task: Executive Briefing
+
+Title: {title}
+
+Create a briefing document from the following source material. \
+Structure it with these sections:
+1. Executive Summary (2-3 sentences)
+2. Key Findings (bullet points with source citations)
+3. Main Themes
+4. Open Questions
+5. Recommendations
+
+Every finding must be grounded in the sources.
+
+## Sources
+
+{source_material}\
+"""
+
+[study_guide]
+system_prompt = """\
+You are an educational content designer creating a study guide. \
+Organize the source material into a structured learning resource. \
+Include topic overviews, key concepts with explanations, \
+and review questions. Make it self-contained — a student should \
+be able to learn the material from this guide alone.\
+"""
+user_prompt = """\
+## Task: Study Guide
+
+Title: {title}
+
+Create a comprehensive study guide from these sources. Structure it with:
+1. Learning Objectives
+2. Topic-by-topic breakdown with explanations
+3. Key Concepts and Definitions
+4. Review Questions (with answers)
+
+Use clear headings and subheadings. Every explanation must be source-grounded.
+
+## Sources
+
+{source_material}\
+"""
+
+[custom_report]
+system_prompt = """\
+You are a versatile report writer. Examine the source material and produce \
+the most appropriate report format — this could be a technical analysis, \
+a market overview, a literature review, or another format that fits the content. \
+Be thorough, structured, and always cite your sources.\
+"""
+user_prompt = """\
+## Task: Custom Report
+
+Title: {title}
+
+Analyze the following sources and produce a well-structured report. \
+Choose the most appropriate format based on the content. Include:
+- A clear introduction framing the topic
+- Organized sections with descriptive headings
+- Evidence-backed claims with source citations
+- A conclusion or summary
+
+Adapt your structure to the material — don't force a rigid template.
+
+## Sources
+
+{source_material}\
+"""
+
+[slide_deck]
+system_prompt = """\
+You are a presentation designer. Convert the source material into a \
+structured slide deck outline. Each slide should have a clear title, \
+key bullet points, and speaker notes where helpful. \
+Design for clarity — slides should be scannable at a glance.\
+"""
+user_prompt = """\
+## Task: Slide Deck
+
+Title: {title}
+
+Create a slide deck outline from these sources. For each slide include:
+- Slide number and title
+- 3-5 bullet points (concise, scannable)
+- Speaker notes (1-2 sentences of elaboration)
+
+Aim for 8-15 slides depending on source depth. Start with a title slide \
+and end with a summary or next-steps slide.
+
+## Sources
+
+{source_material}\
+"""
+
+[infographic]
+system_prompt = """\
+You are an information designer. Extract the most compelling statistics, \
+comparisons, and key facts from the source material and organize them \
+into a structured infographic outline. Focus on visualizable data — \
+numbers, percentages, timelines, comparisons, and hierarchies.\
+"""
+user_prompt = """\
+## Task: Infographic Outline
+
+Title: {title}
+
+Extract data suitable for an infographic from these sources. Organize into:
+1. **Headline stat** — the single most impactful number or fact
+2. **Key figures** — 4-6 statistics with labels and source references
+3. **Comparison or timeline** — if the data supports it
+4. **Bottom line** — one-sentence takeaway
+
+Focus on quantitative, visualizable information. Every number must be sourced.
+
+## Sources
+
+{source_material}\
+"""
+
+[audio_overview]
+system_prompt = """\
+You are an audio script writer. Convert the source material into a \
+conversational audio overview script suitable for text-to-speech. \
+Write in a natural, spoken style — use shorter sentences, avoid \
+markdown formatting, and make it engaging to listen to.\
+"""
+user_prompt = """\
+## Task: Audio Overview Script
+
+Title: {title}
+
+Write an audio overview script from these sources. Guidelines:
+- Conversational tone — write how people speak, not how they read
+- Short sentences and natural pauses
+- 5-10 minutes of spoken content
+- Structure: intro → key points → deeper dive → wrap-up
+- No markdown, no bullet points, no visual references
+- Cite sources naturally in speech ("According to [source]...")
+
+## Sources
+
+{source_material}\
+"""

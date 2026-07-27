@@ -85,6 +85,11 @@ pub fn run_inner() -> tauri::Result<()> {
             let app_handle = app.handle().clone();
             let state = AppState::initialize(&app_handle)?;
 
+            // Recover WAL state on all databases before any writes occur.
+            // Stale WAL from a previous crash is the #1 cause of "read-only database"
+            // errors on Linux. This runs before the queue or any ingestion starts.
+            crate::db::recover_all_wal_on_startup(&state.data_dir);
+
             // Initialize job queue with persistent SQLite storage
             let config = QueueConfig::builder()
                 .with_db_path(state.data_dir.join("queue.db"))

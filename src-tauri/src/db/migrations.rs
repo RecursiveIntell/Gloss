@@ -24,7 +24,8 @@ pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
          PRAGMA synchronous=NORMAL;
          PRAGMA cache_size=-65536;
          PRAGMA mmap_size=67108864;
-         PRAGMA temp_store=MEMORY;",
+         PRAGMA temp_store=MEMORY;
+         PRAGMA wal_autocheckpoint=1000;",
     )
 }
 

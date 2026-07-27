@@ -20,7 +20,7 @@ pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA foreign_keys=ON;
-         PRAGMA busy_timeout=5000;
+         PRAGMA busy_timeout=15000;
          PRAGMA synchronous=NORMAL;
          PRAGMA cache_size=-65536;
          PRAGMA mmap_size=67108864;

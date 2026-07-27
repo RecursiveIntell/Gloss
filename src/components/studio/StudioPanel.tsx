@@ -1,18 +1,24 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
+  BookOpen,
   ClipboardList,
   Download,
+  FileEdit,
   FileText,
   GitCompare,
+  GraduationCap,
   HelpCircle,
   ListTree,
   Map,
-  OctagonX,
   Network,
+  OctagonX,
+  PieChart,
+  Presentation,
   RefreshCw,
   Rows3,
   Sparkles,
   Timer,
+  Volume2,
 } from "lucide-react";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useStudioStore } from "../../stores/studioStore";
@@ -42,6 +48,12 @@ const OUTPUT_TYPES = [
   { id: "timeline", label: "Timeline", icon: Timer },
   { id: "compare_table", label: "Compare", icon: GitCompare },
   { id: "action_plan", label: "Actions", icon: Map },
+  { id: "briefing_doc", label: "Briefing", icon: BookOpen },
+  { id: "study_guide", label: "Study", icon: GraduationCap },
+  { id: "custom_report", label: "Custom", icon: FileEdit },
+  { id: "slide_deck", label: "Slides", icon: Presentation },
+  { id: "infographic", label: "Infographic", icon: PieChart },
+  { id: "audio_overview", label: "Audio", icon: Volume2 },
 ] as const;
 
 export function StudioPanel({ notebookId }: StudioPanelProps) {

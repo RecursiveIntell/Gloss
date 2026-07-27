@@ -3,6 +3,8 @@ use crate::error::GlossError;
 use crate::providers::{
     build_provider, ChatMessage, ChatRequest, LlmExecutionContext, LlmPhaseTimeouts,
 };
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use crate::redaction::redact_path;
 use crate::state::{ActiveStudioAttempt, AppState};
 use crate::studio::{
@@ -700,25 +702,29 @@ async fn run_studio_llm(
     cancellation: CancellationToken,
     attempt_id: &str,
 ) -> Result<(String, StudioProviderRuntimeReceipt), StudioGenerationFailure> {
-    let (config, model) = {
+    // Resolve provider config through the shared path — same as chat uses.
+    // This ensures both paths agree on model selection, provider routing,
+    // and context window detection.
+    let resolved = {
         let app_db = state
             .app_db
             .lock()
             .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
-        let model = app_db
-            .get_setting("default_model")
-            .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?
-            .unwrap_or_else(|| "qwen3.5:4b".to_string());
-        let config = crate::providers::provider_config_from_db(&app_db, &state.secret_store, {
-            let selected = app_db
-                .get_setting("default_provider")
-                .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?
-                .and_then(|p| crate::providers::ProviderType::from_str(p.trim()));
-            selected.unwrap_or(crate::providers::ProviderType::Ollama)
-        })
-        .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
-        (config, model)
+        let registry = state
+            .model_registry
+            .lock()
+            .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
+        crate::providers::resolve_llm_config(
+            &app_db,
+            &state.secret_store,
+            Some(&*registry),
+            None, // use default_model from settings — no hardcoded fallback
+        )
+        .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?
     };
+    let config = resolved.config;
+    let model = resolved.model;
+    let model_context_window = resolved.model_context_window;
     let provider_name = config.provider_type.as_str().to_string();
 
     let _llm_permit = state.llm_gate.acquire().await.map_err(|e| {
@@ -738,14 +744,14 @@ async fn run_studio_llm(
             content: user_prompt,
             images: None,
         }],
-        max_tokens: 4096,
+        max_tokens: 4096, // Studio generates structured content — keep a generous output window
         temperature,
         top_p: None,
         top_k: None,
         min_p: None,
         repeat_penalty: None,
-        stream: false,
-        num_ctx: Some(16384),
+        stream: false, // Studio collects full structured JSON, not token-by-token chat
+        num_ctx: Some(model_context_window.unwrap_or(16384) as u32),
     };
 
     let start = Instant::now();
@@ -1206,184 +1212,48 @@ async fn generate_structured_widget_content(
 fn studio_prompt_for_kind(
     kind: &str,
     title: &str,
-    kind_label: &str,
+    _kind_label: &str,
     source_material: &str,
 ) -> (String, String) {
-    match kind {
-        "report" => (
-            "You are an expert analyst writing a source-grounded report. \
-             Synthesize the provided sources into a structured report. \
-             Use clear section headers, cite specific claims from the sources, \
-             and never fabricate information. Your tone is professional and objective."
-                .to_string(),
-            format!(
-                "## Task: Source-Grounded Report\n\n\
-                 Title: {title}\n\n\
-                 Write a detailed report based EXCLUSIVELY on the following sources. \
-                 Organize it with clear sections — e.g. Overview, Key Findings, Details, \
-                 and Recommendations if applicable. \
-                 Every claim must be traceable back to the sources.\n\n\
-                 ## Sources\n\n{source_material}"
-            ),
-        ),
-        "summary" => (
-            "You are a concise summarizer. Read the provided sources and produce \
-             a tight, high-density summary covering only the most important points. \
-             Be factual, don't editorialize. Use bullet points for key takeaways."
-                .to_string(),
-            format!(
-                "## Task: Concise Summary\n\n\
-                 Title: {title}\n\n\
-                 Summarize ALL of the following sources into a concise overview. \
-                 Capture the essential arguments, facts, and conclusions. \
-                 Start with a 2-3 sentence overview, then use bullet points for \
-                 the most important takeaways from each source. Keep it dense.\n\n\
-                 ## Sources\n\n{source_material}"
-            ),
-        ),
-        "outline" => (
-            "You are a structural editor. Build a hierarchical outline from the \
-             provided source material. Use nested headings — main topics at the top, \
-             subtopics indented underneath. Every heading must correspond to real content \
-             in the sources. Don't invent structure where none exists."
-                .to_string(),
-            format!(
-                "## Task: Hierarchical Outline\n\n\
-                 Title: {title}\n\n\
-                 Build a nested outline from the following sources. \
-                 Use markdown headings (##, ###, ####) to show the hierarchy. \
-                 Each heading must reflect real content — don't add fictional topics.\n\n\
-                 ## Sources\n\n{source_material}"
-            ),
-        ),
-        "faq" => (
-            "You are a knowledge curator writing a FAQ. Generate question-answer pairs \
-             based on the source material. Questions should anticipate what a reader \
-             would genuinely ask. Answers must be factual and cite the relevant source. \
-             Format as Q&A."
-                .to_string(),
-            format!(
-                "## Task: FAQ\n\n\
-                 Title: {title}\n\n\
-                 Generate 5-10 question-answer pairs based on the following sources. \
-                 Questions should be natural and useful. Answers must be grounded in \
-                 the source text. Format each as:\n\n\
-                 **Q:** [question]\n\
-                 **A:** [answer — cite the source]\n\n\
-                 ## Sources\n\n{source_material}"
-            ),
-        ),
-        "flashcards" => (
-            "You create study flashcards from source material. Each card has a front \
-             (question or prompt) and a back (answer). Make them self-contained — \
-             someone should be able to test themselves with just these cards."
-                .to_string(),
-            format!(
-                "## Task: Flashcards\n\n\
-                 Title: {title}\n\n\
-                 Create 8-15 flashcards from the following sources. \
-                 Format each card as:\n\n\
-                 **Front:** [question / concept / term]\n\
-                 **Back:** [answer / definition / explanation]\n\n\
-                 ## Sources\n\n{source_material}"
-            ),
-        ),
-        "quiz" => (
-            "You are a quiz designer. Write multiple-choice quiz questions \
-             that test understanding of the source material. Each question needs \
-             4 plausible choices with exactly one correct answer."
-                .to_string(),
-            format!(
-                "## Task: Quiz\n\n\
-                 Title: {title}\n\n\
-                 Write 5-8 multiple-choice quiz questions based on these sources. \
-                 For each question, provide 4 choices (A-D) and indicate the correct answer. \
-                 Format as:\n\n\
-                 **[N]. Question text**\n\
-                 A. Choice one\n\
-                 B. Choice two\n\
-                 C. Choice three\n\
-                 D. Choice four\n\n\
-                 Answer: [letter]\n\n\
-                 ## Sources\n\n{source_material}"
-            ),
-        ),
-        "mind_map" => (
-            "You extract conceptual relationships from source material for mind map \
-             visualization. Identify central concepts and their connections. \
-             Output a hierarchical concept tree with labeled relationships."
-                .to_string(),
-            format!(
-                "## Task: Mind Map / Concept Tree\n\n\
-                 Title: {title}\n\n\
-                 Extract the key concepts from these sources and map their relationships. \
-                 Output as a hierarchical concept tree:\n\n\
-                 - **Central concept** (root node)\n\
-                   - Related concept with relationship label\n\
-                     - Sub-concept\n\
-                   - Another branch\n\n\
-                 Keep relationships clear and labeled. Every concept must come from the sources.\n\n\
-                 ## Sources\n\n{source_material}"
-            ),
-        ),
-        "timeline" => (
-            "You reconstruct chronological sequences from source material. \
-             Extract dated events and arrange them in temporal order. \
-             If exact dates are missing, use relative ordering where the text indicates it."
-                .to_string(),
-            format!(
-                "## Task: Timeline\n\n\
-                 Title: {title}\n\n\
-                 Extract all dated or time-sequenced events from these sources and \
-                 arrange them chronologically. For each event include:\n\
-                 - Date (approximate if exact unknown)\n\
-                 - Event description\n\
-                 - Source reference\n\n\
-                 ## Sources\n\n{source_material}"
-            ),
-        ),
-        "compare_table" => (
-            "You build comparison tables from source material. Identify comparable \
-             entities, dimensions, or arguments and present them in a structured table. \
-             Every cell must be source-grounded."
-                .to_string(),
-            format!(
-                "## Task: Comparison Table\n\n\
-                 Title: {title}\n\n\
-                 Identify the key entities, approaches, or arguments in these sources \
-                 and build a comparison table. Present as a markdown table with clear \
-                 column headers. Every value must be traceable to the sources.\n\n\
-                 ## Sources\n\n{source_material}"
-            ),
-        ),
-        "action_plan" => (
-            "You derive actionable plans from source material. Extract recommendations, \
-             next steps, or implied actions and organize them into a concrete plan. \
-             Each action must be justified by the source text."
-                .to_string(),
-            format!(
-                "## Task: Action Plan\n\n\
-                 Title: {title}\n\n\
-                 Derive a concrete action plan from these sources. For each action include:\n\
-                 - What needs to be done\n\
-                 - Why (source justification)\n\
-                 - Priority or suggested order\n\n\
-                 ## Sources\n\n{source_material}"
-            ),
-        ),
-        _ => (
-            format!(
-                "You produce a well-structured {kind_label} from source material. \
-                 Be factual, source-grounded, and never invent information."
-            ),
-            format!(
-                "## Task: {kind_label}\n\n\
-                 Title: {title}\n\n\
-                 Produce a {kind_label} based on the following sources:\n\n\
-                 {source_material}"
-            ),
-        ),
+    let prompts = studio_prompts();
+    if let Some(tmpl) = prompts.get(kind) {
+        return (
+            tmpl.system_prompt.clone(),
+            tmpl.user_prompt
+                .replace("{title}", title)
+                .replace("{source_material}", source_material),
+        );
     }
+    // Generic fallback for unknown output types
+    let label = kind.replace('_', " ");
+    (
+        format!(
+            "You produce a well-structured {label} from source material. \
+             Be factual, source-grounded, and never invent information."
+        ),
+        format!(
+            "## Task: {label}\n\n\
+             Title: {title}\n\n\
+             Produce a {label} based on the following sources:\n\n\
+             {source_material}"
+        ),
+    )
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct StudioPromptTemplate {
+    system_prompt: String,
+    user_prompt: String,
+}
+
+static STUDIO_PROMPTS_TOML: &str = include_str!("../../../prompts/studio_prompts.toml");
+
+fn studio_prompts() -> &'static HashMap<String, StudioPromptTemplate> {
+    static PROMPTS: OnceLock<HashMap<String, StudioPromptTemplate>> = OnceLock::new();
+    PROMPTS.get_or_init(|| {
+        toml::from_str(STUDIO_PROMPTS_TOML)
+            .expect("prompts/studio_prompts.toml is malformed — fix at compile time")
+    })
 }
 #[cfg(test)]
 mod tests {

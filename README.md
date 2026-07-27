@@ -26,6 +26,77 @@ Gloss is designed around four boundaries:
 - Evidence is inspectable. Citations, source scope, prompt metadata, decoding settings, retrieval decisions, and generation status are available in the desktop inspector.
 - Degradation is disclosed. Missing indices, optional tools, or model capabilities produce reason codes, disabled paths, or bounded fallbacks.
 
+## Architecture
+
+### Retrieval and chat pipeline
+
+```mermaid
+flowchart TD
+    A[User query] --> B[Multi-angle query rewriting\n5s timeout, graceful fallback]
+    B --> C[Source scope resolution]
+    C --> D{Retrieval backends}
+    D --> E[SQLite FTS5 / BM25]
+    D --> F[HNSW dense search\nusearch]
+    E --> G[Reciprocal-rank fusion]
+    F --> G
+    G --> H[Optional re-rank / fallback]
+    H --> I[Context assembly\nbounded prompt window]
+    I --> J[Provider stream\nOllama / OpenAI / Anthropic / llama.cpp]
+    J --> K[Citation extraction]
+    K --> L[Answer + citations + receipts]
+```
+
+### Provider resolution
+
+```mermaid
+flowchart TD
+    A[LLM request] --> B{Model specified?}
+    B -->|Yes| C[resolve_llm_config\nshared chat + studio path]
+    B -->|No| D[Read default_model\nfrom settings]
+    D --> C
+    C --> E{Model registry\navailable?}
+    E -->|Yes| F[get_provider_config_for_model\nvalidates model exists]
+    E -->|No| G[provider_config_from_db\nwith default_provider]
+    F --> H[ProviderConfig + model + context_window]
+    G --> H
+    H --> I[build_provider]
+    I --> J[LlmProvider trait\nchat / health_check]
+    J --> K{Provider type}
+    K -->|Ollama/llama.cpp| L[Loopback default\nLAN with opt-in]
+    K -->|OpenAI/Anthropic| M[Official host default\ncustom cloud with opt-in]
+```
+
+### Studio generation pipeline
+
+```mermaid
+flowchart TD
+    A[User selects output type\n16 types available] --> B[Build deterministic artifact\ngenerate_artifact with snippets]
+    B --> C{LLM refinement\nenabled?}
+    C -->|No| D[Return deterministic template]
+    C -->|Yes| E{Widget type?\nflashcards/quiz/mind_map}
+    E -->|Yes| F[generate_structured_widget_content\nJSON schema validation]
+    E -->|No| G[refine_studio_artifact\nLLM prompt from TOML templates]
+    F --> H{Validation passed?}
+    G --> H
+    H -->|Yes| I[Return LLM-refined content]
+    H -->|No| J[Fallback to deterministic template\nStudioFallbackReceipt recorded]
+    D --> K[Persist + render]
+    I --> K
+    J --> K
+```
+
+### Ingestion pipeline
+
+```mermaid
+flowchart LR
+    A[Source added] --> B[Extract\ntext/PDF/docx/xlsx/URL/YouTube/audio/video/image]
+    B --> C[Chunk\nrecursive split, 800-token target]
+    C --> D[Embed\nNomicEmbedTextV15 via FastEmbed/Candle]
+    D --> E[Index\nHNSW via usearch]
+    E --> F[Summarize\nLLM summary with suggested questions]
+    F --> G[Ready]
+```
+
 ## What works today
 
 ### Notebooks and sources
@@ -49,7 +120,7 @@ Gloss is designed around four boundaries:
 
 - Create, edit, pin, and delete notebook-scoped notes.
 - Save useful chat responses as notes.
-- Generate source-bound reports, summaries, outlines, FAQs, flashcards, quizzes, mind maps, timelines, comparison tables, and action plans from the current source scope.
+- Generate source-bound reports, summaries, outlines, FAQs, flashcards, quizzes, mind maps, timelines, comparison tables, action plans, briefing docs, study guides, custom reports, slide decks, infographics, and audio overview scripts from the current source scope.
 - Export Studio artifacts as JSON with a digest-bearing export receipt.
 
 ### Diagnostics and recovery
@@ -86,8 +157,8 @@ Archive files and opaque binary/model formats are rejected as ordinary sources.
 | --- | --- | --- |
 | Ollama | `http://localhost:11434` | Loopback only |
 | llama.cpp | `http://localhost:8080/v1` | Loopback only |
-| OpenAI | `https://api.openai.com/v1` | Official HTTPS host only |
-| Anthropic | `https://api.anthropic.com/v1` | Official HTTPS host only |
+| OpenAI | `https://api.openai.com/v1` | Official HTTPS host only; custom endpoints with opt-in |
+| Anthropic | `https://api.anthropic.com/v1` | Official HTTPS host only; custom endpoints with opt-in |
 
 RFC1918 LAN endpoints for local providers require `allow_lan_local_providers`. Custom OpenAI or Anthropic HTTPS endpoints require `allow_custom_cloud_endpoints`. Provider URLs reject embedded credentials, query strings, and fragments.
 
@@ -255,7 +326,7 @@ The primary runtime ownership map is in [`AGENTS.md`](AGENTS.md). Historical aud
 - Image, audio, and video paths depend on configured models or optional local tools and are not equally proven across formats.
 - Audio-overview generation is not a release-proven user workflow.
 - Semantic-memory and TurboQuant controls are experimental. Gloss-local retrieval remains the stable fallback.
-- Studio exposes ten output kinds in the current UI; additional backend artifact kinds are not presented as finished user workflows.
+- Studio exposes sixteen output kinds in the current UI with dedicated LLM prompts configured via `prompts/studio_prompts.toml`.
 - Cloud-provider use sends the assembled request context to that provider.
 
 ## Contributing

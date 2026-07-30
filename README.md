@@ -10,8 +10,8 @@
 
 ![Gloss desktop interface showing notebooks, selected sources, chat, citations, and runtime status](src/assets/gloss-gui/pasted-1779172952776-0.png)
 
-> [!IMPORTANT]
-> Gloss is under active development and currently ships as a source build. Linux x86_64 is the maintained packaging target. The repository does not yet publish a tagged, end-user binary release, and live GUI/installed-workflow certification is still incomplete.
+> [!WARNING]
+> **Current status (July 29, 2026): Gloss is not presently in working order and is not recommended for regular use.** The current default branch needs a dedicated repair and end-to-end verification pass before the maintainer can confidently recommend it. A patched candidate is targeted within the next one to two weeks, but that is an estimate rather than a release commitment. Until fresh build, test, and installed-workflow receipts are published, treat the architecture and feature descriptions below as implementation context—not as a guarantee that the current application works end to end.
 
 ## Why Gloss exists
 

@@ -8,11 +8,13 @@ import { EvidencePanel } from "../inspector/EvidencePanel";
 import { PromptPanel } from "../inspector/PromptPanel";
 import { ReceiptPanel } from "../inspector/ReceiptPanel";
 import { DiagnosticsPanel } from "../inspector/DiagnosticsPanel";
+import { MemoryPanel } from "../inspector/MemoryPanel";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useChatStore } from "../../stores/chatStore";
 import { useNoteStore } from "../../stores/noteStore";
 import {
   Activity,
+  Database,
   FileText,
   MessageSquare,
   PanelLeftClose,
@@ -25,7 +27,7 @@ import {
   StickyNote,
 } from "lucide-react";
 
-type InspectorTab = "notes" | "studio" | "prompt" | "evidence" | "receipt" | "diagnostics" | "sources";
+type InspectorTab = "notes" | "studio" | "prompt" | "evidence" | "receipt" | "diagnostics" | "memory" | "sources";
 
 const PANEL_MIN_WIDTH = 320;
 const PANEL_MAX_WIDTH = 700;
@@ -241,6 +243,7 @@ function InspectorDock({
     { id: "prompt", label: "Prompt", icon: <ScrollText className="h-3.5 w-3.5" /> },
     { id: "receipt", label: "Receipt", icon: <FileText className="h-3.5 w-3.5" /> },
     { id: "diagnostics", label: "Health", icon: <Activity className="h-3.5 w-3.5" /> },
+    { id: "memory", label: "Memory", icon: <Database className="h-3.5 w-3.5" /> },
     { id: "sources", label: "Sources", icon: <PanelLeftOpen className="h-3.5 w-3.5" /> },
   ] as const;
 
@@ -270,6 +273,7 @@ function InspectorDock({
         {activeTab === "prompt" ? <PromptPanel /> : null}
         {activeTab === "receipt" ? <ReceiptPanel /> : null}
         {activeTab === "diagnostics" ? <DiagnosticsPanel notebookId={notebookId} /> : null}
+        {activeTab === "memory" ? <MemoryPanel /> : null}
         {activeTab === "sources" ? <SourcesPanel notebookId={notebookId} /> : null}
       </div>
     </div>

@@ -91,6 +91,7 @@ pub struct MemoryBackendProfileReceipt {
 pub struct NativeFastEmbedDiagnostics {
     pub init_ok: bool,
     pub embed_one_ok: bool,
+    pub model_cached: bool,
     pub dims: Option<usize>,
     pub cache_dir: String,
     pub error: Option<String>,
@@ -591,12 +592,49 @@ pub async fn run_embedding_diagnostics(
     state: State<'_, AppState>,
 ) -> Result<EmbeddingDiagnosticsReceipt, GlossError> {
     let cache_dir = state.data_dir.join("models");
-    let native_fastembed = NativeFastEmbedDiagnostics {
-        init_ok: false,
-        embed_one_ok: false,
-        dims: None,
-        cache_dir: redact_path(&cache_dir),
-        error: Some("native embedder not initialized by semantic-memory diagnostics".to_string()),
+    let native_fastembed = {
+        use crate::ingestion::embed::{candle_model_is_cached, hf_hub_cache_dir};
+
+        let hf_home = hf_hub_cache_dir();
+        let model_cached = candle_model_is_cached(&hf_home, &cache_dir);
+        // Clone the Arc out so no lock guard crosses the .await below.
+        let maybe_embedder = {
+            let embedder_guard = state.embedder.read().unwrap_or_else(|e| e.into_inner());
+            embedder_guard.clone()
+        };
+        match maybe_embedder {
+            Some(service) => {
+                let dims = service.dims();
+                let embed_one_ok = tauri::async_runtime::spawn_blocking(move || {
+                    service.embed_one("gloss embedding diagnostics").is_ok()
+                })
+                .await
+                .unwrap_or(false);
+                NativeFastEmbedDiagnostics {
+                    init_ok: true,
+                    embed_one_ok,
+                    model_cached,
+                    dims: Some(dims),
+                    cache_dir: redact_path(&cache_dir),
+                    error: if embed_one_ok {
+                        None
+                    } else {
+                        Some("embedder initialized but probe embed failed".to_string())
+                    },
+                }
+            }
+            None => NativeFastEmbedDiagnostics {
+                init_ok: false,
+                embed_one_ok: false,
+                model_cached,
+                dims: None,
+                cache_dir: redact_path(&cache_dir),
+                error: Some(
+                    "native embedder not initialized yet — upload a file or restart Gloss to trigger initialization"
+                        .to_string(),
+                ),
+            },
+        }
     };
 
     let (

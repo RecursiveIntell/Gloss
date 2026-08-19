@@ -309,23 +309,45 @@ async fn execute_index_chunks(
     tracing::info!(
         source_id,
         chunks = unindexed_chunks.len(),
-        "Indexing chunks with FastEmbed (Nomic v2 MoE)"
+        "Indexing chunks with local candle embedder (nomic v1.5)"
     );
 
-    // Create embedder via FastEmbed (standalone, no shared state needed)
-    // Model: nomic-ai/nomic-embed-text-v1.5 (768 dimensions)
+    // Create the embedder honoring the configured embedding backend.
+    // Local CPU candle (Nomic v1.5 MoE) is the automatic fallback when Ollama
+    // is not configured or unreachable — no manual setup required.
     let cache_dir = PathBuf::from(data_dir).join("models");
     std::fs::create_dir_all(&cache_dir).ok();
     let app_db_path = PathBuf::from(data_dir).join("gloss.db");
-    let download_consent = crate::db::app_db::AppDb::open(&app_db_path)
-        .and_then(|app_db| app_db.get_setting(crate::features::FASTEMBED_DOWNLOAD_CONSENT))
-        .map_err(|e| {
-            QueueError::Execution(format!("Failed to read embedding download consent: {e}"))
-        })
-        .map(crate::commands::chat::setting_is_enabled)?;
-    let embedder = crate::ingestion::embed::EmbeddingService::new_with_download_policy(
+    let app_db = crate::db::app_db::AppDb::open(&app_db_path).map_err(|e| {
+        QueueError::Execution(format!("Failed to open app DB for embedding config: {e}"))
+    })?;
+    let provider = app_db
+        .get_setting("semantic_memory_embedding_provider")
+        .ok()
+        .flatten();
+    let url = app_db
+        .get_setting("semantic_memory_embedding_url")
+        .ok()
+        .flatten();
+    let model = app_db
+        .get_setting("semantic_memory_embedding_model")
+        .ok()
+        .flatten();
+    let timeout_secs = app_db
+        .get_setting("semantic_memory_embedding_timeout_secs")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<u64>().ok());
+    let download_consent = app_db
+        .get_setting(crate::features::FASTEMBED_DOWNLOAD_CONSENT)
+        .map(crate::commands::chat::setting_is_enabled)
+        .unwrap_or(false);
+    let embedder = crate::ingestion::embed::EmbeddingService::from_configured_provider(
+        provider.as_deref(),
+        url.as_deref(),
+        model.as_deref(),
+        timeout_secs,
         &cache_dir,
-        false,
         download_consent,
     )
     .map_err(|e| QueueError::Execution(format!("Failed to create embedder: {e}")))?;

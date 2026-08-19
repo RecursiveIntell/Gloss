@@ -3,6 +3,7 @@ use crate::db::notebook_db::{
     SemanticMemoryProjectionStatusUpdate, Source, SEMANTIC_MEMORY_INDEX_ID,
 };
 use crate::error::GlossError;
+use crate::ingestion::embed::EmbeddingService;
 use crate::memory::backend::{
     excluded_source_count, filter_semantic_candidates_by_scope, invalid_requested_source_ids,
     requested_source_ids, scope_echo,
@@ -12,7 +13,6 @@ use crate::memory::types::{
     SemanticLinkRow, MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
 };
 use crate::retrieval::source_scope::ResolvedSourceScope;
-use fastembed::NomicV2MoeTextEmbedding;
 use semantic_memory::embedder::{EmbedBatchFuture, EmbedFuture};
 use semantic_memory::{
     ChunkManifestEntry, ChunkManifestIngestOptions, Embedder, EmbeddingConfig, MemoryConfig,
@@ -65,43 +65,22 @@ impl EmbeddingProviderKind {
 }
 
 struct FastEmbedSemanticMemoryEmbedder {
-    model: Arc<Mutex<NomicV2MoeTextEmbedding>>,
+    service: Arc<Mutex<EmbeddingService>>,
     model_name: String,
     dimensions: usize,
 }
 
 impl FastEmbedSemanticMemoryEmbedder {
-    fn try_new(_cache_dir: PathBuf, download_consent: bool) -> Result<Self, GlossError> {
-        // For candle backend, we don't use the cache_dir parameter.
-        // The model downloads to ~/.cache/huggingface/hub automatically.
-        if !download_consent {
-            // Check HF cache for existing model
-            let hf_cache = directories::ProjectDirs::from("com", "gloss", "gloss")
-                .map(|p| p.cache_dir().to_path_buf())
-                .unwrap_or_else(|| std::env::temp_dir().to_path_buf())
-                .join("huggingface")
-                .join("hub");
-            if !hf_cache
-                .join("models--nomic-ai--nomic-embed-text-v1.5")
-                .exists()
-            {
-                return Err(GlossError::Embedding(
-                    "FastEmbed download consent required for first-time model download".into(),
-                ));
-            }
-        }
-
-        let device = candle_core::Device::Cpu;
-        let model = NomicV2MoeTextEmbedding::from_hf(
-            "nomic-ai/nomic-embed-text-v1.5",
-            &device,
-            candle_core::DType::F32,
-            2048,
-        )
-        .map_err(|e| GlossError::Embedding(format!("Failed to initialize NomicV2Moe: {e}")))?;
+    fn try_new(cache_dir: PathBuf, download_consent: bool) -> Result<Self, GlossError> {
+        // Delegate to the shared ingestion embedder: it loads nomic v1.5 via
+        // candle-transformers (fastembed's NomicV2Moe loader cannot load v1.5
+        // at any revision) and checks the real hf-hub cache location, so the
+        // model is reused across the native and semantic-memory paths.
+        let service =
+            EmbeddingService::new_with_download_policy(&cache_dir, false, download_consent)?;
 
         Ok(Self {
-            model: Arc::new(Mutex::new(model)),
+            service: Arc::new(Mutex::new(service)),
             model_name: FASTEMBED_MODEL_NAME.to_string(),
             dimensions: FASTEMBED_DIMENSIONS,
         })
@@ -119,17 +98,16 @@ impl Embedder for FastEmbedSemanticMemoryEmbedder {
     }
 
     fn embed_batch<'a>(&'a self, texts: Vec<String>) -> EmbedBatchFuture<'a> {
-        let model = Arc::clone(&self.model);
+        let service = Arc::clone(&self.service);
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let model = model.lock().map_err(|e| {
-                    MemoryError::Other(format!("FastEmbed model lock poisoned: {e}"))
+                let service = service.lock().map_err(|e| {
+                    MemoryError::Other(format!("FastEmbed service lock poisoned: {e}"))
                 })?;
-                // Convert Vec<String> to &[&str] for NomicV2MoeTextEmbedding
                 let texts_ref: Vec<&str> = texts.iter().map(String::as_str).collect();
-                model
-                    .embed(&texts_ref)
-                    .map_err(|e| MemoryError::Other(format!("NomicV2Moe embedding failed: {e}")))
+                service
+                    .embed_batch(&texts_ref)
+                    .map_err(|e| MemoryError::Other(format!("FastEmbed embedding failed: {e}")))
             })
             .await
             .map_err(|e| MemoryError::Other(format!("FastEmbed task failed: {e}")))?

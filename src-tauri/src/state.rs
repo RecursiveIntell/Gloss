@@ -392,8 +392,13 @@ impl AppState {
             .ok_or_else(|| GlossError::Config("Could not determine data directory".into()))?
             .data_dir()
             .to_path_buf();
+        Self::initialize_in_data_dir(data_dir)
+    }
 
-        std::fs::create_dir_all(&data_dir)?;
+    /// Construct state against an explicitly selected directory. Production
+    /// derives this path from ProjectDirs; tests use a temporary directory so
+    /// they cannot read or mutate an operator's local Gloss state.
+    fn initialize_in_data_dir(data_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(data_dir.join("notebooks"))?;
 
         let db_path = data_dir.join("gloss.db");
@@ -461,11 +466,16 @@ impl AppState {
         {
             app_db.set_setting("semantic_memory_search_timeout_ms", "8000")?;
         }
+        // The local CPU candle embedder is the automatic fallback backend.
+        // Download consent defaults ON so first-time uploads just work; users
+        // can switch it off in Settings → Embeddings. Existing installs that
+        // still hold the old "false" default are migrated the same way.
         if app_db
             .get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?
-            .is_none()
+            .map(|v| v == "false")
+            .unwrap_or(true)
         {
-            app_db.set_setting(features::FASTEMBED_DOWNLOAD_CONSENT, "false")?;
+            app_db.set_setting(features::FASTEMBED_DOWNLOAD_CONSENT, "true")?;
         }
         features::ensure_default_feature_settings(&app_db)?;
         let secret_store = SecretStore::new(&data_dir)?;
@@ -509,6 +519,13 @@ impl AppState {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn initialize_for_test(
+        data_dir: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::initialize_in_data_dir(data_dir.to_path_buf())
+    }
+
     pub fn record_chat_stream_event(
         &self,
         attempt_id: &str,
@@ -550,10 +567,13 @@ impl AppState {
         filter_chat_events_since(&events, notebook_id, conversation_id, after_seq)
     }
 
-    /// Ensure the embedding model is initialized. Reads the configured provider
-    /// from settings: "ollama" uses the external Ollama /api/embed endpoint
-    /// (crash-isolated, preferred); anything else falls back to in-process
-    /// FastEmbed (Nomic v2 MoE via candle, 768d).
+    /// Ensure the embedding model is initialized. Honors the configured
+    /// backend from settings:
+    ///
+    /// - `semantic_memory_embedding_provider == "ollama"` (and reachable) →
+    ///   external Ollama `/api/embed` (crash-isolated, preferred)
+    /// - anything else (or an unreachable Ollama) → the in-process CPU candle
+    ///   embedder (Nomic v1.5 MoE, 768d) as the automatic fallback.
     pub fn ensure_embedder(&self, app_handle: Option<&tauri::AppHandle>) -> Result<(), GlossError> {
         let mut embedder = self.embedder.write().unwrap_or_else(|e| e.into_inner());
 
@@ -562,29 +582,60 @@ impl AppState {
         }
 
         let service = {
-            tracing::info!("Initializing FastEmbed embedding backend (Nomic v1.5 MoE, 768d)");
+            let app_db = self
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            let provider = app_db.get_setting("semantic_memory_embedding_provider")?;
+            let url = app_db.get_setting("semantic_memory_embedding_url")?;
+            let model = app_db.get_setting("semantic_memory_embedding_model")?;
+            let timeout_secs = app_db
+                .get_setting("semantic_memory_embedding_timeout_secs")?
+                .and_then(|s| s.parse::<u64>().ok());
+            let download_consent = crate::commands::chat::setting_is_enabled(
+                app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
+            );
+            drop(app_db);
+
+            tracing::info!(
+                provider = %provider.as_deref().unwrap_or("auto"),
+                "Initializing embedding backend"
+            );
             if let Some(handle) = app_handle {
                 use tauri::Emitter;
                 let _ = handle.emit(
                     "status:embedding_model",
                     serde_json::json!({
-                        "state": "downloading",
-                        "message": "Loading embedding model (first time may download ~100MB)…"
+                        "state": "loading",
+                        "message": "Loading embedding backend…"
                     }),
                 );
             }
             let cache_dir = self.data_dir.join("models");
             std::fs::create_dir_all(&cache_dir)?;
-            let download_consent = {
-                let app_db = self
-                    .app_db
-                    .lock()
-                    .map_err(|e| GlossError::Other(e.to_string()))?;
-                crate::commands::chat::setting_is_enabled(
-                    app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
-                )
-            };
-            EmbeddingService::new_with_download_policy(&cache_dir, false, download_consent)?
+            match EmbeddingService::from_configured_provider(
+                provider.as_deref(),
+                url.as_deref(),
+                model.as_deref(),
+                timeout_secs,
+                &cache_dir,
+                download_consent,
+            ) {
+                Ok(service) => service,
+                Err(e) => {
+                    if let Some(handle) = app_handle {
+                        use tauri::Emitter;
+                        let _ = handle.emit(
+                            "status:embedding_model",
+                            serde_json::json!({
+                                "state": "error",
+                                "message": format!("Embedding backend failed: {e}")
+                            }),
+                        );
+                    }
+                    return Err(e);
+                }
+            }
         };
 
         if let Some(handle) = app_handle {
@@ -1354,6 +1405,72 @@ mod tests {
     use super::*;
     use crate::db::notebook_db::Source;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_state_initializes_in_supplied_temp_dir() {
+        let dir = tempdir().unwrap();
+        let state = AppState::initialize_for_test(dir.path()).expect("test state initializes");
+
+        assert_eq!(state.data_dir, dir.path());
+        assert!(dir.path().join("gloss.db").is_file());
+        assert!(dir.path().join("notebooks").is_dir());
+    }
+
+    /// Reproduces the production call pattern for `ensure_embedder` (warmup
+    /// spawn, chat command, import path all call it from inside a tokio async
+    /// runtime) with the Ollama provider configured — exactly the user setup
+    /// that has been hitting "poisoned lock" cascades in the field. If the
+    /// blocking HTTP probe panics inside the async context, this test captures
+    /// the panic message so the original trigger is visible.
+    ///
+    /// Run with:
+    /// `cargo test --features semantic-memory-turbo-quant state::tests::ollama_embedder_initializes_inside_async_context -- --ignored --nocapture`
+    #[test]
+    #[ignore] // requires a reachable Ollama on localhost:11434
+    fn ollama_embedder_initializes_inside_async_context() {
+        let dir = tempdir().unwrap();
+        let state = AppState::initialize_for_test(dir.path()).expect("test state initializes");
+        {
+            let app_db = state.app_db.lock().unwrap_or_else(|e| e.into_inner());
+            app_db
+                .set_setting("semantic_memory_embedding_provider", "ollama")
+                .unwrap();
+            app_db
+                .set_setting("semantic_memory_embedding_url", "http://localhost:11434")
+                .unwrap();
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async {
+                state.ensure_embedder(None).expect("embedder initializes");
+            });
+        }));
+
+        match result {
+            Ok(()) => {
+                let guard = state.embedder.read().unwrap_or_else(|e| e.into_inner());
+                let svc = guard.as_ref().expect("embedder stored");
+                println!(
+                    "ok: embedder {} ({}) dims={}",
+                    svc.provider_id(),
+                    svc.model_id(),
+                    svc.dims()
+                );
+            }
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                panic!("PANIC INSIDE ASYNC ensure_embedder: {msg}");
+            }
+        }
+    }
 
     #[test]
     fn active_counter_guard_finalizes_on_drop_and_saturates() {

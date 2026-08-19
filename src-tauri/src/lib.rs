@@ -399,11 +399,16 @@ async fn summary_job_loop(
         // Snapshot epoch before processing
         let epoch_before = state.get_active_epoch();
 
-        let job_result = tokio::time::timeout(
-            Duration::from_secs(180),
-            queue.process_one::<jobs::GlossJob>(&emitter),
-        )
-        .await;
+        // Run the job on its own task so a panicking job cannot kill the
+        // background loop (previously a panic here — e.g. the
+        // reqwest::blocking-in-async panic — silently stranded every pending
+        // job). A panic surfaces as a JoinError handled below.
+        let queue_task = Arc::clone(&queue);
+        let emitter_task = Arc::clone(&emitter);
+        let guarded = tokio::task::spawn(async move {
+            queue_task.process_one::<jobs::GlossJob>(&emitter_task).await
+        });
+        let job_result = tokio::time::timeout(Duration::from_secs(180), guarded).await;
 
         match job_result {
             Err(_timeout) => {
@@ -414,7 +419,20 @@ async fn summary_job_loop(
                 drop(permit);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            Ok(Ok(Some(job))) => {
+            Ok(Err(join_err)) => {
+                // Task panicked or was cancelled. Log and keep the loop alive
+                // so remaining jobs still get processed.
+                tracing::error!(
+                    error = %join_err,
+                    "Background queue task failed; continuing with remaining jobs"
+                );
+                state.clear_gate_owner("GPU gate", "background_summary");
+                state.clear_gate_owner("LLM gate", "background_summary");
+                drop(gpu_permit);
+                drop(permit);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Ok(Ok(Ok(Some(job)))) => {
                 let job_meta = serde_json::from_value::<jobs::GlossJob>(job.job_data.clone()).ok();
 
                 // Validate that the job was for the active notebook + epoch
@@ -535,7 +553,7 @@ async fn summary_job_loop(
                 // Cool-down between jobs to prevent GPU thermal throttling / CUDA errors
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
-            Ok(Ok(None)) => {
+            Ok(Ok(Ok(None))) => {
                 state.clear_gate_owner("GPU gate", "background_summary");
                 state.clear_gate_owner("LLM gate", "background_summary");
                 drop(gpu_permit);
@@ -573,7 +591,7 @@ async fn summary_job_loop(
                 // Poll less frequently when idle
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
-            Ok(Err(e)) => {
+            Ok(Ok(Err(e))) => {
                 tracing::error!("Job processing error: {}", e);
                 state.clear_gate_owner("GPU gate", "background_summary");
                 state.clear_gate_owner("LLM gate", "background_summary");

@@ -183,6 +183,7 @@ export interface EmbeddingDiagnosticsReceipt {
   native_fastembed: {
     init_ok: boolean;
     embed_one_ok: boolean;
+    model_cached: boolean;
     dims?: number | null;
     cache_dir: string;
     error?: string | null;

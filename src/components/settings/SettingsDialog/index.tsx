@@ -14,8 +14,9 @@ import {
 } from "../../../lib/features";
 import type {
   ChatAttemptTraceV1,
-  FeatureFlagStatus,
   DbDoctorReceipt,
+  EmbeddingDiagnosticsReceipt,
+  FeatureFlagStatus,
   MemoryBackendStatus,
   SemanticMemoryProfileStatus,
   SemanticMemoryLinkStatus,
@@ -372,6 +373,8 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const [rebuildingTurboQuant, setRebuildingTurboQuant] = useState(false);
   const [runningRetrievalProbe, setRunningRetrievalProbe] = useState(false);
   const [runningEmbeddingDiagnostics, setRunningEmbeddingDiagnostics] = useState(false);
+  const [embeddingDiagnostics, setEmbeddingDiagnostics] =
+    useState<EmbeddingDiagnosticsReceipt | null>(null);
   const [runningDbDoctor, setRunningDbDoctor] = useState<"check" | "repair" | null>(null);
   const [dbDoctorReceipt, setDbDoctorReceipt] = useState<DbDoctorReceipt | null>(null);
   const [runningChatSmoke, setRunningChatSmoke] = useState(false);
@@ -635,10 +638,15 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     setRunningEmbeddingDiagnostics(true);
     try {
       const receipt = await api.runEmbeddingDiagnostics();
+      setEmbeddingDiagnostics(receipt);
+      const native = receipt.native_fastembed;
+      const healthy = native.init_ok && native.embed_one_ok;
       useToastStore.getState().addToast({
-        type: receipt.native_fastembed.embed_one_ok ? "success" : "error",
+        type: healthy ? "success" : "error",
         title: "Embedding diagnostics complete",
-        message: `${receipt.semantic_memory_provider.provider}: ${receipt.semantic_memory_provider.dims} dims`,
+        message: healthy
+          ? `${receipt.semantic_memory_provider.provider} ready · ${native.dims ?? "?"} dims`
+          : native.error || "Embedding backend not ready",
         duration: 6000,
       });
     } catch (error) {
@@ -1100,6 +1108,40 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               )}
               Run embedding diagnostics
             </button>
+            {embeddingDiagnostics && (
+              <div className="rounded border border-border bg-bg-tertiary/40 px-3 py-2 text-xs text-text-secondary">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <span
+                    className={
+                      embeddingDiagnostics.native_fastembed.init_ok &&
+                      embeddingDiagnostics.native_fastembed.embed_one_ok
+                        ? "text-success"
+                        : "text-warning"
+                    }
+                  >
+                    {embeddingDiagnostics.native_fastembed.init_ok &&
+                    embeddingDiagnostics.native_fastembed.embed_one_ok
+                      ? "● Ready"
+                      : "● Not ready"}
+                  </span>
+                  <span>
+                    Backend: {embeddingDiagnostics.semantic_memory_provider.provider}
+                  </span>
+                  {embeddingDiagnostics.native_fastembed.dims != null && (
+                    <span>{embeddingDiagnostics.native_fastembed.dims}d</span>
+                  )}
+                  <span>
+                    Model cached:{" "}
+                    {embeddingDiagnostics.native_fastembed.model_cached ? "yes" : "no"}
+                  </span>
+                </div>
+                {embeddingDiagnostics.native_fastembed.error && (
+                  <p className="mt-1 text-[11px] text-warning">
+                    {embeddingDiagnostics.native_fastembed.error}
+                  </p>
+                )}
+              </div>
+            )}
             {profileStatus?.projection_summary && (
               <div className="rounded border border-border bg-bg-tertiary/40 px-3 py-2 text-xs text-text-secondary">
                 <div className="grid gap-1 sm:grid-cols-4">
@@ -1229,16 +1271,40 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               />
               Use proveKV pool candidates; exact f32 rerank stays mandatory
             </label>
+            <div className="rounded border border-border bg-bg-tertiary/40 px-3 py-2">
+              <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-text">
+                <Cpu className="h-3.5 w-3.5 text-accent" />
+                Embedding backend
+              </div>
+              <select
+                value={settings["semantic_memory_embedding_provider"] || "fastembed"}
+                onChange={(e) =>
+                  updateSetting("semantic_memory_embedding_provider", e.target.value)
+                }
+                aria-label="Embedding backend"
+                className="w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
+              >
+                <option value="fastembed">
+                  Automatic · CPU candle (local, no setup)
+                </option>
+                <option value="ollama">Ollama (external server)</option>
+              </select>
+              <p className="mt-1 text-[11px] text-text-muted">
+                No Ollama? Gloss automatically falls back to the built-in CPU
+                embedder (candle, nomic-embed-text-v1.5) — nothing else needs
+                configuring.
+              </p>
+            </div>
             <label className="flex items-center gap-2 text-xs text-text-secondary">
               <input
                 type="checkbox"
-                checked={(settings["fastembed_download_consent"] || "false") === "true"}
+                checked={(settings["fastembed_download_consent"] || "true") === "true"}
                 onChange={(e) =>
                   updateSetting("fastembed_download_consent", e.target.checked ? "true" : "false")
                 }
                 className="accent-accent"
               />
-              Permit first-use FastEmbed model download
+              Automatically download the embedding model on first use (~550MB)
             </label>
             <div className="flex flex-wrap items-center gap-2">
               <button

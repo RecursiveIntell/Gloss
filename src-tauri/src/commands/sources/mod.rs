@@ -465,19 +465,14 @@ fn run_ingestion_inner(
     let result = (|| -> Result<IngestionTerminalState, GlossError> {
         // Get notebook dir + source record
         let nb_dir = {
-            let app_db = state
-                .app_db
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
+            // Poison recovery: a one-off panic elsewhere must not brick imports.
+            let app_db = state.app_db.lock().unwrap_or_else(|e| e.into_inner());
             let nb = app_db.get_notebook(notebook_id)?;
             PathBuf::from(nb.directory)
         };
 
         let target_tokens = {
-            let app_db = state
-                .app_db
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
+            let app_db = state.app_db.lock().unwrap_or_else(|e| e.into_inner());
             app_db
                 .get_setting("chunk_target_tokens")
                 .ok()
@@ -1088,7 +1083,8 @@ fn resolve_background_job_config(
     state: &AppState,
     kind: BackgroundJobKind,
 ) -> Result<BackgroundJobConfig, String> {
-    let app_db = state.app_db.lock().map_err(|e| e.to_string())?;
+    // Poison recovery: a one-off panic elsewhere must not brick every import.
+    let app_db = state.app_db.lock().unwrap_or_else(|e| e.into_inner());
     resolve_background_job_config_from_db(&app_db, kind)
 }
 
@@ -1520,10 +1516,8 @@ fn invalidate_suggested_questions(state: &AppState, notebook_id: &str) {
 
 fn sync_notebook_source_count(state: &AppState, notebook_id: &str) -> Result<(), GlossError> {
     let count = state.with_notebook_db(notebook_id, |db| db.source_count())?;
-    let app_db = state
-        .app_db
-        .lock()
-        .map_err(|e| GlossError::Other(e.to_string()))?;
+    // Poison recovery: a one-off panic elsewhere must not brick every import.
+    let app_db = state.app_db.lock().unwrap_or_else(|e| e.into_inner());
     app_db.update_source_count(notebook_id, count)?;
     Ok(())
 }
@@ -3383,10 +3377,9 @@ pub async fn delete_source(
 
     if !old_embedding_ids.is_empty() {
         let removed_count = {
-            let mut indices = state
-                .hnsw_indices
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
+            // Recover from a poisoned lock instead of failing every retry with
+            // "poisoned lock: another task failed inside".
+            let mut indices = state.hnsw_indices.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(index) = indices.get_mut(&notebook_id) {
                 let mut removed = 0usize;
                 for embedding_id in &old_embedding_ids {
@@ -3710,10 +3703,9 @@ pub async fn retry_source_ingestion(
 
     if !old_embedding_ids.is_empty() {
         let removed_count = {
-            let mut indices = state
-                .hnsw_indices
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
+            // Recover from a poisoned lock instead of failing every retry with
+            // "poisoned lock: another task failed inside".
+            let mut indices = state.hnsw_indices.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(index) = indices.get_mut(&notebook_id) {
                 let mut removed = 0usize;
                 for eid in &old_embedding_ids {
@@ -3747,8 +3739,10 @@ pub async fn retry_source_ingestion(
         }
     }
 
-    // Reset status and delete old chunks
-    let source_type = state.with_notebook_db(&notebook_id, |db| {
+    // Reset status and delete old chunks. NOTE: this must use the WRITE pool
+    // connection — the read pool opens SQLite READ_ONLY and writes here used to
+    // fail with "attempt to write a readonly database".
+    let source_type = state.with_notebook_db_write(&notebook_id, |db| {
         db.conn().execute(
             "UPDATE semantic_memory_links
              SET sync_status = 'stale',

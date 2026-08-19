@@ -379,4 +379,51 @@ mod tests {
             cached.len()
         );
     }
+
+    /// A write closure that panics must NOT strand the connection: the write
+    /// method's `catch_unwind` returns the connection to the pool, so the
+    /// next write succeeds.  This is the regression that previously produced
+    /// "write connection not available" on every retry after a single panic.
+    #[test]
+    fn write_closure_panic_does_not_strand_connection() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_nb.db");
+        let pool = NotebookDbPool::new(&db_path).unwrap();
+
+        // First closure panics inside the write — it is caught.
+        let res: Result<(), GlossError> = pool.write(|_db| {
+            panic!("simulated ingestion panic (e.g. blocking reqwest)");
+        });
+        assert!(res.is_err());
+        let err_str = format!("{}", res.unwrap_err());
+        assert!(
+            err_str.contains("panic"),
+            "expected panic in error, got: {err_str}"
+        );
+
+        // The write connection must still be available for a second write.
+        let ok: Result<i64, GlossError> = pool.write(|db| {
+            db.conn()
+                .execute(
+                    "UPDATE _meta SET value = 'recovered' WHERE key = 'test'",
+                    [],
+                )
+                .map_err(GlossError::from)
+                .map(|_| 42i64)
+        });
+        // The _meta table is empty, so UPDATE affects 0 rows — that's fine.
+        // The point: the closure ran (connection was available). If the
+        // connection had been stranded we'd get "write connection not
+        // available" (or a poisoned lock) instead.
+        match &ok {
+            Ok(_) => {}
+            Err(e) => {
+                let s = format!("{e}");
+                assert!(
+                    !s.contains("not available") && !s.contains("poisoned"),
+                    "write connection was stranded after panic: {s}"
+                );
+            }
+        }
+    }
 }

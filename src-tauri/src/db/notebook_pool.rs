@@ -111,6 +111,13 @@ impl NotebookDbPool {
     ///
     /// Only one writer may hold the connection at a time.  The connection is
     /// released when the closure returns.
+    ///
+    /// **Panic safety:** the closure runs under `catch_unwind` so a panicking
+    /// write can never strand the connection outside the pool (which
+    /// previously left the slot empty and made every later write fail with
+    /// "write connection not available" until the app restarted — the
+    /// root cause of bulk `Retry Failed` failures after any panic in
+    /// ingestion).
     pub fn write<F, T>(&self, f: F) -> Result<T, GlossError>
     where
         F: FnOnce(&NotebookDb) -> Result<T, GlossError>,
@@ -118,10 +125,27 @@ impl NotebookDbPool {
         info!("[notebook-pool] write acquire for {:?}", self.db_path);
         let conn = self.take_write_conn()?;
         let db = NotebookDb::from_conn_ref(&conn);
-        let result = f(db);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(db)));
+        // ALWAYS return the connection, even if the closure panicked.
         self.return_write_conn(conn);
         info!("[notebook-pool] write release for {:?}", self.db_path);
-        result
+        match result {
+            Ok(inner) => inner,
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                warn!(
+                    "[notebook-pool] write closure panicked for {:?}; connection returned to pool (panic: {})",
+                    self.db_path, msg
+                );
+                Err(GlossError::Other(format!(
+                    "notebook write closure panicked: {msg}"
+                )))
+            }
+        }
     }
 
     /// Return the database path this pool manages.

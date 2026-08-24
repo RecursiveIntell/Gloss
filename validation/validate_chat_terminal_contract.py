@@ -6,33 +6,36 @@ root = Path(sys.argv[1]) if len(sys.argv)>1 else Path('.')
 path = root/'src-tauri/src/commands/chat/mod.rs'
 text = path.read_text(encoding='utf-8')
 
-# More robust spawn detection: tolerate 'async move {' variations
+def balanced_block_end(source: str, open_at: int) -> int:
+    depth = 0
+    for index in range(open_at, len(source)):
+        if source[index] == '{':
+            depth += 1
+        elif source[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return -1
+
+
+# The current owner is `SpawnedChatAttempt::run`; older snapshots owned the
+# body directly inside `tokio::spawn(async move { ... })`. Accept both shapes
+# so the gate follows the lifecycle owner instead of a historical spelling.
+owner_match = re.search(
+    r'(?m)^\s*(?:pub\(crate\)\s+)?async\s+fn\s+run\s*\(\s*self\s*\)\s*\{',
+    text,
+)
 spawn_match = re.search(r'tokio::spawn\s*\(\s*async\s+(?:move\s+)?\{', text)
-if not spawn_match:
-    print('FAIL: could not locate spawned chat task block')
+match = owner_match or spawn_match
+if not match:
+    print('FAIL: could not locate spawned chat lifecycle owner')
     sys.exit(1)
 
-start = spawn_match.start()
-# Find end: either a comment or a reasonable boundary (150 chars after last significant return)
-end_comment = text.find('// Release gates', start)
-# Also look for the closing of the spawn block — match braces
-brace_depth = 0
-found_open = False
-end_brace = start
-for i, ch in enumerate(text[start:], start):
-    if ch == '{':
-        brace_depth += 1
-        found_open = True
-    elif ch == '}':
-        brace_depth -= 1
-        if found_open and brace_depth == 0:
-            end_brace = i + 1
-            break
-
-# Prefer the earlier of comment or brace close
-end = end_comment if end_comment != -1 and end_comment < end_brace else end_brace
-if start == -1 or end == -1 or end <= start:
-    print('FAIL: could not locate spawned chat task block end')
+start = match.start()
+open_at = text.find('{', match.start())
+end = balanced_block_end(text, open_at)
+if open_at == -1 or end == -1 or end <= start:
+    print('FAIL: could not locate spawned chat lifecycle block end')
     sys.exit(1)
 
 block = text[start:end]

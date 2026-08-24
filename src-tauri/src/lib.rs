@@ -406,7 +406,9 @@ async fn summary_job_loop(
         let queue_task = Arc::clone(&queue);
         let emitter_task = Arc::clone(&emitter);
         let guarded = tokio::task::spawn(async move {
-            queue_task.process_one::<jobs::GlossJob>(&emitter_task).await
+            queue_task
+                .process_one::<jobs::GlossJob>(&emitter_task)
+                .await
         });
         let job_result = tokio::time::timeout(Duration::from_secs(180), guarded).await;
 

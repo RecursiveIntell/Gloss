@@ -305,25 +305,31 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   stopStreaming: async (notebookId) => {
     try {
       await api.stopChat(notebookId);
-    } finally {
-      const { isStreaming, streamingMessageId, streamingContent } = get();
-      if (!isStreaming || !streamingMessageId) return;
-      set((state) => ({
-        pendingEvidence: Object.fromEntries(
-          Object.entries(state.pendingEvidence).filter(([id]) => id !== streamingMessageId)
-        ),
-        pendingMessageIds: Object.fromEntries(
-          Object.entries(state.pendingMessageIds).filter(([id]) => id !== streamingMessageId)
-        ),
-        isStreaming: false,
-        streamingContent,
-        streamingNotebookId: null,
-        streamingMessageId: null,
-        streamingError: streamingContent
-          ? 'Generation stopped. Partial output was not saved as an assistant message.'
-          : 'Generation stopped before any output was received.',
-        streamingStatus: null,
-      }));
+      const { isStreaming, streamingMessageId, activeConversationId } = get();
+      if (!isStreaming || !streamingMessageId || !activeConversationId) return;
+      // The command only acknowledges a cancellation request. The backend
+      // stream task is authoritative for terminal cleanup via chat:cancelled,
+      // chat:error, or chat:done.
+      set({
+        streamingStatus: {
+          notebook_id: notebookId,
+          conversation_id: activeConversationId,
+          message_id: streamingMessageId,
+          phase: 'cancelling',
+          message: 'Cancellation requested',
+          elapsed_ms: 0,
+          truncated: false,
+        },
+      });
+    } catch (error) {
+      const { activeConversationId, streamingMessageId } = get();
+      if (!activeConversationId || !streamingMessageId) return;
+      get().setStreamingError(
+        notebookId,
+        activeConversationId,
+        streamingMessageId,
+        `Cancellation request failed: ${errorMessage(error)}`
+      );
     }
   },
 

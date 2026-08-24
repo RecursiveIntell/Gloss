@@ -52,6 +52,7 @@ def main() -> int:
     lib = text(repo / "src-tauri/src/lib.rs")
     ui = text(repo / "src/components/sources/SourcesPanel.tsx")
     tauri = text(repo / "src/lib/tauri.ts")
+    contract = text(repo / "schemas/tauri-contract-v1.json")
     receipt_path = (
         repo
         / "docs/codex-runs"
@@ -79,14 +80,23 @@ def main() -> int:
 
     if 'get_import_capability_matrix' not in sources or 'get_import_capability_matrix' not in lib:
         failures.append("import capability command is not registered")
+    if "getImportCapabilityMatrix" not in tauri:
+        try:
+            contract_entry = json.loads(contract).get("commands", {}).get("get_import_capability_matrix", {})
+        except json.JSONDecodeError:
+            contract_entry = {}
+        if not (
+            contract_entry.get("operator_only") is True
+            and contract_entry.get("wrapper") is None
+            and contract_entry.get("caller_count") == 0
+        ):
+            failures.append("frontend tauri wrapper does not expose import capability matrix")
     if "walk_report.skipped_unsupported" not in sources:
         failures.append("folder scan does not carry skipped unsupported/deferred count")
     if 'classify_import_extension(&ext)' not in sources:
         failures.append("folder/direct import does not use strict capability classifier")
     if "Treat unknown extensions as plain text" in sources:
         failures.append("legacy unknown-extension text fallback remains in sources command")
-    if "getImportCapabilityMatrix" not in tauri:
-        failures.append("frontend tauri wrapper does not expose import capability matrix")
     if "local PDF/DOCX/DOC/XLSX/XLS/PPTX/PPT/EPUB extraction" not in ui:
         failures.append("source panel does not disclose local document extractor support")
     if "audio metadata" not in ui:

@@ -160,7 +160,7 @@ impl HnswIndex {
 /// it is the automatic fallback whenever no Ollama server is configured or
 /// reachable.
 pub enum EmbeddingBackend {
-    NomicV15(NomicV15Embedder),
+    NomicV15(Box<NomicV15Embedder>),
     Ollama {
         client: reqwest::Client,
         url: String,
@@ -457,7 +457,7 @@ impl EmbeddingService {
         )?;
 
         Ok(Self {
-            backend: EmbeddingBackend::NomicV15(model),
+            backend: EmbeddingBackend::NomicV15(Box::new(model)),
             dims: 768,
             model_id: CANDLE_EMBEDDING_MODEL.to_string(),
         })

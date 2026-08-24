@@ -10,7 +10,7 @@ vi.mock('../../lib/tauri', () => ({
   loadMessages: vi.fn().mockResolvedValue([]),
   getChatEventsSince: vi.fn().mockResolvedValue([]),
   sendMessage: vi.fn().mockResolvedValue('msg-1'),
-  stopChat: vi.fn().mockResolvedValue(undefined),
+  stopChat: vi.fn().mockResolvedValue({ cancellation_requested: true, attempts: [] }),
   getSuggestedQuestions: vi.fn().mockResolvedValue([]),
   deleteConversation: vi.fn().mockResolvedValue(undefined),
 }));
@@ -234,7 +234,7 @@ describe('chatStore', () => {
     expect(after.messages).toEqual(persisted);
   });
 
-  it('stopStreaming sets isStreaming=false and streamingError', async () => {
+  it('stopStreaming keeps the stream pending until chat:cancelled is observed', async () => {
     const msgId = 'msg-assistant-2';
 
     useChatStore.setState({
@@ -242,14 +242,45 @@ describe('chatStore', () => {
       streamingContent: 'partial...',
       streamingNotebookId: 'nb-1',
       streamingMessageId: msgId,
+      pendingMessageIds: { [msgId]: true },
+      activeConversationId: 'conv-1',
+    });
+
+    await useChatStore.getState().stopStreaming('nb-1');
+
+    const afterAcknowledgement = useChatStore.getState();
+    expect(afterAcknowledgement.isStreaming).toBe(true);
+    expect(afterAcknowledgement.streamingError).toBeNull();
+    expect(afterAcknowledgement.streamingNotebookId).toBe('nb-1');
+    expect(afterAcknowledgement.streamingMessageId).toBe(msgId);
+    expect(afterAcknowledgement.streamingStatus?.phase).toBe('cancelling');
+
+    useChatStore.getState().handleChatCancelled('nb-1', 'conv-1', msgId, 'Cancelled by user');
+
+    const afterTerminalEvent = useChatStore.getState();
+    expect(afterTerminalEvent.isStreaming).toBe(false);
+    expect(afterTerminalEvent.streamingError).toBe('Cancelled by user');
+    expect(afterTerminalEvent.streamingNotebookId).toBeNull();
+    expect(afterTerminalEvent.streamingMessageId).toBeNull();
+  });
+
+  it('stopStreaming reports a cancellation request failure as an error terminal state', async () => {
+    const msgId = 'msg-cancel-request-failure';
+    vi.mocked(api.stopChat).mockRejectedValueOnce(new Error('backend unavailable'));
+    useChatStore.setState({
+      isStreaming: true,
+      streamingContent: 'partial...',
+      streamingNotebookId: 'nb-1',
+      streamingMessageId: msgId,
+      pendingMessageIds: { [msgId]: true },
+      activeConversationId: 'conv-1',
     });
 
     await useChatStore.getState().stopStreaming('nb-1');
 
     const after = useChatStore.getState();
     expect(after.isStreaming).toBe(false);
-    // Error should be set because partial output wasn't finalized as a message
-    expect(after.streamingError).toBeTruthy();
+    expect(after.streamingError).toBe('Cancellation request failed: backend unavailable');
     expect(after.streamingNotebookId).toBeNull();
     expect(after.streamingMessageId).toBeNull();
   });

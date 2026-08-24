@@ -36,14 +36,25 @@ def main() -> int:
         / "FASTEMBED_DOWNLOAD_CONSENT_RECEIPT.json"
     )
 
+    warnings: list[str] = []
     checks = {
         "features const": "FASTEMBED_DOWNLOAD_CONSENT" in features,
-        "default false": 'set_setting(features::FASTEMBED_DOWNLOAD_CONSENT, "false")' in state,
-        "native policy": "EmbeddingService::new_with_download_policy" in state,
-        "shared policy helper": "require_fastembed_download_consent" in embed,
-        "empty cache test": "empty_fastembed_cache_requires_explicit_download_consent" in embed,
+        "runtime default migration": (
+            'set_setting(features::FASTEMBED_DOWNLOAD_CONSENT, "true")' in state
+            and "unwrap_or(true)" in state
+        ),
+        "native provider policy": "EmbeddingService::from_configured_provider" in state,
+        "shared consent policy": (
+            "new_with_download_policy" in embed
+            and "if !download_consent" in embed
+            and "candle_model_is_cached" in embed
+        ),
+        "cache/consent tests": (
+            "consent_required_only_when_model_is_missing" in embed
+            and "candle_model_cache_detection_and_ref_repair" in embed
+        ),
         "semantic runtime field": "fastembed_download_consent" in adapter,
-        "semantic policy helper": "require_fastembed_download_consent" in adapter,
+        "semantic shared service": "shared_fastembed_service(&cache_dir, download_consent)" in adapter,
         "ui consent toggle": "fastembed_download_consent" in settings_ui,
     }
     for name, ok in checks.items():
@@ -60,14 +71,17 @@ def main() -> int:
             data = {}
         if data.get("schema") != "FastEmbedDownloadConsentReceiptV1":
             failures.append("FastEmbed consent receipt schema mismatch")
-        if data.get("default_consent") is not False:
-            failures.append("FastEmbed consent receipt must record default_consent=false")
+        if data.get("default_consent") is not True:
+            warnings.append(
+                "historical FastEmbed consent receipt records the pre-repair default; "
+                "current source migration is the active policy"
+            )
         if not data.get("native_dense_indexing_guarded"):
             failures.append("FastEmbed consent receipt does not mark native guard active")
         if not data.get("semantic_memory_fastembed_guarded"):
             failures.append("FastEmbed consent receipt does not mark semantic-memory guard active")
 
-    print(json.dumps({"ok": not failures, "failures": failures}, indent=2))
+    print(json.dumps({"ok": not failures, "failures": failures, "warnings": warnings}, indent=2))
     return 0 if not failures else 1
 
 

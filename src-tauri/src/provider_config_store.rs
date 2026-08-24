@@ -1,6 +1,6 @@
 use crate::error::GlossError;
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::aead::{Aead, Generate, KeyInit, Nonce as AeadNonce};
+use aes_gcm::Aes256Gcm;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -77,8 +77,12 @@ impl SecretStore {
         let key = self.load_or_create_key()?;
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|e| GlossError::Other(format!("Failed to initialize secret cipher: {e}")))?;
+        let nonce: AeadNonce<Aes256Gcm> = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| GlossError::Other("Secret store nonce has invalid length".into()))?;
         let plaintext = cipher
-            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .decrypt(&nonce, ciphertext.as_ref())
             .map_err(|e| GlossError::Other(format!("Failed to decrypt local secret store: {e}")))?;
 
         serde_json::from_slice(&plaintext).map_err(GlossError::JsonParse)
@@ -89,16 +93,15 @@ impl SecretStore {
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|e| GlossError::Other(format!("Failed to initialize secret cipher: {e}")))?;
 
-        let mut nonce = [0u8; 12];
-        aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut OsRng, &mut nonce);
+        let nonce = AeadNonce::<Aes256Gcm>::generate();
 
         let plaintext = serde_json::to_vec(secrets)?;
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .encrypt(&nonce, plaintext.as_ref())
             .map_err(|e| GlossError::Other(format!("Failed to encrypt local secret store: {e}")))?;
 
         let payload = EncryptedSecrets {
-            nonce_b64: base64::engine::general_purpose::STANDARD.encode(nonce),
+            nonce_b64: base64::engine::general_purpose::STANDARD.encode(nonce.as_slice()),
             ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(ciphertext),
         };
 
@@ -119,8 +122,7 @@ impl SecretStore {
                 .map_err(|_| GlossError::Other("Secret-store key has invalid length".into()));
         }
 
-        let mut key = [0u8; 32];
-        aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut OsRng, &mut key);
+        let key: [u8; 32] = <[u8; 32] as Generate>::generate();
 
         let mut file = open_owner_only_create_new(&key_path)?;
         file.write_all(&key)?;

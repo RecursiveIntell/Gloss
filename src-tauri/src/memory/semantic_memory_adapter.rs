@@ -22,8 +22,36 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+/// Process-wide cache of the shared candle [`EmbeddingService`].
+///
+/// Loading the 550MB nomic v1.5 model takes seconds warm but tens of seconds
+/// cold, and the semantic-memory projection previously constructed a
+/// brand-new service PER SOURCE inside the folder-import loop — each source
+/// paid a full model reload (~65s wall per source, ~550MB of disk reads),
+/// which is why a 279-source folder import took hours with every item stuck
+/// at "pending". Sharing one instance across all projections (and both the
+/// native + semantic-memory lanes) makes the model load happen exactly once
+/// per process.
+static SHARED_FASTEMBED_SERVICE: OnceLock<Mutex<Option<Arc<Mutex<EmbeddingService>>>>> =
+    OnceLock::new();
+
+fn shared_fastembed_service(
+    cache_dir: &Path,
+    download_consent: bool,
+) -> Result<Arc<Mutex<EmbeddingService>>, GlossError> {
+    let cell = SHARED_FASTEMBED_SERVICE.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(service) = guard.as_ref() {
+        return Ok(Arc::clone(service));
+    }
+    let service = EmbeddingService::new_with_download_policy(cache_dir, false, download_consent)?;
+    let arc = Arc::new(Mutex::new(service));
+    *guard = Some(Arc::clone(&arc));
+    Ok(arc)
+}
 
 const BACKEND_VERSION: &str = "semantic-memory 0.5.0";
 // FastEmbed is now the only embedding provider (Nomic v2 MoE, 768d, candle-based).
@@ -76,11 +104,16 @@ impl FastEmbedSemanticMemoryEmbedder {
         // candle-transformers (fastembed's NomicV2Moe loader cannot load v1.5
         // at any revision) and checks the real hf-hub cache location, so the
         // model is reused across the native and semantic-memory paths.
-        let service =
-            EmbeddingService::new_with_download_policy(&cache_dir, false, download_consent)?;
+        //
+        // The service is shared process-wide (loaded exactly once) rather than
+        // rebuilt per source: the folder-import loop projects each source
+        // through a fresh open_store() → try_new(), and a per-source model
+        // reload made 279-source imports take ~65s per source with every item
+        // stuck at "pending".
+        let service = shared_fastembed_service(&cache_dir, download_consent)?;
 
         Ok(Self {
-            service: Arc::new(Mutex::new(service)),
+            service,
             model_name: FASTEMBED_MODEL_NAME.to_string(),
             dimensions: FASTEMBED_DIMENSIONS,
         })
@@ -166,6 +199,7 @@ pub struct SemanticMemoryRuntimeConfig {
     pub fastembed_download_consent: bool,
     pub turbo_quant_enabled: bool,
     pub turbo_quant_require_fresh_artifacts: bool,
+    #[cfg_attr(not(feature = "semantic-memory-turbo-quant"), allow(dead_code))]
     pub provekv_pool_enabled: bool,
 }
 

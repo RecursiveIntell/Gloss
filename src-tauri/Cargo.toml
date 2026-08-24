@@ -49,19 +49,20 @@ serde_json = "1"
 toml = "0.8"
 
 # === HTTP (for Ollama provider) ===
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "blocking"] }
+reqwest = { version = "0.13", features = ["json", "stream", "rustls", "blocking"] }
 
 # === Embeddings + Reranking ===
-fastembed = { version = "5", default-features = false, features = ["hf-hub-native-tls", "nomic-v2-moe", "ort-download-binaries-native-tls"] }
-candle-core = "0.10"
-candle-nn = "0.10"
-candle-transformers = "0.10"
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# The runtime's canonical native path is Candle; the historical `fastembed`
+# setting/model identifiers remain compatibility labels in persisted state.
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 hf-hub = { version = "0.4", features = ["ureq", "native-tls"] }
 
 # === Vector search ===
 usearch = "2.25"
-semantic-memory = { version = "=0.5.11", optional = true }
+semantic-memory = { version = "=0.5.15", optional = true }
 
 # === Database ===
 rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
@@ -83,11 +84,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
-directories = "5"
+directories = "6"
 async-trait = "0.1"
 regex = "1"
-base64 = "0.22"
-aes-gcm = "0.10"
+base64 = "0.23"
+aes-gcm = "0.11"
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

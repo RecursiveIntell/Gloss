@@ -26,8 +26,8 @@ pub(crate) struct ChatStatusPayload<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_chat_status(
-    handle: &tauri::AppHandle,
+pub(crate) fn emit_chat_status<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
     notebook_id: &str,
     conversation_id: &str,
     message_id: &str,
@@ -102,8 +102,8 @@ fn status_reason_code(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_chat_stream_event(
-    handle: &tauri::AppHandle,
+fn emit_chat_stream_event<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
     event_name: &str,
     kind: &str,
     attempt_id: &str,
@@ -137,17 +137,17 @@ fn emit_chat_stream_event(
 /// chat:cancelled) is emitted per chat stream. Uses an `AtomicBool` guard so
 /// that even when multiple exit paths race (e.g. notebook-switch cancellation
 /// and normal completion), only the first caller actually emits.
-pub(crate) struct ChatTerminalGuard {
+pub(crate) struct ChatTerminalGuard<R: tauri::Runtime> {
     fired: AtomicBool,
-    handle: tauri::AppHandle,
+    handle: tauri::AppHandle<R>,
     notebook_id: String,
     conversation_id: String,
     message_id: String,
 }
 
-impl ChatTerminalGuard {
+impl<R: tauri::Runtime> ChatTerminalGuard<R> {
     pub fn new(
-        handle: tauri::AppHandle,
+        handle: tauri::AppHandle<R>,
         notebook_id: &str,
         conversation_id: &str,
         message_id: &str,
@@ -217,12 +217,17 @@ impl ChatTerminalGuard {
 
 /// Convenience: wraps a `ChatTerminalGuard` in `Arc` and provides helper methods.
 /// This is the primary API for spawned chat tasks.
-#[derive(Clone)]
-pub(crate) struct ChatTerminalEmitter(Arc<ChatTerminalGuard>);
+pub(crate) struct ChatTerminalEmitter<R: tauri::Runtime>(Arc<ChatTerminalGuard<R>>);
 
-impl ChatTerminalEmitter {
+impl<R: tauri::Runtime> Clone for ChatTerminalEmitter<R> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<R: tauri::Runtime> ChatTerminalEmitter<R> {
     pub fn new(
-        handle: tauri::AppHandle,
+        handle: tauri::AppHandle<R>,
         notebook_id: &str,
         conversation_id: &str,
         message_id: &str,
@@ -253,8 +258,8 @@ impl ChatTerminalEmitter {
     }
 }
 
-pub(crate) fn emit_chat_done(
-    handle: &tauri::AppHandle,
+pub(crate) fn emit_chat_done<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
     notebook_id: &str,
     conversation_id: &str,
     message_id: &str,
@@ -262,8 +267,8 @@ pub(crate) fn emit_chat_done(
     emit_chat_token(handle, notebook_id, conversation_id, message_id, "", true);
 }
 
-pub(crate) fn emit_chat_token(
-    handle: &tauri::AppHandle,
+pub(crate) fn emit_chat_token<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
     notebook_id: &str,
     conversation_id: &str,
     message_id: &str,
@@ -292,8 +297,8 @@ pub(crate) fn emit_chat_token(
     let _ = handle.emit("chat:token", payload);
 }
 
-pub(crate) fn emit_chat_evidence(
-    handle: &tauri::AppHandle,
+pub(crate) fn emit_chat_evidence<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
     notebook_id: &str,
     conversation_id: &str,
     message_id: &str,
@@ -321,8 +326,8 @@ pub(crate) fn emit_chat_evidence(
     let _ = handle.emit("chat:evidence", payload);
 }
 
-pub(crate) fn emit_chat_error(
-    handle: &tauri::AppHandle,
+pub(crate) fn emit_chat_error<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
     notebook_id: &str,
     conversation_id: &str,
     message_id: &str,
@@ -352,8 +357,8 @@ pub(crate) fn emit_chat_error(
 /// when a chat was cancelled (e.g. notebook switch) rather than treating it
 /// as an error. The frontend should treat this as a terminal event: it ends
 /// the streaming state.
-pub(crate) fn emit_chat_cancelled(
-    handle: &tauri::AppHandle,
+pub(crate) fn emit_chat_cancelled<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
     notebook_id: &str,
     conversation_id: &str,
     message_id: &str,
@@ -392,6 +397,18 @@ mod tests {
                 Some("search-timeout: semantic-memory preview timed out")
             ),
             Some(RetrievalReasonCode::SemanticMemoryTimeout)
+        );
+    }
+
+    #[test]
+    fn provider_timeouts_are_not_mislabeled_as_retrieval_timeouts() {
+        assert_eq!(
+            status_reason_code(
+                "provider_start_timeout",
+                None,
+                Some("Provider did not return a stream before timeout")
+            ),
+            None
         );
     }
 }

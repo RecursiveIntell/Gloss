@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Notebook,
   Source,
+
   Conversation,
   Message,
   Note,
@@ -32,6 +33,7 @@ import type {
   NotebookPortableManifest,
   StudioOutput,
   StudioExportReceipt,
+  StopChatResponseV1,
 } from "./types";
 
 // === Notebooks ===
@@ -306,7 +308,7 @@ export async function sendMessage(
   });
 }
 
-export async function stopChat(notebookId: string): Promise<void> {
+export async function stopChat(notebookId: string): Promise<StopChatResponseV1> {
   return invoke("stop_chat", { notebookId });
 }
 

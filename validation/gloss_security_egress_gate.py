@@ -50,8 +50,12 @@ def main() -> int:
     for token in required_tokens:
         if token not in providers:
             failures.append(f"providers/mod.rs missing {token}")
-    if "validate_provider_base_url(provider_type, &candidate_url, allow_lan)" not in settings and \
-       "validate_provider_base_url(provider_type, candidate_url, allow_lan)" not in settings:
+    validation_call = re.search(
+        r"validate_provider_base_url\s*\(\s*provider_type\s*,\s*&?candidate_url\s*,\s*allow_lan\s*,\s*allow_custom_cloud_endpoints",
+        settings,
+        re.DOTALL,
+    )
+    if validation_call is None:
         failures.append("update_provider does not validate provider base URL before persistence")
     if "HTTP {}: {}" in provider_modules:
         failures.append("provider module still formats raw HTTP error body")

@@ -837,7 +837,7 @@
       "definition": "src-tauri/src/commands/sources/mod.rs",
       "error_family": "GlossError",
       "wrapper": "runRetrievalProbe",
-      "caller_count": 1,
+      "caller_count": 2,
       "operator_only": false,
       "request": {
         "casing": "camelCase",
@@ -1043,7 +1043,7 @@
           "notebookId"
         ]
       },
-      "response_family": "void"
+      "response_family": "StopChatResponseV1"
     },
     "test_provider": {
       "registered": true,

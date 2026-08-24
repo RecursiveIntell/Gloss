@@ -16,8 +16,8 @@ pub(crate) fn gate_owner_for(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn acquire_gate_with_epoch<'a>(
-    app_handle: &tauri::AppHandle,
+pub(crate) async fn acquire_gate_with_epoch<'a, R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
     state: &'a AppState,
     notebook_id: &str,
     conversation_id: &str,

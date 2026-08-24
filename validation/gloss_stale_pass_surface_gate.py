@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse, json, pathlib, re, sys
 OLD_RUN_RE = re.compile(r"(P31|P32|P33|P34|P35|P36|GLOSS_P3[1-6]|p31|p32|p33|p34|p35|p36)")
-FORBIDDEN_ROOT_DIRS = ["p33boot", "phase_prompts", "manual_injections", "prompts"]
+# `prompts/` is an active source-owned Studio prompt directory. The other
+# directories are historical pass scaffolding and must not remain active.
+FORBIDDEN_ROOT_DIRS = ["p33boot", "phase_prompts", "manual_injections"]
 FORBIDDEN_SKILL_PATTERNS = ["p31", "p32", "p33", "p34", "p35", "p36"]
 
 def read(p):

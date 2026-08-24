@@ -3,8 +3,6 @@ use crate::error::GlossError;
 use crate::providers::{
     build_provider, ChatMessage, ChatRequest, LlmExecutionContext, LlmPhaseTimeouts,
 };
-use std::collections::HashMap;
-use std::sync::OnceLock;
 use crate::redaction::redact_path;
 use crate::state::{ActiveStudioAttempt, AppState};
 use crate::studio::{
@@ -14,8 +12,10 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tauri::State;
 use tokio_util::sync::CancellationToken;

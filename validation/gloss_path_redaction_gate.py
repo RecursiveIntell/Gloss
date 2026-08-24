@@ -46,7 +46,11 @@ def main() -> int:
         "redaction helper": "pub fn redact_path" in helper and "pub fn redact_text_paths" in helper,
         "redaction tests": "redact_path_keeps_only_leaf_for_absolute_paths" in helper,
         "tool stderr redaction": "redact_text_paths" in text(repo / "src-tauri/src/tool_invocation.rs"),
-        "embedding cache redaction": "redact_path(cache_dir)" in text(repo / "src-tauri/src/ingestion/embed.rs"),
+        "embedding errors omit raw cache paths": (
+            "cache_dir" in text(repo / "src-tauri/src/ingestion/embed.rs")
+            and ".display()" not in text(repo / "src-tauri/src/ingestion/embed.rs")
+            and "hf_home.display()" not in text(repo / "src-tauri/src/ingestion/embed.rs")
+        ),
         "settings diagnostics redaction": "cache_dir: redact_path(&cache_dir)" in text(repo / "src-tauri/src/commands/settings.rs"),
         "jobs image redaction": "redact_path(&full_path)" in text(repo / "src-tauri/src/jobs/mod.rs"),
         "state tracing redaction": "redact_path(&notebook_db_path)" in text(repo / "src-tauri/src/state.rs"),

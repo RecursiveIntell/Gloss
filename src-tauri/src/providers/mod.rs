@@ -1024,6 +1024,9 @@ mod tests {
         LateChunksAfterCancel,
         IncompleteEof,
         DoneNoContent,
+        DoneThenNeverEof {
+            chunks: Vec<&'static str>,
+        },
         Normal {
             chunks: Vec<&'static str>,
         },
@@ -1159,6 +1162,22 @@ mod tests {
                                 token: String::new(),
                                 done: true,
                             }),
+                            MockProviderMode::DoneThenNeverEof { chunks } => {
+                                if let Some(chunk) = chunks.get(state.step) {
+                                    Ok(ChatToken {
+                                        token: (*chunk).to_string(),
+                                        done: false,
+                                    })
+                                } else if state.step == chunks.len() {
+                                    Ok(ChatToken {
+                                        token: String::new(),
+                                        done: true,
+                                    })
+                                } else {
+                                    futures::future::pending::<()>().await;
+                                    unreachable!("pending future cannot complete")
+                                }
+                            }
                             MockProviderMode::Normal { chunks } => {
                                 if let Some(chunk) = chunks.get(state.step) {
                                     Ok(ChatToken {
@@ -1295,6 +1314,39 @@ mod tests {
             assert_eq!(done, expected_terminal_done);
             assert_eq!(provider.active_requests.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn scripted_done_frame_remains_terminal_without_waiting_for_eof() {
+        let provider = HarnessMockProvider::new(MockProviderMode::DoneThenNeverEof {
+            chunks: vec!["first", " second"],
+        });
+        let mut stream = provider
+            .chat(mock_chat_request(), LlmExecutionContext::uncancellable())
+            .await
+            .expect("scripted provider starts");
+
+        let mut response = String::new();
+        loop {
+            let token = stream
+                .next()
+                .await
+                .expect("script emits a done frame")
+                .expect("scripted token succeeds");
+            response.push_str(&token.token);
+            if token.done {
+                break;
+            }
+        }
+
+        assert_eq!(response, "first second");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), stream.next())
+                .await
+                .is_err()
+        );
+        drop(stream);
+        assert_eq!(provider.active_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

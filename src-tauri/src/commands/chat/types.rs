@@ -20,6 +20,22 @@ pub struct ChatStreamEventV1 {
     pub recorded_at: String,
 }
 
+/// Acknowledges that the backend accepted a cancellation request. This is not
+/// terminal state: the stream task remains the sole owner of the eventual
+/// `chat:cancelled`, `chat:error`, or `chat:done` event.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatCancellationRequestV1 {
+    pub attempt_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StopChatResponseV1 {
+    pub cancellation_requested: bool,
+    pub attempts: Vec<ChatCancellationRequestV1>,
+}
+
 // ---------------------------------------------------------------------------
 // Chat evidence disclosure
 // ---------------------------------------------------------------------------

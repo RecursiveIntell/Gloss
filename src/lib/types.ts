@@ -770,6 +770,16 @@ export interface ChatCancelledPayload {
   reason: string;
 }
 
+/** Acknowledgement that cancellation was requested, not that streaming ended. */
+export interface StopChatResponseV1 {
+  cancellation_requested: boolean;
+  attempts: Array<{
+    attempt_id: string;
+    conversation_id: string;
+    message_id: string;
+  }>;
+}
+
 export interface QueueStatus {
   paused: boolean;
   mode: string;

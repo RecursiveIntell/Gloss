@@ -20,9 +20,10 @@ use crate::retrieval::hybrid_search;
 use crate::retrieval::source_scope::{ResolvedSourceScope, SourceScope};
 use crate::state::AppState;
 use crate::studio::build_snippets;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use serde::Serialize;
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,6 +66,637 @@ const MAX_CONTEXT_WINDOW_TOKENS: u32 = 32_768;
 const MAX_CONTEXT_CHARS_TOTAL: usize = 32_000;
 
 // All struct/type definitions moved to types.rs; imported via `use types::*` above.
+
+/// Owns every value that the asynchronous chat lifecycle consumes after
+/// `send_message` has persisted the user turn and assembled retrieval context.
+///
+/// Keeping this as a runtime-generic job makes the real lifecycle directly
+/// callable under `tauri::test::mock_app` without changing the production
+/// state or provider path.
+struct SpawnedChatAttempt<R: tauri::Runtime> {
+    handle: tauri::AppHandle<R>,
+    active_chat_attempt: crate::state::ActiveChatAttempt,
+    provider: Box<dyn providers::LlmProvider>,
+    terminal: ChatTerminalEmitter<R>,
+    notebook_id: String,
+    conversation_id: String,
+    message_id: String,
+    query: String,
+    model: String,
+    history: Vec<Message>,
+    custom_goal: Option<String>,
+    style: String,
+    response_length: String,
+    source_scope: ResolvedSourceScope,
+    source_context: Vec<ContextPassage>,
+    model_context_window: Option<i32>,
+    evidence_for_message: ChatEvidenceDisclosure,
+    epoch: u64,
+    attempt_id: String,
+    user_message_id: String,
+    provider_name: String,
+    operation_receipt_id: String,
+    attempt_trace: Arc<Mutex<ChatAttemptTraceV1>>,
+    trace_data_dir: std::path::PathBuf,
+    phase_timeouts: providers::LlmPhaseTimeouts,
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_string()
+}
+
+impl<R: tauri::Runtime> SpawnedChatAttempt<R> {
+    /// Convert an unexpected task panic into the same durable terminal
+    /// contract as provider/stream failures. Without this boundary, a panic
+    /// would drop the detached JoinHandle and leave the frontend in a
+    /// permanent streaming state.
+    pub(crate) async fn run_with_panic_boundary(self) {
+        let handle = self.handle.clone();
+        let terminal = self.terminal.clone();
+        let notebook_id = self.notebook_id.clone();
+        let conversation_id = self.conversation_id.clone();
+        let attempt_id = self.attempt_id.clone();
+        let message_id = self.message_id.clone();
+        let user_message_id = self.user_message_id.clone();
+        let provider_name = self.provider_name.clone();
+        let model = self.model.clone();
+        let attempt_trace = Arc::clone(&self.attempt_trace);
+        let trace_data_dir = self.trace_data_dir.clone();
+
+        if let Err(payload) = std::panic::AssertUnwindSafe(self.run())
+            .catch_unwind()
+            .await
+        {
+            let error = format!(
+                "Chat task panicked: {}",
+                panic_payload_message(payload.as_ref())
+            );
+            let app_state: tauri::State<'_, AppState> = handle.state();
+            tracing::error!(
+                notebook_id = %notebook_id,
+                conversation_id = %conversation_id,
+                attempt_id = %attempt_id,
+                message_id = %message_id,
+                error = %error,
+                "Detached chat task panicked"
+            );
+            if !terminal.is_fired() {
+                record_chat_attempt_trace(
+                    &attempt_trace,
+                    &trace_data_dir,
+                    "chat_task_panic",
+                    Some(Duration::ZERO),
+                    Some("Detached chat task panicked"),
+                    Some(&error),
+                    |_| {},
+                );
+                persist_chat_attempt_status(
+                    &app_state,
+                    &notebook_id,
+                    &conversation_id,
+                    &attempt_id,
+                    &message_id,
+                    Some(&user_message_id),
+                    Some(&provider_name),
+                    Some(&model),
+                    "error",
+                    Some("chat_task_panic"),
+                    Some("chat_task_panic"),
+                    Some(&error),
+                    None,
+                    true,
+                );
+                terminal.emit_error(&error);
+            }
+            app_state.finish_active_chat_attempt(&notebook_id, &conversation_id, &attempt_id);
+        }
+    }
+
+    /// Runs the sole owner of the post-context chat lifecycle.
+    pub(crate) async fn run(self) {
+        use tauri::Manager;
+
+        let Self {
+            handle,
+            active_chat_attempt,
+            provider,
+            terminal,
+            notebook_id,
+            conversation_id,
+            message_id,
+            query,
+            model,
+            history,
+            custom_goal,
+            style,
+            response_length,
+            source_scope,
+            source_context,
+            model_context_window,
+            evidence_for_message,
+            epoch,
+            attempt_id,
+            user_message_id,
+            provider_name,
+            operation_receipt_id,
+            attempt_trace,
+            trace_data_dir,
+            phase_timeouts,
+        } = self;
+        let app_state: tauri::State<'_, AppState> = handle.state();
+        let execution_context = providers::LlmExecutionContext::new(
+            active_chat_attempt.cancellation.clone(),
+            phase_timeouts,
+        )
+        .with_operation(providers::LlmOperationContext::chat(
+            notebook_id.clone(),
+            conversation_id.clone(),
+            message_id.clone(),
+            epoch,
+            attempt_id.clone(),
+            provider_name.clone(),
+            model.clone(),
+            operation_receipt_id.clone(),
+        ));
+
+        // Acquire gates in the same order as the background summary loop:
+        // GPU first, then LLM. Keeping one global order prevents lock-order
+        // inversion when chat races a summary job.
+        let gpu_permit = match acquire_gate_with_epoch(
+            &handle,
+            &app_state,
+            &notebook_id,
+            &conversation_id,
+            &message_id,
+            epoch,
+            &app_state.gpu_gate,
+            Duration::from_secs(120),
+            "GPU gate",
+        )
+        .await
+        {
+            Ok(Some(permit)) => permit,
+            Ok(None) => {
+                execution_context.cancellation.cancel();
+                record_chat_attempt_trace(
+                    &attempt_trace,
+                    &trace_data_dir,
+                    "cancelled",
+                    Some(Duration::ZERO),
+                    Some("GPU gate wait cancelled by notebook switch"),
+                    Some("chat cancelled before acquiring GPU gate"),
+                    |_| {},
+                );
+                persist_chat_attempt_status(
+                    &app_state,
+                    &notebook_id,
+                    &conversation_id,
+                    &attempt_id,
+                    &message_id,
+                    Some(&user_message_id),
+                    Some(&provider_name),
+                    Some(&model),
+                    "cancelled",
+                    Some("gpu_gate_cancelled"),
+                    Some("cancelled"),
+                    Some("chat cancelled before acquiring GPU gate"),
+                    None,
+                    true,
+                );
+                app_state.finish_active_chat_attempt(&notebook_id, &conversation_id, &attempt_id);
+                terminal.emit_cancelled("Chat cancelled before acquiring GPU gate");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(message_id = %message_id, error = %e, "GPU gate acquisition failed");
+                terminal.emit_error(&e.to_string());
+                persist_chat_attempt_status(
+                    &app_state,
+                    &notebook_id,
+                    &conversation_id,
+                    &attempt_id,
+                    &message_id,
+                    Some(&user_message_id),
+                    Some(&provider_name),
+                    Some(&model),
+                    "error",
+                    Some("gpu_gate_error"),
+                    Some("gate_error"),
+                    Some(&e.to_string()),
+                    None,
+                    true,
+                );
+                record_chat_attempt_trace(
+                    &attempt_trace,
+                    &trace_data_dir,
+                    "gate_error",
+                    Some(Duration::ZERO),
+                    Some("GPU gate acquisition failed"),
+                    Some(&e.to_string()),
+                    |_| {},
+                );
+                app_state.finish_active_chat_attempt(&notebook_id, &conversation_id, &attempt_id);
+                return;
+            }
+        };
+        let _gpu_owner = app_state.gate_owner_guard("GPU gate", "chat", &message_id);
+
+        let permit = match acquire_gate_with_epoch(
+            &handle,
+            &app_state,
+            &notebook_id,
+            &conversation_id,
+            &message_id,
+            epoch,
+            &app_state.llm_gate,
+            Duration::from_secs(120),
+            "LLM gate",
+        )
+        .await
+        {
+            Ok(Some(permit)) => permit,
+            Ok(None) => {
+                execution_context.cancellation.cancel();
+                app_state.clear_gate_owner("GPU gate", "chat");
+                drop(gpu_permit);
+                record_chat_attempt_trace(
+                    &attempt_trace,
+                    &trace_data_dir,
+                    "cancelled",
+                    Some(Duration::ZERO),
+                    Some("LLM gate wait cancelled by notebook switch"),
+                    Some("chat cancelled before acquiring LLM gate"),
+                    |_| {},
+                );
+                persist_chat_attempt_status(
+                    &app_state,
+                    &notebook_id,
+                    &conversation_id,
+                    &attempt_id,
+                    &message_id,
+                    Some(&user_message_id),
+                    Some(&provider_name),
+                    Some(&model),
+                    "cancelled",
+                    Some("llm_gate_cancelled"),
+                    Some("cancelled"),
+                    Some("chat cancelled before acquiring LLM gate"),
+                    None,
+                    true,
+                );
+                app_state.finish_active_chat_attempt(&notebook_id, &conversation_id, &attempt_id);
+                terminal.emit_cancelled("Chat cancelled before acquiring LLM gate");
+                return;
+            }
+            Err(e) => {
+                app_state.clear_gate_owner("GPU gate", "chat");
+                drop(gpu_permit);
+                terminal.emit_error(&e.to_string());
+                persist_chat_attempt_status(
+                    &app_state,
+                    &notebook_id,
+                    &conversation_id,
+                    &attempt_id,
+                    &message_id,
+                    Some(&user_message_id),
+                    Some(&provider_name),
+                    Some(&model),
+                    "error",
+                    Some("llm_gate_error"),
+                    Some("gate_error"),
+                    Some(&e.to_string()),
+                    None,
+                    true,
+                );
+                record_chat_attempt_trace(
+                    &attempt_trace,
+                    &trace_data_dir,
+                    "gate_error",
+                    Some(Duration::ZERO),
+                    Some("LLM gate acquisition failed"),
+                    Some(&e.to_string()),
+                    |_| {},
+                );
+                app_state.finish_active_chat_attempt(&notebook_id, &conversation_id, &attempt_id);
+                return;
+            }
+        };
+        let _llm_owner = app_state.gate_owner_guard("LLM gate", "chat", &message_id);
+
+        let result = stream_chat_response(
+            &handle,
+            provider.as_ref(),
+            &notebook_id,
+            epoch,
+            &conversation_id,
+            &message_id,
+            &query,
+            &model,
+            &history,
+            custom_goal.as_deref(),
+            &style,
+            &response_length,
+            &source_scope,
+            &source_context,
+            model_context_window,
+            &attempt_trace,
+            &trace_data_dir,
+            execution_context.clone(),
+        )
+        .await;
+
+        match &result {
+            Ok(stream_result) => {
+                let full_response = &stream_result.full_response;
+                if !app_state.is_active_notebook_epoch(&notebook_id, epoch) {
+                    // Notebook switched after stream completed — emit cancelled terminal
+                    persist_chat_attempt_status(
+                        &app_state,
+                        &notebook_id,
+                        &conversation_id,
+                        &attempt_id,
+                        &message_id,
+                        Some(&user_message_id),
+                        Some(&provider_name),
+                        Some(&model),
+                        "cancelled",
+                        Some("late_cancelled_after_stream"),
+                        Some("cancelled"),
+                        Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
+                        stream_result.generation_receipt.response_digest.as_deref(),
+                        true,
+                    );
+                    terminal.emit_cancelled(CHAT_CANCELLED_NOTEBOOK_SWITCH);
+                    app_state.clear_gate_owner("GPU gate", "chat");
+                    app_state.clear_gate_owner("LLM gate", "chat");
+                    drop(gpu_permit);
+                    drop(permit);
+                    app_state.finish_active_chat_attempt(
+                        &notebook_id,
+                        &conversation_id,
+                        &attempt_id,
+                    );
+                    return;
+                }
+
+                // Extract citations from the response
+                let (extracted, citation_filter_reasons) =
+                    citations::extract_citations_from_context_with_reasons(
+                        full_response,
+                        &source_context,
+                    );
+                let citation_ref_count = citations::count_unique_citation_refs(full_response);
+                let mut evidence = evidence_for_message.clone();
+                evidence.citation_valid_count = extracted.len();
+                evidence.citation_invalid_count =
+                    citation_ref_count.saturating_sub(extracted.len());
+                evidence.citation_filter_reasons = citation_filter_reasons;
+                evidence.omitted_candidate_count =
+                    source_context.len().saturating_sub(extracted.len());
+                evidence.decoding_settings_receipt =
+                    Some(stream_result.decoding_settings_receipt.clone());
+                evidence.prompt_receipt = Some(stream_result.prompt_receipt.clone());
+                evidence.generation_receipt = Some(stream_result.generation_receipt.clone());
+                evidence.prompt_budget_receipt = stream_result.prompt_budget_receipt.clone();
+                let citations_payload = AssistantMessageEvidence {
+                    citations: extracted,
+                    evidence,
+                };
+                let citations_json = serde_json::to_string(&citations_payload).ok();
+
+                // Persist assistant message to DB — BEFORE chat:done.
+                // If persistence fails, emit chat:error (not chat:done).
+                let assistant_msg = Message {
+                    id: message_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    role: "assistant".to_string(),
+                    content: full_response.clone(),
+                    citations: citations_json,
+                    model_used: Some(model.clone()),
+                    tokens_prompt: None,
+                    tokens_response: None,
+                    created_at: String::new(),
+                };
+                if let Err(e) = app_state
+                    .with_notebook_db_write(&notebook_id, |db| db.insert_message(&assistant_msg))
+                {
+                    tracing::error!(message_id = %message_id, "Failed to persist assistant message: {}", e);
+                    record_chat_attempt_trace(
+                        &attempt_trace,
+                        &trace_data_dir,
+                        "assistant_persist_error",
+                        Some(Duration::ZERO),
+                        Some("Assistant message streaming completed but persistence failed"),
+                        Some(&e.to_string()),
+                        |_| {},
+                    );
+                    persist_chat_attempt_status(
+                        &app_state,
+                        &notebook_id,
+                        &conversation_id,
+                        &attempt_id,
+                        &message_id,
+                        Some(&user_message_id),
+                        Some(&provider_name),
+                        Some(&model),
+                        "error",
+                        Some("assistant_persist_error"),
+                        Some("assistant_persist_error"),
+                        Some(&e.to_string()),
+                        stream_result.generation_receipt.response_digest.as_deref(),
+                        true,
+                    );
+                    // DB insert failure → chat:error, NOT chat:done.
+                    terminal.emit_error(&format!("Assistant message persistence failed: {e}"));
+                    app_state.clear_gate_owner("GPU gate", "chat");
+                    app_state.clear_gate_owner("LLM gate", "chat");
+                    drop(gpu_permit);
+                    drop(permit);
+                    app_state.finish_active_chat_attempt(
+                        &notebook_id,
+                        &conversation_id,
+                        &attempt_id,
+                    );
+                    return;
+                } else {
+                    let prompt_json = serde_json::to_string(&stream_result.prompt_receipt).ok();
+                    let generation_json =
+                        serde_json::to_string(&stream_result.generation_receipt).ok();
+                    if let Some(prompt_json) = prompt_json.as_deref() {
+                        if let Err(e) = app_state.with_notebook_db_write(&notebook_id, |db| {
+                            db.insert_prompt_receipt(
+                                &stream_result.prompt_receipt.receipt_id,
+                                &notebook_id,
+                                &conversation_id,
+                                &message_id,
+                                &stream_result.prompt_receipt.prompt_digest,
+                                &stream_result.prompt_receipt.context_payload_digest,
+                                prompt_json,
+                            )
+                        }) {
+                            tracing::warn!(message_id = %message_id, error = %e, "Failed to persist PromptReceiptV1");
+                        }
+                    }
+                    if let Some(generation_json) = generation_json.as_deref() {
+                        if let Err(e) = app_state.with_notebook_db_write(&notebook_id, |db| {
+                            db.insert_generation_receipt(
+                                &stream_result.generation_receipt.receipt_id,
+                                &notebook_id,
+                                &conversation_id,
+                                &message_id,
+                                &stream_result.generation_receipt.provider,
+                                &stream_result.generation_receipt.model,
+                                &stream_result.generation_receipt.provider_request_digest,
+                                stream_result.generation_receipt.response_digest.as_deref(),
+                                &stream_result.generation_receipt.status,
+                                generation_json,
+                            )
+                        }) {
+                            tracing::warn!(message_id = %message_id, error = %e, "Failed to persist GenerationReceiptV1");
+                        }
+                    }
+                    record_chat_attempt_trace(
+                        &attempt_trace,
+                        &trace_data_dir,
+                        "assistant_persisted",
+                        Some(Duration::ZERO),
+                        Some("Assistant message persisted after provider completion"),
+                        None,
+                        |trace| {
+                            trace.assistant_persisted = true;
+                        },
+                    );
+                    persist_chat_attempt_status(
+                        &app_state,
+                        &notebook_id,
+                        &conversation_id,
+                        &attempt_id,
+                        &message_id,
+                        Some(&user_message_id),
+                        Some(&provider_name),
+                        Some(&model),
+                        "succeeded",
+                        Some("assistant_persisted"),
+                        None,
+                        None,
+                        stream_result.generation_receipt.response_digest.as_deref(),
+                        true,
+                    );
+                }
+                // Assistant message persisted successfully — now emit evidence and chat:done.
+                emit_chat_evidence(
+                    &handle,
+                    &notebook_id,
+                    &conversation_id,
+                    &message_id,
+                    serde_json::to_value(&citations_payload.citations)
+                        .unwrap_or_else(|_| serde_json::json!([])),
+                    serde_json::to_value(&citations_payload.evidence)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                );
+                terminal.emit_done();
+            }
+            Err(e) => {
+                let cancellation_reason = e.to_string();
+                if cancellation_reason == CHAT_CANCELLED_NOTEBOOK_SWITCH
+                    || cancellation_reason == CHAT_CANCELLED_USER_REQUEST
+                {
+                    // Notebook-switch cancellation — emit chat:cancelled so frontend can clear state.
+                    let terminal_reason = if cancellation_reason == CHAT_CANCELLED_NOTEBOOK_SWITCH {
+                        CHAT_CANCELLED_NOTEBOOK_SWITCH
+                    } else {
+                        "Chat cancelled by user"
+                    };
+                    terminal.emit_cancelled(terminal_reason);
+                    persist_chat_attempt_status(
+                        &app_state,
+                        &notebook_id,
+                        &conversation_id,
+                        &attempt_id,
+                        &message_id,
+                        Some(&user_message_id),
+                        Some(&provider_name),
+                        Some(&model),
+                        "cancelled",
+                        Some("stream_cancelled"),
+                        Some("cancelled"),
+                        Some(terminal_reason),
+                        None,
+                        true,
+                    );
+                    record_chat_attempt_trace(
+                        &attempt_trace,
+                        &trace_data_dir,
+                        "cancelled",
+                        Some(Duration::ZERO),
+                        Some("Chat cancelled during streaming"),
+                        Some(terminal_reason),
+                        |_| {},
+                    );
+                } else {
+                    let error_text = e.to_string();
+                    tracing::error!(message_id = %message_id, "Chat streaming failed: {}", error_text);
+                    emit_chat_status(
+                        &handle,
+                        &notebook_id,
+                        &conversation_id,
+                        &message_id,
+                        "error",
+                        "Chat request failed",
+                        None,
+                        Some(&model),
+                        None,
+                        None,
+                        None,
+                        Duration::ZERO,
+                        None,
+                        false,
+                        Some(&error_text),
+                    );
+                    terminal.emit_error(&error_text);
+                    persist_chat_attempt_status(
+                        &app_state,
+                        &notebook_id,
+                        &conversation_id,
+                        &attempt_id,
+                        &message_id,
+                        Some(&user_message_id),
+                        Some(&provider_name),
+                        Some(&model),
+                        "error",
+                        Some("stream_error"),
+                        Some("provider_error"),
+                        Some(&error_text),
+                        None,
+                        true,
+                    );
+                    record_chat_attempt_trace(
+                        &attempt_trace,
+                        &trace_data_dir,
+                        "error",
+                        Some(Duration::ZERO),
+                        Some("Chat streaming failed"),
+                        Some(&error_text),
+                        |_| {},
+                    );
+                }
+            }
+        }
+
+        // Release gates
+        app_state.clear_gate_owner("GPU gate", "chat");
+        app_state.clear_gate_owner("LLM gate", "chat");
+        drop(gpu_permit);
+        drop(permit);
+        app_state.finish_active_chat_attempt(&notebook_id, &conversation_id, &attempt_id);
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn persist_chat_attempt_status(
@@ -447,19 +1079,33 @@ pub async fn delete_conversation(
 }
 
 #[tauri::command]
-pub async fn stop_chat(notebook_id: String, state: State<'_, AppState>) -> Result<(), GlossError> {
+pub async fn stop_chat(
+    notebook_id: String,
+    state: State<'_, AppState>,
+) -> Result<StopChatResponseV1, GlossError> {
     let cancelled = state.cancel_active_chats_for_notebook(&notebook_id);
+    let attempts = cancelled
+        .iter()
+        .map(|attempt| ChatCancellationRequestV1 {
+            attempt_id: attempt.attempt_id.clone(),
+            conversation_id: attempt.conversation_id.clone(),
+            message_id: attempt.message_id.clone(),
+        })
+        .collect::<Vec<_>>();
     if !cancelled.is_empty() {
         tracing::info!(
             notebook_id = %notebook_id,
             attempts = cancelled.len(),
             conversations = ?cancelled.iter().map(|attempt| attempt.conversation_id.as_str()).collect::<Vec<_>>(),
             message_ids = ?cancelled.iter().map(|attempt| attempt.message_id.as_str()).collect::<Vec<_>>(),
-            "Cancelled active chat attempt(s) by request"
+            "Cancellation requested for active chat attempt(s)"
         );
         state.bump_user_activity();
     }
-    Ok(())
+    Ok(StopChatResponseV1 {
+        cancellation_requested: !attempts.is_empty(),
+        attempts,
+    })
 }
 
 #[tauri::command]
@@ -2378,486 +3024,34 @@ pub async fn send_message(
         &message_id,
     );
 
-    tokio::spawn(async move {
-        use tauri::Manager;
-        let app_state: tauri::State<'_, AppState> = handle.state();
-        let execution_context = providers::LlmExecutionContext::default_with_token(
-            active_chat_attempt.cancellation.clone(),
-        )
-        .with_operation(providers::LlmOperationContext::chat(
-            nb_id.clone(),
-            conv_id.clone(),
-            msg_id.clone(),
-            epoch,
-            spawned_attempt_id.clone(),
-            spawned_provider.clone(),
-            model.clone(),
-            spawned_operation_receipt_id.clone(),
-        ));
-
-        // Acquire gates in the same order as the background summary loop:
-        // GPU first, then LLM. Keeping one global order prevents lock-order
-        // inversion when chat races a summary job.
-        let gpu_permit = match acquire_gate_with_epoch(
-            &handle,
-            &app_state,
-            &nb_id,
-            &conv_id,
-            &msg_id,
-            epoch,
-            &app_state.gpu_gate,
-            Duration::from_secs(120),
-            "GPU gate",
-        )
-        .await
-        {
-            Ok(Some(permit)) => permit,
-            Ok(None) => {
-                execution_context.cancellation.cancel();
-                record_chat_attempt_trace(
-                    &spawned_attempt_trace,
-                    &spawned_trace_data_dir,
-                    "cancelled",
-                    Some(Duration::ZERO),
-                    Some("GPU gate wait cancelled by notebook switch"),
-                    Some("chat cancelled before acquiring GPU gate"),
-                    |_| {},
-                );
-                persist_chat_attempt_status(
-                    &app_state,
-                    &nb_id,
-                    &conv_id,
-                    &spawned_attempt_id,
-                    &msg_id,
-                    Some(&spawned_user_message_id),
-                    Some(&spawned_provider),
-                    Some(&model),
-                    "cancelled",
-                    Some("gpu_gate_cancelled"),
-                    Some("cancelled"),
-                    Some("chat cancelled before acquiring GPU gate"),
-                    None,
-                    true,
-                );
-                app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
-                terminal.emit_cancelled("Chat cancelled before acquiring GPU gate");
-                return;
-            }
-            Err(e) => {
-                tracing::error!(message_id = %msg_id, error = %e, "GPU gate acquisition failed");
-                terminal.emit_error(&e.to_string());
-                persist_chat_attempt_status(
-                    &app_state,
-                    &nb_id,
-                    &conv_id,
-                    &spawned_attempt_id,
-                    &msg_id,
-                    Some(&spawned_user_message_id),
-                    Some(&spawned_provider),
-                    Some(&model),
-                    "error",
-                    Some("gpu_gate_error"),
-                    Some("gate_error"),
-                    Some(&e.to_string()),
-                    None,
-                    true,
-                );
-                record_chat_attempt_trace(
-                    &spawned_attempt_trace,
-                    &spawned_trace_data_dir,
-                    "gate_error",
-                    Some(Duration::ZERO),
-                    Some("GPU gate acquisition failed"),
-                    Some(&e.to_string()),
-                    |_| {},
-                );
-                app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
-                return;
-            }
-        };
-        let _gpu_owner = app_state.gate_owner_guard("GPU gate", "chat", &msg_id);
-
-        let permit = match acquire_gate_with_epoch(
-            &handle,
-            &app_state,
-            &nb_id,
-            &conv_id,
-            &msg_id,
-            epoch,
-            &app_state.llm_gate,
-            Duration::from_secs(120),
-            "LLM gate",
-        )
-        .await
-        {
-            Ok(Some(permit)) => permit,
-            Ok(None) => {
-                execution_context.cancellation.cancel();
-                app_state.clear_gate_owner("GPU gate", "chat");
-                drop(gpu_permit);
-                record_chat_attempt_trace(
-                    &spawned_attempt_trace,
-                    &spawned_trace_data_dir,
-                    "cancelled",
-                    Some(Duration::ZERO),
-                    Some("LLM gate wait cancelled by notebook switch"),
-                    Some("chat cancelled before acquiring LLM gate"),
-                    |_| {},
-                );
-                persist_chat_attempt_status(
-                    &app_state,
-                    &nb_id,
-                    &conv_id,
-                    &spawned_attempt_id,
-                    &msg_id,
-                    Some(&spawned_user_message_id),
-                    Some(&spawned_provider),
-                    Some(&model),
-                    "cancelled",
-                    Some("llm_gate_cancelled"),
-                    Some("cancelled"),
-                    Some("chat cancelled before acquiring LLM gate"),
-                    None,
-                    true,
-                );
-                app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
-                terminal.emit_cancelled("Chat cancelled before acquiring LLM gate");
-                return;
-            }
-            Err(e) => {
-                app_state.clear_gate_owner("GPU gate", "chat");
-                drop(gpu_permit);
-                terminal.emit_error(&e.to_string());
-                persist_chat_attempt_status(
-                    &app_state,
-                    &nb_id,
-                    &conv_id,
-                    &spawned_attempt_id,
-                    &msg_id,
-                    Some(&spawned_user_message_id),
-                    Some(&spawned_provider),
-                    Some(&model),
-                    "error",
-                    Some("llm_gate_error"),
-                    Some("gate_error"),
-                    Some(&e.to_string()),
-                    None,
-                    true,
-                );
-                record_chat_attempt_trace(
-                    &spawned_attempt_trace,
-                    &spawned_trace_data_dir,
-                    "gate_error",
-                    Some(Duration::ZERO),
-                    Some("LLM gate acquisition failed"),
-                    Some(&e.to_string()),
-                    |_| {},
-                );
-                app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
-                return;
-            }
-        };
-        let _llm_owner = app_state.gate_owner_guard("LLM gate", "chat", &msg_id);
-
-        let result = stream_chat_response(
-            &handle,
-            provider.as_ref(),
-            &nb_id,
-            epoch,
-            &conv_id,
-            &msg_id,
-            &query,
-            &model,
-            &history,
-            spawned_custom_goal.as_deref(),
-            &spawned_style,
-            &spawned_response_length,
-            &prompt_scope,
-            &source_context,
-            model_context_window,
-            &spawned_attempt_trace,
-            &spawned_trace_data_dir,
-            execution_context.clone(),
-        )
-        .await;
-
-        match &result {
-            Ok(stream_result) => {
-                let full_response = &stream_result.full_response;
-                if !app_state.is_active_notebook_epoch(&nb_id, epoch) {
-                    // Notebook switched after stream completed — emit cancelled terminal
-                    persist_chat_attempt_status(
-                        &app_state,
-                        &nb_id,
-                        &conv_id,
-                        &spawned_attempt_id,
-                        &msg_id,
-                        Some(&spawned_user_message_id),
-                        Some(&spawned_provider),
-                        Some(&model),
-                        "cancelled",
-                        Some("late_cancelled_after_stream"),
-                        Some("cancelled"),
-                        Some(CHAT_CANCELLED_NOTEBOOK_SWITCH),
-                        stream_result.generation_receipt.response_digest.as_deref(),
-                        true,
-                    );
-                    terminal.emit_cancelled(CHAT_CANCELLED_NOTEBOOK_SWITCH);
-                    app_state.clear_gate_owner("GPU gate", "chat");
-                    app_state.clear_gate_owner("LLM gate", "chat");
-                    drop(gpu_permit);
-                    drop(permit);
-                    app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
-                    return;
-                }
-
-                // Extract citations from the response
-                let (extracted, citation_filter_reasons) =
-                    citations::extract_citations_from_context_with_reasons(
-                        full_response,
-                        &source_context,
-                    );
-                let citation_ref_count = citations::count_unique_citation_refs(full_response);
-                let mut evidence = evidence_for_message.clone();
-                evidence.citation_valid_count = extracted.len();
-                evidence.citation_invalid_count =
-                    citation_ref_count.saturating_sub(extracted.len());
-                evidence.citation_filter_reasons = citation_filter_reasons;
-                evidence.omitted_candidate_count =
-                    source_context.len().saturating_sub(extracted.len());
-                evidence.decoding_settings_receipt =
-                    Some(stream_result.decoding_settings_receipt.clone());
-                evidence.prompt_receipt = Some(stream_result.prompt_receipt.clone());
-                evidence.generation_receipt = Some(stream_result.generation_receipt.clone());
-                evidence.prompt_budget_receipt = stream_result.prompt_budget_receipt.clone();
-                let citations_payload = AssistantMessageEvidence {
-                    citations: extracted,
-                    evidence,
-                };
-                let citations_json = serde_json::to_string(&citations_payload).ok();
-
-                // Persist assistant message to DB — BEFORE chat:done.
-                // If persistence fails, emit chat:error (not chat:done).
-                let assistant_msg = Message {
-                    id: msg_id.clone(),
-                    conversation_id: conv_id.clone(),
-                    role: "assistant".to_string(),
-                    content: full_response.clone(),
-                    citations: citations_json,
-                    model_used: Some(model.clone()),
-                    tokens_prompt: None,
-                    tokens_response: None,
-                    created_at: String::new(),
-                };
-                if let Err(e) =
-                    app_state.with_notebook_db_write(&nb_id, |db| db.insert_message(&assistant_msg))
-                {
-                    tracing::error!(message_id = %msg_id, "Failed to persist assistant message: {}", e);
-                    record_chat_attempt_trace(
-                        &spawned_attempt_trace,
-                        &spawned_trace_data_dir,
-                        "assistant_persist_error",
-                        Some(Duration::ZERO),
-                        Some("Assistant message streaming completed but persistence failed"),
-                        Some(&e.to_string()),
-                        |_| {},
-                    );
-                    persist_chat_attempt_status(
-                        &app_state,
-                        &nb_id,
-                        &conv_id,
-                        &spawned_attempt_id,
-                        &msg_id,
-                        Some(&spawned_user_message_id),
-                        Some(&spawned_provider),
-                        Some(&model),
-                        "error",
-                        Some("assistant_persist_error"),
-                        Some("assistant_persist_error"),
-                        Some(&e.to_string()),
-                        stream_result.generation_receipt.response_digest.as_deref(),
-                        true,
-                    );
-                    // DB insert failure → chat:error, NOT chat:done.
-                    terminal.emit_error(&format!("Assistant message persistence failed: {e}"));
-                    app_state.clear_gate_owner("GPU gate", "chat");
-                    app_state.clear_gate_owner("LLM gate", "chat");
-                    drop(gpu_permit);
-                    drop(permit);
-                    app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
-                    return;
-                } else {
-                    let prompt_json = serde_json::to_string(&stream_result.prompt_receipt).ok();
-                    let generation_json =
-                        serde_json::to_string(&stream_result.generation_receipt).ok();
-                    if let Some(prompt_json) = prompt_json.as_deref() {
-                        if let Err(e) = app_state.with_notebook_db_write(&nb_id, |db| {
-                            db.insert_prompt_receipt(
-                                &stream_result.prompt_receipt.receipt_id,
-                                &nb_id,
-                                &conv_id,
-                                &msg_id,
-                                &stream_result.prompt_receipt.prompt_digest,
-                                &stream_result.prompt_receipt.context_payload_digest,
-                                prompt_json,
-                            )
-                        }) {
-                            tracing::warn!(message_id = %msg_id, error = %e, "Failed to persist PromptReceiptV1");
-                        }
-                    }
-                    if let Some(generation_json) = generation_json.as_deref() {
-                        if let Err(e) = app_state.with_notebook_db_write(&nb_id, |db| {
-                            db.insert_generation_receipt(
-                                &stream_result.generation_receipt.receipt_id,
-                                &nb_id,
-                                &conv_id,
-                                &msg_id,
-                                &stream_result.generation_receipt.provider,
-                                &stream_result.generation_receipt.model,
-                                &stream_result.generation_receipt.provider_request_digest,
-                                stream_result.generation_receipt.response_digest.as_deref(),
-                                &stream_result.generation_receipt.status,
-                                generation_json,
-                            )
-                        }) {
-                            tracing::warn!(message_id = %msg_id, error = %e, "Failed to persist GenerationReceiptV1");
-                        }
-                    }
-                    record_chat_attempt_trace(
-                        &spawned_attempt_trace,
-                        &spawned_trace_data_dir,
-                        "assistant_persisted",
-                        Some(Duration::ZERO),
-                        Some("Assistant message persisted after provider completion"),
-                        None,
-                        |trace| {
-                            trace.assistant_persisted = true;
-                        },
-                    );
-                    persist_chat_attempt_status(
-                        &app_state,
-                        &nb_id,
-                        &conv_id,
-                        &spawned_attempt_id,
-                        &msg_id,
-                        Some(&spawned_user_message_id),
-                        Some(&spawned_provider),
-                        Some(&model),
-                        "succeeded",
-                        Some("assistant_persisted"),
-                        None,
-                        None,
-                        stream_result.generation_receipt.response_digest.as_deref(),
-                        true,
-                    );
-                }
-                // Assistant message persisted successfully — now emit evidence and chat:done.
-                emit_chat_evidence(
-                    &handle,
-                    &nb_id,
-                    &conv_id,
-                    &msg_id,
-                    serde_json::to_value(&citations_payload.citations)
-                        .unwrap_or_else(|_| serde_json::json!([])),
-                    serde_json::to_value(&citations_payload.evidence)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                );
-                terminal.emit_done();
-            }
-            Err(e) => {
-                let cancellation_reason = e.to_string();
-                if cancellation_reason == CHAT_CANCELLED_NOTEBOOK_SWITCH
-                    || cancellation_reason == CHAT_CANCELLED_USER_REQUEST
-                {
-                    // Notebook-switch cancellation — emit chat:cancelled so frontend can clear state.
-                    let terminal_reason = if cancellation_reason == CHAT_CANCELLED_NOTEBOOK_SWITCH {
-                        CHAT_CANCELLED_NOTEBOOK_SWITCH
-                    } else {
-                        "Chat cancelled by user"
-                    };
-                    terminal.emit_cancelled(terminal_reason);
-                    persist_chat_attempt_status(
-                        &app_state,
-                        &nb_id,
-                        &conv_id,
-                        &spawned_attempt_id,
-                        &msg_id,
-                        Some(&spawned_user_message_id),
-                        Some(&spawned_provider),
-                        Some(&model),
-                        "cancelled",
-                        Some("stream_cancelled"),
-                        Some("cancelled"),
-                        Some(terminal_reason),
-                        None,
-                        true,
-                    );
-                    record_chat_attempt_trace(
-                        &spawned_attempt_trace,
-                        &spawned_trace_data_dir,
-                        "cancelled",
-                        Some(Duration::ZERO),
-                        Some("Chat cancelled during streaming"),
-                        Some(terminal_reason),
-                        |_| {},
-                    );
-                } else {
-                    let error_text = e.to_string();
-                    tracing::error!(message_id = %msg_id, "Chat streaming failed: {}", error_text);
-                    emit_chat_status(
-                        &handle,
-                        &nb_id,
-                        &conv_id,
-                        &msg_id,
-                        "error",
-                        "Chat request failed",
-                        None,
-                        Some(&model),
-                        None,
-                        None,
-                        None,
-                        Duration::ZERO,
-                        None,
-                        false,
-                        Some(&error_text),
-                    );
-                    terminal.emit_error(&error_text);
-                    persist_chat_attempt_status(
-                        &app_state,
-                        &nb_id,
-                        &conv_id,
-                        &spawned_attempt_id,
-                        &msg_id,
-                        Some(&spawned_user_message_id),
-                        Some(&spawned_provider),
-                        Some(&model),
-                        "error",
-                        Some("stream_error"),
-                        Some("provider_error"),
-                        Some(&error_text),
-                        None,
-                        true,
-                    );
-                    record_chat_attempt_trace(
-                        &spawned_attempt_trace,
-                        &spawned_trace_data_dir,
-                        "error",
-                        Some(Duration::ZERO),
-                        Some("Chat streaming failed"),
-                        Some(&error_text),
-                        |_| {},
-                    );
-                }
-            }
-        }
-
-        // Release gates
-        app_state.clear_gate_owner("GPU gate", "chat");
-        app_state.clear_gate_owner("LLM gate", "chat");
-        drop(gpu_permit);
-        drop(permit);
-        app_state.finish_active_chat_attempt(&nb_id, &conv_id, &spawned_attempt_id);
-    });
+    let job = SpawnedChatAttempt {
+        handle,
+        active_chat_attempt,
+        provider,
+        terminal,
+        notebook_id: nb_id,
+        conversation_id: conv_id,
+        message_id: msg_id,
+        query,
+        model,
+        history,
+        custom_goal: spawned_custom_goal,
+        style: spawned_style,
+        response_length: spawned_response_length,
+        source_scope: prompt_scope,
+        source_context,
+        model_context_window,
+        evidence_for_message,
+        epoch,
+        attempt_id: spawned_attempt_id,
+        user_message_id: spawned_user_message_id,
+        provider_name: spawned_provider,
+        operation_receipt_id: spawned_operation_receipt_id,
+        attempt_trace: spawned_attempt_trace,
+        trace_data_dir: spawned_trace_data_dir,
+        phase_timeouts: providers::LlmPhaseTimeouts::default(),
+    };
+    tokio::spawn(job.run_with_panic_boundary());
 
     Ok(message_id)
 }
@@ -3196,6 +3390,107 @@ pub async fn get_last_chat_attempt_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::stream;
+    use tokio::sync::{oneshot, Mutex as AsyncMutex};
+
+    #[derive(Clone, Copy)]
+    enum ScriptedLifecycleMode {
+        ProviderStartNeverReturns,
+        FirstTokenNeverArrives,
+        IdleAfterFirstToken,
+        ProviderReturnsError,
+        Panics,
+        CancelDuringStream,
+        SuccessfulDone,
+    }
+
+    struct ScriptedLifecycleProvider {
+        mode: ScriptedLifecycleMode,
+        first_token_sent: Option<Arc<AsyncMutex<Option<oneshot::Sender<()>>>>>,
+    }
+
+    #[async_trait]
+    impl providers::LlmProvider for ScriptedLifecycleProvider {
+        async fn list_models(&self) -> Result<Vec<providers::ModelInfo>, GlossError> {
+            Ok(Vec::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            _context: providers::LlmExecutionContext,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatToken, GlossError>> + Send>>,
+            GlossError,
+        > {
+            match self.mode {
+                ScriptedLifecycleMode::ProviderStartNeverReturns => {
+                    futures::future::pending::<
+                        Result<
+                            std::pin::Pin<
+                                Box<
+                                    dyn futures::Stream<Item = Result<ChatToken, GlossError>>
+                                        + Send,
+                                >,
+                            >,
+                            GlossError,
+                        >,
+                    >()
+                    .await
+                }
+                ScriptedLifecycleMode::FirstTokenNeverArrives => Ok(Box::pin(stream::pending())),
+                ScriptedLifecycleMode::IdleAfterFirstToken
+                | ScriptedLifecycleMode::CancelDuringStream => {
+                    let first_token_sent = self.first_token_sent.clone();
+                    Ok(Box::pin(stream::unfold(0_u8, move |step| {
+                        let first_token_sent = first_token_sent.clone();
+                        async move {
+                            match step {
+                                0 => {
+                                    if let Some(sender) = first_token_sent {
+                                        if let Some(sender) = sender.lock().await.take() {
+                                            let _ = sender.send(());
+                                        }
+                                    }
+                                    Some((
+                                        Ok(ChatToken {
+                                            token: "partial".to_string(),
+                                            done: false,
+                                        }),
+                                        1,
+                                    ))
+                                }
+                                _ => futures::future::pending().await,
+                            }
+                        }
+                    })))
+                }
+                ScriptedLifecycleMode::ProviderReturnsError => Err(GlossError::Other(
+                    "scripted lifecycle provider failure".to_string(),
+                )),
+                ScriptedLifecycleMode::Panics => panic!("scripted lifecycle panic"),
+                ScriptedLifecycleMode::SuccessfulDone => Ok(Box::pin(stream::iter([
+                    Ok(ChatToken {
+                        token: "complete response".to_string(),
+                        done: false,
+                    }),
+                    Ok(ChatToken {
+                        token: String::new(),
+                        done: true,
+                    }),
+                ]))),
+            }
+        }
+
+        async fn health_check(&self) -> Result<bool, GlossError> {
+            Ok(true)
+        }
+
+        fn provider_type(&self) -> providers::ProviderType {
+            providers::ProviderType::Ollama
+        }
+    }
 
     #[test]
     fn chat_stream_contract_done_frame_no_eof_terminal_metadata() {
@@ -3211,6 +3506,25 @@ mod tests {
     #[test]
     fn chat_done_frame_without_eof() {
         chat_stream_contract_done_frame_no_eof_terminal_metadata();
+    }
+
+    #[test]
+    fn stop_chat_response_acknowledges_requests_without_claiming_terminal_state() {
+        let response = StopChatResponseV1 {
+            cancellation_requested: true,
+            attempts: vec![ChatCancellationRequestV1 {
+                attempt_id: "attempt-1".to_string(),
+                conversation_id: "conversation-1".to_string(),
+                message_id: "message-1".to_string(),
+            }],
+        };
+
+        let value = serde_json::to_value(response).expect("response serializes");
+        assert_eq!(value["cancellation_requested"], true);
+        assert_eq!(value["attempts"][0]["attempt_id"], "attempt-1");
+        assert_eq!(value["attempts"][0]["message_id"], "message-1");
+        assert!(value.get("cancelled").is_none());
+        assert!(value.get("terminal").is_none());
     }
 
     #[test]
@@ -3231,5 +3545,492 @@ mod tests {
             retrieval_reason_code_from_text("semantic-memory returned no mapped candidates"),
             Some(RetrievalReasonCode::NoRetrievalContext)
         );
+    }
+
+    #[tokio::test]
+    async fn spawned_lifecycle_provider_error_emits_one_terminal_event_and_status() {
+        let data_dir = tempfile::tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        let notebook_id = "notebook-1";
+        let conversation_id = "conversation-1";
+        let notebook_dir = data_dir.path().join("notebooks").join(notebook_id);
+        std::fs::create_dir_all(&notebook_dir).expect("test notebook directory");
+        {
+            let app_db = state.app_db.lock().expect("app database lock");
+            app_db
+                .create_notebook(
+                    notebook_id,
+                    "Lifecycle test",
+                    &notebook_dir.to_string_lossy(),
+                )
+                .expect("test notebook registration");
+        }
+        crate::db::notebook_db::NotebookDb::open(&notebook_dir.join("notebook.db"))
+            .expect("test notebook database");
+        state
+            .with_notebook_db_write(notebook_id, |db| db.create_conversation(conversation_id))
+            .expect("test conversation");
+        state.set_active_notebook(Some(notebook_id.to_string()), Some(7));
+        let active_chat_attempt = state
+            .register_active_chat_attempt(notebook_id, conversation_id, "attempt-1", "assistant-1")
+            .expect("active test attempt");
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
+            notebook_id,
+            conversation_id,
+            "assistant-1",
+            "scripted-model",
+            None,
+            None,
+            Some("none".to_string()),
+        )));
+        let retrieval_decision = RetrievalCapabilityDecisionV1 {
+            requested_backend: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+            effective_backend: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+            decision_reason: None,
+            decision_reason_code: None,
+            build_feature_available: cfg!(feature = "semantic-memory-backend"),
+            runtime_enabled: false,
+            projection_ready: true,
+            dense_ready: false,
+            fallback_allowed: true,
+            degraded: false,
+        };
+        let evidence_for_message = ChatEvidenceDisclosure {
+            backend_requested: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+            backend_used: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+            retrieval_mode: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+            fallback_used: false,
+            fallback_reason: None,
+            fallback_reason_code: None,
+            degradation_markers: Vec::new(),
+            source_scope_mode: "none".to_string(),
+            requested_source_ids: Vec::new(),
+            selected_source_ids: Vec::new(),
+            effective_source_ids: Vec::new(),
+            invalid_source_ids: Vec::new(),
+            excluded_source_ids: Vec::new(),
+            invalid_source_count: 0,
+            effective_source_count: 0,
+            excluded_source_count: 0,
+            context_passage_count: 0,
+            citation_valid_count: 0,
+            citation_invalid_count: 0,
+            citation_anchors: Vec::new(),
+            citation_filter_reasons: Vec::new(),
+            omitted_candidate_count: 0,
+            source_scope_preserved: true,
+            index_status: "scope-none".to_string(),
+            link_status: "gloss-local".to_string(),
+            receipt_id: "operation-receipt-1".to_string(),
+            context_digest: source_context_digest(&[]),
+            source_context_digest: source_context_digest(&[]),
+            prompt_digest: None,
+            semantic_memory_receipt_id: None,
+            candidate_backend: None,
+            turbo_quant_generation_id: None,
+            vector_artifact_manifest_digest: None,
+            exact_rerank: None,
+            exact_rerank_count: None,
+            approximate_candidate_count: None,
+            semantic_memory_fallback_reason: None,
+            retrieval_outcome: None,
+            retrieval_capability_decision: retrieval_decision.clone(),
+            semantic_memory_runtime_truth: SemanticMemoryRuntimeTruthV1 {
+                schema: "SemanticMemoryRuntimeTruthV1".to_string(),
+                receipt_id: "runtime-truth-1".to_string(),
+                build: serde_json::json!({}),
+                settings: serde_json::json!({}),
+                projection: serde_json::json!({}),
+                turbo_quant: serde_json::json!({}),
+                decision: retrieval_decision,
+            },
+            decoding_settings_receipt: None,
+            prompt_receipt: None,
+            generation_receipt: None,
+            prompt_budget_receipt: None,
+        };
+        let job = SpawnedChatAttempt {
+            handle: app.handle().clone(),
+            active_chat_attempt,
+            provider: Box::new(ScriptedLifecycleProvider {
+                mode: ScriptedLifecycleMode::ProviderReturnsError,
+                first_token_sent: None,
+            }),
+            terminal: ChatTerminalEmitter::new(
+                app.handle().clone(),
+                notebook_id,
+                conversation_id,
+                "assistant-1",
+            ),
+            notebook_id: notebook_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: "assistant-1".to_string(),
+            query: "hello".to_string(),
+            model: "scripted-model".to_string(),
+            history: Vec::new(),
+            custom_goal: None,
+            style: "default".to_string(),
+            response_length: "default".to_string(),
+            source_scope: SourceScope::None.resolve(&[]),
+            source_context: Vec::new(),
+            model_context_window: None,
+            evidence_for_message,
+            epoch: 7,
+            attempt_id: "attempt-1".to_string(),
+            user_message_id: "user-1".to_string(),
+            provider_name: "ollama".to_string(),
+            operation_receipt_id: "operation-receipt-1".to_string(),
+            attempt_trace: trace,
+            trace_data_dir: data_dir.path().to_path_buf(),
+            phase_timeouts: providers::LlmPhaseTimeouts {
+                provider_start: Duration::from_millis(1),
+                first_token: Duration::from_millis(1),
+                stream_idle: Duration::from_millis(1),
+            },
+        };
+
+        job.run_with_panic_boundary().await;
+
+        let state = app.state::<AppState>();
+        let events = state.chat_events_since(notebook_id, conversation_id, None);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind.as_str(), "done" | "error" | "cancelled"))
+                .count(),
+            1,
+            "the lifecycle must emit exactly one terminal event"
+        );
+        assert!(events.iter().any(|event| event.kind == "error"));
+        assert!(!events.iter().any(|event| event.kind == "done"));
+        let (status, phase, terminal): (String, Option<String>, Option<String>) = state
+            .with_notebook_db(notebook_id, |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT status, phase, terminal_at FROM chat_attempts WHERE attempt_id = ?1",
+                        ["attempt-1"],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("terminal chat attempt status");
+        assert_eq!(status, "error");
+        assert_eq!(phase.as_deref(), Some("stream_error"));
+        assert!(terminal.is_some());
+    }
+
+    struct SpawnedLifecycleOutcome {
+        events: Vec<ChatStreamEventV1>,
+        status: String,
+        phase: Option<String>,
+        terminal_at: Option<String>,
+    }
+
+    async fn run_spawned_lifecycle_case(
+        mode: ScriptedLifecycleMode,
+        persistence_failure: bool,
+        cancel_after_first_token: bool,
+    ) -> SpawnedLifecycleOutcome {
+        let data_dir = tempfile::tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        let notebook_id = "notebook-1";
+        let conversation_id = "conversation-1";
+        let message_id = "assistant-1";
+        let attempt_id = "attempt-1";
+        let notebook_dir = data_dir.path().join("notebooks").join(notebook_id);
+        std::fs::create_dir_all(&notebook_dir).expect("test notebook directory");
+        {
+            let app_db = state.app_db.lock().expect("app database lock");
+            app_db
+                .create_notebook(
+                    notebook_id,
+                    "Lifecycle test",
+                    &notebook_dir.to_string_lossy(),
+                )
+                .expect("test notebook registration");
+        }
+        crate::db::notebook_db::NotebookDb::open(&notebook_dir.join("notebook.db"))
+            .expect("test notebook database");
+        state
+            .with_notebook_db_write(notebook_id, |db| db.create_conversation(conversation_id))
+            .expect("test conversation");
+        if persistence_failure {
+            state
+                .with_notebook_db_write(notebook_id, |db| {
+                    db.insert_message(&Message {
+                        id: message_id.to_string(),
+                        conversation_id: conversation_id.to_string(),
+                        role: "assistant".to_string(),
+                        content: "existing message forces a SQLite primary-key failure".to_string(),
+                        citations: None,
+                        model_used: None,
+                        tokens_prompt: None,
+                        tokens_response: None,
+                        created_at: String::new(),
+                    })
+                })
+                .expect("deterministic pre-existing assistant message");
+        }
+        state.set_active_notebook(Some(notebook_id.to_string()), Some(7));
+        let active_chat_attempt = state
+            .register_active_chat_attempt(notebook_id, conversation_id, attempt_id, message_id)
+            .expect("active test attempt");
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
+            notebook_id,
+            conversation_id,
+            message_id,
+            "scripted-model",
+            None,
+            None,
+            Some("none".to_string()),
+        )));
+        let retrieval_decision = RetrievalCapabilityDecisionV1 {
+            requested_backend: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+            effective_backend: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+            decision_reason: None,
+            decision_reason_code: None,
+            build_feature_available: cfg!(feature = "semantic-memory-backend"),
+            runtime_enabled: false,
+            projection_ready: true,
+            dense_ready: false,
+            fallback_allowed: true,
+            degraded: false,
+        };
+        let evidence_for_message = ChatEvidenceDisclosure {
+            backend_requested: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+            backend_used: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+            retrieval_mode: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
+            fallback_used: false,
+            fallback_reason: None,
+            fallback_reason_code: None,
+            degradation_markers: Vec::new(),
+            source_scope_mode: "none".to_string(),
+            requested_source_ids: Vec::new(),
+            selected_source_ids: Vec::new(),
+            effective_source_ids: Vec::new(),
+            invalid_source_ids: Vec::new(),
+            excluded_source_ids: Vec::new(),
+            invalid_source_count: 0,
+            effective_source_count: 0,
+            excluded_source_count: 0,
+            context_passage_count: 0,
+            citation_valid_count: 0,
+            citation_invalid_count: 0,
+            citation_anchors: Vec::new(),
+            citation_filter_reasons: Vec::new(),
+            omitted_candidate_count: 0,
+            source_scope_preserved: true,
+            index_status: "scope-none".to_string(),
+            link_status: "gloss-local".to_string(),
+            receipt_id: "operation-receipt-1".to_string(),
+            context_digest: source_context_digest(&[]),
+            source_context_digest: source_context_digest(&[]),
+            prompt_digest: None,
+            semantic_memory_receipt_id: None,
+            candidate_backend: None,
+            turbo_quant_generation_id: None,
+            vector_artifact_manifest_digest: None,
+            exact_rerank: None,
+            exact_rerank_count: None,
+            approximate_candidate_count: None,
+            semantic_memory_fallback_reason: None,
+            retrieval_outcome: None,
+            retrieval_capability_decision: retrieval_decision.clone(),
+            semantic_memory_runtime_truth: SemanticMemoryRuntimeTruthV1 {
+                schema: "SemanticMemoryRuntimeTruthV1".to_string(),
+                receipt_id: "runtime-truth-1".to_string(),
+                build: serde_json::json!({}),
+                settings: serde_json::json!({}),
+                projection: serde_json::json!({}),
+                turbo_quant: serde_json::json!({}),
+                decision: retrieval_decision,
+            },
+            decoding_settings_receipt: None,
+            prompt_receipt: None,
+            generation_receipt: None,
+            prompt_budget_receipt: None,
+        };
+        let (first_token_sent, first_token_received) = if cancel_after_first_token {
+            let (sender, receiver) = oneshot::channel();
+            (
+                Some(Arc::new(AsyncMutex::new(Some(sender)))),
+                Some(receiver),
+            )
+        } else {
+            (None, None)
+        };
+        let job = SpawnedChatAttempt {
+            handle: app.handle().clone(),
+            active_chat_attempt,
+            provider: Box::new(ScriptedLifecycleProvider {
+                mode,
+                first_token_sent,
+            }),
+            terminal: ChatTerminalEmitter::new(
+                app.handle().clone(),
+                notebook_id,
+                conversation_id,
+                message_id,
+            ),
+            notebook_id: notebook_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            query: "hello".to_string(),
+            model: "scripted-model".to_string(),
+            history: Vec::new(),
+            custom_goal: None,
+            style: "default".to_string(),
+            response_length: "default".to_string(),
+            source_scope: SourceScope::None.resolve(&[]),
+            source_context: Vec::new(),
+            model_context_window: None,
+            evidence_for_message,
+            epoch: 7,
+            attempt_id: attempt_id.to_string(),
+            user_message_id: "user-1".to_string(),
+            provider_name: "ollama".to_string(),
+            operation_receipt_id: "operation-receipt-1".to_string(),
+            attempt_trace: trace,
+            trace_data_dir: data_dir.path().to_path_buf(),
+            phase_timeouts: providers::LlmPhaseTimeouts {
+                provider_start: Duration::from_millis(1),
+                first_token: Duration::from_millis(1),
+                stream_idle: Duration::from_millis(1),
+            },
+        };
+
+        if let Some(mut first_token_received) = first_token_received {
+            let mut run = Box::pin(job.run_with_panic_boundary());
+            tokio::select! {
+                _ = &mut run => panic!("lifecycle ended before the scripted first token"),
+                received = &mut first_token_received => received.expect("scripted first-token signal"),
+            }
+            let stop = stop_chat(notebook_id.to_string(), app.state::<AppState>())
+                .await
+                .expect("user cancellation request");
+            assert!(stop.cancellation_requested);
+            assert_eq!(stop.attempts.len(), 1);
+            run.await;
+        } else {
+            job.run_with_panic_boundary().await;
+        }
+
+        let state = app.state::<AppState>();
+        let events = state.chat_events_since(notebook_id, conversation_id, None);
+        let (status, phase, terminal_at): (String, Option<String>, Option<String>) = state
+            .with_notebook_db(notebook_id, |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT status, phase, terminal_at FROM chat_attempts WHERE attempt_id = ?1",
+                        [attempt_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("terminal chat attempt status");
+        SpawnedLifecycleOutcome {
+            events,
+            status,
+            phase,
+            terminal_at,
+        }
+    }
+
+    fn assert_spawned_terminal_contract(
+        outcome: &SpawnedLifecycleOutcome,
+        terminal_kind: &str,
+        status: &str,
+        phase: &str,
+    ) {
+        assert_eq!(
+            outcome
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind.as_str(), "done" | "error" | "cancelled"))
+                .count(),
+            1,
+            "the spawned lifecycle must emit exactly one terminal event"
+        );
+        assert!(outcome
+            .events
+            .iter()
+            .any(|event| event.kind == terminal_kind));
+        assert_eq!(outcome.status, status);
+        assert_eq!(outcome.phase.as_deref(), Some(phase));
+        assert!(outcome.terminal_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn spawned_lifecycle_provider_start_timeout_has_terminal_attempt_contract() {
+        let outcome = run_spawned_lifecycle_case(
+            ScriptedLifecycleMode::ProviderStartNeverReturns,
+            false,
+            false,
+        )
+        .await;
+
+        assert_spawned_terminal_contract(&outcome, "error", "error", "stream_error");
+        assert!(outcome.events.iter().any(|event| {
+            event.kind == "status" && event.payload["phase"] == "provider_start_timeout"
+        }));
+    }
+
+    #[tokio::test]
+    async fn spawned_lifecycle_first_token_timeout_has_terminal_attempt_contract() {
+        let outcome =
+            run_spawned_lifecycle_case(ScriptedLifecycleMode::FirstTokenNeverArrives, false, false)
+                .await;
+
+        assert_spawned_terminal_contract(&outcome, "error", "error", "stream_error");
+        assert!(outcome.events.iter().any(|event| {
+            event.kind == "status" && event.payload["phase"] == "first_token_timeout"
+        }));
+    }
+
+    #[tokio::test]
+    async fn spawned_lifecycle_stream_idle_timeout_has_terminal_attempt_contract() {
+        let outcome =
+            run_spawned_lifecycle_case(ScriptedLifecycleMode::IdleAfterFirstToken, false, false)
+                .await;
+
+        assert_spawned_terminal_contract(&outcome, "error", "error", "stream_error");
+        assert!(outcome.events.iter().any(|event| {
+            event.kind == "status" && event.payload["phase"] == "stream_idle_timeout"
+        }));
+    }
+
+    #[tokio::test]
+    async fn spawned_lifecycle_user_cancellation_has_terminal_attempt_contract() {
+        let outcome =
+            run_spawned_lifecycle_case(ScriptedLifecycleMode::CancelDuringStream, false, true)
+                .await;
+
+        assert_spawned_terminal_contract(&outcome, "cancelled", "cancelled", "stream_cancelled");
+    }
+
+    #[tokio::test]
+    async fn spawned_lifecycle_assistant_persistence_failure_has_terminal_attempt_contract() {
+        let outcome =
+            run_spawned_lifecycle_case(ScriptedLifecycleMode::SuccessfulDone, true, false).await;
+
+        assert_spawned_terminal_contract(&outcome, "error", "error", "assistant_persist_error");
+        assert!(!outcome.events.iter().any(|event| event.kind == "done"));
+    }
+
+    #[tokio::test]
+    async fn spawned_lifecycle_panic_has_terminal_attempt_contract() {
+        let outcome = run_spawned_lifecycle_case(ScriptedLifecycleMode::Panics, false, false).await;
+
+        assert_spawned_terminal_contract(&outcome, "error", "error", "chat_task_panic");
+        assert!(outcome.events.iter().any(|event| {
+            event.kind == "error"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("scripted lifecycle panic"))
+        }));
     }
 }

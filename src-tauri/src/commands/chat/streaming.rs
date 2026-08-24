@@ -44,8 +44,8 @@ pub(crate) fn source_context_digest(source_context: &[ContextPassage]) -> String
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn stream_chat_response(
-    app_handle: &tauri::AppHandle,
+pub(crate) async fn stream_chat_response<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
     provider: &dyn LlmProvider,
     notebook_id: &str,
     epoch: u64,
@@ -785,4 +785,367 @@ pub(crate) async fn stream_chat_response(
         generation_receipt,
         prompt_budget_receipt: Some(prompt_budget_receipt),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::chat::receipts::new_chat_attempt_trace;
+    use crate::retrieval::source_scope::SourceScope;
+    use async_trait::async_trait;
+    use futures::stream;
+    use tauri::Manager;
+    use tempfile::tempdir;
+
+    enum ScriptedFailureMode {
+        ProviderStartNeverReturns,
+        FirstTokenNeverArrives,
+        IdleAfterFirstToken,
+        ProviderReturnsError,
+        CancelDuringStream,
+    }
+
+    struct ScriptedFailureProvider(ScriptedFailureMode);
+
+    #[async_trait]
+    impl LlmProvider for ScriptedFailureProvider {
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, GlossError> {
+            Ok(Vec::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            _context: LlmExecutionContext,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatToken, GlossError>> + Send>>,
+            GlossError,
+        > {
+            match self.0 {
+                ScriptedFailureMode::ProviderStartNeverReturns => {
+                    futures::future::pending::<
+                        Result<
+                            std::pin::Pin<
+                                Box<
+                                    dyn futures::Stream<Item = Result<ChatToken, GlossError>>
+                                        + Send,
+                                >,
+                            >,
+                            GlossError,
+                        >,
+                    >()
+                    .await
+                }
+                ScriptedFailureMode::FirstTokenNeverArrives => Ok(Box::pin(stream::pending())),
+                ScriptedFailureMode::IdleAfterFirstToken => Ok(Box::pin(
+                    stream::iter([Ok(ChatToken {
+                        token: "partial".to_string(),
+                        done: false,
+                    })])
+                    .chain(stream::pending()),
+                )),
+                ScriptedFailureMode::ProviderReturnsError => {
+                    Err(GlossError::Other("scripted provider failure".to_string()))
+                }
+                ScriptedFailureMode::CancelDuringStream => {
+                    let cancellation = _context.cancellation.clone();
+                    let stream = stream::unfold(0_u8, move |step| {
+                        let cancellation = cancellation.clone();
+                        async move {
+                            match step {
+                                0 => Some((
+                                    Ok(ChatToken {
+                                        token: "partial".to_string(),
+                                        done: false,
+                                    }),
+                                    1,
+                                )),
+                                1 => {
+                                    cancellation.cancel();
+                                    futures::future::pending::<
+                                        Option<(Result<ChatToken, GlossError>, u8)>,
+                                    >()
+                                    .await
+                                }
+                                _ => None,
+                            }
+                        }
+                    });
+                    Ok(Box::pin(stream))
+                }
+            }
+        }
+
+        async fn health_check(&self) -> Result<bool, GlossError> {
+            Ok(true)
+        }
+
+        fn provider_type(&self) -> crate::providers::ProviderType {
+            crate::providers::ProviderType::Ollama
+        }
+    }
+
+    async fn run_scripted_failure(
+        mode: ScriptedFailureMode,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> (
+        Result<ChatStreamResult, GlossError>,
+        Vec<ChatStreamEventV1>,
+        ChatAttemptTraceV1,
+    ) {
+        let data_dir = tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        state.set_active_notebook(Some("notebook-1".to_string()), Some(7));
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
+            "notebook-1",
+            "conversation-1",
+            "message-1",
+            "scripted-model",
+            None,
+            None,
+            Some("none".to_string()),
+        )));
+        let scope = SourceScope::Explicit(Vec::new()).resolve(&[]);
+        let result = stream_chat_response(
+            app.handle(),
+            &ScriptedFailureProvider(mode),
+            "notebook-1",
+            7,
+            "conversation-1",
+            "message-1",
+            "hello",
+            "scripted-model",
+            &[],
+            None,
+            "balanced",
+            "normal",
+            &scope,
+            &[],
+            None,
+            &trace,
+            data_dir.path(),
+            LlmExecutionContext::new(
+                cancellation,
+                crate::providers::LlmPhaseTimeouts {
+                    provider_start: Duration::from_millis(1),
+                    first_token: Duration::from_millis(1),
+                    stream_idle: Duration::from_millis(1),
+                },
+            ),
+        )
+        .await;
+        let events =
+            app.state::<AppState>()
+                .chat_events_since("notebook-1", "conversation-1", None);
+        (
+            result,
+            events,
+            receipts::chat_attempt_trace_snapshot(&trace),
+        )
+    }
+
+    struct ScriptedDoneProvider;
+
+    #[async_trait]
+    impl LlmProvider for ScriptedDoneProvider {
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, GlossError> {
+            Ok(Vec::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            _context: LlmExecutionContext,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatToken, GlossError>> + Send>>,
+            GlossError,
+        > {
+            let stream = stream::unfold(0_u8, |step| async move {
+                let token = match step {
+                    0 => ChatToken {
+                        token: "hello".to_string(),
+                        done: false,
+                    },
+                    1 => ChatToken {
+                        token: " world".to_string(),
+                        done: false,
+                    },
+                    2 => ChatToken {
+                        token: String::new(),
+                        done: true,
+                    },
+                    _ => {
+                        futures::future::pending::<()>().await;
+                        unreachable!("pending fake transport cannot finish")
+                    }
+                };
+                Some((Ok(token), step.saturating_add(1)))
+            });
+            Ok(Box::pin(stream))
+        }
+
+        async fn health_check(&self) -> Result<bool, GlossError> {
+            Ok(true)
+        }
+
+        fn provider_type(&self) -> crate::providers::ProviderType {
+            crate::providers::ProviderType::Ollama
+        }
+    }
+
+    #[tokio::test]
+    async fn scripted_done_frame_without_eof_completes_real_stream_path() {
+        let data_dir = tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        state.set_active_notebook(Some("notebook-1".to_string()), Some(7));
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
+            "notebook-1",
+            "conversation-1",
+            "message-1",
+            "scripted-model",
+            None,
+            None,
+            Some("none".to_string()),
+        )));
+        let scope = SourceScope::Explicit(Vec::new()).resolve(&[]);
+        let provider = ScriptedDoneProvider;
+
+        let result = stream_chat_response(
+            app.handle(),
+            &provider,
+            "notebook-1",
+            7,
+            "conversation-1",
+            "message-1",
+            "hello",
+            "scripted-model",
+            &[],
+            None,
+            "balanced",
+            "normal",
+            &scope,
+            &[],
+            None,
+            &trace,
+            data_dir.path(),
+            LlmExecutionContext::uncancellable(),
+        )
+        .await
+        .expect("done frame must complete without waiting for EOF");
+
+        assert_eq!(result.full_response, "hello world");
+        assert!(result.generation_receipt.done_frame_seen);
+        assert!(!result.generation_receipt.eof_seen);
+        assert_eq!(
+            app.state::<AppState>()
+                .chat_events_since("notebook-1", "conversation-1", None)
+                .iter()
+                .filter(|event| event.kind == "token")
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_provider_start_timeout_records_its_typed_phase() {
+        let (result, events, trace) = run_scripted_failure(
+            ScriptedFailureMode::ProviderStartNeverReturns,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(events.iter().any(|event| {
+            event.kind == "status" && event.payload["phase"] == "provider_start_timeout"
+        }));
+        assert!(trace
+            .events
+            .iter()
+            .any(|event| event.phase == "provider_start_timeout"));
+    }
+
+    #[tokio::test]
+    async fn scripted_first_token_timeout_records_its_typed_phase() {
+        let (result, events, trace) = run_scripted_failure(
+            ScriptedFailureMode::FirstTokenNeverArrives,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(events.iter().any(|event| {
+            event.kind == "status" && event.payload["phase"] == "first_token_timeout"
+        }));
+        assert!(trace
+            .events
+            .iter()
+            .any(|event| event.phase == "first_token_timeout"));
+    }
+
+    #[tokio::test]
+    async fn scripted_stream_idle_timeout_records_its_typed_phase() {
+        let (result, events, trace) = run_scripted_failure(
+            ScriptedFailureMode::IdleAfterFirstToken,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(events.iter().any(|event| event.kind == "token"));
+        assert!(events.iter().any(|event| {
+            event.kind == "status" && event.payload["phase"] == "stream_idle_timeout"
+        }));
+        assert!(trace
+            .events
+            .iter()
+            .any(|event| event.phase == "stream_idle_timeout"));
+    }
+
+    #[tokio::test]
+    async fn scripted_provider_error_returns_provider_error_without_terminal_completion() {
+        let (result, events, trace) = run_scripted_failure(
+            ScriptedFailureMode::ProviderReturnsError,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!events.iter().any(|event| event.kind == "done"));
+        assert!(trace
+            .events
+            .iter()
+            .any(|event| event.phase == "llm_invocation_receipt"));
+    }
+
+    #[tokio::test]
+    async fn scripted_cancel_before_provider_start_is_not_reported_as_success() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let (result, events, trace) =
+            run_scripted_failure(ScriptedFailureMode::ProviderStartNeverReturns, cancellation)
+                .await;
+
+        assert!(result.is_err());
+        assert!(!events.iter().any(|event| event.kind == "done"));
+        assert!(trace.events.iter().any(|event| event.phase == "cancelled"));
+    }
+
+    #[tokio::test]
+    async fn scripted_cancellation_during_stream_is_not_reported_as_success() {
+        let (result, events, trace) = run_scripted_failure(
+            ScriptedFailureMode::CancelDuringStream,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(events.iter().any(|event| event.kind == "token"));
+        assert!(!events.iter().any(|event| event.kind == "done"));
+        assert!(trace.events.iter().any(|event| event.phase == "cancelled"));
+    }
 }

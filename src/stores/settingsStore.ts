@@ -31,7 +31,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   models: [],
   settings: {},
   featureFlags: [],
-  activeModel: 'qwen3.5:4b',
+  activeModel: '',
   selectionError: null,
   loading: false,
   externalTools: {},
@@ -39,9 +39,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   loadSettings: async () => {
     try {
       const settings = await api.getSettings();
+      const defaultModel = settings['default_model']?.trim() ?? '';
       set({
         settings,
-        activeModel: settings['default_model'] || 'qwen3.5:4b',
+        activeModel: defaultModel,
+        selectionError: defaultModel
+          ? null
+          : 'No default model is configured. Select an available model in Settings.',
       });
     } catch (e) {
       console.warn('Failed to load settings:', e);
@@ -72,7 +76,19 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   loadModels: async () => {
     try {
       const models = await api.getAllModels();
-      set({ models });
+      const activeModel = get().activeModel;
+      const selectedProviderId = get().settings['default_provider'];
+      const selectedModel = activeModel
+        ? models.find(
+            (model) =>
+              model.id === activeModel &&
+              (!selectedProviderId || model.provider_id === selectedProviderId)
+          ) ?? models.find((model) => model.id === activeModel)
+        : undefined;
+      const selectionError = activeModel && (!selectedModel || !selectedModel.available || selectedModel.stale)
+        ? `Selected model '${activeModel}' is unavailable. Refresh models or select an available model.`
+        : null;
+      set({ models, selectionError });
     } catch (e) {
       console.warn('Failed to load models:', e);
       useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load models', duration: 5000 });

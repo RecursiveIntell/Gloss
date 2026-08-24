@@ -33,6 +33,7 @@ def main() -> int:
     sidebar = text(repo / "src/components/notebooks/NotebookSidebar.tsx")
     capabilities = text(repo / "src-tauri/capabilities/default.json")
     frontend_contract_tests = text(repo / "scripts/run_frontend_contract_tests.mjs")
+    contract = text(repo / "schemas/tauri-contract-v1.json")
     receipt_path = (
         repo
         / "docs/codex-runs"
@@ -82,15 +83,24 @@ def main() -> int:
         if marker not in types:
             failures.append(f"frontend type missing: {marker}")
     for marker in [
-        "exportNotebook",
         "exportNotebookArchive",
-        "validateNotebookImportPackage",
         "validateNotebookImportArchive",
-        "importNotebook",
         "importNotebookArchive",
     ]:
         if marker not in tauri:
             failures.append(f"frontend wrapper missing: {marker}")
+    try:
+        contract_commands = json.loads(contract).get("commands", {})
+    except json.JSONDecodeError:
+        contract_commands = {}
+    for command in ["export_notebook", "validate_notebook_import_package", "import_notebook"]:
+        entry = contract_commands.get(command, {})
+        if not (
+            entry.get("operator_only") is True
+            and entry.get("wrapper") is None
+            and entry.get("caller_count") == 0
+        ):
+            failures.append(f"directory-package command is not explicitly operator-only: {command}")
     for marker in [
         "handleExportNotebook",
         "handleImportNotebook",

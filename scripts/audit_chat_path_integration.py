@@ -1,58 +1,110 @@
 #!/usr/bin/env python3
+"""Static contract audit for the current Gloss chat path.
+
+This is intentionally a source-structure audit, not a historical-name check.
+Runtime behavior remains owned by Rust and Vitest tests; this gate protects the
+minimum wiring those tests depend on: replay-backed terminal emission, typed
+retrieval disclosure, and frontend terminal-state ownership.
+"""
+
+from __future__ import annotations
+
 import json
 import pathlib
 import sys
 
 
-def main() -> int:
-    root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
-    chat = (root / "src-tauri/src/commands/chat/mod.rs").read_text()
-    store = (root / "src/stores/chatStore.ts").read_text()
-    types = (root / "src/lib/types.ts").read_text()
-    errors = []
+REQUIRED_FILES = {
+    "chat": "src-tauri/src/commands/chat/mod.rs",
+    "emit": "src-tauri/src/commands/chat/emit.rs",
+    "chat_types": "src-tauri/src/commands/chat/types.rs",
+    "store": "src/stores/chatStore.ts",
+    "web_types": "src/lib/types.ts",
+    "tauri": "src/lib/tauri.ts",
+}
 
-    required_chat_markers = [
-        "GlossLocalMemoryBackend::new",
-        "MemorySearchRequest",
-        "allow_fallback: true",
-        "raw-content-text-fallback",
-        "semantic-memory-empty-context",
-        "chat:evidence",
-        "AssistantMessageEvidence",
+
+def read_sources(root: pathlib.Path) -> tuple[dict[str, str], list[str]]:
+    sources: dict[str, str] = {}
+    errors: list[str] = []
+    for name, relative_path in REQUIRED_FILES.items():
+        path = root / relative_path
+        if not path.is_file():
+            errors.append(f"required chat-path source missing: {relative_path}")
+            continue
+        sources[name] = path.read_text(encoding="utf-8")
+    return sources, errors
+
+
+def require_contains(errors: list[str], text: str, marker: str, contract: str) -> None:
+    if marker not in text:
+        errors.append(f"{contract}: missing {marker!r}")
+
+
+def stop_streaming_body(store: str) -> str:
+    start = store.find("  stopStreaming: async")
+    end = store.find("  attachAssistantEvidence:", start)
+    return store[start:end] if start >= 0 and end > start else ""
+
+
+def audit(root: pathlib.Path) -> list[str]:
+    sources, errors = read_sources(root)
+    if errors:
+        return errors
+
+    chat = sources["chat"]
+    emit = sources["emit"]
+    chat_types = sources["chat_types"]
+    store = sources["store"]
+    web_types = sources["web_types"]
+    tauri = sources["tauri"]
+
+    # Backend terminal events must be persisted for replay before webview emit.
+    for marker in ("record_chat_stream_event", 'handle.emit("chat:stream_event"', "ChatTerminalGuard", "emit_cancelled"):
+        require_contains(errors, emit, marker, "replay-backed terminal contract")
+    require_contains(errors, chat, "ChatTerminalEmitter::new", "chat stream terminal ownership")
+    require_contains(errors, chat, "StopChatResponseV1", "cancellation request acknowledgement")
+    require_contains(errors, chat_types, "ChatCancellationRequestV1", "typed cancellation acknowledgement")
+    require_contains(errors, chat_types, "cancellation_requested", "typed cancellation acknowledgement")
+
+    # Retrieval disclosure describes requested and effective behavior, without
+    # pinning a deleted backend class or fallback implementation spelling.
+    for marker in (
+        "ChatEvidenceDisclosure",
         "backend_requested",
         "backend_used",
-        "retrieval_mode",
         "fallback_used",
-        "fallback_reason",
-        "degradation_markers",
-        "receipt_id",
-    ]
-    for marker in required_chat_markers:
-        if marker not in chat:
-            errors.append(f"chat.rs missing marker: {marker}")
+        "retrieval_capability_decision",
+    ):
+        require_contains(errors, chat_types, marker, "typed retrieval disclosure")
+    for marker in ("retrieval_backend_requested", "retrieval_backend_used", "emit_chat_evidence"):
+        require_contains(errors, chat, marker, "retrieval disclosure emission")
+    for marker in ("ChatEvidenceDisclosure", "backend_requested", "backend_used", "fallback_used"):
+        require_contains(errors, web_types, marker, "frontend retrieval disclosure type")
 
-    local_pos = chat.find("GlossLocalMemoryBackend::new")
-    raw_pos = chat.find("raw-content-text-fallback")
-    if local_pos < 0 or raw_pos < 0 or local_pos > raw_pos:
-        errors.append("ranked gloss-local retrieval must appear before raw content_text fallback")
+    # A stop request is not terminal. Frontend cleanup remains event-driven.
+    body = stop_streaming_body(store)
+    if not body:
+        errors.append("frontend cancellation ownership: stopStreaming body not found")
+    else:
+        require_contains(errors, body, "await api.stopChat", "frontend cancellation request")
+        require_contains(errors, body, "phase: 'cancelling'", "frontend cancellation pending state")
+        for forbidden in ("isStreaming: false", "streamingMessageId: null", "streamingNotebookId: null"):
+            if forbidden in body:
+                errors.append(f"frontend cancellation ownership: stopStreaming clears terminal state via {forbidden!r}")
+    require_contains(errors, store, "handleChatCancelled", "frontend cancellation terminal handler")
+    require_contains(errors, store, "get().handleChatCancelled", "frontend cancellation replay routing")
+    # TypeScript permits either an inline import type or a named type import.
+    # The contract is the exported typed response, not a particular import spelling.
+    require_contains(errors, tauri, "Promise<StopChatResponseV1>", "typed stop_chat IPC response")
+    require_contains(errors, tauri, "StopChatResponseV1", "typed stop_chat IPC response")
 
-    if "get_chunks_for_source" in chat:
-        errors.append("chat.rs should not use direct source-order get_chunks_for_source fallback")
-    if "chunk_id: None" in chat[chat.find("MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW"):chat.find("Err(err) if semantic_fallback_allowed")]:
-        errors.append("semantic preview context should preserve exact candidate chunk_id")
-    if "let mut retrieval_backend_used" not in chat or "backend_used: retrieval_backend_used" not in chat:
-        errors.append("chat evidence must track actual backend_used separately from requested backend")
-    if "semantic-memory-empty-context-fallback" not in chat:
-        errors.append("empty semantic preview results must explicitly fall back or degrade")
+    return errors
 
-    for marker in ["pendingEvidence", "attachAssistantEvidence", "citations: pendingEvidence"]:
-        if marker not in store:
-            errors.append(f"chatStore.ts missing evidence buffering marker: {marker}")
 
-    for marker in ["ChatEvidenceDisclosure", "retrieval_mode", "ChatEvidencePayload"]:
-        if marker not in types:
-            errors.append(f"types.ts missing evidence type marker: {marker}")
-
+def main() -> int:
+    root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+    errors = audit(root)
     result = {"errors": errors, "status": "pass" if not errors else "fail"}
     print(json.dumps(result, indent=2))
     return 0 if not errors else 1

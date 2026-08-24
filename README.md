@@ -10,8 +10,14 @@
 
 ![Gloss desktop interface showing notebooks, selected sources, chat, citations, and runtime status](src/assets/gloss-gui/pasted-1779172952776-0.png)
 
-> [!IMPORTANT]
-> Gloss is under active development and currently ships as a source build. Linux x86_64 is the maintained packaging target. The repository does not yet publish a tagged, end-user binary release, and live GUI/installed-workflow certification is still incomplete.
+> [!WARNING]
+> Gloss is under active development and currently distributed as source. Linux x86_64 is the maintained development/build target. The repository does not publish a tagged, end-user binary release.
+>
+> Current source-level verification passes for the checked paths: `npm test`, the production frontend build, and the Cargo feature checks/tests/strict Clippy run completed successfully for this local snapshot. These results verify source/build/test gates only; they do not establish live runtime behavior.
+>
+> No live desktop GUI smoke test, installed-workflow test, or real provider/model smoke test has been run for this snapshot. Those paths remain unverified. This status is not a release-readiness declaration.
+>
+> Remote/cloud-provider workflows are configurable, but they were not exercised against a real provider and model in this snapshot; when using a cloud provider, the assembled prompt and source context leave the machine.
 
 ## Why Gloss exists
 

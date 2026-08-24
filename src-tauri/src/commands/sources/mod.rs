@@ -768,14 +768,31 @@ fn maybe_auto_project_semantic_memory(
     );
     let receipt_id = uuid::Uuid::new_v4().to_string();
     let db_path = state.notebook_db_path(notebook_id)?;
-    match tauri::async_runtime::block_on(semantic_memory_adapter::reindex_source(
-        &state.data_dir,
-        notebook_id,
-        &db_path,
-        source_id,
-        Some(receipt_id),
-        Some(runtime_config),
-    )) {
+    // Bound the projection so a stuck embed/ingest (or a hung Ollama call)
+    // cannot freeze the folder-import loop indefinitely. This ran unbounded
+    // and was observed holding a source at "projecting" for minutes with 16
+    // cores pegged before the process died.
+    const SEMANTIC_MEMORY_PROJECTION_TIMEOUT_SECS: u64 = 120;
+    match tauri::async_runtime::block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(SEMANTIC_MEMORY_PROJECTION_TIMEOUT_SECS),
+            semantic_memory_adapter::reindex_source(
+                &state.data_dir,
+                notebook_id,
+                &db_path,
+                source_id,
+                Some(receipt_id),
+                Some(runtime_config),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            GlossError::Other(
+                "semantic-memory projection timed out after 120s; source will be retried later"
+                    .into(),
+            )
+        })?
+    }) {
         Ok(receipt) => {
             let message = serde_json::to_string(&receipt).ok();
             emit_status(

@@ -416,11 +416,12 @@
       "stdout_tail": "{\n  \"ok\": true,\n  \"run_id\": \"GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526\",\n  \"receipt\": \"/home/sikmindz/Coding/Gloss/docs/codex-runs/GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526/LIVE_DESKTOP_SMOKE_RECEIPT.json\",\n  \"release_grade\": false,\n  \"live_desktop_exercised\": false,\n  \"failures\": [],\n  \"warnings\": [\n    \"desktop GUI smoke is still not release-grade; receipt is an honest blocker\"\n  ]\n}\n"
     }
   ],
-  "public_claim_ready": true,
-  "reason_release_ready_false": "",
-  "recorded_utc": "2026-08-24T13:21:21.564260+00:00",
+  "live_desktop_release_grade": false,
+  "public_claim_ready": false,
+  "reason_release_ready_false": "release_ready=false: static gates may pass, but a live release-grade desktop smoke receipt is missing",
+  "recorded_utc": "2026-08-24T13:25:13.209274+00:00",
   "release_candidate_gate_passed": true,
-  "release_ready": true,
+  "release_ready": false,
   "run_id": "GLOSS_TOTAL_COMPLETION_AND_HARDENING_SUPERPASS_20260526",
   "schema": "GlossReleaseCandidateGateV1"
 }

@@ -80,12 +80,27 @@ def main():
             # gloss_* gates accept --repo flag
             results.append(run(repo, [sys.executable, gate, "--repo", str(repo)]))
     release_candidate_gate_passed = all(result["passed"] for result in results)
-    # Only claim release_ready if the gate passed AND at least one live receipt exists
-    run_dir_contents = [p.name for p in run_dir.iterdir()] if run_dir.exists() else []
-    has_live_receipt = any('receipt' in n.lower() or 'live' in n.lower() for n in run_dir_contents)
-    # Release is ready only if: gate passed, has live receipts, and not missing desktop smoke
-    release_ready = release_candidate_gate_passed and has_live_receipt
-    reason = "release_ready: gate passed with live receipts" if release_ready else "release_ready=false: either gate failed, or missing live receipts (desktop smoke, live semantic memory smoke, etc.)"
+    # A scripted receipt is not live evidence. Require the canonical desktop
+    # receipt to explicitly record a headed/live exercise and release-grade
+    # status before promoting either release_ready or public_claim_ready.
+    desktop_receipt = run_dir / "LIVE_DESKTOP_SMOKE_RECEIPT.json"
+    desktop_release_grade = False
+    if desktop_receipt.exists():
+        try:
+            desktop = json.loads(desktop_receipt.read_text())
+            desktop_release_grade = (
+                desktop.get("live_desktop_exercised") is True
+                and desktop.get("release_grade") is True
+                and not desktop.get("failures")
+            )
+        except (OSError, json.JSONDecodeError):
+            desktop_release_grade = False
+    release_ready = release_candidate_gate_passed and desktop_release_grade
+    reason = (
+        "release_ready: static gates passed and live desktop smoke is release-grade"
+        if release_ready
+        else "release_ready=false: static gates may pass, but a live release-grade desktop smoke receipt is missing"
+    )
     payload = {
         "schema": "GlossReleaseCandidateGateV1",
         "run_id": run_id,
@@ -93,6 +108,7 @@ def main():
         "release_candidate_gate_passed": release_candidate_gate_passed,
         "release_ready": release_ready,
         "public_claim_ready": release_ready,
+        "live_desktop_release_grade": desktop_release_grade,
         "reason_release_ready_false": reason if not release_ready else "",
         "commands": results,
     }

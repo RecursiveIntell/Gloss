@@ -35,8 +35,10 @@ def main():
     if current_run and not (root/'docs/codex-runs'/current_run).is_dir():
         failures.append(f'current run directory docs/codex-runs/{current_run} is missing')
     for label, text in [('AGENTS.md',agents),('README.md',readme)]:
-        if current_run and current_run not in text:
+        if label == 'AGENTS.md' and current_run and current_run not in text:
             failures.append(f'{label} does not reference current run {current_run}')
+        if label == 'README.md' and current_run and current_run in text:
+            warnings.append('README references dated run metadata; public status should remain source/evidence bounded')
         if 'GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519' in text and current_run != 'GLOSS_P33_RELEASE_CANDIDATE_SM_TQ_SETTINGS_GUI_20260519':
             failures.append(f'{label} references P33 while CURRENT_RUN is {current_run}')
         for match in re.findall(r'scripts/(p33_[A-Za-z0-9_]+\.(?:py|sh))', text):

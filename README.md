@@ -1,238 +1,89 @@
-<div align="center">
-  <img src="src-tauri/icons/icon.png" alt="Gloss icon" width="104" />
-  <h1>Gloss</h1>
-  <p><strong>A local-first desktop notebook for source-grounded research and chat.</strong></p>
-  <p>
-    Import files, organize them into isolated notebooks, ask questions with local or explicitly configured cloud models,
-    and inspect the evidence and runtime receipts behind each answer.
-  </p>
-</div>
+<!-- last-verified: 2026-08-24 -->
 
-![Gloss desktop interface showing notebooks, selected sources, chat, citations, and runtime status](src/assets/gloss-gui/pasted-1779172952776-0.png)
+# Gloss
+
+<p align="center">
+  <img src="src-tauri/icons/icon.png" alt="Gloss application icon" width="104" />
+</p>
+
+> A local-first desktop notebook for source-grounded research and chat.
+
+Gloss is a source-implemented local-first desktop notebook for source-grounded research and chat. The input, retrieval, provider, and receipt paths described below are source-level capabilities; live provider/model and release-grade desktop behavior are not verified in this snapshot.
 
 > [!WARNING]
 > Gloss is under active development and currently distributed as source. Linux x86_64 is the maintained development/build target. The repository does not publish a tagged, end-user binary release.
 >
-> Current source-level verification passes for the checked paths: `npm test`, the production frontend build, and the Cargo feature checks/tests/strict Clippy run completed successfully for this local snapshot. These results verify source/build/test gates only; they do not establish live runtime behavior.
+> The current source/build verification passes for the checked paths, including frontend tests/build, Cargo feature checks/tests, strict Clippy, dependency policy checks, and a Tauri debug compile. Those results do **not** establish live desktop behavior, an installed workflow, or real provider/model execution.
 >
-> No live desktop GUI smoke test, installed-workflow test, or real provider/model smoke test has been run for this snapshot. Those paths remain unverified. This status is not a release-readiness declaration.
->
-> Remote/cloud-provider workflows are configurable, but they were not exercised against a real provider and model in this snapshot; when using a cloud provider, the assembled prompt and source context leave the machine.
+> The scripted desktop contract passes, but no live GUI driver or live desktop receipt exists for this snapshot. AppImage installer smoke is also blocked because no release AppImage artifact is available. Treat Gloss as source/build/test verified, not release-proven.
 
-## Why Gloss exists
+![Gloss desktop interface showing notebooks, selected sources, chat, citations, and runtime status](src/assets/gloss-gui/pasted-1779172952776-0.png)
 
-Most document-chat tools hide the retrieval path that produced an answer. Gloss keeps that path visible.
+*Representative interface screenshot; illustrative only and not evidence of current live desktop or release behavior.*
 
-A Gloss notebook owns its source files, SQLite data, conversations, notes, vector artifacts, and receipts. Chat can run against all sources, an explicit selection, or no retrieval context. When dense retrieval or semantic memory is unavailable, Gloss records the fallback instead of presenting it as an equivalent result.
+## Contents
 
-Gloss is designed around four boundaries:
+- [Who Gloss is for](#who-gloss-is-for)
+- [What is verified](#what-is-verified)
+- [Quick start](#quick-start)
+- [What the source implements](#what-the-source-currently-implements)
+- [Source and provider boundaries](#source-and-provider-boundaries)
+- [Architecture](#architecture)
+- [Build and development](#build-and-development)
+- [Verification](#verification)
+- [Repository map](#repository-map)
+- [Known limitations](#known-limitations)
+- [Contributing and security](#contributing-and-security)
+- [License](#license)
 
-- Local data is the default. Notebook state is stored on the machine, not in a Gloss service.
-- Network use is explicit. Local providers use loopback by default; LAN and custom cloud endpoints require operator opt-in.
-- Evidence is inspectable. Citations, source scope, prompt metadata, decoding settings, retrieval decisions, and generation status are available in the desktop inspector.
-- Degradation is disclosed. Missing indices, optional tools, or model capabilities produce reason codes, disabled paths, or bounded fallbacks.
+## Who Gloss is for
 
-## Architecture
+Gloss is for people who want a source-implemented local notebook that makes the intended path from imported source to model response inspectable.
 
-### Retrieval and chat pipeline
+It is a good fit when you want:
 
-```mermaid
-flowchart TD
-    A[User query] --> B[Multi-angle query rewriting\n5s timeout, graceful fallback]
-    B --> C[Source scope resolution]
-    C --> D{Retrieval backends}
-    D --> E[SQLite FTS5 / BM25]
-    D --> F[HNSW dense search\nusearch]
-    E --> G[Reciprocal-rank fusion]
-    F --> G
-    G --> H[Optional re-rank / fallback]
-    H --> I[Context assembly\nbounded prompt window]
-    I --> J[Provider stream\nOllama / OpenAI / Anthropic / llama.cpp]
-    J --> K[Citation extraction]
-    K --> L[Answer + citations + receipts]
-```
+- notebook-scoped source files, conversations, notes, and receipts;
+- explicit `all`, `selected`, or `none` retrieval scope;
+- local FTS/BM25 and dense retrieval with disclosed degradation;
+- local or explicitly configured remote provider paths, subject to provider availability and network consent; no real provider/model smoke was run for this snapshot;
+- structured Studio outputs tied to the current source scope;
+- a desktop interface backed by Rust/Tauri rather than a hosted Gloss service.
 
-### Provider resolution
+It is **not** currently a packaged end-user release, a hosted synchronization service, a formal security/compliance product, or a substitute for validating model answers.
 
-```mermaid
-flowchart TD
-    A[LLM request] --> B{Model specified?}
-    B -->|Yes| C[resolve_llm_config\nshared chat + studio path]
-    B -->|No| D[Read default_model\nfrom settings]
-    D --> C
-    C --> E{Model registry\navailable?}
-    E -->|Yes| F[get_provider_config_for_model\nvalidates model exists]
-    E -->|No| G[provider_config_from_db\nwith default_provider]
-    F --> H[ProviderConfig + model + context_window]
-    G --> H
-    H --> I[build_provider]
-    I --> J[LlmProvider trait\nchat / health_check]
-    J --> K{Provider type}
-    K -->|Ollama/llama.cpp| L[Loopback default\nLAN with opt-in]
-    K -->|OpenAI/Anthropic| M[Official host default\ncustom cloud with opt-in]
-```
+## What is verified
 
-### Studio generation pipeline
+The evidence states below are deliberately separate:
 
-```mermaid
-flowchart TD
-    A[User selects output type\n16 types available] --> B[Build deterministic artifact\ngenerate_artifact with snippets]
-    B --> C{LLM refinement\nenabled?}
-    C -->|No| D[Return deterministic template]
-    C -->|Yes| E{Widget type?\nflashcards/quiz/mind_map}
-    E -->|Yes| F[generate_structured_widget_content\nJSON schema validation]
-    E -->|No| G[refine_studio_artifact\nLLM prompt from TOML templates]
-    F --> H{Validation passed?}
-    G --> H
-    H -->|Yes| I[Return LLM-refined content]
-    H -->|No| J[Fallback to deterministic template\nStudioFallbackReceipt recorded]
-    D --> K[Persist + render]
-    I --> K
-    J --> K
-```
-
-### Ingestion pipeline
-
-```mermaid
-flowchart LR
-    A[Source added] --> B[Extract\ntext/PDF/docx/xlsx/URL/YouTube/audio/video/image]
-    B --> C[Chunk\nrecursive split, 800-token target]
-    C --> D[Embed\nNomicEmbedTextV15 via FastEmbed/Candle]
-    D --> E[Index\nHNSW via usearch]
-    E --> F[Summarize\nLLM summary with suggested questions]
-    F --> G[Ready]
-```
-
-## What works today
-
-### Notebooks and sources
-
-- Create, rename, switch, and delete isolated notebooks.
-- Import individual files, folders, pasted text, URLs, and public YouTube caption tracks.
-- Track extraction, chunking, embedding, indexing, and background-job state per source.
-- Review failed imports and retry, quarantine, or delete them.
-- Export and validate portable `.glosspkg.tar.gz` notebook archives with per-file SHA-256 hashes and a package manifest.
-
-### Source-grounded chat
-
-- Stream responses from Ollama, llama.cpp, OpenAI, or Anthropic.
-- Chat with every ready source, a selected subset, or no source context.
-- Combine SQLite FTS5/BM25 and local HNSW dense retrieval, then fuse candidates with reciprocal-rank fusion.
-- Use bounded multi-angle query rewriting when a provider is available; failure returns to the original query.
-- Persist partial, cancelled, errored, and completed chat outcomes instead of leaving the interface in an indefinite loading state.
-- Inspect citations, retrieval mode, fallback reason codes, prompt digests, decoding settings, and generation receipts.
-
-### Notes and Studio
-
-- Create, edit, pin, and delete notebook-scoped notes.
-- Save useful chat responses as notes.
-- Generate source-bound reports, summaries, outlines, FAQs, flashcards, quizzes, mind maps, timelines, comparison tables, action plans, briefing docs, study guides, custom reports, slide decks, infographics, and audio overview scripts from the current source scope.
-- Export Studio artifacts as JSON with a digest-bearing export receipt.
-
-### Diagnostics and recovery
-
-- Test provider connectivity and inspect model availability.
-- Check embedding, dense-index, semantic-memory, and TurboQuant runtime status.
-- Run database doctor checks for missing notebook data, source-count drift, orphaned rows, failed imports, and stale jobs.
-- Rebuild supported vector artifacts from the settings interface.
-
-## Source support
-
-The import capability matrix lives in [`src-tauri/src/ingestion/import_capability.rs`](src-tauri/src/ingestion/import_capability.rs). The short version:
-
-| Input | Current behavior |
-| --- | --- |
-| Text, Markdown, reStructuredText, code, and config files | Local UTF-8 extraction with format or language metadata |
-| CSV and TSV | Imported as plain text; table normalization is not claimed |
-| PDF | Bounded local text extraction; no OCR, forms, or layout fidelity |
-| DOCX, XLSX, and PPTX | Bounded OOXML text/value extraction; no rendering fidelity |
-| Legacy DOC, XLS, and PPT | Optional local `antiword`, `xls2csv`, and `catppt` commands with timeout and redacted tool receipts |
-| EPUB | Bounded local spine/XHTML text extraction; no DRM support |
-| HTML files | Imported as source text; readability extraction is not applied |
-| URL | One explicitly requested HTTP(S) fetch with host, redirect, content-type, timeout, and byte limits; no crawling or authenticated fetch |
-| YouTube | Public caption tracks only, with per-import network consent; no video download |
-| Images | Routed to a configured vision-capable model; quality depends on that model |
-| Audio | `ffprobe` metadata plus optional transcription when a compatible Whisper CLI and local model are already available |
-| Video | Bounded `ffmpeg`/`ffprobe` processing; full video understanding and general transcription are not claimed |
-
-Archive files and opaque binary/model formats are rejected as ordinary sources.
-
-## Providers and network boundaries
-
-| Provider | Default endpoint | Default policy |
+| Surface | State in this snapshot | Boundary |
 | --- | --- | --- |
-| Ollama | `http://localhost:11434` | Loopback only |
-| llama.cpp | `http://localhost:8080/v1` | Loopback only |
-| OpenAI | `https://api.openai.com/v1` | Official HTTPS host only; custom endpoints with opt-in |
-| Anthropic | `https://api.anthropic.com/v1` | Official HTTPS host only; custom endpoints with opt-in |
+| Frontend unit and contract tests | **Verified-executed** | 28 frontend tests plus static contract checks passed locally |
+| Frontend production build | **Verified-executed** | `npm run build` passed; Vite emitted a non-blocking chunk-size advisory |
+| Rust default, semantic-memory, and TurboQuant profiles | **Verified-executed** | Cargo checks passed for all three profiles |
+| Rust feature test suite | **Verified-executed** | 212 passed, 2 intentionally ignored |
+| Strict Clippy | **Verified-executed** | `-D warnings` passed for the TurboQuant profile |
+| Tauri debug desktop compile | **Verified-executed** | `npm run verify` built `target/debug/gloss` without bundling |
+| Scripted desktop contract | **Verified-executed** | Contract harness passed, but `live_desktop_exercised=false` |
+| AppImage packaging | **Blocked** | No AppImage artifact is available and the release packaging toolchain is incomplete in the current environment |
+| Installed package workflow | **Not verified** | No installed GUI workflow receipt exists beyond the available scripted/package checks |
+| Real provider/model chat | **Blocked** | No live provider/model smoke receipt exists for this snapshot |
+| Offline cached Nomic embedding smoke | **Blocked** | The local Hugging Face cache does not contain the model |
+| Other desktop operating systems | **Not verified in this snapshot** | No CI, packaging, or live-runtime evidence is provided here for non-Linux platforms |
 
-RFC1918 LAN endpoints for local providers require `allow_lan_local_providers`. Custom OpenAI or Anthropic HTTPS endpoints require `allow_custom_cloud_endpoints`. Provider URLs reject embedded credentials, query strings, and fragments.
+The canonical release projection is intentionally `release_ready: false` and `public_claim_ready: false` until a live, release-grade desktop receipt exists.
 
-API keys are stored in a local AES-256-GCM encrypted file. On Unix, Gloss applies owner-only permissions to the secret directory, key, and ciphertext. This is application-managed local encryption, not an operating-system keyring. Anyone who can read both the key file and ciphertext under the same user account can decrypt the stored secrets.
+## Quick start
 
-Gloss has no product telemetry or hosted synchronization service in the current source. Network traffic still occurs when you:
+### 1. Install prerequisites
 
-- use OpenAI, Anthropic, a LAN model server, or a custom cloud endpoint;
-- import a URL or YouTube transcript;
-- allow the first download of a local embedding model;
-- use a model-backed image or summarization workflow through a non-loopback provider.
-
-When a cloud provider is selected, the prompt and any source context assembled for that request leave the machine. "Local-first" does not mean "network impossible."
-
-## Retrieval and proof model
-
-```text
-selected notebook + source scope
-              |
-              v
-       extraction/chunking
-              |
-      +-------+--------+
-      |                |
- SQLite FTS5/BM25   local embeddings
-      |                |
-      |            HNSW/usearch
-      +-------+--------+
-              |
-        RRF candidate fusion
-              |
-      optional rerank/fallback
-              |
-       bounded prompt context
-              |
-         provider stream
-              |
- answer + citations + receipts
-```
-
-The stable local path uses SQLite FTS5/BM25 and a local HNSW index. The native embedding path uses `nomic-ai/nomic-embed-text-v1.5` through FastEmbed/Candle and requires explicit consent before its first model download.
-
-The semantic-memory backend and TurboQuant candidate sidecars are compiled into the release profile but remain experimental runtime surfaces. TurboQuant is candidate acceleration only; exact reranking remains required. Dependency presence by itself is not treated as runtime proof.
-
-Gloss records structured evidence for important operations, including:
-
-- source scope, backend requested/used, retrieval mode, fallbacks, and degradation markers;
-- citation anchors and filtered-citation reasons;
-- prompt, context, request, and response digests;
-- requested and effective decoding settings;
-- generation terminal state and partial-response persistence;
-- external-tool invocation status with redacted arguments and bounded output previews;
-- notebook and Studio export hashes.
-
-Receipts improve auditability. They do not prove that a model answer is factually correct.
-
-## Build from source
-
-### Prerequisites
-
-The maintained path is Linux x86_64 with:
+The verified CI development path uses:
 
 - Node.js 22 and npm;
 - the stable Rust toolchain with `rustfmt`;
 - Tauri 2 Linux development libraries;
-- a supported model provider, usually a local Ollama or llama.cpp server.
+- a configured provider for interactive model-backed chat.
 
-On Ubuntu or Debian, the CI system dependencies are:
+On Ubuntu/Debian, the repository's Linux CI path installs this system set. This does not certify other distributions, desktop platforms, or installed workflows. Review system-package changes before running them:
 
 ```bash
 sudo apt-get update
@@ -242,72 +93,196 @@ sudo apt-get install -y \
   libwebkit2gtk-4.1-dev libxdo-dev pkg-config wget
 ```
 
-Install Rust from [rustup.rs](https://rustup.rs/) and Node.js 22 from your preferred package manager.
+Install Rust through [rustup](https://rustup.rs/) and use Node.js 22 from your preferred package manager or runtime manager.
 
-### Run the desktop app
+### 2. Clone and install JavaScript dependencies
 
 ```bash
 git clone https://github.com/RecursiveIntell/Gloss.git
 cd Gloss
 npm ci
-npm run tauri:dev:release
 ```
 
-The first embedding-model initialization may request download consent. You can still use no-retrieval chat or BM25-backed paths when dense embeddings are unavailable.
+### 3. Reach a deterministic first success
 
-Open Settings to choose a provider and model. Ollama defaults to `http://localhost:11434`; llama.cpp defaults to `http://localhost:8080/v1`. OpenAI and Anthropic require API keys.
-
-### Build the current release profile
+Run the repository-owned verifier:
 
 ```bash
-npm run tauri:build:sm-tq
-```
-
-Tauri is configured to produce an AppImage. AppImage packaging also needs `squashfs-tools` and the normal Tauri bundler prerequisites.
-
-## Verification
-
-The canonical verifier is:
-
-```bash
-npm ci
-cargo install cargo-deny --version 0.19.8 --locked
 npm run verify
 ```
 
-It runs, in order:
+A full run with no skipped gates ends with a JSON receipt whose status is `"passed"`. This status covers the listed source/build/dependency gates only.
 
-1. Rust formatting;
-2. Tauri command/event contract validation;
-3. static repair gates;
-4. Cargo checks for the default, semantic-memory, and semantic-memory + TurboQuant profiles;
-5. Rust tests for the semantic-memory + TurboQuant profile;
-6. frontend unit and contract tests;
-7. the production frontend build;
-8. Cargo advisory/license/source policy checks;
-9. the production npm audit;
-10. a debug desktop compile without bundling.
-
-For a faster local diagnostic that deliberately skips desktop compilation:
+### 4. Start the desktop app
 
 ```bash
-npm run verify -- --skip-desktop-compile
+npm run tauri:dev:release
 ```
 
-That command must report `passed_with_skips`. It is not release proof.
+This command launches a Tauri development app using the `semantic-memory-turbo-quant` feature profile. It was not exercised in a live GUI session here; the debug compile and scripted contract were verified instead.
 
-Useful focused checks:
+Open Settings to select a provider and model. Chat can use no retrieval context, but interactive model-backed chat still requires a configured provider and model.
+
+## What the source currently implements
+
+The following are source-declared paths. They are covered by the repository's build/tests/static gates to varying degrees, but they have not all been live-smoke tested in this snapshot.
+
+### Notebooks and sources
+
+- Isolated notebook directories containing source files, SQLite state, conversations, notes, vector artifacts, and receipts.
+- Source-declared ingestion paths include individual files, folders, pasted text, URLs, public YouTube caption tracks, images, audio, video, and documents.
+- Source lifecycle, extraction/chunking state, background jobs, failed-import review, retry, quarantine, and deletion.
+- Portable `.glosspkg.tar.gz` notebook archives with manifest and per-file SHA-256 validation.
+
+### Source-grounded chat
+
+- Source-level provider adapters exist for Ollama, llama.cpp, OpenAI, and Anthropic. No live provider/model execution was verified for this snapshot.
+- `all`, explicit selected-source, and `none` retrieval scope.
+- SQLite FTS5/BM25 and local HNSW dense retrieval with reciprocal-rank fusion.
+- Bounded query rewriting with fallback to the original query when refinement is unavailable.
+- Partial, cancelled, errored, and completed attempt persistence.
+- Replayable chat events and visible evidence, fallback, citation, decoding, prompt, and generation receipts.
+
+### Notes and Studio
+
+Source-level Studio paths define structured outputs and deterministic fallback artifacts. Their live model-backed execution is not verified in this snapshot; deterministic fallback paths are covered by source/build tests.
+
+- Notebook-scoped notes, saved responses, pinning, editing, and deletion.
+- Source-bound structured outputs such as reports, summaries, outlines, FAQs, flashcards, quizzes, mind maps, timelines, comparison tables, action plans, study guides, slide-style outputs, infographics, and audio-overview scripts.
+- JSON export with digest-bearing Studio receipts.
+- Deterministic fallback artifacts when LLM refinement is unavailable or validation fails.
+
+### Diagnostics and recovery
+
+- Provider connectivity and model-list checks.
+- Embedding, dense-index, semantic-memory, and TurboQuant diagnostics.
+- Database doctor checks for source-count drift, orphan rows, failed imports, stale queue jobs, and missing notebook state.
+- Vector-artifact rebuild paths and redacted external-tool receipts.
+
+## Source and provider boundaries
+
+### Import capability matrix
+
+The canonical source owner is [`import_capability.rs`](src-tauri/src/ingestion/import_capability.rs). Unknown, archive, binary, and model formats are not silently widened into text import.
+
+| Input | Behavior | Boundary |
+| --- | --- | --- |
+| Text, Markdown, reStructuredText, code, config | Local UTF-8 extraction with format/language metadata | Source text is not automatically summarized or normalized |
+| CSV/TSV | Plain-text import | Table normalization is not claimed |
+| PDF | Bounded local extraction | OCR, forms, and layout fidelity are not claimed |
+| DOCX/XLSX/PPTX | Bounded OOXML text/value extraction | Rendering fidelity is not claimed |
+| Legacy DOC/XLS/PPT | Optional `antiword`, `xls2csv`, and `catppt` tools | Timeout, output-size, and redacted receipt boundaries apply |
+| EPUB | Bounded spine/XHTML extraction | DRM and layout fidelity are not supported |
+| HTML files | Source-text import | Readability extraction is not applied |
+| URL | One consented HTTP(S) fetch | Public-host, redirect, content-type, timeout, and byte limits; no crawling/authenticated fetch |
+| YouTube | Public caption tracks only | Per-import network consent; no video download or authenticated access |
+| Images | Vision-job route | Quality depends on the configured vision-capable model |
+| Audio | `ffprobe` metadata plus optional cached Whisper transcription | Transcription is skipped unless a compatible local model is already cached |
+| Video | Bounded `ffmpeg`/`ffprobe` processing | Full video understanding and general transcription are not claimed |
+
+### Providers
+
+| Provider | Default endpoint | Default policy |
+| --- | --- | --- |
+| Ollama | `http://localhost:11434` | Loopback only |
+| llama.cpp | `http://localhost:8080/v1` | Loopback only |
+| OpenAI | `https://api.openai.com/v1` | Official HTTPS host; custom endpoint requires opt-in |
+| Anthropic | `https://api.anthropic.com/v1` | Official HTTPS host; custom endpoint requires opt-in |
+
+RFC1918 LAN endpoints for local providers require `allow_lan_local_providers`. Custom OpenAI/Anthropic HTTPS endpoints require `allow_custom_cloud_endpoints`. Provider URLs reject embedded credentials, query strings, and fragments.
+
+API keys are stored in an application-managed AES-256-GCM encrypted file. On Unix, Gloss applies owner-only permissions to the secret directory, key, and ciphertext. This is not an operating-system keyring; a user who can read both the key and ciphertext under the same account can decrypt the secrets.
+
+Gloss has no hosted synchronization service in the current source. Network activity still occurs when you:
+
+- use OpenAI, Anthropic, a LAN model server, or a custom cloud endpoint;
+- import a URL or YouTube transcript;
+- permit a first-use local embedding-model download;
+- use model-backed image or summarization workflows through a non-loopback provider.
+
+When a cloud provider is selected, the assembled prompt and source context leave the machine. “Local-first” does not mean “network impossible.”
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Notebook + selected scope] --> B[Extraction and chunking]
+    B --> C[SQLite FTS5/BM25]
+    B --> D[Configured embedding backend:\nOllama when selected/reachable;\notherwise Candle/Nomic fallback]
+    D --> E[HNSW/usearch]
+    C --> F[Candidate fusion]
+    E --> F
+    F --> G[Optional rerank or disclosed fallback]
+    G --> H[Bounded prompt context]
+    H --> I[Local or explicitly configured provider]
+    I --> J[Answer, citations, terminal state, and receipts]
+```
+
+The text equivalent is: notebook scope controls which source records enter extraction; FTS/BM25 and optional dense HNSW search produce candidates; Gloss fuses or degrades those candidates; the prompt is bounded; the provider returns a stream; and the answer is persisted with citations and runtime evidence.
+
+### Retrieval and evidence ownership
+
+```text
+source scope -> extraction/chunking -> FTS + dense candidates
+       -> fusion/rerank/fallback -> bounded prompt -> provider stream
+       -> persisted response + citations + receipts
+```
+
+The frontend renders backend-owned attempt, source-scope, retrieval, and terminal state. It does not invent cancellation completion or silently widen an invalid selected-source scope.
+
+## Build and development
+
+### Useful scripts
+
+| Command | Purpose | Evidence boundary |
+| --- | --- | --- |
+| `npm run dev` | Vite frontend development server | Does not launch the Tauri desktop shell by itself |
+| `npm run tauri:dev:release` | Tauri development app with the release feature profile | Live GUI behavior remains environment-dependent |
+| `npm run build` | TypeScript check plus production Vite build | Frontend build only |
+| `npm test` | Frontend unit and static contract tests | Does not prove live Tauri interaction |
+| `npm run verify` | Canonical source/build verification | Checks static gates, Cargo profiles/tests, frontend tests/build, cargo-deny, npm audit, and a debug Tauri compile; it does not prove AppImage packaging, live GUI behavior, or provider/model execution |
+| `npm run desktop-smoke` | Scripted runtime/evidence contract harness | Passes without proving a headed live GUI workflow |
+| `npm run installer-smoke` | Release bundle and installer smoke | Requires release packaging tools and an artifact; currently blocked here |
+
+### Feature profiles
+
+The active Rust manifest declares these profiles:
+
+- default: `semantic-memory-backend` plus `semantic-memory-turbo-quant`;
+- `semantic-memory-backend`: semantic-memory integration without TurboQuant candidate features;
+- `semantic-memory-turbo-quant`: semantic-memory plus TurboQuant candidate codecs.
+
+The runtime and README treat semantic-memory/TurboQuant as experimental/candidate surfaces. Their compile/test coverage is not a claim that every model/cache/provider combination is live-proven.
+
+### Repository checks
 
 ```bash
-npm run build
-npm test
 cargo fmt --all -- --check
-cargo test --locked --manifest-path src-tauri/Cargo.toml \
-  --no-default-features --features semantic-memory-turbo-quant
+cargo clippy --locked \
+  --manifest-path src-tauri/Cargo.toml \
+  --features semantic-memory-turbo-quant \
+  --all-targets -- -D warnings
+cargo test --locked \
+  --manifest-path src-tauri/Cargo.toml \
+  --features semantic-memory-turbo-quant \
+  --all-targets
 bash validation/run_all_gloss_repair_gates.sh .
 ```
 
-The GitHub Actions workflow runs `npm run verify` for pull requests.
+## Verification
+
+The CI workflow runs `npm run verify` on pull requests and pushes to `main`. The local verifier currently performs:
+
+1. Rust formatting and source-derived Tauri command/event checks;
+2. static repair and security/receipt gates;
+3. default, semantic-memory, and semantic-memory/TurboQuant Cargo checks;
+4. semantic-memory/TurboQuant Rust tests;
+5. frontend unit, contract, and production build checks;
+6. Cargo advisory/license/source policy checks;
+7. production npm audit;
+8. a debug Tauri desktop compile without bundling.
+
+The current local evidence is source/build/test verified. The release projection remains blocked until live desktop, installed workflow, and real provider/model evidence exists.
 
 ## Repository map
 
@@ -318,32 +293,34 @@ src-tauri/vendor/          Reviewed local copies of selected RecursiveIntell cra
 scripts/                   Build, smoke, replay, and canonical verification entry points
 validation/                Static, contract, packaging, and release-consistency gates
 docs/                      Current plans, receipts, audits, and archived evidence
-fixtures/                   Deterministic import and live-smoke fixtures
+fixtures/                  Deterministic import and runtime-log fixtures
+prompts/                   Source-owned Studio prompt templates
 ```
 
-The primary runtime ownership map is in [`AGENTS.md`](AGENTS.md). Historical audit documents are evidence from specific runs, not a substitute for current source or a fresh verifier receipt.
+Canonical ownership and development rules are in [`AGENTS.md`](AGENTS.md). The active import policy is in [`import_capability.rs`](src-tauri/src/ingestion/import_capability.rs); provider network policy is in [`providers/mod.rs`](src-tauri/src/providers/mod.rs); chat lifecycle ownership is in [`commands/chat/mod.rs`](src-tauri/src/commands/chat/mod.rs); and release verification is in [`scripts/verify_release.py`](scripts/verify_release.py).
 
-## Current limitations
+## Known limitations
 
-- There is no tagged binary release or in-app updater.
-- Linux x86_64 is the maintained build and packaging target. Other desktop platforms are not CI-certified here.
-- Automated live GUI coverage and installed end-to-end workflow certification remain incomplete.
-- PDF and office-document support extracts text and values; it does not preserve visual layout.
-- Image, audio, and video paths depend on configured models or optional local tools and are not equally proven across formats.
-- Audio-overview generation is not a release-proven user workflow.
-- Semantic-memory and TurboQuant controls are experimental. Gloss-local retrieval remains the stable fallback.
-- Studio exposes sixteen output kinds in the current UI with dedicated LLM prompts configured via `prompts/studio_prompts.toml`.
-- Cloud-provider use sends the assembled request context to that provider.
+- No tagged binary release or in-app updater is published.
+- Linux x86_64 is the maintained build/packaging target; other desktop platforms are not CI-certified in this repository.
+- No automated live GUI driver is currently shipped, so scripted desktop smoke is not release-grade GUI proof.
+- AppImage installer smoke requires a release artifact and packaging tooling that are not present in the current environment.
+- A real cached Nomic model is required for offline embedding-model smoke; the model is not bundled in the repository.
+- Document extraction preserves text/value content, not visual layout, forms, or OCR fidelity.
+- Image, audio, and video paths depend on model/tool availability and are not equally proven across formats.
+- Semantic-memory/TurboQuant remain candidate/experimental runtime surfaces; Gloss-local retrieval is the stable fallback path.
+- Cloud-provider use sends assembled request context to that provider.
+- A dedicated `SECURITY.md` is not currently present; do not put credentials, private source text, local paths, or unredacted receipts in public issues.
 
-## Contributing
+## Contributing and security
 
-1. Open an issue describing the user-visible problem, expected behavior, and platform.
-2. Keep source-of-truth ownership intact. Do not add shadow stores, duplicate provider policy, or alternate receipt authority.
-3. Add behavioral tests for functional changes and contract gates for cross-language IPC or event changes.
-4. Run `npm run verify` before requesting review.
-5. State any skipped live, packaging, model, or hardware validation in the pull request.
+1. Open an issue with the user-visible problem, expected behavior, and platform.
+2. Preserve source ownership; do not add shadow stores, duplicate provider policy, or alternate receipt authority.
+3. Add behavioral tests for functional changes and contract gates for IPC/event changes.
+4. Run `npm run verify` and strict Clippy before requesting review.
+5. State skipped live, packaging, model, or hardware validation explicitly.
 
-Security-sensitive reports should not include API keys, private source text, local paths, or unredacted receipts in public issues.
+For security-sensitive reports, avoid public reproduction details containing secrets or private data. Use a private maintainer/security channel when available rather than posting credentials or unredacted evidence publicly.
 
 ## License
 

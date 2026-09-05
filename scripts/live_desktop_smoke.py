@@ -236,8 +236,47 @@ class WebDriver:
             self.call("POST", f"/element/{identifier}/value", {"text": value})
 
     def select(self, selector: str, value: str):
-        element = self.wait(lambda: self.execute("""const s=document.querySelector(arguments[0]); return s && s.getClientRects().length ? Array.from(s.options).find(o=>o.value===arguments[1] && !o.disabled) || null : null""", [selector, value]), label=f"selectable {value}")
-        self.click_ref(element)
+        target = self.wait(lambda: self.execute("""const s=document.querySelector(arguments[0]);
+            const o=s && Array.from(s.options).find(o=>o.value===arguments[1] && !o.matches(':disabled'));
+            return s && !s.matches(':disabled') && s.getClientRects().length && o
+                ? {select:s, option:o, original_value:s.value} : null""", [selector, value]), label=f"selectable {value}")
+        select_element, option = target["select"], target["option"]
+        # WebKit's standard Send Keys focuses the select and schedules native
+        # scrolling. Balanced Shift changes no option and leaves no modifier
+        # held. Empty Send Keys is rejected by WebKit's keyboard backend.
+        self.call("POST", f"/element/{select_element[ELEMENT_KEY]}/value", {"text": "\ue008\ue008"})
+        observation = {}
+
+        def ready():
+            nonlocal observation
+            observation = self.execute("""const s=arguments[1], o=arguments[2];
+                const r=s.getClientRects()[0], v=window.visualViewport;
+                const viewport={left:v?.offsetLeft || 0, top:v?.offsetTop || 0,
+                    width:v?.width ?? window.innerWidth, height:v?.height ?? window.innerHeight};
+                const left=r ? Math.max(r.left,viewport.left) : 0;
+                const top=r ? Math.max(r.top,viewport.top) : 0;
+                const right=r ? Math.min(r.right,viewport.left+viewport.width) : 0;
+                const bottom=r ? Math.min(r.bottom,viewport.top+viewport.height) : 0;
+                const in_view=right>left && bottom>top;
+                const hits=in_view ? document.elementsFromPoint((left+right)/2,(top+bottom)/2) : [];
+                return {same_select:s.isConnected && document.querySelector(arguments[0])===s,
+                    same_option:o.isConnected && Array.from(s.options).includes(o) && o.value===arguments[3],
+                    focused:document.activeElement===s, enabled:!s.matches(':disabled') && !o.matches(':disabled'),
+                    value_unchanged:s.value===arguments[4], in_view,
+                    select_hit:hits.includes(s), top_hit_owned:!!hits[0] && (hits[0]===s || s.contains(hits[0])),
+                    rect:r ? {x:r.x,y:r.y,width:r.width,height:r.height} : null, viewport};
+                """, [selector, select_element, option, value, target["original_value"]])
+            if not observation["same_select"] or not observation["same_option"]:
+                raise RuntimeError("select target changed during native focus preparation")
+            if not observation["value_unchanged"]:
+                raise RuntimeError("select value changed during native focus preparation")
+            return all(observation[key] for key in ("focused", "enabled", "in_view", "select_hit", "top_hit_owned"))
+
+        try:
+            self.wait(ready, timeout=5, label=f"select interactable {value}")
+        finally:
+            self.trace.append({"at": now(), "select_readiness": selector, "target_geometry": observation})
+        self.click_ref(option)
         self.wait(lambda: self.execute("return document.querySelector(arguments[0])?.value===arguments[1]", [selector, value]), label=f"selected {value}")
 
     def text(self, selector: str = "body") -> str:
@@ -864,7 +903,9 @@ def main() -> int:
         receipt["blockers"].append(str(error))
         details = {"case": workflow.case_id if workflow else "baseline-or-build", "error": str(error)[-2000:], "traceback": traceback.format_exc()[-3000:]}
         if driver:
-            details["last_webdriver_request"] = json.dumps(driver.trace[-1])[-2000:] if driver.trace else None
+            last_request = next((item for item in reversed(driver.trace) if "method" in item and "path" in item), None)
+            details["last_webdriver_request"] = json.dumps(last_request)[-2000:] if last_request else None
+            details["last_select_readiness"] = next((item for item in reversed(driver.trace) if "select_readiness" in item), None)
             try:
                 details["visible_ui_text"] = driver.text()[-8000:]
                 driver.snapshot("failure", root)

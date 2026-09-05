@@ -134,6 +134,9 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   loadEpoch: 0,
 
   loadSources: async (notebookId) => {
+    // A completed import may refresh after its notebook was deactivated.
+    // It must not invalidate the active notebook's in-flight load epoch.
+    if (useNotebookStore.getState().activeNotebookId !== notebookId) return;
     const loadEpoch = get().loadEpoch + 1;
     const selectionAtStart = get().selectedSourceIds;
     const selectionPendingAtStart = persistSelectedSourcesPending.has(notebookId) || persistSelectedSourcesInFlight.has(notebookId);

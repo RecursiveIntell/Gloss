@@ -36,6 +36,9 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Native DB, dense publication and SSE contract tests
+        run: cargo test --locked --manifest-path validation/native_harness/Cargo.toml
+
       - name: Install Linux dependencies
         run: |
           sudo apt-get update

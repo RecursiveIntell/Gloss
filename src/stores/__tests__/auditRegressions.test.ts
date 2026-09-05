@@ -9,7 +9,7 @@ import type { Note, Source } from '../../lib/types';
 
 vi.mock('../../lib/tauri', () => ({
   createConversation: vi.fn(), listConversations: vi.fn().mockResolvedValue([]),
-  sendMessage: vi.fn(), loadMessages: vi.fn().mockResolvedValue([]),
+  sendMessage: vi.fn(), stopChat: vi.fn().mockResolvedValue(undefined), loadMessages: vi.fn().mockResolvedValue([]),
   listNotes: vi.fn(), listSources: vi.fn(), getAllModels: vi.fn(),
   selectChatModel: vi.fn(), getSettings: vi.fn(),
   setSelectedSources: vi.fn().mockResolvedValue(undefined),
@@ -38,6 +38,49 @@ beforeEach(() => {
 });
 
 describe('audit regressions: asynchronous ownership', () => {
+  it('Stop during conversation creation cancels preparation without sending', async () => {
+    const created = deferred<string>();
+    useChatStore.setState({ activeConversationId: null });
+    vi.mocked(api.createConversation).mockReturnValueOnce(created.promise);
+    const sending = useChatStore.getState().sendMessage('nb-1', 'cancel me', { kind: 'none' }, 'model');
+    await useChatStore.getState().stopStreaming('nb-1');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    created.resolve('cancelled-conversation');
+    await sending;
+    expect(api.sendMessage).not.toHaveBeenCalled();
+    expect(api.stopChat).not.toHaveBeenCalled();
+    expect(useChatStore.getState().activeConversationId).toBeNull();
+    expect(useChatStore.getState().pendingMessageIds).toEqual({});
+  });
+
+  it('submitted Stop waits for the matching backend terminal event', async () => {
+    vi.mocked(api.sendMessage).mockImplementationOnce(async (...args) => args[5]!);
+    await useChatStore.getState().sendMessage('nb-1', 'sent', { kind: 'none' }, 'model');
+    const id = useChatStore.getState().streamingMessageId!;
+    await useChatStore.getState().stopStreaming('nb-1');
+    expect(api.stopChat).toHaveBeenCalledExactlyOnceWith('nb-1');
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    expect(useChatStore.getState().streamingMessageId).toBe(id);
+    useChatStore.getState().handleChatCancelled('nb-1', 'conv-1', id, 'Stopped');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
+  it('inactive source refresh cannot invalidate an active notebook load', async () => {
+    const active = deferred<Source[]>();
+    useNotebookStore.setState({ activeNotebookId: 'nb-2' });
+    vi.mocked(api.listSources).mockReturnValueOnce(active.promise).mockResolvedValueOnce([]);
+    const loading = useSourceStore.getState().loadSources('nb-2');
+    const epoch = useSourceStore.getState().loadEpoch;
+    await useSourceStore.getState().loadSources('nb-1');
+    expect(api.listSources).toHaveBeenCalledExactlyOnceWith('nb-2');
+    expect(useSourceStore.getState().loadEpoch).toBe(epoch);
+    active.resolve([{ id: 'active', selected: true } as Source]);
+    await loading;
+    expect(useSourceStore.getState().sources.map(s => s.id)).toEqual(['active']);
+    expect(useSourceStore.getState().loading).toBe(false);
+    expect(useSourceStore.getState().loadedNotebookId).toBe('nb-2');
+  });
+
   it('model selection commits one acknowledged provider/model pair', async () => {
     const committed = deferred<void>();
     vi.mocked(api.selectChatModel).mockReturnValueOnce(committed.promise);

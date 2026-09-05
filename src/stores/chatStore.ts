@@ -22,6 +22,7 @@ interface ChatStore {
   streamingContent: string;
   streamingNotebookId: string | null;
   streamingMessageId: string | null;
+  preparingMessageId: string | null;
   streamingError: string | null;
   streamingStatus: ChatStatusPayload | null;
   pendingEvidence: Record<string, ChatEvidencePayload>;
@@ -36,7 +37,7 @@ interface ChatStore {
   customGoal: string;
   responseLength: string;
   loadConversations: (notebookId: string) => Promise<void>;
-  createConversation: (notebookId: string) => Promise<string>;
+  createConversation: (notebookId: string, requestMessageId?: string) => Promise<string>;
   deleteConversation: (notebookId: string, conversationId: string) => Promise<void>;
   setActiveConversation: (id: string | null) => void;
   loadMessages: (notebookId: string, conversationId: string) => Promise<void>;
@@ -66,6 +67,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   streamingContent: '',
   streamingNotebookId: null,
   streamingMessageId: null,
+  preparingMessageId: null,
   streamingError: null,
   streamingStatus: null,
   pendingEvidence: {},
@@ -90,11 +92,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
-  createConversation: async (notebookId) => {
+  createConversation: async (notebookId, requestMessageId) => {
     const previousConversationId = get().activeConversationId;
     const id = await api.createConversation(notebookId);
     await get().loadConversations(notebookId);
-    if (useNotebookStore.getState().activeNotebookId !== notebookId ||
+    if ((requestMessageId !== undefined && get().streamingMessageId !== requestMessageId) ||
+        useNotebookStore.getState().activeNotebookId !== notebookId ||
         get().activeConversationId !== previousConversationId) {
       return id;
     }
@@ -195,6 +198,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set({
       isStreaming: true, streamingNotebookId: notebookId,
       streamingMessageId: assistantMessageId, streamingContent: '',
+      preparingMessageId: assistantMessageId,
       streamingError: null, streamingStatus: null,
       pendingMessageIds: { [assistantMessageId]: true }, pendingEvidence: {},
     });
@@ -202,7 +206,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     try {
       let { activeConversationId } = get();
       if (!activeConversationId) {
-        activeConversationId = await get().createConversation(notebookId);
+        activeConversationId = await get().createConversation(notebookId, assistantMessageId);
       }
       if (!ownsRequest()) return;
       if (useNotebookStore.getState().activeNotebookId !== notebookId ||
@@ -217,6 +221,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       };
       set((state) => ({
         messages: [...state.messages, userMsg!],
+        preparingMessageId: null,
         streamingStatus: {
           notebook_id: notebookId, conversation_id: activeConversationId,
           message_id: assistantMessageId, phase: 'queued', message: 'Queued',
@@ -254,6 +259,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   stopStreaming: async (notebookId) => {
     const requestedMessageId = get().streamingMessageId;
     if (get().streamingNotebookId !== notebookId) return;
+    if (requestedMessageId && get().preparingMessageId === requestedMessageId) {
+      // No backend attempt exists yet. Invalidate this owner synchronously so
+      // a late conversation-creation response cannot submit or activate it.
+      set({ isStreaming: false, preparingMessageId: null,
+        streamingMessageId: null, streamingNotebookId: null,
+        streamingContent: '', streamingStatus: null,
+        pendingMessageIds: {}, pendingEvidence: {} });
+      return;
+    }
     try {
       await api.stopChat(notebookId);
       if (get().streamingMessageId !== requestedMessageId) return;

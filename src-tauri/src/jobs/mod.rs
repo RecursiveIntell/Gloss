@@ -355,70 +355,6 @@ async fn execute_index_chunks(
     let index_path = crate::ingestion::embed::native_dense_artifact_path(&nb_dir);
     let dims = embedder.dims();
 
-    // Load or create HNSW index
-    let mut index = {
-        let max_id = db.max_embedding_id().unwrap_or(None).unwrap_or(0);
-        crate::ingestion::embed::HnswIndex::load_with_hwm(&index_path, max_id, dims)
-            .map_err(|e| QueueError::Execution(format!("Failed to load HNSW index: {e}")))?
-    };
-
-    let mut embedded_count = 0;
-    db.mark_embedding_index_status(
-        crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
-        crate::db::notebook_db::EmbeddingIndexMetadataStatus::Building,
-        Some("Native dense indexing is in progress; verified publication is pending"),
-    )
-    .map_err(|e| QueueError::Execution(e.to_string()))?;
-
-    // Process in batches
-    for chunk_batch in unindexed_chunks.chunks(MAX_CHUNKS_PER_BATCH) {
-        if ctx.is_cancelled() {
-            // Save index on cancel so partial work persists
-            if let Err(e) = index.save_atomic_verified(
-                &index_path,
-                db.max_embedding_id().unwrap_or(None).unwrap_or(0),
-            ) {
-                tracing::warn!(error = %e, "failed to save HNSW index on cancel");
-            }
-            return Err(QueueError::Cancelled);
-        }
-
-        let texts: Vec<&str> = chunk_batch.iter().map(|c| c.content.as_str()).collect();
-        let embeddings = embedder
-            .embed_batch(&texts)
-            .map_err(|e| QueueError::Execution(format!("Embedding failed: {e}")))?;
-        if embeddings.len() != chunk_batch.len() {
-            return Err(QueueError::Execution(format!(
-                "Embedding batch returned {} vectors for {} chunks",
-                embeddings.len(),
-                chunk_batch.len()
-            )));
-        }
-
-        // Add to HNSW and update DB
-        for (i, chunk) in chunk_batch.iter().enumerate() {
-            if let Some(embedding) = embeddings.get(i) {
-                let label = index
-                    .add(embedding)
-                    .map_err(|e| QueueError::Execution(format!("HNSW add failed: {e}")))?;
-                db.update_chunk_embedding(&chunk.id, label as i64, embedder.model_id())
-                    .map_err(|e| QueueError::Execution(e.to_string()))?;
-                embedded_count += 1;
-            }
-        }
-
-        // Save index after each batch
-        index
-            .save_atomic_verified(
-                &index_path,
-                db.max_embedding_id().unwrap_or(None).unwrap_or(0),
-            )
-            .map_err(|e| {
-                QueueError::Execution(format!("Failed to publish native dense artifact: {e}"))
-            })?;
-    }
-
-    // Update embedding index metadata
     let metadata = crate::db::notebook_db::EmbeddingIndexMetadata::ready(
         crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
         embedder.provider_id(),
@@ -426,8 +362,27 @@ async fn execute_index_chunks(
         embedder.model_digest(),
         dims,
     );
-    db.upsert_embedding_index_metadata(&metadata)
-        .map_err(|e| QueueError::Execution(e.to_string()))?;
+    let mut embedded_count = 0;
+    for chunk_batch in unindexed_chunks.chunks(MAX_CHUNKS_PER_BATCH) {
+        if ctx.is_cancelled() {
+            return Err(QueueError::Cancelled);
+        }
+        let texts: Vec<&str> = chunk_batch.iter().map(|c| c.content.as_str()).collect();
+        let embeddings = embedder
+            .embed_batch(&texts)
+            .map_err(|e| QueueError::Execution(format!("Embedding failed: {e}")))?;
+        if ctx.is_cancelled() {
+            return Err(QueueError::Cancelled);
+        }
+        embedded_count += crate::ingestion::embed::publish_dense_batch(
+            &db,
+            &index_path,
+            chunk_batch,
+            &embeddings,
+            &metadata,
+        )
+        .map_err(|e| QueueError::Execution(format!("Failed to commit native dense batch: {e}")))?;
+    }
 
     tracing::info!(
         source_id,

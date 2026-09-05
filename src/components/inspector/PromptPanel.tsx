@@ -84,6 +84,11 @@ export function PromptPanel() {
           </div>
         </Section>
       )}
+      {!promptReceipt?.system_prompt_text && (
+        <Section title="System Prompt">
+          <p className="text-text-muted">{promptReceipt ? "System prompt text is not included in this receipt." : "System prompt text was not captured for this response."}</p>
+        </Section>
+      )}
 
       {/* Decoding Settings Receipt */}
       {decodingReceipt && (

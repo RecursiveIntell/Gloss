@@ -241,27 +241,11 @@ pub fn feature_definitions() -> &'static [FeatureDefinition] {
     ]
 }
 
-/// Marker for the one-time re-seed of the Studio widget flags: earlier builds
-/// seeded them to false while the widgets could not render real data, so a
-/// stored "false" predating this marker reflects the old default, not a user
-/// choice.
-const STUDIO_WIDGET_FLAGS_RESEEDED: &str = "studio_widget_flags_reseeded_v2";
-
 pub fn ensure_default_feature_settings(app_db: &AppDb) -> Result<(), GlossError> {
     for definition in feature_definitions() {
         if app_db.get_setting(definition.id)?.is_none() {
             app_db.set_setting(definition.id, bool_to_setting(definition.default_enabled))?;
         }
-    }
-    if app_db.get_setting(STUDIO_WIDGET_FLAGS_RESEEDED)?.is_none() {
-        for id in [
-            FEATURE_FLASHCARD_WIDGET_ENABLED,
-            FEATURE_QUIZ_WIDGET_ENABLED,
-            FEATURE_MIND_MAP_WIDGET_ENABLED,
-        ] {
-            app_db.set_setting(id, bool_to_setting(true))?;
-        }
-        app_db.set_setting(STUDIO_WIDGET_FLAGS_RESEEDED, "true")?;
     }
     Ok(())
 }
@@ -272,7 +256,26 @@ pub fn feature_flag_statuses(app_db: &AppDb) -> Result<Vec<FeatureFlagStatus>, G
     feature_definitions()
         .iter()
         .map(|definition| {
-            let enabled = setting_bool(app_db, definition.id, definition.default_enabled)?;
+            if matches!(definition.id, FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED | FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED) {
+                let available = build_feature_available(definition.build_feature);
+                return Ok(FeatureFlagStatus {
+                    id: definition.id.into(), label: definition.label.replace(" Preview", ""),
+                    section: "Memory & Retrieval".into(),
+                    description: "Included in this build; select a memory profile to control retrieval behavior.".into(),
+                    enabled: available, active: available, available, stable: true,
+                    default_enabled: true, requires_experimental: false,
+                    unavailable_reason: if available { None } else { Some("Not included in this build".into()) },
+                });
+            }
+            if unsupported_control(definition.id) {
+                return Ok(FeatureFlagStatus {
+                    id: definition.id.into(), label: definition.label.into(), section: definition.section.into(),
+                    description: definition.description.into(), enabled: false, active: false, available: false,
+                    stable: false, default_enabled: false, requires_experimental: false,
+                    unavailable_reason: Some("This control is not implemented in this build".into()),
+                });
+            }
+            let enabled = if definition.stable && !runtime_mutable(definition.id) { definition.default_enabled } else { setting_bool(app_db, definition.id, definition.default_enabled)? };
             let build_available = build_feature_available(definition.build_feature);
             let dependency_available = feature_dependencies_available(app_db, definition)?;
             let available = build_available
@@ -302,6 +305,11 @@ pub fn update_feature_flag(app_db: &AppDb, id: &str, enabled: bool) -> Result<()
     ensure_default_feature_settings(app_db)?;
     let definition = find_feature_definition(id)
         .ok_or_else(|| GlossError::Config(format!("Unknown feature flag '{id}'")))?;
+    if !runtime_mutable(id) {
+        return Err(GlossError::Config(
+            "This capability has no runtime switch; use a supported memory profile".into(),
+        ));
+    }
     if enabled && !build_feature_available(definition.build_feature) {
         return Err(GlossError::Config(format!(
             "Feature '{}' is not available in this build",
@@ -312,13 +320,30 @@ pub fn update_feature_flag(app_db: &AppDb, id: &str, enabled: bool) -> Result<()
         require_semantic_memory_preview_enabled(app_db)?;
     }
     app_db.set_setting(definition.id, bool_to_setting(enabled))?;
-    if definition.id == EXPERIMENTAL_FEATURES_ENABLED && !enabled {
-        reset_experimental_runtime_settings(app_db)?;
-    }
     Ok(())
 }
 
+fn runtime_mutable(id: &str) -> bool {
+    matches!(
+        id,
+        FEATURE_FLASHCARD_WIDGET_ENABLED
+            | FEATURE_QUIZ_WIDGET_ENABLED
+            | FEATURE_MIND_MAP_WIDGET_ENABLED
+    )
+}
+
+fn unsupported_control(id: &str) -> bool {
+    matches!(
+        id,
+        EXPERIMENTAL_FEATURES_ENABLED
+            | FEATURE_ADVANCED_RETRIEVAL_CONTROLS_ENABLED
+            | FEATURE_INDEX_REPLAY_TOOLS_ENABLED
+            | FEATURE_PACKAGE_RELEASE_PANEL_ENABLED
+    )
+}
+
 pub fn validate_setting_update(app_db: &AppDb, key: &str, value: &str) -> Result<(), GlossError> {
+    crate::settings_contract::validate_setting_value(key, value)?;
     if key == "memory_backend" && value == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW {
         require_semantic_memory_preview_enabled(app_db)?;
     }
@@ -330,57 +355,22 @@ pub fn validate_setting_update(app_db: &AppDb, key: &str, value: &str) -> Result
     Ok(())
 }
 
-pub fn apply_setting_update_side_effects(
-    app_db: &AppDb,
-    key: &str,
-    value: &str,
-) -> Result<(), GlossError> {
-    if key == EXPERIMENTAL_FEATURES_ENABLED && !setting_value_is_enabled(value) {
-        reset_experimental_runtime_settings(app_db)?;
-    }
-    // C4 — When the embedding model identity changes, the cached query
-    // embeddings (in state.query_embed_cache) and the HNSW index (in
-    // state.hnsw_indices) are stale. The query cache is auto-flushed by
-    // AppState::ensure_embedder on next call; the HNSW index is checked by
-    // dimension in ensure_hnsw_index. Here we just log so the user
-    // notices that changing the model triggers a re-index.
-    if key == "semantic_memory_embedding_model" {
-        let prior = app_db
-            .get_setting("semantic_memory_embedding_model")
-            .ok()
-            .flatten();
-        if prior.as_deref() != Some(value) {
-            tracing::warn!(
-                prior = ?prior,
-                new = %value,
-                "embedding model changed; HNSW index will be re-created on next chat"
-            );
-        }
-    }
-    Ok(())
-}
-
 pub fn require_semantic_memory_preview_enabled(_app_db: &AppDb) -> Result<(), GlossError> {
-    Ok(())
+    if cfg!(feature = "semantic-memory-backend") {
+        Ok(())
+    } else {
+        Err(GlossError::Config(
+            "Semantic memory is not included in this build".into(),
+        ))
+    }
 }
 
 pub fn semantic_memory_preview_active(_app_db: &AppDb) -> Result<bool, GlossError> {
-    Ok(true)
+    Ok(cfg!(feature = "semantic-memory-backend"))
 }
 
 pub fn turbo_quant_active(_app_db: &AppDb) -> Result<bool, GlossError> {
     Ok(cfg!(feature = "semantic-memory-turbo-quant"))
-}
-
-fn reset_experimental_runtime_settings(app_db: &AppDb) -> Result<(), GlossError> {
-    if app_db
-        .get_setting("memory_backend")?
-        .as_deref()
-        .is_some_and(|value| value == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW)
-    {
-        app_db.set_setting("memory_backend", MEMORY_BACKEND_GLOSS_LOCAL)?;
-    }
-    Ok(())
 }
 
 fn find_feature_definition(id: &str) -> Option<&'static FeatureDefinition> {
@@ -503,24 +493,68 @@ mod tests {
     }
 
     #[test]
-    fn semantic_memory_backend_always_available() {
+    fn existing_widget_opt_out_survives_settings_load_and_restart_seed() {
         let db = test_db();
+        db.set_setting(FEATURE_FLASHCARD_WIDGET_ENABLED, "false")
+            .unwrap();
         ensure_default_feature_settings(&db).unwrap();
-        // Semantic-memory is now always active — no gate to check.
-        let is_active = semantic_memory_preview_active(&db).unwrap();
-        assert!(is_active);
+        assert_eq!(
+            db.get_setting(FEATURE_FLASHCARD_WIDGET_ENABLED)
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+        let flags = feature_flag_statuses(&db).unwrap();
+        assert!(
+            !flags
+                .iter()
+                .find(|flag| flag.id == FEATURE_FLASHCARD_WIDGET_ENABLED)
+                .unwrap()
+                .active
+        );
     }
 
     #[test]
-    fn master_off_resets_preview_memory_backend() {
+    fn unimplemented_and_compiled_capabilities_are_not_mutable_claims() {
+        let db = test_db();
+        let flags = feature_flag_statuses(&db).unwrap();
+        for id in [
+            EXPERIMENTAL_FEATURES_ENABLED,
+            FEATURE_ADVANCED_RETRIEVAL_CONTROLS_ENABLED,
+            FEATURE_INDEX_REPLAY_TOOLS_ENABLED,
+            FEATURE_PACKAGE_RELEASE_PANEL_ENABLED,
+        ] {
+            let flag = flags.iter().find(|flag| flag.id == id).unwrap();
+            assert!(!flag.available && !flag.active);
+            assert!(update_feature_flag(&db, id, true).is_err());
+        }
+        let semantic = flags
+            .iter()
+            .find(|flag| flag.id == FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED)
+            .unwrap();
+        assert_eq!(semantic.active, cfg!(feature = "semantic-memory-backend"));
+        assert_eq!(semantic.available, semantic.active);
+    }
+
+    #[test]
+    fn semantic_memory_availability_matches_build_without_legacy_switches() {
+        let db = test_db();
+        ensure_default_feature_settings(&db).unwrap();
+        // Build availability is independent of obsolete persisted preview switches.
+        let is_active = semantic_memory_preview_active(&db).unwrap();
+        assert_eq!(is_active, cfg!(feature = "semantic-memory-backend"));
+    }
+
+    #[test]
+    fn master_off_preserves_selected_memory_backend() {
         let db = test_db();
         ensure_default_feature_settings(&db).unwrap();
         db.set_setting("memory_backend", MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW)
             .unwrap();
-        update_feature_flag(&db, EXPERIMENTAL_FEATURES_ENABLED, false).unwrap();
+        assert!(update_feature_flag(&db, EXPERIMENTAL_FEATURES_ENABLED, false).is_err());
         assert_eq!(
             db.get_setting("memory_backend").unwrap(),
-            Some(MEMORY_BACKEND_GLOSS_LOCAL.to_string())
+            Some(MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string())
         );
     }
 
@@ -535,12 +569,12 @@ mod tests {
 
     #[cfg(feature = "semantic-memory-turbo-quant")]
     #[test]
-    fn turbo_quant_update_allowed_with_always_on_semantic_memory() {
+    fn turbo_quant_build_capability_rejects_ineffective_runtime_switch() {
         let db = test_db();
         ensure_default_feature_settings(&db).unwrap();
-        // Semantic-memory is always-on now — enabling turbo_quant should work.
+        // A build capability is not a mutable runtime switch.
         let result = update_feature_flag(&db, FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED, true);
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[cfg(not(feature = "semantic-memory-backend"))]
@@ -548,9 +582,10 @@ mod tests {
     fn semantic_memory_preview_flag_rejects_unavailable_build() {
         let db = test_db();
         ensure_default_feature_settings(&db).unwrap();
-        update_feature_flag(&db, EXPERIMENTAL_FEATURES_ENABLED, true).unwrap();
+        db.set_setting(EXPERIMENTAL_FEATURES_ENABLED, "true")
+            .unwrap();
         let err =
             update_feature_flag(&db, FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED, true).unwrap_err();
-        assert!(err.to_string().contains("not available in this build"));
+        assert!(err.to_string().contains("no runtime switch"));
     }
 }

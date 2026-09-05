@@ -145,10 +145,13 @@ impl AppDb {
 
     /// Update last_accessed timestamp for a notebook.
     pub fn touch_notebook(&self, id: &str) -> Result<(), GlossError> {
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE notebooks SET last_accessed = datetime('now'), updated_at = datetime('now') WHERE id = ?1",
             [id],
         )?;
+        if changed != 1 {
+            return Err(GlossError::NotFound(format!("Notebook {id} not found")));
+        }
         Ok(())
     }
 
@@ -559,6 +562,28 @@ mod tests {
         db.rename_notebook("nb1", "After").unwrap();
         let notebook = db.get_notebook("nb1").unwrap();
         assert_eq!(notebook.name, "After");
+    }
+
+    #[test]
+    fn activation_touch_rejects_missing_notebook_and_write_failure() {
+        let db = test_db();
+        assert!(matches!(
+            db.touch_notebook("missing"),
+            Err(GlossError::NotFound(_))
+        ));
+        db.create_notebook("nb1", "Present", "/tmp/nb1").unwrap();
+        db.touch_notebook("nb1").unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_touch BEFORE UPDATE OF last_accessed ON notebooks
+             BEGIN SELECT RAISE(FAIL, 'fixture write failure'); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            db.touch_notebook("nb1"),
+            Err(GlossError::Database(_))
+        ));
+        assert_eq!(db.get_notebook("nb1").unwrap().name, "Present");
     }
 
     #[test]

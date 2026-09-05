@@ -692,6 +692,37 @@ fn truncate_to_char_boundary(text: &str, max_chars: usize) -> String {
     format!("{truncated}\n[...truncated]")
 }
 
+/// Use the same GPU -> LLM order as chat and background work. Cancellation
+/// while queued drops any acquired permit before returning to the caller.
+async fn acquire_studio_permits<'a>(
+    gpu: &'a tokio::sync::Semaphore,
+    llm: &'a tokio::sync::Semaphore,
+    cancellation: &CancellationToken,
+    attempt_id: &str,
+) -> Result<
+    (
+        tokio::sync::SemaphorePermit<'a>,
+        tokio::sync::SemaphorePermit<'a>,
+    ),
+    StudioGenerationFailure,
+> {
+    let gpu_permit = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(studio_cancelled(attempt_id, 0)),
+        permit = gpu.acquire() => permit.map_err(|e| {
+            studio_provider_error(attempt_id, &format!("Failed to acquire GPU gate: {e}"), 0)
+        })?,
+    };
+    let llm_permit = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(studio_cancelled(attempt_id, 0)),
+        permit = llm.acquire() => permit.map_err(|e| {
+            studio_provider_error(attempt_id, &format!("Failed to acquire LLM gate: {e}"), 0)
+        })?,
+    };
+    Ok((gpu_permit, llm_permit))
+}
+
 /// Run a single non-streaming Studio LLM call behind the LLM/GPU gates.
 async fn run_studio_llm(
     state: &AppState,
@@ -727,12 +758,8 @@ async fn run_studio_llm(
     let model_context_window = resolved.model_context_window;
     let provider_name = config.provider_type.as_str().to_string();
 
-    let _llm_permit = state.llm_gate.acquire().await.map_err(|e| {
-        studio_provider_error(attempt_id, &format!("Failed to acquire LLM gate: {e}"), 0)
-    })?;
-    let _gpu_permit = state.gpu_gate.acquire().await.map_err(|e| {
-        studio_provider_error(attempt_id, &format!("Failed to acquire GPU gate: {e}"), 0)
-    })?;
+    let (_gpu_permit, _llm_permit) =
+        acquire_studio_permits(&state.gpu_gate, &state.llm_gate, &cancellation, attempt_id).await?;
 
     let provider = build_provider(&config)
         .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
@@ -856,6 +883,13 @@ async fn run_studio_llm(
         };
         saw_token = true;
         response.push_str(&token.token);
+    }
+    if response.trim().is_empty() {
+        return Err(studio_provider_error(
+            attempt_id,
+            "Provider completed without usable Studio content",
+            start.elapsed().as_millis(),
+        ));
     }
     tracing::info!(
         attempt_id = %attempt_id,
@@ -1258,6 +1292,48 @@ fn studio_prompts() -> &'static HashMap<String, StudioPromptTemplate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn studio_gate_wait_uses_gpu_first_and_releases_on_cancellation() {
+        for block_gpu in [true, false] {
+            let gpu = tokio::sync::Semaphore::new(1);
+            let llm = tokio::sync::Semaphore::new(1);
+            let held = if block_gpu {
+                gpu.acquire().await.unwrap()
+            } else {
+                llm.acquire().await.unwrap()
+            };
+            let cancellation = CancellationToken::new();
+            {
+                let waiting = acquire_studio_permits(&gpu, &llm, &cancellation, "fixture");
+                tokio::pin!(waiting);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
+                        .await
+                        .is_err()
+                );
+                if block_gpu {
+                    assert_eq!(
+                        llm.available_permits(),
+                        1,
+                        "Studio must not hold LLM while waiting for GPU"
+                    );
+                } else {
+                    assert_eq!(gpu.available_permits(), 0);
+                }
+                cancellation.cancel();
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting)
+                        .await
+                        .unwrap()
+                        .is_err()
+                );
+            }
+            drop(held);
+            assert_eq!(gpu.available_permits(), 1);
+            assert_eq!(llm.available_permits(), 1);
+        }
+    }
 
     fn source(id: &str, title: &str, status: &str, selected: bool) -> Source {
         Source {

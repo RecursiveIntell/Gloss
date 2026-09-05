@@ -4,6 +4,12 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+# These flags exercise the pure settings capability projection only. This
+# harness does not compile the semantic adapter or certify its runtime build.
+[features]
+semantic-memory-backend = []
+semantic-memory-turbo-quant = ["semantic-memory-backend"]
+
 # Compile the actual pure native owner modules without the desktop/embedding
 # runtime graph. This is not a substitute for the full application gate.
 [dependencies]
@@ -17,5 +23,16 @@ tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 usearch = "=2.26.1"
 tracing = "0.1"
+log = "0.4"
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+reqwest = { version = "0.13", features = ["json", "stream", "rustls", "blocking"] }
+aes-gcm = "0.11"
+base64 = "0.23"
+zeroize = "1"
+regex = "1"
+agent-queue = "=0.2.0"
 
 [workspace]

@@ -7,8 +7,11 @@ mod jobs;
 mod memory;
 mod provider_config_store;
 mod providers;
+mod queue_task;
+pub(crate) use tauri_queue as queue_core;
 mod redaction;
 mod retrieval;
+mod settings_contract;
 mod state;
 mod studio;
 mod tool_invocation;
@@ -168,6 +171,7 @@ pub fn run_inner() -> tauri::Result<()> {
             commands::sources::retry_source_ingestion,
             commands::sources::get_notebook_stats,
             commands::sources::diagnose_retrieval_coverage,
+            commands::sources::native_dense_rebuild,
             commands::sources::diagnose_retrieval_query,
             commands::sources::run_retrieval_probe,
             commands::sources::regenerate_missing_summaries,
@@ -210,6 +214,7 @@ pub fn run_inner() -> tauri::Result<()> {
             commands::settings::get_settings,
             commands::settings::run_embedding_diagnostics,
             commands::settings::update_setting,
+            commands::settings::update_embedding_settings,
             commands::settings::select_chat_model,
             commands::settings::get_feature_flags,
             commands::settings::update_feature_flag,
@@ -228,7 +233,9 @@ pub fn run_inner() -> tauri::Result<()> {
 ///    records gate owner state, and releases both gates at safe boundaries so
 ///    chat can disclose who owns contested runtime capacity.
 /// 4. **Notebook switching** — validates job notebook_id + epoch before executing.
-/// 5. **Manual pause** — respects `summary_paused` flag.
+/// 5. **Manual mode** — cancels automatic summaries, while explicit requests and
+///    ingestion remain eligible. Notebook/grace/import checks are conservative
+///    queue-wide deferrals until the core supports filtered claims.
 async fn summary_job_loop(
     queue: Arc<QueueManager>,
     emitter: Arc<dyn QueueEventEmitter>,
@@ -248,14 +255,10 @@ async fn summary_job_loop(
             continue;
         }
 
-        // 2. Manual pause
-        if state
-            .summary_paused
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
-        }
+        // Manual mode controls automatic summary admission, not the shared
+        // ingestion/media/index queue. Explicit one-shot summaries remain valid.
+        let automatic_enabled = state.summary_mode_is_auto().unwrap_or(false);
+        jobs::cancel_disallowed_auto_summaries(&queue, automatic_enabled);
 
         // 3. Chat grace window — don't start a new summary within 15s of last user message
         if state.is_in_chat_grace() {
@@ -263,9 +266,9 @@ async fn summary_job_loop(
             continue;
         }
 
-        // 3b. Don't start summaries while sources are actively being ingested.
-        // The atomic counter is set by run_ingestion_inner (text/code sources).
-        // The DB check catches image/video sources in 'describing'/'described' status.
+        // 3b. Defer while synchronous imports own source processing. Pending
+        // image/video descriptions are handled by this queue itself; using
+        // their source status as a veto would strand those jobs forever.
         if state
             .ingestion_active
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -280,30 +283,6 @@ async fn summary_job_loop(
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
-        if let Some(ref nb_id) = active_nb {
-            let nb_id_clone = nb_id.clone();
-            let handle_clone = handle.clone();
-            let has_describing = tokio::task::spawn_blocking(move || {
-                let state = handle_clone.state::<AppState>();
-                state
-                    .with_notebook_db(&nb_id_clone, |db| {
-                        let count: i64 = db.conn().query_row(
-                        "SELECT COUNT(*) FROM sources WHERE status IN ('describing', 'described')",
-                        [],
-                        |row| row.get(0),
-                    ).unwrap_or(0);
-                        Ok(count > 0)
-                    })
-                    .unwrap_or(false)
-            })
-            .await
-            .unwrap_or(false);
-            if has_describing {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        }
-
         let active_epoch = state.get_active_epoch();
         let cancelled = jobs::cancel_jobs_not_matching_active_notebook(
             &queue,
@@ -335,10 +314,7 @@ async fn summary_job_loop(
         let (llm_gate_wait, permit) = acquire_summary_llm_gate_while_holding_gpu(
             &state.llm_gate,
             || {
-                state
-                    .summary_paused
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    || state.is_in_chat_grace()
+                state.is_in_chat_grace()
                     || active_nb
                         .as_deref()
                         .map(|nb_id| !state.is_active_notebook_epoch(nb_id, active_epoch))
@@ -380,10 +356,7 @@ async fn summary_job_loop(
 
         // Re-check conditions after acquiring the permit (chat may have arrived
         // while we were waiting, or notebook may have changed).
-        if state
-            .summary_paused
-            .load(std::sync::atomic::Ordering::SeqCst)
-            || state.is_in_chat_grace()
+        if state.is_in_chat_grace()
             || active_nb
                 .as_deref()
                 .map(|nb_id| !state.is_active_notebook_epoch(nb_id, active_epoch))
@@ -411,18 +384,22 @@ async fn summary_job_loop(
                 .process_one::<jobs::GlossJob>(&emitter_task)
                 .await
         });
-        let job_result = tokio::time::timeout(Duration::from_secs(180), guarded).await;
+        let job_result = queue_task::join_with_cancellation(
+            guarded,
+            Duration::from_secs(180),
+            || {
+                tracing::error!(
+                    "Background job exceeded 180s; cancelling and retaining inference gates until it exits"
+                );
+                // This loop owns the sole process_one task and both permits.
+                // Its ingestion job may belong to a previously selected notebook.
+                jobs::cancel_jobs_matching(&queue, |_job, status| status == "processing");
+            },
+        )
+        .await;
 
         match job_result {
-            Err(_timeout) => {
-                tracing::error!("Summary job timed out after 180s — releasing LLM gate");
-                state.clear_gate_owner("GPU gate", "background_summary");
-                state.clear_gate_owner("LLM gate", "background_summary");
-                drop(gpu_permit);
-                drop(permit);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            Ok(Err(join_err)) => {
+            Err(join_err) => {
                 // Task panicked or was cancelled. Log and keep the loop alive
                 // so remaining jobs still get processed.
                 tracing::error!(
@@ -435,7 +412,7 @@ async fn summary_job_loop(
                 drop(permit);
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            Ok(Ok(Ok(Some(job)))) => {
+            Ok(Ok(Some(job))) => {
                 let job_meta = serde_json::from_value::<jobs::GlossJob>(job.job_data.clone()).ok();
 
                 // Validate that the job was for the active notebook + epoch
@@ -469,14 +446,19 @@ async fn summary_job_loop(
                                     let job_is_current = job_meta
                                         .as_ref()
                                         .map(|job| {
-                                            state.is_active_notebook_epoch(
-                                                job.notebook_id(),
-                                                job.epoch(),
-                                            )
+                                            !job.resource_policy().requires_active_notebook
+                                                || state.is_active_notebook_epoch(
+                                                    job.notebook_id(),
+                                                    job.epoch(),
+                                                )
                                         })
                                         .unwrap_or(false);
                                     let job_epoch =
                                         job_meta.as_ref().map(|job| job.epoch()).unwrap_or(0);
+                                    let requires_active_notebook = job_meta
+                                        .as_ref()
+                                        .map(|job| job.resource_policy().requires_active_notebook)
+                                        .unwrap_or(true);
                                     if !job_is_current {
                                         tracing::info!(
                                             job_id = %job.job_id,
@@ -512,7 +494,9 @@ async fn summary_job_loop(
                                     let q2 = Arc::clone(&queue);
                                     let embed_result = tokio::task::spawn_blocking(move || {
                                         let state = handle2.state::<AppState>();
-                                        if !state.is_active_notebook_epoch(&nb, job_epoch) {
+                                        if requires_active_notebook
+                                            && !state.is_active_notebook_epoch(&nb, job_epoch)
+                                        {
                                             return;
                                         }
                                         commands::sources::finalize_described_source(
@@ -556,7 +540,7 @@ async fn summary_job_loop(
                 // Cool-down between jobs to prevent GPU thermal throttling / CUDA errors
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
-            Ok(Ok(Ok(None))) => {
+            Ok(Ok(None)) => {
                 state.clear_gate_owner("GPU gate", "background_summary");
                 state.clear_gate_owner("LLM gate", "background_summary");
                 drop(gpu_permit);
@@ -594,7 +578,7 @@ async fn summary_job_loop(
                 // Poll less frequently when idle
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
-            Ok(Ok(Err(e))) => {
+            Ok(Err(e)) => {
                 tracing::error!("Job processing error: {}", e);
                 state.clear_gate_owner("GPU gate", "background_summary");
                 state.clear_gate_owner("LLM gate", "background_summary");

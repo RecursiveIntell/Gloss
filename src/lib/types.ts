@@ -190,8 +190,11 @@ export interface EmbeddingDiagnosticsReceipt {
   };
   semantic_memory_provider: {
     provider: string;
-    dims: number;
+    dims: number | null;
+    dimensions: number | null;
     model: string;
+    probe_ok: boolean | null;
+    error: string | null;
   };
   optional_ollama: {
     configured: boolean;

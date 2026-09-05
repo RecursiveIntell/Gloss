@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type React from "react";
 import { useSettingsStore } from "../../../stores/settingsStore";
 import { useToastStore } from "../../../stores/toastStore";
@@ -98,57 +98,6 @@ function providerUrlClass(rawUrl: string | undefined): string {
   }
 }
 
-/**
- * Debounce wrapper around `updateSetting` for text/number inputs that fire
- * onChange per keystroke. Without this, typing "http://localhost:11434"
- * would issue 21 IPC calls.
- *
- * Returns a tuple: [localValue, onChange, syncLocal]. The local value mirrors
- * `settings[key]` so the input stays controlled even while the debounce
- * timer is pending. `syncLocal` updates the local value WITHOUT scheduling a
- * write — use it when syncing from the canonical settings store, otherwise
- * every settings load would echo a redundant (or default-clobbering) write
- * back to the backend.
- */
-function useDebouncedSetting(
-  key: string,
-  updateSetting: (key: string, value: string) => Promise<void>,
-  delayMs: number = 400
-): [string, (value: string) => void, (value: string) => void] {
-  const [localValue, setLocalValue] = useState("");
-  const lastEmittedRef = useRef<string | null>(null);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
-  }, []);
-  const onChange = (value: string) => {
-    setLocalValue(value);
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => {
-      lastEmittedRef.current = value;
-      timerRef.current = null;
-      // Fire-and-forget: the store now handles rollback on failure.
-      updateSetting(key, value).catch(() => {
-        // Already toasted inside the store; do nothing extra.
-      });
-    }, delayMs);
-  };
-  const syncLocal = (value: string) => {
-    // The store optimistically echoes our own debounced write back through
-    // settings[key]; ignore it so keystrokes typed in that window survive.
-    if (value === lastEmittedRef.current) return;
-    setLocalValue(value);
-    // A genuinely external canonical value arrived — drop any pending write
-    // so a stale keystroke cannot overwrite it.
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
-  };
-  return [localValue, onChange, syncLocal];
-}
 
 function SettingsSection({
   title,
@@ -193,34 +142,46 @@ function ProviderSection({
   const [showKey, setShowKey] = useState(false);
   const [testStatus, setTestStatus] = useState<TestStatus>("idle");
   const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
   const configuredKey = apiKeyKey ? `${apiKeyKey}_configured` : null;
   const hasStoredSecret = configuredKey ? settings[configuredKey] === "1" : false;
 
   useEffect(() => {
+    if (dirty) return;
     setUrl(settings[urlKey] || urlDefault);
     if (apiKeyKey) setApiKey("");
     setDirty(false);
-  }, [settings, urlKey, urlDefault, apiKeyKey]);
+  }, [settings[urlKey], hasStoredSecret, urlKey, urlDefault, apiKeyKey, dirty]);
 
   const handleSave = async () => {
-    const updates: Record<string, string> = { [urlKey]: url };
+    if (saving) return;
+    setSaving(true);
+    const updates: Record<string, string> = { [urlKey]: url.trim() };
     if (apiKeyKey && (apiKey.trim() || !hasStoredSecret)) {
       updates[apiKeyKey] = apiKey;
     }
-    await onSave(updates);
-    if (apiKeyKey) setApiKey("");
-    setDirty(false);
+    try {
+      await onSave(updates);
+      if (apiKeyKey) setApiKey("");
+      setDirty(false);
+    } finally { setSaving(false); }
   };
 
   const handleClearKey = async () => {
-    if (!apiKeyKey) return;
-    await onSave({ [apiKeyKey]: "" });
-    setApiKey("");
-    setDirty(false);
+    if (!apiKeyKey || saving) return;
+    setSaving(true);
+    try {
+      await onSave({ [apiKeyKey]: "" });
+      setApiKey("");
+      setDirty(false);
+    } finally { setSaving(false); }
   };
 
   const handleTest = async () => {
-    if (dirty) await handleSave();
+    if (dirty) {
+      try { await handleSave(); }
+      catch { setTestStatus("error"); return; }
+    }
     setTestStatus("testing");
     const ok = await testProvider(id);
     setTestStatus(ok ? "success" : "error");
@@ -239,7 +200,7 @@ function ProviderSection({
         <p className="text-xs font-medium text-text">{label}</p>
         <button
           onClick={handleTest}
-          disabled={testStatus === "testing"}
+          disabled={testStatus === "testing" || saving}
           className="flex items-center gap-1.5 rounded bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text disabled:opacity-50"
         >
           {testStatus === "testing" && <Loader2 className="h-3 w-3 animate-spin" />}
@@ -260,6 +221,7 @@ function ProviderSection({
         <input
           type="text"
           value={url}
+          disabled={saving}
           onChange={(e) => {
             setUrl(e.target.value);
             setDirty(true);
@@ -269,11 +231,11 @@ function ProviderSection({
           aria-label={`${label} server URL`}
         />
         <button
-          onClick={handleSave}
-          disabled={!dirty}
+          onClick={() => { void handleSave().catch(() => {}); }}
+          disabled={!dirty || saving}
           className="rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
         >
-          Save
+          {saving ? "Saving…" : "Save"}
         </button>
       </div>
       {apiKeyKey && (
@@ -286,7 +248,9 @@ function ProviderSection({
             <div className="relative min-w-0 flex-1">
               <input
                 type={showKey ? "text" : "password"}
+                aria-label={`${label} API key`}
                 value={apiKey}
+                disabled={saving}
                 onChange={(e) => {
                   setApiKey(e.target.value);
                   setDirty(true);
@@ -296,6 +260,7 @@ function ProviderSection({
               />
               <button
                 onClick={() => setShowKey(!showKey)}
+                aria-label={showKey ? `Hide ${label} API key` : `Show ${label} API key`}
                 className="absolute right-2 top-1/2 -translate-y-1/2 text-text-muted hover:text-text"
               >
                 {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
@@ -303,7 +268,8 @@ function ProviderSection({
             </div>
             {hasStoredSecret && (
               <button
-                onClick={handleClearKey}
+                onClick={() => { void handleClearKey().catch(() => {}); }}
+                disabled={saving}
                 className="rounded bg-bg-tertiary px-3 py-1.5 text-xs text-text-secondary hover:bg-border hover:text-text"
               >
                 Clear
@@ -360,6 +326,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     loadFeatureFlags,
     refreshModels,
     updateSetting,
+    applyEmbeddingSettings,
     updateProvider,
     updateFeatureFlag,
     selectModel,
@@ -383,37 +350,44 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     settings["allow_custom_cloud_endpoints"] === "true" ||
     settings["allow_custom_cloud_endpoints"] === "1";
 
-  // Debounce the 5 text/number inputs that previously fired updateSetting on
-  // every keystroke (H-4 from the hostile audit). Typing "http://localhost"
-  // used to issue 17+ IPC calls; now it issues 1.
-  const [embeddingUrl, setEmbeddingUrl, syncEmbeddingUrl] = useDebouncedSetting("semantic_memory_embedding_url", updateSetting);
-  const [embeddingModel, setEmbeddingModel, syncEmbeddingModel] = useDebouncedSetting("semantic_memory_embedding_model", updateSetting);
-  const [embeddingTimeout, setEmbeddingTimeout, syncEmbeddingTimeout] = useDebouncedSetting("semantic_memory_embedding_timeout_secs", updateSetting);
-  const [searchTimeout, setSearchTimeout, syncSearchTimeout] = useDebouncedSetting("semantic_memory_search_timeout_ms", updateSetting);
-  const [chunkTargetTokens, setChunkTargetTokens, syncChunkTargetTokens] = useDebouncedSetting("chunk_target_tokens", updateSetting);
-  // Sync local debounced state from settings whenever the canonical value
-  // changes (e.g. on dialog open or external update). Uses the sync-only
-  // setter so syncing never schedules a write back to the backend.
+  const [embeddingProvider, setEmbeddingProvider] = useState("ollama");
+  const [embeddingUrl, setEmbeddingUrl] = useState("");
+  const [embeddingModel, setEmbeddingModel] = useState("");
+  const [embeddingTimeout, setEmbeddingTimeout] = useState("10");
+  const [downloadConsent, setDownloadConsent] = useState(false);
+  const [searchTimeout, setSearchTimeout] = useState("8000");
+  const [chunkTargetTokens, setChunkTargetTokens] = useState("1100");
+  const [embeddingDirty, setEmbeddingDirty] = useState(false);
+  const [savingEmbedding, setSavingEmbedding] = useState(false);
+  const [embeddingSaveError, setEmbeddingSaveError] = useState<string | null>(null);
   useEffect(() => {
-    syncEmbeddingUrl(settings["semantic_memory_embedding_url"] || "http://localhost:11434");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings["semantic_memory_embedding_url"]]);
-  useEffect(() => {
-    syncEmbeddingModel(settings["semantic_memory_embedding_model"] || "bge-m3");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings["semantic_memory_embedding_model"]]);
-  useEffect(() => {
-    syncEmbeddingTimeout(settings["semantic_memory_embedding_timeout_secs"] || "10");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings["semantic_memory_embedding_timeout_secs"]]);
-  useEffect(() => {
-    syncSearchTimeout(settings["semantic_memory_search_timeout_ms"] || "8000");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings["semantic_memory_search_timeout_ms"]]);
-  useEffect(() => {
-    syncChunkTargetTokens(settings["chunk_target_tokens"] || "1100");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings["chunk_target_tokens"]]);
+    if (!open) { setEmbeddingDirty(false); return; }
+    if (embeddingDirty) return;
+    setEmbeddingProvider(settings.semantic_memory_embedding_provider || "ollama");
+    setEmbeddingUrl(settings.semantic_memory_embedding_url || "http://localhost:11434");
+    setEmbeddingModel(settings.semantic_memory_embedding_model || "bge-m3");
+    setEmbeddingTimeout(settings.semantic_memory_embedding_timeout_secs || "10");
+    setDownloadConsent(settings.fastembed_download_consent === "true");
+    setSearchTimeout(settings.semantic_memory_search_timeout_ms || "8000");
+    setChunkTargetTokens(settings.chunk_target_tokens || "1100");
+  }, [open, settings, embeddingDirty]);
+  const editEmbedding = (setter: (value: string) => void, value: string) => {
+    setter(value); setEmbeddingDirty(true); setEmbeddingSaveError(null);
+  };
+  const handleApplyEmbedding = async () => {
+    setSavingEmbedding(true); setEmbeddingSaveError(null);
+    try {
+      const warnings = await applyEmbeddingSettings({
+        provider: embeddingProvider, url: embeddingUrl.trim(), model: embeddingModel.trim(),
+        timeout_secs: Number(embeddingTimeout), download_consent: downloadConsent,
+        search_timeout_ms: Number(searchTimeout), chunk_target_tokens: Number(chunkTargetTokens),
+      });
+      setEmbeddingDirty(false);
+      useToastStore.getState().addToast({ type: warnings.length ? "warning" : "success", title: "Embedding settings saved", message: warnings.length ? warnings.join("; ") : "New embedding identities require Rebuild notebook index. Chunk size applies to future imports or reimports.", duration: 7000 });
+      await refreshMemoryEvidence();
+    } catch (error) { setEmbeddingSaveError(String(error)); }
+    finally { setSavingEmbedding(false); }
+  };
 
   useEffect(() => {
     if (open) {
@@ -468,7 +442,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   );
   const summaryModels = models.filter(
     (model) =>
-      model.provider_id !== undefined &&
+      model.provider_id === "ollama" && model.available && !model.stale &&
       enabledProviderIds.has(model.provider_id)
   );
   const visionModels = summaryModels.filter(isVisionCapableModel);
@@ -481,7 +455,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   // Discovery is a cache, not authority to erase configured model intent.
 
   const handleProviderSave = async (updates: Record<string, string>) => {
-    if (updates["ollama_url"]) {
+    if ("ollama_url" in updates) {
       await updateProvider("ollama", true, updates["ollama_url"]);
     }
     if ("openai_api_key" in updates || "openai_base_url" in updates) {
@@ -495,7 +469,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
         updates["anthropic_api_key"]
       );
     }
-    if (updates["llamacpp_url"]) {
+    if ("llamacpp_url" in updates) {
       await updateProvider("llamacpp", true, updates["llamacpp_url"]);
     }
     await loadSettings();
@@ -630,13 +604,18 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       const receipt = await api.runEmbeddingDiagnostics();
       setEmbeddingDiagnostics(receipt);
       const native = receipt.native_fastembed;
-      const healthy = native.init_ok && native.embed_one_ok;
+      const semantic = receipt.semantic_memory_provider;
+      const nativePassed = native.init_ok && native.embed_one_ok;
+      const nativeResult = nativePassed ? "passed" : native.init_ok ? "failed" : "not run";
+      const semanticResult = semantic.probe_ok === true ? "passed" : semantic.probe_ok === false ? "failed" : "not run";
       useToastStore.getState().addToast({
-        type: healthy ? "success" : "error",
+        type: nativePassed && semantic.probe_ok === true
+          ? "success"
+          : (native.init_ok && !native.embed_one_ok) || semantic.probe_ok === false
+            ? "error"
+            : "warning",
         title: "Embedding diagnostics complete",
-        message: healthy
-          ? `${receipt.semantic_memory_provider.provider} ready · ${native.dims ?? "?"} dims`
-          : native.error || "Embedding backend not ready",
+        message: `Native probe: ${nativeResult}. Semantic probe (${semantic.provider}, ${semantic.model}): ${semanticResult}.`,
         duration: 6000,
       });
     } catch (error) {
@@ -841,7 +820,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 type="checkbox"
                 checked={settings["allow_lan_local_providers"] === "true" || settings["allow_lan_local_providers"] === "1"}
                 onChange={(e) => {
-                  updateSetting("allow_lan_local_providers", e.target.checked ? "true" : "false");
+                  void updateSetting("allow_lan_local_providers", e.target.checked ? "true" : "false").catch(() => {});
                 }}
                 className="rounded border-border"
               />
@@ -853,10 +832,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 type="checkbox"
                 checked={allowCustomCloudEndpoints}
                 onChange={(e) => {
-                  updateSetting(
+                  void updateSetting(
                     "allow_custom_cloud_endpoints",
                     e.target.checked ? "true" : "false"
-                  );
+                  ).catch(() => {});
                 }}
                 className="mt-0.5 rounded border-border"
               />
@@ -1099,8 +1078,9 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               Run embedding diagnostics
             </button>
             {embeddingDiagnostics && (
-              <div className="rounded border border-border bg-bg-tertiary/40 px-3 py-2 text-xs text-text-secondary">
+              <div role="status" className="space-y-2 rounded border border-border bg-bg-tertiary/40 px-3 py-2 text-xs text-text-secondary">
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <span>Native embedding probe</span>
                   <span
                     className={
                       embeddingDiagnostics.native_fastembed.init_ok &&
@@ -1111,25 +1091,52 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                   >
                     {embeddingDiagnostics.native_fastembed.init_ok &&
                     embeddingDiagnostics.native_fastembed.embed_one_ok
-                      ? "● Ready"
-                      : "● Not ready"}
-                  </span>
-                  <span>
-                    Backend: {embeddingDiagnostics.semantic_memory_provider.provider}
+                      ? "Passed"
+                      : embeddingDiagnostics.native_fastembed.init_ok ? "Failed" : "Not run"}
                   </span>
                   {embeddingDiagnostics.native_fastembed.dims != null && (
-                    <span>{embeddingDiagnostics.native_fastembed.dims}d</span>
+                    <span>
+                      {embeddingDiagnostics.native_fastembed.embed_one_ok ? "Dimensions" : "Declared dimensions"}:{" "}
+                      {embeddingDiagnostics.native_fastembed.dims}
+                    </span>
                   )}
-                  <span>
-                    Model cached:{" "}
-                    {embeddingDiagnostics.native_fastembed.model_cached ? "yes" : "no"}
-                  </span>
                 </div>
                 {embeddingDiagnostics.native_fastembed.error && (
-                  <p className="mt-1 text-[11px] text-warning">
+                  <p className="break-words text-[11px] text-warning">
                     {embeddingDiagnostics.native_fastembed.error}
                   </p>
                 )}
+                <p className="text-[11px] text-text-muted">
+                  Local Candle model cached: {embeddingDiagnostics.native_fastembed.model_cached ? "yes" : "no"}
+                </p>
+                <div className="space-y-1 border-t border-border pt-2">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <span>Semantic embedding probe</span>
+                    <span className={embeddingDiagnostics.semantic_memory_provider.probe_ok === true
+                      ? "text-success"
+                      : embeddingDiagnostics.semantic_memory_provider.probe_ok === false ? "text-warning" : "text-text-muted"}>
+                      {embeddingDiagnostics.semantic_memory_provider.probe_ok === true
+                        ? "Passed"
+                        : embeddingDiagnostics.semantic_memory_provider.probe_ok === false ? "Failed" : "Not run"}
+                    </span>
+                  </div>
+                  <p className="break-words">
+                    {embeddingDiagnostics.semantic_memory_provider.provider} · {embeddingDiagnostics.semantic_memory_provider.model}
+                  </p>
+                  <p>
+                    {(embeddingDiagnostics.semantic_memory_provider.dimensions ?? embeddingDiagnostics.semantic_memory_provider.dims) != null
+                      ? `${embeddingDiagnostics.semantic_memory_provider.probe_ok === true ? "Dimensions" : "Declared dimensions"}: ${embeddingDiagnostics.semantic_memory_provider.dimensions ?? embeddingDiagnostics.semantic_memory_provider.dims}`
+                      : "Dimensions unknown"}
+                  </p>
+                  {embeddingDiagnostics.semantic_memory_provider.probe_ok == null && (
+                    <p className="text-[11px] text-text-muted">This semantic provider has not been probed.</p>
+                  )}
+                  {embeddingDiagnostics.semantic_memory_provider.error && (
+                    <p className="break-words text-[11px] text-warning">
+                      {embeddingDiagnostics.semantic_memory_provider.error}
+                    </p>
+                  )}
+                </div>
               </div>
             )}
             {profileStatus?.projection_summary && (
@@ -1167,8 +1174,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
             <div className="grid gap-2 sm:grid-cols-3">
               {[
                 ["gloss-local", "Gloss local", true],
-                ["semantic-memory-safe", "Enable semantic-memory", semanticPreviewSelectable],
-                ["semantic-memory-turbo-quant-safe", "TurboQuant", Boolean(turboQuant?.available)],
+                ["semantic-memory-safe", "Semantic memory (safe)", semanticPreviewSelectable],
               ].map(([profile, label, enabled]) => (
                 <button
                   key={String(profile)}
@@ -1183,20 +1189,12 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
             </div>
             <div className="grid gap-2 sm:grid-cols-2">
               <button
-                onClick={() => handleMemoryProfile("semantic-memory-strict")}
+                onClick={() => handleMemoryProfile(turboQuant?.available ? "semantic-memory-turbo-quant-strict" : "semantic-memory-strict")}
                 disabled={!activeNotebookId || !semanticPreviewSelectable}
                 className="inline-flex items-center justify-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <ShieldCheck className="h-3.5 w-3.5" />
-                Strict semantic-memory
-              </button>
-              <button
-                onClick={() => handleMemoryProfile("semantic-memory-turbo-quant-strict")}
-                disabled={!activeNotebookId || !turboQuant?.available}
-                className="inline-flex items-center justify-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <ShieldCheck className="h-3.5 w-3.5" />
-                Strict TurboQuant
+                Strict retrieval {turboQuant?.available ? "with TurboQuant proof" : ""}
               </button>
             </div>
             <select
@@ -1254,7 +1252,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                   updateSetting(
                     "semantic_memory_provekv_pool_candidates_enabled",
                     e.target.checked ? "true" : "false"
-                  )
+                  ).catch(() => {})
                 }
                 disabled={!turboQuant?.available}
                 className="accent-accent"
@@ -1267,30 +1265,30 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 Embedding backend
               </div>
               <select
-                value={settings["semantic_memory_embedding_provider"] || "fastembed"}
+                value={embeddingProvider}
+                disabled={savingEmbedding}
                 onChange={(e) =>
-                  updateSetting("semantic_memory_embedding_provider", e.target.value)
+                  editEmbedding(setEmbeddingProvider, e.target.value)
                 }
                 aria-label="Embedding backend"
                 className="w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
               >
                 <option value="fastembed">
-                  Automatic · CPU candle (local, no setup)
+                  Built-in CPU embedder (model download required)
                 </option>
                 <option value="ollama">Ollama (external server)</option>
               </select>
               <p className="mt-1 text-[11px] text-text-muted">
-                No Ollama? Gloss automatically falls back to the built-in CPU
-                embedder (candle, nomic-embed-text-v1.5) — nothing else needs
-                configuring.
+                Gloss uses exactly the selected embedding backend. The built-in CPU model is nomic-embed-text-v1.5; Ollama uses the server and model below.
               </p>
             </div>
             <label className="flex items-center gap-2 text-xs text-text-secondary">
               <input
                 type="checkbox"
-                checked={(settings["fastembed_download_consent"] || "true") === "true"}
+                checked={downloadConsent}
+                disabled={savingEmbedding}
                 onChange={(e) =>
-                  updateSetting("fastembed_download_consent", e.target.checked ? "true" : "false")
+                  { setDownloadConsent(e.target.checked); setEmbeddingDirty(true); }
                 }
                 className="accent-accent"
               />
@@ -1353,8 +1351,9 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               <div className="relative">
                 <input
                   value={embeddingUrl}
-                  onChange={(e) => setEmbeddingUrl(e.target.value)}
+                  onChange={(e) => editEmbedding(setEmbeddingUrl, e.target.value)}
                   className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none w-full"
+                  disabled={savingEmbedding || embeddingProvider !== "ollama"}
                   aria-label="Embedding URL"
                 />
                 {(() => {
@@ -1371,23 +1370,26 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               </div>
               <input
                 value={embeddingModel}
-                onChange={(e) => setEmbeddingModel(e.target.value)}
+                onChange={(e) => editEmbedding(setEmbeddingModel, e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
+                disabled={savingEmbedding || embeddingProvider !== "ollama"}
                 aria-label="Embedding model"
               />
               <input
                 type="number"
-                min="1"
                 value={embeddingTimeout}
-                onChange={(e) => setEmbeddingTimeout(e.target.value)}
+                disabled={savingEmbedding || embeddingProvider !== "ollama"}
+                onChange={(e) => editEmbedding(setEmbeddingTimeout, e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
+                min="2" max="300"
                 aria-label="Embedding timeout seconds"
               />
               <input
                 type="number"
-                min="1"
+                min="100" max="300000"
                 value={searchTimeout}
-                onChange={(e) => setSearchTimeout(e.target.value)}
+                disabled={savingEmbedding}
+                onChange={(e) => editEmbedding(setSearchTimeout, e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
                 aria-label="Search timeout milliseconds"
               />
@@ -1396,11 +1398,15 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 min="100"
                 max="3000"
                 value={chunkTargetTokens}
-                onChange={(e) => setChunkTargetTokens(e.target.value)}
+                disabled={savingEmbedding}
+                onChange={(e) => editEmbedding(setChunkTargetTokens, e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
                 aria-label="Chunk target tokens"
               />
             </div>
+            <button onClick={handleApplyEmbedding} disabled={!embeddingDirty || savingEmbedding} className="rounded bg-accent px-3 py-2 text-sm text-white disabled:opacity-40">{savingEmbedding ? "Saving…" : "Apply embedding and ingestion settings"}</button>
+            {embeddingDirty && <p className="text-xs text-warning">Unsaved changes. Apply before rebuilding or importing sources.</p>}
+            {embeddingSaveError && <p role="alert" className="text-xs text-error">{embeddingSaveError}</p>}
           </SettingsSection>
 
           <SettingsSection title="Sources & Ingestion" icon={<BookOpen className="h-4 w-4" />}>
@@ -1409,15 +1415,19 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
 
           <SettingsSection title="Summaries" icon={<BookOpen className="h-4 w-4" />}>
             <FeatureStatusGrid flags={sections["Summaries"] || []} />
+            <p className="text-xs text-text-muted">Background summaries use Ollama. Select an installed model or use an Ollama chat model.</p>
+            {!settings.summary_model && configuredProviderId !== "ollama" && <p role="alert" className="text-xs text-warning">Choose an Ollama summary model; the current chat provider cannot run background summaries.</p>}
             <select
               value={settings["summary_model"] || ""}
-              onChange={(e) => updateSetting("summary_model", e.target.value)}
+              onChange={(e) => { void updateSetting("summary_model", e.target.value).catch(() => {}); }}
+              aria-label="summary model"
               className="w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
             >
-              <option value="">Same as chat model ({activeModel})</option>
+              <option value="" disabled={configuredProviderId !== "ollama"}>Same as chat model ({activeModel}){configuredProviderId !== "ollama" ? " — requires Ollama" : ""}</option>
+              {settings.summary_model && !summaryModels.some(model => model.id === settings.summary_model) && <option value={settings.summary_model} disabled>{settings.summary_model} — unavailable Ollama model</option>}
               {summaryModels.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.display_name}
+                <option key={model.provider_id + ":" + model.id} value={model.id}>
+                  {model.display_name} · Ollama
                   {model.parameter_size ? ` (${model.parameter_size})` : ""}
                 </option>
               ))}
@@ -1426,15 +1436,18 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
 
           <SettingsSection title="Vision & Media" icon={<Image className="h-4 w-4" />}>
             <FeatureStatusGrid flags={sections["Vision & Media"] || []} />
+            {!settings.vision_model && (configuredProviderId !== "ollama" || !visionModels.some(model => model.id === activeModel)) && <p role="alert" className="text-xs text-warning">Choose an installed Ollama vision model before importing images or video.</p>}
             <select
               value={settings["vision_model"] || ""}
-              onChange={(e) => updateSetting("vision_model", e.target.value)}
+              onChange={(e) => { void updateSetting("vision_model", e.target.value).catch(() => {}); }}
+              aria-label="vision model"
               className="w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
             >
-              <option value="">Same as chat model ({activeModel})</option>
+              <option value="" disabled={configuredProviderId !== "ollama" || !visionModels.some(model => model.id === activeModel)}>Same as chat model ({activeModel}){configuredProviderId !== "ollama" || !visionModels.some(model => model.id === activeModel) ? " — requires an Ollama vision model" : ""}</option>
+              {settings.vision_model && !visionModels.some(model => model.id === settings.vision_model) && <option value={settings.vision_model} disabled>{settings.vision_model} — unavailable vision model</option>}
               {visionModels.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.display_name}
+                <option key={model.provider_id + ":" + model.id} value={model.id}>
+                  {model.display_name} · Ollama
                   {model.parameter_size ? ` (${model.parameter_size})` : ""}
                 </option>
               ))}
@@ -1552,20 +1565,20 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
 
           <SettingsSection title="Experimental Features" icon={<ShieldCheck className="h-4 w-4" />}>
             {experimentalMaster && (
-              <FeatureToggleRow flag={experimentalMaster} mutable onToggle={handleFeatureToggle} />
+              <p className="text-xs text-text-muted">Experimental switches are unavailable until their controls are implemented. Memory capabilities included in this build are listed above.</p>
             )}
             {[semanticPreview, turboQuant, ...(sections["Experimental Features"] || [])]
               .filter((flag): flag is FeatureFlagStatus => Boolean(flag))
               .filter((flag, index, flags) => flags.findIndex((item) => item.id === flag.id) === index)
               .filter((flag) => flag.id !== EXPERIMENTAL_FEATURES_ENABLED)
               .map((flag) => (
-                <FeatureToggleRow key={flag.id} flag={flag} mutable onToggle={handleFeatureToggle} />
+                <FeatureToggleRow key={flag.id} flag={flag} mutable={flag.available && flag.requires_experimental} onToggle={handleFeatureToggle} />
               ))}
           </SettingsSection>
 
           <SettingsSection title="Release / Validation" icon={<ShieldCheck className="h-4 w-4" />}>
             {(sections["Release / Validation"] || []).map((flag) => (
-              <FeatureToggleRow key={flag.id} flag={flag} mutable onToggle={handleFeatureToggle} />
+              <FeatureToggleRow key={flag.id} flag={flag} mutable={flag.available} onToggle={handleFeatureToggle} />
             ))}
           </SettingsSection>
         </div>

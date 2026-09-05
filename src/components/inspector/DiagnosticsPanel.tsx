@@ -1,9 +1,11 @@
-import { useSettingsStore } from "../../stores/settingsStore";
+import { findSelectedModel, useSettingsStore } from "../../stores/settingsStore";
 import { useSourceStore } from "../../stores/sourceStore";
+import { useNotebookStore } from "../../stores/notebookStore";
+import * as api from "../../lib/tauri";
 import {
   Wifi, WifiOff, RefreshCw,
 } from "lucide-react";
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useHealthStore } from "../../stores/healthStore";
 
 /**
@@ -19,11 +21,8 @@ export function DiagnosticsPanel({ notebookId }: { notebookId: string }) {
   const loading = useSettingsStore((s) => s.loading);
   const stats = useSourceStore((s) => s.stats);
   const selectedProviderId = settings["default_provider"] || null;
-  const activeModelRecord =
-    models.find(
-      (m) => m.id === activeModel && (!selectedProviderId || m.provider_id === selectedProviderId),
-    ) ?? models.find((m) => m.id === activeModel);
-  const activeProviderId = activeModelRecord?.provider_id ?? selectedProviderId;
+  const activeModelRecord = findSelectedModel(models, selectedProviderId, activeModel);
+  const activeProviderId = selectedProviderId;
   const selectedModelPresent = Boolean(activeModelRecord);
   const selectedModelAvailable = Boolean(activeModelRecord && activeModelRecord.available && !activeModelRecord.stale);
   const selectedModelError = activeModelRecord?.last_error ?? null;
@@ -32,19 +31,37 @@ export function DiagnosticsPanel({ notebookId }: { notebookId: string }) {
   const memoryStatus = useHealthStore((s) => s.memoryStatus);
   const profileStatus = useHealthStore((s) => s.profileStatus);
   const queueStatus = useHealthStore((s) => s.queueStatus);
-  const startHealthPolling = useHealthStore((s) => s.startPolling);
   const [refreshing, setRefreshing] = useState(false);
   const poll = useHealthStore((s) => s.poll);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [rebuildError, setRebuildError] = useState<string | null>(null);
+  const [rebuildReceipt, setRebuildReceipt] = useState<Awaited<ReturnType<typeof api.nativeDenseRebuild>> | null>(null);
 
-  useEffect(() => {
-    startHealthPolling(notebookId, activeProviderId);
-  }, [activeProviderId, notebookId, startHealthPolling]);
+  const handleRebuild = async () => {
+    if (rebuilding) return;
+    setRebuilding(true);
+    setRebuildError(null);
+    setRebuildReceipt(null);
+    try {
+      const receipt = await api.nativeDenseRebuild(notebookId);
+      if (useNotebookStore.getState().activeNotebookId !== notebookId) return;
+      setRebuildReceipt(receipt);
+    } catch (error) {
+      if (useNotebookStore.getState().activeNotebookId !== notebookId) return;
+      setRebuildError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (useNotebookStore.getState().activeNotebookId === notebookId) {
+        setRebuilding(false);
+        await Promise.all([useSourceStore.getState().loadSources(notebookId), poll()]);
+      }
+    }
+  };
 
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
       await refreshModels();
-      poll();
+      await poll();
     } finally {
       setRefreshing(false);
     }
@@ -154,6 +171,22 @@ export function DiagnosticsPanel({ notebookId }: { notebookId: string }) {
 
       {/* Index / Notebook Stats */}
       <Section title="Notebook Index">
+        <p className="text-text-muted">Rebuild dense search from this notebook’s saved chunks using the configured embedding model. Sources and notes are preserved. Dense retrieval is unavailable during the rebuild.</p>
+        <button onClick={() => void handleRebuild()} disabled={rebuilding}
+          className="rounded border border-border px-2 py-1.5 text-text-secondary hover:bg-bg-tertiary disabled:opacity-50">
+          {rebuilding ? "Rebuilding dense index…" : "Rebuild dense index"}
+        </button>
+        {rebuilding && <p role="status" className="text-text-muted">Rebuilding. Large notebooks may take several minutes.</p>}
+        {rebuildError && <p role="alert" className="text-error">Dense rebuild failed: {rebuildError}</p>}
+        {rebuildReceipt && <div role="status" className="rounded border border-border p-2">
+          <p>Dense index {rebuildReceipt.status}: {rebuildReceipt.chunks_indexed} chunks.</p>
+          <p className="break-words text-text-muted">{rebuildReceipt.provider} · {rebuildReceipt.model} · {rebuildReceipt.dimensions} dimensions</p>
+          <details className="mt-1 text-text-muted"><summary>Rebuild receipt</summary>
+            <p className="break-all">{rebuildReceipt.rebuild_id}</p>
+            <p className="break-all">SHA-256: {rebuildReceipt.artifact_sha256}</p>
+            <p>Previous artifact quarantined: {rebuildReceipt.previous_artifact_quarantined ? "yes" : "no"}</p>
+          </details>
+        </div>}
         <KVRow label="Sources" value={`${stats?.source_count ?? 0}`} />
         <KVRow label="Chunks" value={`${stats?.chunk_count ?? 0}`} />
         <KVRow label="Total words" value={`${(stats?.total_words ?? 0).toLocaleString()}`} />

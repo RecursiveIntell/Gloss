@@ -464,16 +464,13 @@ impl AppState {
         {
             app_db.set_setting("semantic_memory_search_timeout_ms", "8000")?;
         }
-        // The local CPU candle embedder is the automatic fallback backend.
-        // Download consent defaults ON so first-time uploads just work; users
-        // can switch it off in Settings → Embeddings. Existing installs that
-        // still hold the old "false" default are migrated the same way.
+        // Model downloads require explicit consent. Startup must preserve a
+        // user's refusal rather than treating it as an obsolete default.
         if app_db
             .get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?
-            .map(|v| v == "false")
-            .unwrap_or(true)
+            .is_none()
         {
-            app_db.set_setting(features::FASTEMBED_DOWNLOAD_CONSENT, "true")?;
+            app_db.set_setting(features::FASTEMBED_DOWNLOAD_CONSENT, "false")?;
         }
         features::ensure_default_feature_settings(&app_db)?;
         let secret_store = SecretStore::new(&data_dir)?;
@@ -565,110 +562,96 @@ impl AppState {
         filter_chat_events_since(&events, notebook_id, conversation_id, after_seq)
     }
 
-    /// Ensure the embedding model is initialized. Honors the configured
-    /// backend from settings:
-    ///
-    /// - `semantic_memory_embedding_provider == "ollama"` (and reachable) →
-    ///   external Ollama `/api/embed` (crash-isolated, preferred)
-    /// - anything else (or an unreachable Ollama) → the in-process CPU candle
-    ///   embedder (Nomic v1.5 MoE, 768d) as the automatic fallback.
+    /// Initialize exactly the selected backend, replacing a stale cached service.
     pub fn ensure_embedder(&self, app_handle: Option<&tauri::AppHandle>) -> Result<(), GlossError> {
-        let mut embedder = self.embedder.write().unwrap_or_else(|e| e.into_inner());
+        let guard = self.try_native_inference()?;
+        self.ensure_embedder_guarded(app_handle, &guard)
+    }
 
-        if embedder.is_some() {
-            return Ok(());
-        }
+    pub fn try_native_inference(
+        &self,
+    ) -> Result<crate::ingestion::native_gates::NativeInferenceGuard<'_>, GlossError> {
+        crate::ingestion::native_gates::try_acquire(&self.gpu_gate, &self.llm_gate)
+    }
 
-        let service = {
-            let app_db = self
+    pub fn ensure_embedder_guarded(
+        &self,
+        app_handle: Option<&tauri::AppHandle>,
+        _guard: &crate::ingestion::native_gates::NativeInferenceGuard<'_>,
+    ) -> Result<(), GlossError> {
+        let mut embedder = self
+            .embedder
+            .write()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let config = {
+            let db = self
                 .app_db
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
-            let provider = app_db.get_setting("semantic_memory_embedding_provider")?;
-            let url = app_db.get_setting("semantic_memory_embedding_url")?;
-            let model = app_db.get_setting("semantic_memory_embedding_model")?;
-            let timeout_secs = app_db
-                .get_setting("semantic_memory_embedding_timeout_secs")?
-                .and_then(|s| s.parse::<u64>().ok());
-            let download_consent = crate::commands::chat::setting_is_enabled(
-                app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
-            );
-            drop(app_db);
-
-            tracing::info!(
-                provider = %provider.as_deref().unwrap_or("auto"),
-                "Initializing embedding backend"
-            );
-            if let Some(handle) = app_handle {
-                use tauri::Emitter;
-                let _ = handle.emit(
-                    "status:embedding_model",
-                    serde_json::json!({
-                        "state": "loading",
-                        "message": "Loading embedding backend…"
-                    }),
-                );
-            }
-            let cache_dir = self.data_dir.join("models");
-            std::fs::create_dir_all(&cache_dir)?;
-            match EmbeddingService::from_configured_provider(
-                provider.as_deref(),
-                url.as_deref(),
-                model.as_deref(),
-                timeout_secs,
-                &cache_dir,
-                download_consent,
-            ) {
-                Ok(service) => service,
-                Err(e) => {
-                    if let Some(handle) = app_handle {
-                        use tauri::Emitter;
-                        let _ = handle.emit(
-                            "status:embedding_model",
-                            serde_json::json!({
-                                "state": "error",
-                                "message": format!("Embedding backend failed: {e}")
-                            }),
-                        );
-                    }
-                    return Err(e);
+            crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&db)?
+        };
+        if embedder
+            .as_ref()
+            .is_some_and(|service| service.configured_identity.as_ref() == Some(&config))
+        {
+            return Ok(());
+        }
+        // Never keep serving a previous configuration after initialization fails.
+        *embedder = None;
+        self.query_embed_cache
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?
+            .clear();
+        *self
+            .query_embed_cache_model
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))? = None;
+        self.hnsw_indices
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?
+            .clear();
+        self.hnsw_index_dims
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?
+            .clear();
+        if let Some(handle) = app_handle {
+            use tauri::Emitter;
+            let _ = handle.emit("status:embedding_model", serde_json::json!({"state":"loading", "message":"Loading configured embedding backend…"}));
+        }
+        let cache_dir = self.data_dir.join("models");
+        std::fs::create_dir_all(&cache_dir)?;
+        let service = match EmbeddingService::from_config(&config, &cache_dir) {
+            Ok(service) => service,
+            Err(error) => {
+                if let Some(handle) = app_handle {
+                    use tauri::Emitter;
+                    let _ = handle.emit("status:embedding_model", serde_json::json!({"state":"error", "message":format!("Embedding backend failed: {error}")}));
                 }
+                return Err(error);
             }
         };
-
+        // Configuration changes during the network/model initialization must
+        // not install a service belonging to the previous selection.
+        let db = self
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        if crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&db)? != config {
+            return Err(GlossError::Embedding(
+                "Embedding configuration changed during initialization; retry required".into(),
+            ));
+        }
+        *self
+            .query_embed_cache_model
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))? = service.model_digest();
+        *embedder = Some(Arc::new(service));
         if let Some(handle) = app_handle {
             use tauri::Emitter;
             let _ = handle.emit(
                 "status:embedding_model",
-                serde_json::json!({
-                    "state": "ready",
-                    "message": "Embedding backend loaded"
-                }),
+                serde_json::json!({"state":"ready", "message":"Embedding backend loaded"}),
             );
-        }
-
-        let provider_id = service.provider_id();
-        let model_id = service.model_id().to_string();
-
-        tracing::info!("Embedding backend ready");
-        *embedder = Some(Arc::new(service));
-
-        // Now that we know the real model identity, flush the query-embed
-        // cache if it was built against a different model. This is the
-        // only place the cache is invalidated on model change.
-        {
-            let mut cache_model = self
-                .query_embed_cache_model
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            let cache_key = format!("{}:{}", provider_id, model_id);
-            if cache_model.as_deref() != Some(cache_key.as_str()) {
-                if let Ok(mut cache) = self.query_embed_cache.lock() {
-                    cache.clear();
-                }
-                *cache_model = Some(cache_key.clone());
-                tracing::info!(model = %cache_key, "Flushed query-embed cache on model change");
-            }
         }
         Ok(())
     }
@@ -691,7 +674,10 @@ impl AppState {
                 embedder.dims(),
             )
         };
-        let db_path = self.notebook_db_path(notebook_id)?;
+        // Resolve the pool before taking the index lock: a registry cache miss
+        // may need AppDb, while publication/retrieval lock AppDb before indices.
+        let pool = self.notebook_db_pool(notebook_id)?;
+        let db_path = pool.db_path();
         let index_path = crate::ingestion::embed::native_dense_artifact_path(
             db_path
                 .parent()
@@ -701,9 +687,7 @@ impl AppState {
             .hnsw_indices
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        let stored = self.with_notebook_db(notebook_id, |db| {
-            db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
-        })?;
+        let stored = pool.read(|db| db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID))?;
         if !stored
             .as_ref()
             .is_some_and(|stored| stored.identity_matches(&expected))
@@ -722,7 +706,7 @@ impl AppState {
                 return Ok(());
             }
         }
-        let index = self.with_notebook_db(notebook_id, |db| {
+        let index = pool.read(|db| {
             crate::ingestion::dense::load_published_dense_index(db, &index_path, &expected)
         })?;
         indices.insert(notebook_id.to_string(), index);
@@ -735,7 +719,8 @@ impl AppState {
 
     /// Persist detached-vector cleanup without promoting publication metadata.
     pub fn save_hnsw_index(&self, notebook_id: &str) -> Result<(), GlossError> {
-        let db_path = self.notebook_db_path(notebook_id)?;
+        let pool = self.notebook_db_pool(notebook_id)?;
+        let db_path = pool.db_path();
         let index_path = crate::ingestion::embed::native_dense_artifact_path(
             db_path
                 .parent()
@@ -747,7 +732,7 @@ impl AppState {
             .map_err(|e| GlossError::Other(e.to_string()))?;
         if let Some(index) = indices.get(notebook_id) {
             if index.has_pending_changes() {
-                self.with_notebook_db_write(notebook_id, |db| {
+                pool.write(|db| {
                     crate::ingestion::dense::publish_dense_cleanup(db, &index_path, index)
                 })?;
             }
@@ -999,16 +984,22 @@ impl AppState {
         now.saturating_sub(*last) / 1000
     }
 
-    pub(crate) fn notebook_db_path(&self, notebook_id: &str) -> Result<PathBuf, GlossError> {
-        let pool = self.notebook_pools.get_or_create(notebook_id, || {
+    fn notebook_db_pool(
+        &self,
+        notebook_id: &str,
+    ) -> Result<Arc<crate::db::notebook_pool::NotebookDbPool>, GlossError> {
+        self.notebook_pools.get_or_create(notebook_id, || {
             let app_db = self
                 .app_db
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
             let notebook = app_db.get_notebook(notebook_id)?;
             Ok(PathBuf::from(notebook.directory).join("notebook.db"))
-        })?;
-        Ok(pool.db_path().to_path_buf())
+        })
+    }
+
+    pub(crate) fn notebook_db_path(&self, notebook_id: &str) -> Result<PathBuf, GlossError> {
+        Ok(self.notebook_db_pool(notebook_id)?.db_path().to_path_buf())
     }
 
     /// Execute a function with a notebook database connection.
@@ -1019,14 +1010,7 @@ impl AppState {
     where
         F: FnOnce(&NotebookDb) -> Result<T, GlossError>,
     {
-        let pool = self.notebook_pools.get_or_create(notebook_id, || {
-            let app_db = self
-                .app_db
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            let notebook = app_db.get_notebook(notebook_id)?;
-            Ok(PathBuf::from(notebook.directory).join("notebook.db"))
-        })?;
+        let pool = self.notebook_db_pool(notebook_id)?;
         pool.read(f)
     }
 
@@ -1037,14 +1021,7 @@ impl AppState {
     where
         F: FnOnce(&NotebookDb) -> Result<T, GlossError>,
     {
-        let pool = self.notebook_pools.get_or_create(notebook_id, || {
-            let app_db = self
-                .app_db
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            let notebook = app_db.get_notebook(notebook_id)?;
-            Ok(PathBuf::from(notebook.directory).join("notebook.db"))
-        })?;
+        let pool = self.notebook_db_pool(notebook_id)?;
         pool.write(f)
     }
 
@@ -1058,6 +1035,24 @@ impl AppState {
     /// (the caller decides whether to silently degrade to BM25 or surface
     /// a toast).
     pub fn get_or_embed_query(&self, query: &str) -> Result<Vec<f32>, GlossError> {
+        let service = self
+            .embedder
+            .read()
+            .map_err(|e| GlossError::Other(e.to_string()))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
+        let config_guard = self
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let current_config =
+            crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&config_guard)?;
+        if service.configured_identity.as_ref() != Some(&current_config) {
+            return Err(GlossError::Embedding(
+                "Embedding configuration changed; retry required".into(),
+            ));
+        }
         // Cache lookup
         {
             let mut cache = self
@@ -1070,17 +1065,21 @@ impl AppState {
         }
 
         // Cache miss: embed fresh
-        let embedding = {
-            let embedder_arc: Arc<EmbeddingService> = {
-                let guard = self.embedder.read().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .as_ref()
-                    .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?
-                    .clone()
-            };
-            embedder_arc.embed_one(query)?
-        };
+        drop(config_guard);
+        let _inference = self.try_native_inference()?;
+        let embedding = service.embed_one(query)?;
 
+        let config_guard = self
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        if crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&config_guard)?
+            != current_config
+        {
+            return Err(GlossError::Embedding(
+                "Embedding configuration changed during query; retry required".into(),
+            ));
+        }
         // Store
         if let Ok(mut cache) = self.query_embed_cache.lock() {
             cache.insert(query.to_string(), embedding.clone());
@@ -1115,14 +1114,13 @@ impl AppState {
                 let embedder_guard = self.embedder.read().unwrap_or_else(|e| e.into_inner());
                 embedder_guard.clone()
             };
-            let indices_guard = self.hnsw_indices.lock().unwrap_or_else(|e| e.into_inner());
-            let index = indices_guard.get(notebook_id);
+            let index_available = self.hnsw_indices.lock().map_err(|e| GlossError::Other(e.to_string()))?.contains_key(notebook_id);
             // Pre-compute the query embedding through the LRU cache so that
             // repeated identical queries ("yes", "explain more", a regenerated
             // message) don't re-hit Ollama / FastEmbed. The cache miss path
             // (which actually calls embed_one) is what gets the timeout / error
             // surfaced to the user. (See hostile audit B4.)
-            let cached_query_embedding = match embedder.as_deref() {
+            let cached_query_embedding = match embedder.as_deref().filter(|_| dense_block_reason.is_none() && index_available) {
                 Some(_emb) => match self.get_or_embed_query(query) {
                     Ok(vec) => Some(vec),
                     Err(e) => {
@@ -1132,10 +1130,24 @@ impl AppState {
                 },
                 None => None,
             };
+            // Never hold the index cache while querying the embedding owner:
+            // model replacement clears this cache under the embedder lock.
+            let config_guard = self.app_db.lock().map_err(|e| GlossError::Other(e.to_string()))?;
+            let current_config = crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&config_guard);
+            let config_matches = current_config.as_ref().is_ok_and(|config| embedder.as_ref().is_some_and(|service| service.configured_identity.as_ref() == Some(config)));
+            if let Err(error) = &current_config {
+                tracing::warn!(error = %error, "Invalid embedding configuration; retaining lexical retrieval");
+            }
+            let current_metadata = nb_db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)?;
+            let dense_block_reason = if !config_matches || !current_metadata.as_ref().is_some_and(|metadata| metadata.status == "ready") {
+                Some(RetrievalReasonCode::EmbeddingIndexMetadataStale)
+            } else { dense_block_reason.clone() };
+            let indices_guard = self.hnsw_indices.lock().map_err(|e| GlossError::Other(e.to_string()))?;
+            let index = indices_guard.get(notebook_id);
             hybrid_search::local_retrieval_outcome_with_query(
                 query,
                 nb_db,
-                embedder.as_deref(),
+                embedder.as_deref().filter(|_| cached_query_embedding.is_some()),
                 index,
                 cached_query_embedding.as_deref(),
                 dense_block_reason.clone(),
@@ -1230,6 +1242,52 @@ mod tests {
         assert_eq!(state.data_dir, dir.path());
         assert!(dir.path().join("gloss.db").is_file());
         assert!(dir.path().join("notebooks").is_dir());
+    }
+
+    #[test]
+    fn startup_preserves_explicit_download_consent_and_seeds_missing_as_false() {
+        let dir = tempdir().unwrap();
+        let state = AppState::initialize_for_test(dir.path()).unwrap();
+        assert_eq!(
+            state
+                .app_db
+                .lock()
+                .unwrap()
+                .get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+        drop(state);
+        let state = AppState::initialize_for_test(dir.path()).unwrap();
+        assert_eq!(
+            state
+                .app_db
+                .lock()
+                .unwrap()
+                .get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+        state
+            .app_db
+            .lock()
+            .unwrap()
+            .set_setting(features::FASTEMBED_DOWNLOAD_CONSENT, "true")
+            .unwrap();
+        drop(state);
+        let state = AppState::initialize_for_test(dir.path()).unwrap();
+        assert_eq!(
+            state
+                .app_db
+                .lock()
+                .unwrap()
+                .get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
     }
 
     /// Reproduces the production call pattern for `ensure_embedder` (warmup

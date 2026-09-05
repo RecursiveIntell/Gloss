@@ -10,6 +10,9 @@ interface NotebookStore {
   notebooks: Notebook[];
   activeNotebookId: string | null;
   activationStatus: 'idle' | 'pending' | 'confirmed' | 'error';
+  activationRequestId: number;
+  activationTargetId: string | null;
+  activationError: string | null;
   loading: boolean;
   loadNotebooks: () => Promise<void>;
   createNotebook: (name: string) => Promise<string>;
@@ -19,6 +22,9 @@ interface NotebookStore {
 }
 
 const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
+// Serialize real IPC effects, not just their UI responses. Every caller still
+// receives its own operation result, including create/import activation.
+let activationQueue: Promise<void> = Promise.resolve();
 
 function readActiveNotebookId(): string | null {
   return typeof globalThis.localStorage === 'undefined'
@@ -30,6 +36,9 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
   notebooks: [],
   activeNotebookId: readActiveNotebookId(),
   activationStatus: readActiveNotebookId() ? 'pending' : 'idle',
+  activationRequestId: 0,
+  activationTargetId: readActiveNotebookId(),
+  activationError: null,
   loading: false,
 
   loadNotebooks: async () => {
@@ -76,36 +85,37 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
       return;
     }
 
-    set({ activationStatus: 'pending' });
-    if (id) {
-      const targetId = id;
+    const requestId = get().activationRequestId + 1;
+    set({ activationStatus: 'pending', activationRequestId: requestId, activationTargetId: id, activationError: null });
+    const operation = activationQueue.then(async () => {
       try {
-        await api.setActiveNotebook(targetId);
+        await api.setActiveNotebook(id);
         useChatStore.getState().resetForNotebookSwitch();
         useNoteStore.getState().resetForNotebookSwitch();
         useSourceStore.getState().resetForNotebookSwitch();
-        localStorage.setItem(ACTIVE_NB_KEY, targetId);
-        set({ activeNotebookId: targetId, activationStatus: 'confirmed' });
-        await get().loadNotebooks();
+        // This cache remembers a preference only. Its failure cannot undo the
+        // backend acknowledgment or leave the frontend pointing elsewhere.
+        try {
+          if (id) localStorage.setItem(ACTIVE_NB_KEY, id);
+          else localStorage.removeItem(ACTIVE_NB_KEY);
+        } catch (error) {
+          console.warn('Could not remember the active notebook locally:', error);
+        }
+        const latest = get().activationRequestId === requestId;
+        set({ activeNotebookId: id, activationStatus: latest ? (id ? 'confirmed' : 'idle') : 'pending' });
+        if (id) await get().loadNotebooks();
       } catch (e) {
         console.warn('Notebook activation failed:', e);
-        set({ activationStatus: 'error' });
+        if (get().activationRequestId === requestId) {
+          set({ activationStatus: 'error', activationError: e instanceof Error ? e.message : String(e) });
+        }
         throw e;
       }
-    } else {
-      try {
-        await api.setActiveNotebook(null);
-        useChatStore.getState().resetForNotebookSwitch();
-        useNoteStore.getState().resetForNotebookSwitch();
-        useSourceStore.getState().resetForNotebookSwitch();
-        localStorage.removeItem(ACTIVE_NB_KEY);
-        set({ activeNotebookId: null, activationStatus: 'idle' });
-      } catch (e) {
-        console.warn('Failed to clear active notebook:', e);
-        set({ activationStatus: 'error' });
-        throw e;
-      }
-    }
+    });
+    // An explicit later request may proceed after a failure. This continuation
+    // never retries the failed operation and does not swallow its caller result.
+    activationQueue = operation.then(() => undefined, () => undefined);
+    return operation;
   },
 }));
 

@@ -1,11 +1,99 @@
 use super::{
-    provider_cancelled_error, provider_http_error, ChatRequest, ChatToken, LlmExecutionContext,
+    provider_cancelled_error, provider_http_failure, ChatRequest, ChatToken, LlmExecutionContext,
     LlmProvider, ModelInfo, ProviderType,
 };
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
+use futures::StreamExt;
+use std::collections::VecDeque;
 use std::pin::Pin;
+
+const MAX_OLLAMA_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_OLLAMA_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+fn ollama_protocol_error(message: impl std::fmt::Display) -> GlossError {
+    GlossError::Provider {
+        provider: "ollama".into(),
+        source: anyhow::anyhow!("Ollama response protocol error: {message}"),
+    }
+}
+
+/// Ollama emits NDJSON, not independently decodable network chunks. Retain raw
+/// bytes until a complete line (or exact EOF JSON value) is available. Never
+/// repair malformed JSON, replace invalid UTF-8, skip bad frames or invent done.
+#[derive(Default)]
+struct OllamaStreamDecoder {
+    line: Vec<u8>,
+    terminal: bool,
+    failed: bool,
+}
+
+impl OllamaStreamDecoder {
+    fn parse_line(&mut self) -> Result<Option<ChatToken>, GlossError> {
+        let bytes = std::mem::take(&mut self.line);
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| ollama_protocol_error("invalid UTF-8 in NDJSON frame"))?;
+        // Empty separator lines and CRLF are accepted; neither is a response.
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        let value = serde_json::from_str(text)
+            .map_err(|_| ollama_protocol_error("malformed or truncated NDJSON frame"))?;
+        let token = ollama_chat_token_from_value(&value)?;
+        self.terminal = token.done;
+        Ok(Some(token))
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Vec<Result<ChatToken, GlossError>> {
+        let mut tokens = Vec::new();
+        for &byte in bytes {
+            if self.terminal || self.failed {
+                break;
+            }
+            if byte == b'\n' {
+                match self.parse_line() {
+                    Ok(Some(token)) => tokens.push(Ok(token)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.failed = true;
+                        tokens.push(Err(error));
+                    }
+                }
+            } else if self.line.len() == MAX_OLLAMA_FRAME_BYTES {
+                self.failed = true;
+                self.line.clear();
+                tokens.push(Err(ollama_protocol_error(
+                    "NDJSON frame exceeds 1 MiB limit",
+                )));
+            } else {
+                self.line.push(byte);
+            }
+        }
+        tokens
+    }
+
+    fn finish(&mut self) -> Vec<Result<ChatToken, GlossError>> {
+        if self.terminal || self.failed {
+            return Vec::new();
+        }
+        let mut tokens = Vec::new();
+        match self.parse_line() {
+            Ok(Some(token)) => tokens.push(Ok(token)),
+            Ok(None) => {}
+            Err(error) => {
+                self.failed = true;
+                tokens.push(Err(error));
+                return tokens;
+            }
+        }
+        if !self.terminal {
+            self.failed = true;
+            tokens.push(Err(ollama_protocol_error("stream ended before done: true")));
+        }
+        tokens
+    }
+}
 
 /// Ollama LLM provider implementation.
 pub struct OllamaProvider {
@@ -23,20 +111,36 @@ impl OllamaProvider {
 }
 
 fn ollama_chat_token_from_value(val: &serde_json::Value) -> Result<ChatToken, GlossError> {
-    if let Some(error) = val.get("error").and_then(|error| error.as_str()) {
+    if let Some(error) = val.get("error") {
+        let message = error
+            .as_str()
+            .ok_or_else(|| ollama_protocol_error("error field must be a string"))?;
         return Err(GlossError::Provider {
             provider: "ollama".into(),
-            source: anyhow::anyhow!("Ollama stream error: {error}"),
+            source: anyhow::anyhow!(
+                "Ollama stream error: {}",
+                super::sanitize_provider_error_body(message)
+            ),
         });
     }
 
-    let done = val.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
-    let token = val
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
+    let done = val
+        .get("done")
+        .and_then(|d| d.as_bool())
+        .ok_or_else(|| ollama_protocol_error("frame must contain boolean done"))?;
+    let token = match val.get("message") {
+        Some(message) => message
+            .get("content")
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| ollama_protocol_error("message.content must be a string"))?
+            .to_string(),
+        None if done => String::new(),
+        None => {
+            return Err(ollama_protocol_error(
+                "nonterminal frame is missing message",
+            ))
+        }
+    };
     Ok(ChatToken { token, done })
 }
 
@@ -168,125 +272,103 @@ impl LlmProvider for OllamaProvider {
         };
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            // F3: bound the error body to ~1KB so a hostile / misconfigured
-            // server can't fill the logs with megabytes of HTML or stack
-            // traces. Use bytes (cheap) instead of text (allocates).
-            let text = {
-                match resp.bytes().await {
-                    Ok(b) => String::from_utf8_lossy(&b[..b.len().min(1024)]).to_string(),
-                    Err(_) => String::new(),
-                }
-            };
-            return Err(provider_http_error("ollama", status, &text));
+            return Err(provider_http_failure("ollama", resp, &ctx).await);
         }
 
         if request.stream {
-            // Streaming: parse NDJSON stream
             let byte_stream = resp.bytes_stream();
-            use futures::StreamExt;
-            use llm_pipeline::StreamingDecoder;
-
+            // One token per poll keeps cancellation authoritative even when one
+            // HTTP chunk contains many JSON frames. Error/done fuses the stream.
             let stream = stream::unfold(
-                (byte_stream, StreamingDecoder::new(), ctx.clone()),
-                |(mut byte_stream, mut decoder, ctx)| async move {
-                    use futures::TryStreamExt;
+                Some((
+                    byte_stream,
+                    OllamaStreamDecoder::default(),
+                    VecDeque::<Result<ChatToken, GlossError>>::new(),
+                    ctx,
+                )),
+                |state| async move {
+                    let (mut byte_stream, mut decoder, mut pending, ctx) = state?;
                     loop {
+                        if ctx.is_cancelled() {
+                            return Some((
+                                Err(provider_cancelled_error(
+                                    "ollama",
+                                    "before_yield_token",
+                                    ctx.attempt_id.as_deref(),
+                                )),
+                                None,
+                            ));
+                        }
+                        if let Some(token) = pending.pop_front() {
+                            let finished = match &token {
+                                Ok(token) => token.done,
+                                Err(_) => true,
+                            };
+                            let next = if finished {
+                                None
+                            } else {
+                                Some((byte_stream, decoder, pending, ctx))
+                            };
+                            return Some((token, next));
+                        }
                         let next = tokio::select! {
                             _ = ctx.cancellation.cancelled() => {
-                                return Some((
-                                    stream::iter(vec![Err(provider_cancelled_error("ollama", "reading_stream_chunk", ctx.attempt_id.as_deref()))]),
-                                    (byte_stream, decoder, ctx),
-                                ));
+                                return Some((Err(provider_cancelled_error(
+                                    "ollama", "reading_stream_chunk", ctx.attempt_id.as_deref(),
+                                )), None));
                             }
-                            next = byte_stream.try_next() => next,
+                            next = byte_stream.next() => next,
                         };
                         match next {
-                            Ok(Some(bytes)) => {
-                                if ctx.is_cancelled() {
-                                    return Some((
-                                        stream::iter(vec![Err(provider_cancelled_error("ollama", "before_yield_token", ctx.attempt_id.as_deref()))]),
-                                        (byte_stream, decoder, ctx),
-                                    ));
-                                }
-                                let values = decoder.decode(&bytes);
-                                let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
-                                for val in values {
-                                    tokens.push(ollama_chat_token_from_value(&val));
-                                }
-                                if !tokens.is_empty() {
-                                    if ctx.is_cancelled() {
-                                        return Some((
-                                            stream::iter(vec![Err(provider_cancelled_error("ollama", "before_yield_token", ctx.attempt_id.as_deref()))]),
-                                            (byte_stream, decoder, ctx),
-                                        ));
-                                    }
-                                    return Some((stream::iter(tokens), (byte_stream, decoder, ctx)));
-                                }
-                            }
-                            Ok(None) => {
-                                // Stream ended — flush decoder
-                                if let Some(val) = decoder.flush() {
-                                    if ctx.is_cancelled() {
-                                        return Some((
-                                            stream::iter(vec![Err(provider_cancelled_error("ollama", "before_terminal_frame", ctx.attempt_id.as_deref()))]),
-                                            (byte_stream, decoder, ctx),
-                                        ));
-                                    }
-                                    return Some((
-                                        stream::iter(vec![ollama_chat_token_from_value(&val)]),
-                                        (byte_stream, decoder, ctx),
-                                    ));
-                                }
-                                return None;
-                            }
-                            Err(e) => {
+                            Some(Ok(bytes)) => pending.extend(decoder.push(&bytes)),
+                            Some(Err(error)) => {
                                 return Some((
-                                    stream::iter(vec![Err(GlossError::Provider {
+                                    Err(GlossError::Provider {
                                         provider: "ollama".into(),
-                                        source: e.into(),
-                                    })]),
-                                    (byte_stream, decoder, ctx),
+                                        source: error.into(),
+                                    }),
+                                    None,
                                 ));
                             }
+                            None => pending.extend(decoder.finish()),
                         }
                     }
                 },
-            )
-            .flatten();
+            );
 
-            Ok(Box::pin(stream))
+            Ok(Box::pin(stream.fuse()))
         } else {
-            // Non-streaming: parse single response
-            let body: serde_json::Value = tokio::select! {
-                _ = ctx.cancellation.cancelled() => {
-                    return Err(provider_cancelled_error("ollama", "reading_non_stream_response", ctx.attempt_id.as_deref()));
+            // Bound non-stream responses while reading, before JSON allocation.
+            let mut resp = resp;
+            let mut bytes = Vec::new();
+            loop {
+                let next = tokio::select! {
+                    _ = ctx.cancellation.cancelled() => {
+                        return Err(provider_cancelled_error("ollama", "reading_non_stream_response", ctx.attempt_id.as_deref()));
+                    }
+                    result = resp.chunk() => result.map_err(|error| GlossError::Provider {
+                        provider: "ollama".into(), source: error.into(),
+                    })?
+                };
+                let Some(chunk) = next else { break };
+                if chunk.len() > MAX_OLLAMA_RESPONSE_BYTES - bytes.len() {
+                    return Err(ollama_protocol_error(
+                        "non-stream response exceeds 8 MiB limit",
+                    ));
                 }
-                result = resp.json() => result.map_err(|e| GlossError::Provider {
-                provider: "ollama".into(),
-                source: e.into(),
-                })?
-            };
+                bytes.extend_from_slice(&chunk);
+            }
+            let body: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|_| ollama_protocol_error("malformed non-stream JSON response"))?;
             ctx.check_cancelled("ollama", "before_terminal_frame")?;
 
-            if let Some(error) = body.get("error").and_then(|error| error.as_str()) {
-                return Err(GlossError::Provider {
-                    provider: "ollama".into(),
-                    source: anyhow::anyhow!("Ollama response error: {error}"),
-                });
+            let token = ollama_chat_token_from_value(&body)?;
+            if !token.done {
+                return Err(ollama_protocol_error(
+                    "non-stream response is missing done: true",
+                ));
             }
-
-            let content = body
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            Ok(Box::pin(stream::iter(vec![Ok(ChatToken {
-                token: content,
-                done: true,
-            })])))
+            Ok(Box::pin(stream::iter(vec![Ok(token)])))
         }
     }
 
@@ -371,5 +453,221 @@ mod tests {
         let token = ollama_chat_token_from_value(&value).expect("normal frame should parse");
         assert_eq!(token.token, "gloss smoke ok");
         assert!(token.done);
+    }
+
+    #[test]
+    fn ndjson_preserves_multibyte_content_at_every_chunk_boundary() {
+        let wire = "{\"message\":{\"content\":\"你好 🦀\"},\"done\":false}\r\n{\"done\":true}\n";
+        for split in 0..=wire.len() {
+            let mut decoder = OllamaStreamDecoder::default();
+            let mut tokens = decoder.push(&wire.as_bytes()[..split]);
+            tokens.extend(decoder.push(&wire.as_bytes()[split..]));
+            tokens.extend(decoder.finish());
+            let tokens: Vec<_> = tokens.into_iter().collect::<Result<_, _>>().unwrap();
+            assert_eq!(tokens.len(), 2);
+            assert_eq!(tokens[0].token, "你好 🦀");
+            assert!(!tokens[0].done);
+            assert!(tokens[1].done);
+        }
+        let mut decoder = OllamaStreamDecoder::default();
+        let tokens: Vec<_> = wire
+            .as_bytes()
+            .chunks(1)
+            .flat_map(|bytes| decoder.push(bytes))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(tokens[0].token, "你好 🦀");
+        assert!(tokens[1].done);
+    }
+
+    #[test]
+    fn ndjson_preserves_prior_tokens_and_fails_at_first_bad_frame() {
+        for bad in [
+            b"{garbage}\n".as_slice(),
+            b"{\"message\":{\"content\":\"\xff\"},\"done\":false}\n",
+            b"{\"message\":{\"content\":17},\"done\":false}\n",
+            b"{\"message\":{\"content\":\"lost\"}}\n",
+            b"{\"done\":\"true\"}\n",
+            b"{\"error\":17}\n",
+            b"{\"done\":false}\n",
+            b"[]\n",
+        ] {
+            let mut decoder = OllamaStreamDecoder::default();
+            let mut bytes = b"{\"message\":{\"content\":\"kept\"},\"done\":false}\n".to_vec();
+            bytes.extend_from_slice(bad);
+            bytes.extend_from_slice(b"{\"done\":true}\n");
+            let mut tokens = decoder.push(&bytes).into_iter();
+            assert_eq!(tokens.next().unwrap().unwrap().token, "kept");
+            assert!(tokens.next().unwrap().is_err());
+            assert!(tokens.next().is_none());
+            assert!(decoder.finish().is_empty());
+            assert!(decoder.push(b"{\"done\":true}\n").is_empty());
+        }
+    }
+
+    #[test]
+    fn ndjson_eof_requires_complete_json_and_real_terminal_marker() {
+        for wire in [
+            "",
+            " \r\n",
+            "{\"done\":tru",
+            "{\"done\":true",
+            "{\"message\":{\"content\":\"partial\"},\"done\":false}",
+            "{\"message\":{\"content\":\"partial\"},\"done\":false}\n",
+        ] {
+            let mut decoder = OllamaStreamDecoder::default();
+            let mut tokens = decoder.push(wire.as_bytes());
+            tokens.extend(decoder.finish());
+            assert!(tokens.iter().any(Result::is_err), "must reject {wire:?}");
+            assert!(!tokens
+                .iter()
+                .any(|item| item.as_ref().is_ok_and(|token| token.done)));
+        }
+        let mut decoder = OllamaStreamDecoder::default();
+        assert!(decoder.push(b"{\"done\":true}").is_empty());
+        assert!(decoder.finish().remove(0).unwrap().done);
+    }
+
+    #[test]
+    fn ndjson_bounds_frame_before_unbounded_allocation() {
+        let mut decoder = OllamaStreamDecoder::default();
+        assert!(decoder.push(&vec![b'x'; MAX_OLLAMA_FRAME_BYTES]).is_empty());
+        let error = decoder.push(b"x").remove(0).unwrap_err();
+        assert!(error.to_string().contains("1 MiB"));
+        assert!(decoder.line.is_empty());
+        assert!(decoder.push(&vec![b'x'; MAX_OLLAMA_FRAME_BYTES]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn actual_ollama_stream_reports_malformed_truncated_and_missing_done() {
+        for body in [
+            b"{invalid}\n".as_slice(),
+            b"{\"done\":true",
+            b"{\"message\":{\"content\":\"partial\"},\"done\":false}\n",
+            b"{\"message\":{\"content\":\"\xff\"},\"done\":false}\n",
+        ] {
+            let (url, fixture) =
+                super::super::test_http::respond("200 OK", body.to_vec(), "").await;
+            let provider = OllamaProvider::new(&url, super::super::build_shared_client().unwrap());
+            let mut stream = provider
+                .chat(smoke_request(), LlmExecutionContext::uncancellable())
+                .await
+                .unwrap();
+            let mut error = None;
+            while let Some(item) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                    .await
+                    .unwrap()
+            {
+                match item {
+                    Ok(token) => assert!(!token.done),
+                    Err(err) => {
+                        error = Some(err);
+                        break;
+                    }
+                }
+            }
+            assert!(error.is_some(), "bad wire response must fail");
+            assert!(stream.next().await.is_none(), "error must fuse stream");
+            assert!(
+                stream.next().await.is_none(),
+                "closed stream remains closed"
+            );
+            fixture.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_ollama_stream_finishes_and_cancel_discards_buffered_tokens() {
+        let body = "{\"message\":{\"content\":\"你好 🦀\"},\"done\":false}\n{\"message\":{\"content\":\"later\"},\"done\":false}\n{\"done\":true}\n";
+        for cancel_after_first in [false, true] {
+            let (url, fixture) =
+                super::super::test_http::respond("200 OK", body.as_bytes().to_vec(), "").await;
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let ctx = LlmExecutionContext::default_with_token(cancellation.clone());
+            let provider = OllamaProvider::new(&url, super::super::build_shared_client().unwrap());
+            let mut stream = provider.chat(smoke_request(), ctx).await.unwrap();
+            assert_eq!(stream.next().await.unwrap().unwrap().token, "你好 🦀");
+            if cancel_after_first {
+                cancellation.cancel();
+                assert!(stream
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cancelled"));
+            } else {
+                assert_eq!(stream.next().await.unwrap().unwrap().token, "later");
+                assert!(stream.next().await.unwrap().unwrap().done);
+            }
+            assert!(stream.next().await.is_none());
+            assert!(stream.next().await.is_none());
+            fixture.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_ollama_non_stream_does_not_invent_completion() {
+        for body in [
+            "{\"message\":{\"content\":\"partial\"},\"done\":false}",
+            "{\"message\":{\"content\":\"partial\"}}",
+        ] {
+            let (url, fixture) =
+                super::super::test_http::respond("200 OK", body.as_bytes().to_vec(), "").await;
+            let provider = OllamaProvider::new(&url, super::super::build_shared_client().unwrap());
+            let mut request = smoke_request();
+            request.stream = false;
+            assert!(provider
+                .chat(request, LlmExecutionContext::uncancellable())
+                .await
+                .is_err());
+            fixture.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_ollama_non_stream_bounds_response_allocation() {
+        let (url, fixture) = super::super::test_http::respond(
+            "200 OK",
+            vec![b' '; MAX_OLLAMA_RESPONSE_BYTES + 1],
+            "",
+        )
+        .await;
+        let provider = OllamaProvider::new(&url, super::super::build_shared_client().unwrap());
+        let mut request = smoke_request();
+        request.stream = false;
+        let error = match provider
+            .chat(request, LlmExecutionContext::uncancellable())
+            .await
+        {
+            Ok(_) => panic!("oversized non-stream response must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("8 MiB"));
+        fixture.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actual_ollama_terminal_frame_finishes_without_waiting_for_eof() {
+        let (url, fixture) = super::super::test_http::hold_open(
+            "200 OK",
+            b"{\"message\":{\"content\":\"complete\"},\"done\":true}\n".to_vec(),
+        )
+        .await;
+        let provider = OllamaProvider::new(&url, super::super::build_shared_client().unwrap());
+        let mut stream = provider
+            .chat(smoke_request(), LlmExecutionContext::uncancellable())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let token = stream.next().await.unwrap().unwrap();
+            assert_eq!(token.token, "complete");
+            assert!(token.done);
+            assert!(stream.next().await.is_none());
+        })
+        .await;
+        fixture.abort();
+        result.expect("a done frame ends the stream without waiting for server EOF");
     }
 }

@@ -21,6 +21,7 @@ semantic-memory-turbo-quant = [
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+toml = "0.8"
 
 [dependencies]
 log = "0.4"

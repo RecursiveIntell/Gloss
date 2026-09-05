@@ -1,118 +1,29 @@
 use crate::db::notebook_db::NotebookDb;
 use crate::error::GlossError;
 use crate::ingestion::chunk::chunk_text_with_title;
-use crate::providers::ollama::OllamaProvider;
 use crate::providers::LlmProvider;
 use crate::redaction::redact_path;
 use crate::tool_invocation::{
     run_tool_output_receipt, run_tool_status_receipt, ToolInvocationReceiptV1,
 };
 use base64::prelude::*;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri_queue::{JobContext, JobHandler, JobResult, QueueError, QueueManager};
 
-/// Background jobs for Gloss.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum GlossJob {
-    /// Generate a summary for a single source using the LLM.
-    SummarizeSource {
-        #[serde(default)]
-        epoch: u64,
-        notebook_id: String,
-        source_id: String,
-        source_title: String,
-        data_dir: String,
-        ollama_url: String,
-        model: String,
-    },
-    /// Describe an image using a vision-capable LLM.
-    DescribeImage {
-        #[serde(default)]
-        epoch: u64,
-        notebook_id: String,
-        source_id: String,
-        source_title: String,
-        data_dir: String,
-        ollama_url: String,
-        model: String,
-        #[serde(default = "default_chunk_target_tokens")]
-        chunk_target_tokens: usize,
-    },
-    /// Extract frames from a video and describe them using a vision model.
-    DescribeVideo {
-        #[serde(default)]
-        epoch: u64,
-        notebook_id: String,
-        source_id: String,
-        source_title: String,
-        data_dir: String,
-        ollama_url: String,
-        model: String,
-        #[serde(default = "default_chunk_target_tokens")]
-        chunk_target_tokens: usize,
-    },
-    /// Extract bounded audio metadata through ffprobe and cached Whisper transcript when available.
-    ExtractAudioMetadata {
-        #[serde(default)]
-        epoch: u64,
-        notebook_id: String,
-        source_id: String,
-        source_title: String,
-        data_dir: String,
-        #[serde(default = "default_chunk_target_tokens")]
-        chunk_target_tokens: usize,
-    },
-    /// C2 — Background re-embed / re-index job for a source's chunks. Uses
-    /// local FastEmbed (Nomic v2 MoE) for embeddings - no Ollama needed.
-    IndexChunks {
-        #[serde(default)]
-        epoch: u64,
-        notebook_id: String,
-        source_id: String,
-        data_dir: String,
-    },
-}
-
-fn default_chunk_target_tokens() -> usize {
-    1100
-}
-
-/// Scheduling authority for a queue job. The summary worker must consult this
-/// policy instead of applying summary throttles to unrelated ingestion/media
-/// work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JobResourcePolicy {
-    pub requires_active_notebook: bool,
-    pub respects_summary_pause: bool,
-    pub respects_chat_grace: bool,
-    pub requires_gpu_gate: bool,
-    pub requires_llm_gate: bool,
-}
-
-impl JobResourcePolicy {
-    const SUMMARY: Self = Self {
-        requires_active_notebook: true,
-        respects_summary_pause: true,
-        respects_chat_grace: true,
-        requires_gpu_gate: true,
-        requires_llm_gate: true,
-    };
-    const INGESTION: Self = Self {
-        requires_active_notebook: false,
-        respects_summary_pause: false,
-        respects_chat_grace: false,
-        requires_gpu_gate: false,
-        requires_llm_gate: false,
-    };
-}
+pub mod queue_policy;
+pub(crate) use queue_policy::{
+    cancel_disallowed_auto_summaries, cancel_jobs_matching,
+    cancel_jobs_not_matching_active_notebook, cancel_summary_jobs, has_jobs_for_notebook_epoch,
+};
+pub use queue_policy::{GlossJob, JobResourcePolicy};
 
 impl JobHandler for GlossJob {
     async fn execute(&self, ctx: &JobContext) -> Result<JobResult, QueueError> {
         match self {
             GlossJob::SummarizeSource {
+                explicit_requested,
                 epoch: _,
                 notebook_id,
                 source_id,
@@ -123,6 +34,7 @@ impl JobHandler for GlossJob {
             } => {
                 execute_summarize(
                     ctx,
+                    *explicit_requested,
                     notebook_id,
                     source_id,
                     source_title,
@@ -214,51 +126,8 @@ impl JobHandler for GlossJob {
     }
 }
 
-impl GlossJob {
-    pub fn resource_policy(&self) -> JobResourcePolicy {
-        match self {
-            GlossJob::SummarizeSource { .. } => JobResourcePolicy::SUMMARY,
-            GlossJob::DescribeImage { .. }
-            | GlossJob::DescribeVideo { .. }
-            | GlossJob::ExtractAudioMetadata { .. }
-            | GlossJob::IndexChunks { .. } => JobResourcePolicy::INGESTION,
-        }
-    }
-
-    pub fn notebook_id(&self) -> &str {
-        match self {
-            GlossJob::SummarizeSource { notebook_id, .. }
-            | GlossJob::DescribeImage { notebook_id, .. }
-            | GlossJob::DescribeVideo { notebook_id, .. }
-            | GlossJob::ExtractAudioMetadata { notebook_id, .. }
-            | GlossJob::IndexChunks { notebook_id, .. } => notebook_id,
-        }
-    }
-
-    pub fn source_id(&self) -> &str {
-        match self {
-            GlossJob::SummarizeSource { source_id, .. }
-            | GlossJob::DescribeImage { source_id, .. }
-            | GlossJob::DescribeVideo { source_id, .. }
-            | GlossJob::ExtractAudioMetadata { source_id, .. }
-            | GlossJob::IndexChunks { source_id, .. } => source_id,
-        }
-    }
-
-    pub fn epoch(&self) -> u64 {
-        match self {
-            GlossJob::SummarizeSource { epoch, .. }
-            | GlossJob::DescribeImage { epoch, .. }
-            | GlossJob::DescribeVideo { epoch, .. }
-            | GlossJob::ExtractAudioMetadata { epoch, .. }
-            | GlossJob::IndexChunks { epoch, .. } => *epoch,
-        }
-    }
-}
-
 // EXECUTE_INDEX_CHUNKS_IMPLEMENTED
-// The IndexChunks job uses local FastEmbed (Nomic v2 MoE) for embeddings.
-// No Ollama needed - model is hardcoded to nomic-ai/nomic-embed-text-v1.5
+// IndexChunks uses the explicitly configured embedding backend.
 
 /// Maximum chunks to batch embed at a time (balances VRAM pressure vs round-trips).
 const MAX_CHUNKS_PER_BATCH: usize = 64;
@@ -309,48 +178,18 @@ async fn execute_index_chunks(
     tracing::info!(
         source_id,
         chunks = unindexed_chunks.len(),
-        "Indexing chunks with local candle embedder (nomic v1.5)"
+        "Indexing chunks with configured embedding backend"
     );
 
-    // Create the embedder honoring the configured embedding backend.
-    // Local CPU candle (Nomic v1.5 MoE) is the automatic fallback when Ollama
-    // is not configured or unreachable — no manual setup required.
+    // Read one explicit configuration; errors never select another backend.
     let cache_dir = PathBuf::from(data_dir).join("models");
-    std::fs::create_dir_all(&cache_dir).ok();
-    let app_db_path = PathBuf::from(data_dir).join("gloss.db");
-    let app_db = crate::db::app_db::AppDb::open(&app_db_path).map_err(|e| {
-        QueueError::Execution(format!("Failed to open app DB for embedding config: {e}"))
-    })?;
-    let provider = app_db
-        .get_setting("semantic_memory_embedding_provider")
-        .ok()
-        .flatten();
-    let url = app_db
-        .get_setting("semantic_memory_embedding_url")
-        .ok()
-        .flatten();
-    let model = app_db
-        .get_setting("semantic_memory_embedding_model")
-        .ok()
-        .flatten();
-    let timeout_secs = app_db
-        .get_setting("semantic_memory_embedding_timeout_secs")
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse::<u64>().ok());
-    let download_consent = app_db
-        .get_setting(crate::features::FASTEMBED_DOWNLOAD_CONSENT)
-        .map(crate::commands::chat::setting_is_enabled)
-        .unwrap_or(false);
-    let embedder = crate::ingestion::embed::EmbeddingService::from_configured_provider(
-        provider.as_deref(),
-        url.as_deref(),
-        model.as_deref(),
-        timeout_secs,
-        &cache_dir,
-        download_consent,
-    )
-    .map_err(|e| QueueError::Execution(format!("Failed to create embedder: {e}")))?;
+    std::fs::create_dir_all(&cache_dir).map_err(|e| QueueError::Execution(e.to_string()))?;
+    let app_db = crate::db::app_db::AppDb::open(&PathBuf::from(data_dir).join("gloss.db"))
+        .map_err(|e| QueueError::Execution(e.to_string()))?;
+    let config = crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&app_db)
+        .map_err(|e| QueueError::Execution(e.to_string()))?;
+    let embedder = crate::ingestion::embed::EmbeddingService::from_config(&config, &cache_dir)
+        .map_err(|e| QueueError::Execution(format!("Failed to create embedder: {e}")))?;
 
     let index_path = crate::ingestion::embed::native_dense_artifact_path(&nb_dir);
     let dims = embedder.dims();
@@ -374,6 +213,21 @@ async fn execute_index_chunks(
         if ctx.is_cancelled() {
             return Err(QueueError::Cancelled);
         }
+        // Queue workers have a separate AppDb connection, so the AppState
+        // mutex alone cannot fence a concurrent atomic settings update.
+        let configuration_guard = rusqlite::Transaction::new_unchecked(
+            app_db.conn(),
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| QueueError::Execution(e.to_string()))?;
+        if crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&app_db)
+            .map_err(|e| QueueError::Execution(e.to_string()))?
+            != config
+        {
+            return Err(QueueError::Execution(
+                "Embedding configuration changed; retry required".into(),
+            ));
+        }
         embedded_count += crate::ingestion::embed::publish_dense_batch(
             &db,
             &index_path,
@@ -382,6 +236,9 @@ async fn execute_index_chunks(
             &metadata,
         )
         .map_err(|e| QueueError::Execution(format!("Failed to commit native dense batch: {e}")))?;
+        configuration_guard
+            .commit()
+            .map_err(|e| QueueError::Execution(e.to_string()))?;
     }
 
     tracing::info!(
@@ -398,81 +255,6 @@ async fn execute_index_chunks(
         })
         .to_string(),
     ))
-}
-
-pub(crate) fn cancel_jobs_matching<F>(queue: &Arc<QueueManager>, mut should_cancel: F) -> u32
-where
-    F: FnMut(&GlossJob, &str) -> bool,
-{
-    let jobs = match queue.list_jobs_with_data() {
-        Ok(jobs) => jobs,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to inspect queue jobs");
-            return 0;
-        }
-    };
-
-    let mut cancelled = 0u32;
-    for (job_id, status, data_json) in jobs {
-        if !matches!(status.as_str(), "pending" | "processing") {
-            continue;
-        }
-
-        let job = match serde_json::from_str::<GlossJob>(&data_json) {
-            Ok(job) => job,
-            Err(e) => {
-                tracing::warn!(job_id, error = %e, "Failed to deserialize queue job");
-                continue;
-            }
-        };
-
-        if !should_cancel(&job, &status) {
-            continue;
-        }
-
-        match queue.cancel(&job_id) {
-            Ok(()) => cancelled += 1,
-            Err(e) => tracing::debug!(job_id, error = %e, "Queue cancellation skipped"),
-        }
-    }
-
-    cancelled
-}
-
-pub(crate) fn cancel_jobs_not_matching_active_notebook(
-    queue: &Arc<QueueManager>,
-    active_notebook_id: Option<&str>,
-    active_epoch: u64,
-) -> u32 {
-    cancel_jobs_matching(queue, |job, _status| match active_notebook_id {
-        Some(active_notebook_id) => {
-            job.resource_policy().requires_active_notebook
-                && (job.notebook_id() != active_notebook_id || job.epoch() != active_epoch)
-        }
-        None => job.resource_policy().requires_active_notebook,
-    })
-}
-
-pub(crate) fn has_jobs_for_notebook_epoch(
-    queue: &Arc<QueueManager>,
-    notebook_id: &str,
-    epoch: u64,
-) -> bool {
-    match queue.list_jobs_with_data() {
-        Ok(jobs) => jobs.into_iter().any(|(_job_id, status, data_json)| {
-            if !matches!(status.as_str(), "pending" | "processing") {
-                return false;
-            }
-            match serde_json::from_str::<GlossJob>(&data_json) {
-                Ok(job) => job.notebook_id() == notebook_id && job.epoch() == epoch,
-                Err(_) => false,
-            }
-        }),
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to inspect queue jobs for dedup");
-            false
-        }
-    }
 }
 
 pub(crate) fn max_pending_epoch_for_notebook(
@@ -1049,6 +831,7 @@ fn audio_metadata_description(
 
 async fn execute_summarize(
     ctx: &JobContext,
+    explicit_requested: bool,
     notebook_id: &str,
     source_id: &str,
     source_title: &str,
@@ -1116,15 +899,33 @@ async fn execute_summarize(
     }
 
     // Create provider and generate summary
-    let provider = OllamaProvider::new(ollama_url, crate::providers::build_shared_client());
+    if !queue_policy::summary_dispatch_allowed(Path::new(data_dir), explicit_requested)
+        .map_err(|error| QueueError::Execution(error.to_string()))?
+    {
+        return Err(QueueError::Cancelled);
+    }
+    let provider = crate::providers::background_provider_for_dispatch(
+        Path::new(data_dir),
+        "summary_model",
+        ollama_url,
+        model,
+    )
+    .map_err(|e| QueueError::Execution(e.to_string()))?;
 
     tracing::info!(source_id, source_title, model, "Generating summary");
 
-    let summary_future =
-        crate::ingestion::summarize::summarize_source(&content, source_title, &provider, model);
+    let summary_future = crate::ingestion::summarize::summarize_source(
+        &content,
+        source_title,
+        provider.as_ref(),
+        model,
+    );
     tokio::pin!(summary_future);
     let (summary, call_receipt) = loop {
-        if ctx.is_cancelled() {
+        if ctx.is_cancelled()
+            || !queue_policy::summary_dispatch_allowed(Path::new(data_dir), explicit_requested)
+                .map_err(|error| QueueError::Execution(error.to_string()))?
+        {
             return Err(QueueError::Cancelled);
         }
 
@@ -1279,9 +1080,27 @@ async fn execute_describe_image(
     );
 
     // Call vision model
-    let provider = OllamaProvider::new(ollama_url, crate::providers::build_shared_client());
-    let description_future =
-        crate::ingestion::vision::describe_image(&image_base64, source_title, &provider, model);
+    let provider = crate::providers::background_provider_for_dispatch(
+        Path::new(data_dir),
+        "vision_model",
+        ollama_url,
+        model,
+    )
+    .map_err(|error| {
+        let message = error.to_string();
+        match db.update_source_status(source_id, "error", Some(&message)) {
+            Ok(()) => QueueError::Execution(message),
+            Err(status_error) => QueueError::Execution(format!(
+                "{message}; cannot persist source failure: {status_error}"
+            )),
+        }
+    })?;
+    let description_future = crate::ingestion::vision::describe_image(
+        &image_base64,
+        source_title,
+        provider.as_ref(),
+        model,
+    );
     tokio::pin!(description_future);
     let (description, vision_call_receipt) = loop {
         if ctx.is_cancelled() {
@@ -1611,7 +1430,6 @@ async fn execute_describe_video(
     );
 
     // Describe each frame
-    let provider = OllamaProvider::new(ollama_url, crate::providers::build_shared_client());
     let mut frame_descriptions = Vec::new();
     let mut video_batch_receipt = crate::commands::chat::receipts::BatchReceiptV1::new(
         "video_frame_description",
@@ -1641,8 +1459,29 @@ async fn execute_describe_video(
         let frame_base64 = BASE64_STANDARD.encode(&frame_bytes);
 
         let frame_title = format!("{} (frame at {}:{:02})", source_title, mins, secs);
-        let frame_future =
-            crate::ingestion::vision::describe_image(&frame_base64, &frame_title, &provider, model);
+        // Each frame is a fresh outbound call. A policy or model change during
+        // a long video job must prevent the next frame from leaving the device.
+        let provider = crate::providers::background_provider_for_dispatch(
+            Path::new(data_dir),
+            "vision_model",
+            ollama_url,
+            model,
+        )
+        .map_err(|error| {
+            let message = error.to_string();
+            match db.update_source_status(source_id, "error", Some(&message)) {
+                Ok(()) => QueueError::Execution(message),
+                Err(status_error) => QueueError::Execution(format!(
+                    "{message}; cannot persist source failure: {status_error}"
+                )),
+            }
+        })?;
+        let frame_future = crate::ingestion::vision::describe_image(
+            &frame_base64,
+            &frame_title,
+            provider.as_ref(),
+            model,
+        );
         tokio::pin!(frame_future);
         let frame_result = loop {
             if ctx.is_cancelled() {

@@ -310,6 +310,16 @@ pub async fn set_active_notebook(
     queue: State<'_, Arc<QueueManager>>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), GlossError> {
+    // A rejected activation must leave the current scheduling owner unchanged.
+    // touch_notebook also rejects a missing registry row.
+    if let Some(ref nb_id) = notebook_id {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        app_db.touch_notebook(nb_id)?;
+    }
+
     let next_epoch = notebook_id.as_deref().map(|nb_id| {
         let current_epoch = state.get_active_epoch();
         let resumed_epoch = jobs::max_pending_epoch_for_notebook(&queue, nb_id).unwrap_or(0);
@@ -319,14 +329,6 @@ pub async fn set_active_notebook(
     let changed = state.set_active_notebook(notebook_id.clone(), next_epoch);
     if !changed {
         return Ok(());
-    }
-
-    if let Some(ref nb_id) = notebook_id {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        app_db.touch_notebook(nb_id)?;
     }
 
     let active_epoch = state.get_active_epoch();
@@ -428,6 +430,7 @@ mod tests {
         let queue = queue(&dir);
         queue
             .add(QueueJob::new(GlossJob::SummarizeSource {
+                explicit_requested: false,
                 epoch: 1,
                 notebook_id: "nb1".to_string(),
                 source_id: "missing".to_string(),
@@ -439,6 +442,7 @@ mod tests {
             .unwrap();
         queue
             .add(QueueJob::new(GlossJob::SummarizeSource {
+                explicit_requested: false,
                 epoch: 1,
                 notebook_id: "nb1".to_string(),
                 source_id: "present".to_string(),

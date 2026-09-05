@@ -39,7 +39,7 @@ impl MemorySearchBackend for GlossLocalMemoryBackend<'_> {
             available: true,
             semantic_memory_feature_enabled: cfg!(feature = "semantic-memory-backend"),
             semantic_memory_available: cfg!(feature = "semantic-memory-backend"),
-            semantic_memory_path: Some("src-tauri/vendor/semantic-memory".to_string()),
+            semantic_memory_path: None,
             index_sync_status: "local".to_string(),
             sync_status: "local".to_string(),
             last_sync_at: None,

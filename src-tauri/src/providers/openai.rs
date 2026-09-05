@@ -1,13 +1,145 @@
 use super::{
-    provider_cancelled_error, provider_http_error, ChatRequest, ChatToken, LlmExecutionContext,
+    provider_cancelled_error, provider_http_failure, ChatRequest, ChatToken, LlmExecutionContext,
     LlmProvider, ModelInfo, ProviderType,
 };
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
-use futures::StreamExt;
 use std::pin::Pin;
 use zeroize::Zeroize;
+
+fn parse_stream_event(data: &str) -> Result<Option<ChatToken>, GlossError> {
+    parse_compatible_stream_event("openai", data)
+}
+
+/// Text completions and explicit refusals are supported; a malformed response
+/// or a tool-only answer cannot be represented as a successful empty token.
+pub(super) fn parse_compatible_response(
+    provider: &str,
+    body: &serde_json::Value,
+) -> Result<ChatToken, GlossError> {
+    let choice = body
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .filter(|choice| choice.is_object())
+        .ok_or_else(|| {
+            super::sse::protocol_error(
+                provider,
+                "Non-stream response requires a nonempty choices array",
+            )
+        })?;
+    if !choice
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|reason| !reason.is_empty())
+    {
+        return Err(super::sse::protocol_error(
+            provider,
+            "Non-stream response is missing a terminal finish_reason",
+        ));
+    }
+    let message = choice
+        .get("message")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            super::sse::protocol_error(provider, "Non-stream choice is missing message object")
+        })?;
+    let content = match message.get("content") {
+        Some(serde_json::Value::String(content)) => content,
+        Some(serde_json::Value::Null) | None => message.get("refusal")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| super::sse::protocol_error(provider, "Non-stream message has no text or refusal; tool-only responses are unsupported"))?,
+        _ => return Err(super::sse::protocol_error(provider, "Non-stream message.content must be a string or null")),
+    };
+    Ok(ChatToken {
+        token: content.to_string(),
+        done: true,
+    })
+}
+
+/// Canonical parser for the OpenAI chat-completion SSE dialect, also used by
+/// llama.cpp's compatible endpoint. Framing/lifecycle belongs to `sse`.
+pub(super) fn parse_compatible_stream_event(
+    provider: &str,
+    data: &str,
+) -> Result<Option<ChatToken>, GlossError> {
+    if data == "[DONE]" {
+        return Ok(Some(ChatToken {
+            token: String::new(),
+            done: true,
+        }));
+    }
+    let value: serde_json::Value = serde_json::from_str(data)
+        .map_err(|_| super::sse::protocol_error(provider, "Invalid JSON in SSE event"))?;
+    if let Some(error) = value.get("error") {
+        let message = error
+            .as_str()
+            .or_else(|| error.get("message").and_then(|message| message.as_str()))
+            .unwrap_or("Provider reported a streaming error");
+        return Err(super::sse::protocol_error(
+            provider,
+            &format!(
+                "Provider stream error: {}",
+                super::sanitize_provider_error_body(message)
+            ),
+        ));
+    }
+    let choices = value
+        .get("choices")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            super::sse::protocol_error(provider, "SSE event is missing choices array")
+        })?;
+    let Some(choice) = choices.first() else {
+        // An explicit usage-only chunk contains an empty choices array.
+        return if value.get("usage").is_some_and(|usage| usage.is_object()) {
+            Ok(None)
+        } else {
+            Err(super::sse::protocol_error(
+                provider,
+                "Empty choices without usage metadata",
+            ))
+        };
+    };
+    let done = match choice.get("finish_reason") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(reason))
+            if matches!(
+                reason.as_str(),
+                "stop" | "length" | "tool_calls" | "content_filter" | "function_call"
+            ) =>
+        {
+            true
+        }
+        _ => {
+            return Err(super::sse::protocol_error(
+                provider,
+                "Invalid finish_reason in SSE event",
+            ))
+        }
+    };
+    let delta = choice
+        .get("delta")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| {
+            super::sse::protocol_error(provider, "SSE choice is missing delta object")
+        })?;
+    let content = match delta.get("content") {
+        None | Some(serde_json::Value::Null) => "",
+        Some(serde_json::Value::String(content)) => content,
+        _ => {
+            return Err(super::sse::protocol_error(
+                provider,
+                "Invalid delta.content in SSE event",
+            ))
+        }
+    };
+    Ok(Some(ChatToken {
+        token: content.to_string(),
+        done,
+    }))
+}
 
 /// OpenAI-compatible LLM provider (also works with OpenAI-compatible APIs).
 pub struct OpenAIProvider {
@@ -131,127 +263,20 @@ impl LlmProvider for OpenAIProvider {
         };
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            // F3: bound the error body to ~1KB so a hostile / misconfigured
-            // server can't fill the logs with megabytes of HTML or stack
-            // traces. Use bytes (cheap) instead of text (allocates).
-            let text = {
-                match resp.bytes().await {
-                    Ok(b) => String::from_utf8_lossy(&b[..b.len().min(1024)]).to_string(),
-                    Err(_) => String::new(),
-                }
-            };
-            return Err(provider_http_error("openai", status, &text));
+            return Err(provider_http_failure("openai", resp, &ctx).await);
         }
 
         if request.stream {
-            let byte_stream = resp.bytes_stream();
-
-            let stream = stream::unfold(
-                (byte_stream, super::sse::SseDecoder::new(), ctx.clone()),
-                |(mut byte_stream, mut buffer, ctx)| async move {
-                    loop {
-                        let next = tokio::select! {
-                            _ = ctx.cancellation.cancelled() => {
-                                return Some((
-                                    stream::iter(vec![Err(provider_cancelled_error("openai", "reading_stream_chunk", ctx.attempt_id.as_deref()))]),
-                                    (byte_stream, buffer, ctx),
-                                ));
-                            }
-                            next = byte_stream.next() => next,
-                        };
-                        match next {
-                            Some(Ok(bytes)) => {
-                                if ctx.is_cancelled() {
-                                    return Some((
-                                        stream::iter(vec![Err(provider_cancelled_error("openai", "before_yield_token", ctx.attempt_id.as_deref()))]),
-                                        (byte_stream, buffer, ctx),
-                                    ));
-                                }
-                                let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
-                                let events = match buffer.push(&bytes) {
-                                    Ok(events) => events,
-                                    Err(error) => return Some((
-                                        stream::iter(vec![Err(GlossError::Provider { provider: "openai".into(), source: anyhow::anyhow!(error) })]),
-                                        (byte_stream, buffer, ctx),
-                                    )),
-                                };
-                                for data in events {
-                                    if data == "[DONE]" {
-                                        tokens.push(Ok(ChatToken { token: String::new(), done: true })); break;
-                                    }
-                                    let val: serde_json::Value = match serde_json::from_str(&data) {
-                                        Ok(val) => val,
-                                        Err(error) => {
-                                            tokens.push(Err(GlossError::Provider { provider: "openai".into(), source: anyhow::anyhow!("Invalid JSON in SSE event: {}", error) })); break;
-                                        }
-                                    };
-                                    if let Some(error) = val.get("error") {
-                                        let message = error.as_str().or_else(|| error.get("message").and_then(|v| v.as_str())).unwrap_or("Provider reported a streaming error");
-                                        let bounded: String = message.chars().take(512).collect();
-                                        tokens.push(Err(GlossError::Provider { provider: "openai".into(), source: anyhow::anyhow!("Provider stream error: {}", bounded) })); break;
-                                    }
-                                    let choice = val.get("choices").and_then(|v| v.get(0));
-                                    let content = choice.and_then(|v| v.get("delta")).and_then(|v| v.get("content")).and_then(|v| v.as_str()).unwrap_or("");
-                                    let done = choice.and_then(|v| v.get("finish_reason")).and_then(|v| v.as_str()).is_some();
-                                    tokens.push(Ok(ChatToken { token: content.to_string(), done }));
-                                    if done { break; }
-                                }
-
-                                if !tokens.is_empty() {
-                                    if ctx.is_cancelled() {
-                                        return Some((
-                                            stream::iter(vec![Err(provider_cancelled_error("openai", "before_yield_token", ctx.attempt_id.as_deref()))]),
-                                            (byte_stream, buffer, ctx),
-                                        ));
-                                    }
-                                    return Some((stream::iter(tokens), (byte_stream, buffer, ctx)));
-                                }
-                            }
-                            Some(Err(e)) => {
-                                return Some((
-                                    stream::iter(vec![Err(GlossError::Provider {
-                                        provider: "openai".into(),
-                                        source: e.into(),
-                                    })]),
-                                    (byte_stream, buffer, ctx),
-                                ));
-                            }
-                            None => {
-                                return None;
-                            }
-                        }
-                    }
-                },
-            )
-            .flatten();
-
-            Ok(Box::pin(stream))
+            Ok(super::sse::response_stream(
+                resp,
+                ctx,
+                "openai",
+                parse_stream_event,
+            ))
         } else {
-            let body: serde_json::Value = tokio::select! {
-                _ = ctx.cancellation.cancelled() => {
-                    return Err(provider_cancelled_error("openai", "reading_non_stream_response", ctx.attempt_id.as_deref()));
-                }
-                result = resp.json() => result.map_err(|e| GlossError::Provider {
-                provider: "openai".into(),
-                source: e.into(),
-                })?
-            };
-            ctx.check_cancelled("openai", "before_terminal_frame")?;
-
-            let content = body
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            Ok(Box::pin(stream::iter(vec![Ok(ChatToken {
-                token: content,
-                done: true,
-            })])))
+            let body = super::bounded_json_response("openai", resp, &ctx).await?;
+            let token = parse_compatible_response("openai", &body)?;
+            Ok(Box::pin(stream::iter(vec![Ok(token)])))
         }
     }
 
@@ -281,9 +306,29 @@ mod tests {
 
     #[test]
     fn shared_client_pool_reuses_connections() {
-        let client = build_shared_client();
+        let client = build_shared_client().expect("provider HTTP client initializes");
         let p1 = OpenAIProvider::new("http://x", "k", client.clone());
         let p2 = OpenAIProvider::new("http://x", "k", client.clone());
         let _ = (p1, p2);
+    }
+
+    #[test]
+    fn compatible_stream_requires_typed_content_and_known_terminal_reason() {
+        for wire in [
+            r#"{"choices":[{"delta":{"content":7},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":true}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"unknown"}]}"#,
+            r#"{"choices":[{"finish_reason":"stop"}]}"#,
+            r#"{"choices":[]}"#,
+        ] {
+            assert!(super::parse_compatible_stream_event("openai", wire).is_err());
+        }
+        assert!(super::parse_compatible_stream_event(
+            "openai",
+            r#"{"choices":[],"usage":{"total_tokens":4}}"#
+        )
+        .unwrap()
+        .is_none());
+        assert!(!super::parse_compatible_stream_event("openai", r#"{"choices":[{"delta":{"role":"assistant","content":null},"finish_reason":null}]}"#).unwrap().unwrap().done);
     }
 }

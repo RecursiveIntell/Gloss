@@ -8,6 +8,7 @@ vi.mock("../../lib/tauri", () => ({
   getAllModels: vi.fn(),
   refreshModels: vi.fn(),
   updateSetting: vi.fn(),
+  updateEmbeddingSettings: vi.fn(),
   updateFeatureFlag: vi.fn(),
   updateProvider: vi.fn(),
   getFeatureFlags: vi.fn(),
@@ -34,6 +35,36 @@ describe("settingsStore model readiness", () => {
       externalTools: {},
     });
     vi.clearAllMocks();
+  });
+
+  it("serializes saves and does not display an unacknowledged value", async () => {
+    let rejectFirst!: (reason: Error) => void;
+    vi.mocked(api.updateSetting).mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectFirst = reject; })).mockResolvedValueOnce();
+    useSettingsStore.setState({ settings: { chunk_target_tokens: "1100" } });
+    const first = useSettingsStore.getState().updateSetting("chunk_target_tokens", "1200");
+    const rejected = expect(first).rejects.toThrow("disk full");
+    const second = useSettingsStore.getState().updateSetting("chunk_target_tokens", "1300");
+    await Promise.resolve();
+    expect(api.updateSetting).toHaveBeenCalledTimes(1);
+    expect(useSettingsStore.getState().settings.chunk_target_tokens).toBe("1100");
+    rejectFirst(new Error("disk full"));
+    await rejected;
+    await second;
+    expect(vi.mocked(api.updateSetting).mock.calls).toEqual([["chunk_target_tokens", "1200"], ["chunk_target_tokens", "1300"]]);
+    expect(useSettingsStore.getState().settings.chunk_target_tokens).toBe("1300");
+  });
+
+  it("applies the whole acknowledged embedding pair and preserves unrelated settings", async () => {
+    let acknowledge!: (warnings: string[]) => void;
+    vi.mocked(api.updateEmbeddingSettings).mockImplementationOnce(() => new Promise(resolve => { acknowledge = resolve; }));
+    useSettingsStore.setState({ settings: { semantic_memory_embedding_provider: "ollama", semantic_memory_embedding_model: "old", summary_model: "summary" } });
+    const config = { provider: "fastembed", url: "http://localhost:11434", model: "next", timeout_secs: 60, download_consent: false, search_timeout_ms: 8000, chunk_target_tokens: 1100 };
+    const saving = useSettingsStore.getState().applyEmbeddingSettings(config);
+    await Promise.resolve();
+    expect(useSettingsStore.getState().settings.semantic_memory_embedding_model).toBe("old");
+    acknowledge([]);
+    await saving;
+    expect(useSettingsStore.getState().settings).toMatchObject({ semantic_memory_embedding_provider: "fastembed", semantic_memory_embedding_model: "next", fastembed_download_consent: "false", summary_model: "summary" });
   });
 
   it("does not invent a fallback model when the backend has no configured default", async () => {

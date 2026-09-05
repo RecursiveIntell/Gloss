@@ -1,12 +1,15 @@
 use super::{
-    provider_cancelled_error, provider_http_error, ChatRequest, ChatToken, LlmExecutionContext,
+    provider_cancelled_error, provider_http_failure, ChatRequest, ChatToken, LlmExecutionContext,
     LlmProvider, ModelInfo, ProviderType,
 };
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
-use futures::StreamExt;
 use std::pin::Pin;
+
+fn parse_stream_event(data: &str) -> Result<Option<ChatToken>, GlossError> {
+    super::openai::parse_compatible_stream_event("llamacpp", data)
+}
 
 /// llama.cpp server provider (OpenAI-compatible API).
 pub struct LlamaCppProvider {
@@ -120,128 +123,20 @@ impl LlmProvider for LlamaCppProvider {
         };
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            // F3: bound the error body to ~1KB so a hostile / misconfigured
-            // server can't fill the logs with megabytes of HTML or stack
-            // traces. Use bytes (cheap) instead of text (allocates).
-            let text = {
-                match resp.bytes().await {
-                    Ok(b) => String::from_utf8_lossy(&b[..b.len().min(1024)]).to_string(),
-                    Err(_) => String::new(),
-                }
-            };
-            return Err(provider_http_error("llamacpp", status, &text));
+            return Err(provider_http_failure("llamacpp", resp, &ctx).await);
         }
 
         if request.stream {
-            // SSE parsing identical to OpenAI
-            let byte_stream = resp.bytes_stream();
-
-            let stream = stream::unfold(
-                (byte_stream, super::sse::SseDecoder::new(), ctx.clone()),
-                |(mut byte_stream, mut buffer, ctx)| async move {
-                    loop {
-                        let next = tokio::select! {
-                            _ = ctx.cancellation.cancelled() => {
-                                return Some((
-                                    stream::iter(vec![Err(provider_cancelled_error("llamacpp", "reading_stream_chunk", ctx.attempt_id.as_deref()))]),
-                                    (byte_stream, buffer, ctx),
-                                ));
-                            }
-                            next = byte_stream.next() => next,
-                        };
-                        match next {
-                            Some(Ok(bytes)) => {
-                                if ctx.is_cancelled() {
-                                    return Some((
-                                        stream::iter(vec![Err(provider_cancelled_error("llamacpp", "before_yield_token", ctx.attempt_id.as_deref()))]),
-                                        (byte_stream, buffer, ctx),
-                                    ));
-                                }
-                                let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
-                                let events = match buffer.push(&bytes) {
-                                    Ok(events) => events,
-                                    Err(error) => return Some((
-                                        stream::iter(vec![Err(GlossError::Provider { provider: "llamacpp".into(), source: anyhow::anyhow!(error) })]),
-                                        (byte_stream, buffer, ctx),
-                                    )),
-                                };
-                                for data in events {
-                                    if data == "[DONE]" {
-                                        tokens.push(Ok(ChatToken { token: String::new(), done: true })); break;
-                                    }
-                                    let val: serde_json::Value = match serde_json::from_str(&data) {
-                                        Ok(val) => val,
-                                        Err(error) => {
-                                            tokens.push(Err(GlossError::Provider { provider: "llamacpp".into(), source: anyhow::anyhow!("Invalid JSON in SSE event: {}", error) })); break;
-                                        }
-                                    };
-                                    if let Some(error) = val.get("error") {
-                                        let message = error.as_str().or_else(|| error.get("message").and_then(|v| v.as_str())).unwrap_or("Provider reported a streaming error");
-                                        let bounded: String = message.chars().take(512).collect();
-                                        tokens.push(Err(GlossError::Provider { provider: "llamacpp".into(), source: anyhow::anyhow!("Provider stream error: {}", bounded) })); break;
-                                    }
-                                    let choice = val.get("choices").and_then(|v| v.get(0));
-                                    let content = choice.and_then(|v| v.get("delta")).and_then(|v| v.get("content")).and_then(|v| v.as_str()).unwrap_or("");
-                                    let done = choice.and_then(|v| v.get("finish_reason")).and_then(|v| v.as_str()).is_some();
-                                    tokens.push(Ok(ChatToken { token: content.to_string(), done }));
-                                    if done { break; }
-                                }
-
-                                if !tokens.is_empty() {
-                                    if ctx.is_cancelled() {
-                                        return Some((
-                                            stream::iter(vec![Err(provider_cancelled_error("llamacpp", "before_yield_token", ctx.attempt_id.as_deref()))]),
-                                            (byte_stream, buffer, ctx),
-                                        ));
-                                    }
-                                    return Some((stream::iter(tokens), (byte_stream, buffer, ctx)));
-                                }
-                            }
-                            Some(Err(e)) => {
-                                return Some((
-                                    stream::iter(vec![Err(GlossError::Provider {
-                                        provider: "llamacpp".into(),
-                                        source: e.into(),
-                                    })]),
-                                    (byte_stream, buffer, ctx),
-                                ));
-                            }
-                            None => {
-                                return None;
-                            }
-                        }
-                    }
-                },
-            )
-            .flatten();
-
-            Ok(Box::pin(stream))
+            Ok(super::sse::response_stream(
+                resp,
+                ctx,
+                "llamacpp",
+                parse_stream_event,
+            ))
         } else {
-            let body: serde_json::Value = tokio::select! {
-                _ = ctx.cancellation.cancelled() => {
-                    return Err(provider_cancelled_error("llamacpp", "reading_non_stream_response", ctx.attempt_id.as_deref()));
-                }
-                result = resp.json() => result.map_err(|e| GlossError::Provider {
-                provider: "llamacpp".into(),
-                source: e.into(),
-                })?
-            };
-            ctx.check_cancelled("llamacpp", "before_terminal_frame")?;
-
-            let content = body
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            Ok(Box::pin(stream::iter(vec![Ok(ChatToken {
-                token: content,
-                done: true,
-            })])))
+            let body = super::bounded_json_response("llamacpp", resp, &ctx).await?;
+            let token = super::openai::parse_compatible_response("llamacpp", &body)?;
+            Ok(Box::pin(stream::iter(vec![Ok(token)])))
         }
     }
 

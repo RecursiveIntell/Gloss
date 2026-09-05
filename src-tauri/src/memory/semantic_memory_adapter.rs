@@ -1,13 +1,16 @@
 use crate::db::notebook_db::{
     Chunk, EmbeddingIndexMetadata, EmbeddingIndexMetadataStatus, NotebookDb,
-    SemanticMemoryProjectionStatusUpdate, Source, SEMANTIC_MEMORY_INDEX_ID,
+    SemanticMemoryProjectionStatusUpdate, Source, EMBEDDING_INDEX_SCHEMA_VERSION,
+    SEMANTIC_MEMORY_INDEX_ID,
 };
 use crate::error::GlossError;
 use crate::ingestion::embed::EmbeddingService;
+use crate::ingestion::embedding_contract::{block_on_ollama, ollama_probe_dimension};
 use crate::memory::backend::{
     excluded_source_count, filter_semantic_candidates_by_scope, invalid_requested_source_ids,
     requested_source_ids, scope_echo,
 };
+use crate::memory::ollama_embedder::GlossOllamaEmbedder;
 use crate::memory::types::{
     IndexSourceReceipt, MemorySearchRequest, MemorySearchResponse, SemanticCandidateEnvelope,
     SemanticLinkRow, MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
@@ -20,7 +23,6 @@ use semantic_memory::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -53,7 +55,7 @@ fn shared_fastembed_service(
     Ok(arc)
 }
 
-const BACKEND_VERSION: &str = "semantic-memory 0.5.0";
+const BACKEND_VERSION: &str = env!("GLOSS_SEMANTIC_MEMORY_IDENTITY");
 // FastEmbed is now the only embedding provider (Nomic v2 MoE, 768d, candle-based).
 // The previous Ollama default was changed to avoid ort version conflicts with TTS.
 const DEFAULT_EMBEDDING_PROVIDER: EmbeddingProviderKind = EmbeddingProviderKind::FastEmbed;
@@ -133,7 +135,7 @@ impl Embedder for FastEmbedSemanticMemoryEmbedder {
     fn embed_batch<'a>(&'a self, texts: Vec<String>) -> EmbedBatchFuture<'a> {
         let service = Arc::clone(&self.service);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
+            let embed = || {
                 let service = service.lock().map_err(|e| {
                     MemoryError::Other(format!("FastEmbed service lock poisoned: {e}"))
                 })?;
@@ -141,9 +143,23 @@ impl Embedder for FastEmbedSemanticMemoryEmbedder {
                 service
                     .embed_batch(&texts_ref)
                     .map_err(|e| MemoryError::Other(format!("FastEmbed embedding failed: {e}")))
-            })
-            .await
-            .map_err(|e| MemoryError::Other(format!("FastEmbed task failed: {e}")))?
+            };
+            // Candle is synchronous CPU work. Keep it within this future's
+            // poll so an outer timeout cannot release inference ownership
+            // while a detached worker is still running. Cancellation is
+            // cooperative: it waits for the CPU operation to complete.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle)
+                        if handle.runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    {
+                        tokio::task::block_in_place(embed)
+                    }
+                    _ => embed(),
+                }
+            }))
+            .map_err(|_| MemoryError::Other("FastEmbed task panicked".into()))?
         })
     }
 
@@ -190,12 +206,13 @@ impl Default for ReindexSourceOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticMemoryRuntimeConfig {
     pub embedding_provider: EmbeddingProviderKind,
     pub embedding_ollama_url: String,
     pub embedding_model: String,
     pub embedding_timeout_secs: u64,
+    pub allow_lan: bool,
     pub fastembed_download_consent: bool,
     pub turbo_quant_enabled: bool,
     pub turbo_quant_require_fresh_artifacts: bool,
@@ -210,6 +227,7 @@ impl Default for SemanticMemoryRuntimeConfig {
             embedding_ollama_url: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL.to_string(),
             embedding_model: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL.to_string(),
             embedding_timeout_secs: DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS,
+            allow_lan: false,
             fastembed_download_consent: false,
             turbo_quant_enabled: false,
             turbo_quant_require_fresh_artifacts: true,
@@ -224,6 +242,7 @@ pub fn runtime_config_from_settings(
     embedding_ollama_url: Option<String>,
     embedding_model: Option<String>,
     embedding_timeout_secs: Option<String>,
+    allow_lan: bool,
     fastembed_download_consent: bool,
     turbo_quant_enabled: bool,
     turbo_quant_require_fresh_artifacts: bool,
@@ -247,6 +266,7 @@ pub fn runtime_config_from_settings(
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(defaults.embedding_timeout_secs),
+        allow_lan,
         fastembed_download_consent,
         turbo_quant_enabled,
         turbo_quant_require_fresh_artifacts,
@@ -265,6 +285,7 @@ pub fn validate_embedding_model_role(
             "semantic-memory projection requires a configured Ollama embedding model".to_string(),
         ));
     }
+    crate::providers::validate_embedding_url(&config.embedding_ollama_url, config.allow_lan)?;
     Ok(())
 }
 
@@ -286,6 +307,42 @@ fn embedding_identity_digest(provider: &str, url: &str, model: &str, dimensions:
         hasher.update(b"\0");
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Check stored projection identity against current authority without network I/O.
+/// Reuse the same digest owner as metadata creation; historical proof cannot
+/// establish readiness after the configured model, endpoint or authority changes.
+pub fn embedding_metadata_matches_config(
+    config: &SemanticMemoryRuntimeConfig,
+    metadata: &EmbeddingIndexMetadata,
+) -> bool {
+    let Some(dimensions) = metadata.dimensions.filter(|dimensions| *dimensions > 0) else {
+        return false;
+    };
+    if metadata.index_id != SEMANTIC_MEMORY_INDEX_ID
+        || metadata.schema_version != EMBEDDING_INDEX_SCHEMA_VERSION
+        || metadata.status != EmbeddingIndexMetadataStatus::Ready.as_str()
+        || validate_embedding_model_role(config).is_err()
+    {
+        return false;
+    }
+    let (provider, url, model) = match config.embedding_provider {
+        EmbeddingProviderKind::FastEmbed => {
+            if dimensions != FASTEMBED_DIMENSIONS {
+                return false;
+            }
+            ("fastembed", "fastembed-cache", FASTEMBED_MODEL_NAME)
+        }
+        EmbeddingProviderKind::Ollama => (
+            "ollama",
+            config.embedding_ollama_url.trim_end_matches('/'),
+            config.embedding_model.as_str(),
+        ),
+    };
+    metadata.provider == provider
+        && metadata.model == model
+        && metadata.model_digest.as_deref()
+            == Some(embedding_identity_digest(provider, url, model, dimensions).as_str())
 }
 
 pub fn expected_embedding_index_metadata(
@@ -379,131 +436,29 @@ fn open_store(
             MemoryStore::open_with_embedder(config, Box::new(embedder))
                 .map_err(|e| GlossError::Search(format!("semantic-memory: {e}")))
         }
-        EmbeddingProviderKind::Ollama => MemoryStore::open(config)
-            .map_err(|e| GlossError::Search(format!("semantic-memory: {e}"))),
+        EmbeddingProviderKind::Ollama => {
+            let embedder = GlossOllamaEmbedder::try_new(
+                &config.embedding.ollama_url,
+                &config.embedding.model,
+                config.embedding.dimensions,
+                config.embedding.timeout_secs,
+                runtime_config.is_some_and(|config| config.allow_lan),
+            )?;
+            MemoryStore::open_with_embedder(config, Box::new(embedder))
+                .map_err(|e| GlossError::Search(format!("semantic-memory: {e}")))
+        }
     }
 }
 
 pub(crate) fn probe_ollama_embedding_dimension(
     runtime_config: &SemanticMemoryRuntimeConfig,
 ) -> Result<usize, GlossError> {
-    fn block_on_probe<F, T>(future: F) -> Result<T, GlossError>
-    where
-        F: Future<Output = Result<T, reqwest::Error>>,
-    {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-            Err(_) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| {
-                        GlossError::Embedding(format!("probe runtime build failed: {e}"))
-                    })?;
-                runtime.block_on(future)
-            }
-        }
-        .map_err(|e| GlossError::Embedding(format!("Ollama embedding dimension probe failed: {e}")))
-    }
-
-    fn embedding_dimension_from_embed_response(
-        json: &serde_json::Value,
-    ) -> Result<usize, GlossError> {
-        json.get("embeddings")
-            .and_then(|value| value.as_array())
-            .and_then(|embeddings| embeddings.first())
-            .and_then(|embedding| embedding.as_array())
-            .map(Vec::len)
-            .filter(|dimension| *dimension > 0)
-            .ok_or_else(|| {
-                GlossError::Embedding(
-                    "Ollama /api/embed dimension probe returned no embedding vector".to_string(),
-                )
-            })
-    }
-
-    fn embedding_dimension_from_show_value(value: &serde_json::Value) -> Option<usize> {
-        match value {
-            serde_json::Value::Number(number) => number.as_u64().and_then(|v| {
-                if v > 0 && v <= usize::MAX as u64 {
-                    Some(v as usize)
-                } else {
-                    None
-                }
-            }),
-            serde_json::Value::Array(values) => {
-                values.iter().find_map(embedding_dimension_from_show_value)
-            }
-            serde_json::Value::Object(map) => {
-                for (key, value) in map {
-                    let key = key.to_ascii_lowercase();
-                    if key.ends_with("embedding_length")
-                        || key.ends_with("embedding_dimensions")
-                        || key == "dimensions"
-                    {
-                        if let Some(dimension) = embedding_dimension_from_show_value(value) {
-                            return Some(dimension);
-                        }
-                    }
-                }
-                map.values().find_map(embedding_dimension_from_show_value)
-            }
-            _ => None,
-        }
-    }
-
-    let timeout = Duration::from_secs(runtime_config.embedding_timeout_secs.clamp(2, 300));
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| GlossError::Embedding(format!("HTTP client build failed: {e}")))?;
-    let url = runtime_config.embedding_ollama_url.trim_end_matches('/');
-    let body = serde_json::json!({
-        "model": runtime_config.embedding_model,
-        "input": "semantic-memory-dimension-probe"
-    });
-    let embed_error =
-        match block_on_probe(client.post(format!("{url}/api/embed")).json(&body).send()) {
-            Ok(response) if response.status().is_success() => {
-                let json = block_on_probe(response.json::<serde_json::Value>()).map_err(|e| {
-                    GlossError::Embedding(format!(
-                        "Ollama /api/embed dimension probe parse failed: {e}"
-                    ))
-                })?;
-                return embedding_dimension_from_embed_response(&json);
-            }
-            Ok(response) => format!("HTTP {}", response.status()),
-            Err(err) => err.to_string(),
-        };
-
-    let show_body = serde_json::json!({
-        "model": runtime_config.embedding_model
-    });
-    let show_response = block_on_probe(
-        client
-            .post(format!("{url}/api/show"))
-            .json(&show_body)
-            .send(),
-    )?;
-    if !show_response.status().is_success() {
-        return Err(GlossError::Embedding(format!(
-            "Ollama embedding dimension probe failed: /api/embed {}; /api/show HTTP {}",
-            embed_error,
-            show_response.status()
-        )));
-    }
-    let show_json = block_on_probe(show_response.json::<serde_json::Value>()).map_err(|e| {
-        GlossError::Embedding(format!(
-            "Ollama /api/show dimension probe parse failed: {e}"
-        ))
-    })?;
-    embedding_dimension_from_show_value(&show_json).ok_or_else(|| {
-        GlossError::Embedding(format!(
-            "Ollama embedding dimension probe failed: /api/embed {}; /api/show returned no embedding_length metadata",
-            embed_error
-        ))
-    })
+    block_on_ollama(ollama_probe_dimension(
+        &runtime_config.embedding_ollama_url,
+        &runtime_config.embedding_model,
+        runtime_config.embedding_timeout_secs,
+        runtime_config.allow_lan,
+    ))
 }
 
 #[cfg(feature = "semantic-memory-turbo-quant")]
@@ -1529,13 +1484,10 @@ pub async fn search_preview(
                 "turbo-artifacts-stale: semantic-memory returned no TurboQuant receipt".to_string(),
             )
         })?;
-        let turbo_candidate_used = receipt.candidate_backend.contains("turbo_quant");
-        let exact_rerank_safe = receipt.exact_rerank && receipt.exact_rerank_count.unwrap_or(0) > 0;
-        let artifacts_fresh = receipt.artifact_generation_id.is_some()
-            && receipt.vector_artifact_manifest_digest.is_some()
-            && receipt.vector_artifact_missing_count.unwrap_or(0) == 0
-            && receipt.vector_artifact_stale_count.unwrap_or(0) == 0;
-        if !(turbo_candidate_used && exact_rerank_safe && artifacts_fresh) {
+        let proof = serde_json::to_value(receipt).map_err(|error| {
+            GlossError::Search(format!("TurboQuant receipt serialization failed: {error}"))
+        })?;
+        if !crate::memory::turbo_quant_proof::has_fresh_turbo_quant_proof(&proof) {
             return Err(GlossError::Search(
                 "turbo-artifacts-stale: TurboQuant was requested but fresh candidate artifacts and exact rerank evidence were not present"
                     .to_string(),
@@ -1573,7 +1525,15 @@ pub async fn search_preview(
             &title_map,
             request.limit,
         );
+    let runtime_fallback_reason = response
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.fallback.clone());
+    let runtime_fallback_used = runtime_fallback_reason.is_some();
     let mut degradation_markers = Vec::new();
+    if runtime_fallback_used {
+        degradation_markers.push("semantic-memory-vector-fallback".to_string());
+    }
     if !source_scope_violations.is_empty() || !unmapped_semantic_candidates.is_empty() {
         degradation_markers.push("semantic-memory-backpointer-filtered".to_string());
     }
@@ -1614,16 +1574,16 @@ pub async fn search_preview(
                 .is_some_and(|config| config.turbo_quant_enabled),
             "source_scope_violations": source_scope_violations,
             "unmapped_semantic_candidates": unmapped_semantic_candidates,
-            "fallback_used": false,
+            "fallback_used": runtime_fallback_used,
             "degraded": degraded,
             "backend_version_or_digest": BACKEND_VERSION,
             "source_scope_preserved": source_scope_preserved
         }),
-        fallback_reason: None,
+        fallback_reason: runtime_fallback_reason.clone(),
         fallback_reason_code: None,
         degradation_markers,
         source_scope_preserved,
-        fallback_used: false,
+        fallback_used: runtime_fallback_used,
         degraded,
     })
 }
@@ -1667,6 +1627,7 @@ mod tests {
             embedding_ollama_url: base_url,
             embedding_model: "bge-m3".to_string(),
             embedding_timeout_secs: 2,
+            allow_lan: false,
             fastembed_download_consent: false,
             turbo_quant_enabled: false,
             turbo_quant_require_fresh_artifacts: true,
@@ -1762,9 +1723,58 @@ mod tests {
     }
 
     #[test]
+    fn metadata_config_comparison_rejects_changed_identity_or_authority_without_io() {
+        let config = test_runtime_config("http://127.0.0.1:11434/".into());
+        let metadata = EmbeddingIndexMetadata::ready(
+            SEMANTIC_MEMORY_INDEX_ID,
+            "ollama",
+            "bge-m3",
+            Some(embedding_identity_digest(
+                "ollama",
+                "http://127.0.0.1:11434",
+                "bge-m3",
+                1024,
+            )),
+            1024,
+        );
+        assert!(embedding_metadata_matches_config(&config, &metadata));
+        let mut changed = config.clone();
+        changed.embedding_model = "another-model".into();
+        assert!(!embedding_metadata_matches_config(&changed, &metadata));
+        changed = config.clone();
+        changed.embedding_ollama_url = "http://127.0.0.1:11435".into();
+        assert!(!embedding_metadata_matches_config(&changed, &metadata));
+        changed.embedding_ollama_url = "http://192.168.1.2:11434".into();
+        let mut lan_metadata = metadata.clone();
+        lan_metadata.model_digest = Some(embedding_identity_digest(
+            "ollama",
+            &changed.embedding_ollama_url,
+            "bge-m3",
+            1024,
+        ));
+        assert!(!embedding_metadata_matches_config(&changed, &lan_metadata));
+        changed.allow_lan = true;
+        assert!(embedding_metadata_matches_config(&changed, &lan_metadata));
+        for fault in ["status", "schema", "dimensions", "index", "digest"] {
+            let mut broken = metadata.clone();
+            match fault {
+                "status" => broken.status = "stale".into(),
+                "schema" => broken.schema_version += 1,
+                "dimensions" => broken.dimensions = Some(0),
+                "index" => broken.index_id = "native".into(),
+                _ => broken.model_digest = None,
+            }
+            assert!(
+                !embedding_metadata_matches_config(&config, &broken),
+                "{fault}"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_config_defaults_turbo_quant_off() {
         let config =
-            runtime_config_from_settings(None, None, None, None, false, false, true, false);
+            runtime_config_from_settings(None, None, None, None, false, false, false, true, false);
         // FastEmbed is now the default (Nomic v2 MoE via candle, 768d).
         // The Ollama default was removed because we now require FastEmbed-only
         // to avoid ONNX/candle conflicts with TTS (any-tts).
@@ -1774,13 +1784,15 @@ mod tests {
             DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS
         );
         assert!(!config.fastembed_download_consent);
+        assert!(!config.allow_lan);
         assert!(!config.turbo_quant_enabled);
         assert!(!config.provekv_pool_enabled);
     }
 
     #[test]
     fn runtime_config_carries_explicit_provekv_pool_consent() {
-        let config = runtime_config_from_settings(None, None, None, None, false, false, true, true);
+        let config =
+            runtime_config_from_settings(None, None, None, None, false, false, false, true, true);
         assert!(config.provekv_pool_enabled);
         assert!(!config.turbo_quant_enabled);
     }
@@ -1792,6 +1804,7 @@ mod tests {
             Some("http://localhost:11435".to_string()),
             Some("embed-model".to_string()),
             Some("12".to_string()),
+            true,
             false,
             true,
             true,
@@ -1800,6 +1813,7 @@ mod tests {
         assert_eq!(config.embedding_ollama_url, "http://localhost:11435");
         assert_eq!(config.embedding_model, "embed-model");
         assert_eq!(config.embedding_timeout_secs, 12);
+        assert!(config.allow_lan);
         assert!(config.turbo_quant_enabled);
         assert!(config.turbo_quant_require_fresh_artifacts);
     }
@@ -1813,6 +1827,7 @@ mod tests {
             Some("http://localhost:11435".to_string()),
             Some("nomic-embed-text".to_string()),
             Some("12".to_string()),
+            false,
             true,
             false,
             true,
@@ -1928,6 +1943,7 @@ mod tests {
             embedding_model: std::env::var("GLOSS_SEMANTIC_MEMORY_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL.to_string()),
             embedding_timeout_secs: 30,
+            allow_lan: false,
             fastembed_download_consent: false,
             turbo_quant_enabled: false,
             turbo_quant_require_fresh_artifacts: true,

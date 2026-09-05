@@ -13,11 +13,14 @@ import shlex
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, NamedTuple, Sequence
 
+from source_snapshot import capture_source_identity
 
-MAX_GATE_RECORDS = 16
+
+MAX_GATE_RECORDS = 24
 MAX_COMMAND_CHARS = 512
 
 
@@ -56,6 +59,22 @@ def build_gates(*, skip_desktop_compile: bool) -> list[Gate]:
         Gate(
             "rust_static_repair_gates",
             ("bash", "validation/run_all_gloss_repair_gates.sh", "."),
+        ),
+        Gate(
+            "python_script_contracts",
+            ("python3", "-m", "unittest", "discover", "-s", "scripts/tests", "-v"),
+        ),
+        Gate(
+            "python_validation_contracts",
+            ("python3", "-m", "unittest", "discover", "-s", "validation/tests", "-v"),
+        ),
+        Gate(
+            "native_owner_contracts",
+            ("cargo", "test", "--locked", "--manifest-path", "validation/native_harness/Cargo.toml"),
+        ),
+        Gate(
+            "turbo_quant_runtime_contracts",
+            ("cargo", "test", "--locked", "--manifest-path", "validation/turbo_quant_harness/Cargo.toml"),
         ),
         Gate(
             "cargo_check_default",
@@ -103,6 +122,11 @@ def build_gates(*, skip_desktop_compile: bool) -> list[Gate]:
         Gate("npm_unit_tests", ("npm", "run", "test:unit")),
         Gate("npm_static_contract_tests", ("npm", "run", "test:contracts")),
         Gate("npm_build", ("npm", "run", "build")),
+        Gate(
+            "cargo_clippy",
+            ("cargo", "clippy", "--locked", "--manifest-path", "src-tauri/Cargo.toml",
+             "--features", "semantic-memory-turbo-quant", "--", "-D", "warnings"),
+        ),
         Gate("cargo_deny", ("cargo", "deny", "check", "advisories", "licenses", "sources")),
         Gate(
             "npm_production_audit",
@@ -133,6 +157,8 @@ def run_gates(
     runner: Runner = subprocess_runner,
 ) -> tuple[dict[str, object], int]:
     """Run ordered gates once, returning after the first failed command."""
+    if len(gates) > MAX_GATE_RECORDS:
+        raise ValueError("Gate inventory exceeds the receipt bound; refusing truncated proof")
     records: list[dict[str, object]] = []
     skipped = False
 
@@ -185,12 +211,50 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def verify_snapshot(
+    root: Path, gates: Sequence[Gate], *, runner: Runner = subprocess_runner,
+) -> tuple[dict[str, object], int]:
+    """Bind execution to one unchanged source snapshot and retain missing gates."""
+    started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        source_before = capture_source_identity(root)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {
+            "schema": "GlossBuildVerificationV2", "status": "failed",
+            "scope": "build_and_contracts_only", "source_error": str(exc),
+            "gates": [], "unrun_gates": [gate.name for gate in gates],
+        }, 1
+    receipt, exit_code = run_gates(
+        gates, root=root, runner=runner,
+    )
+    try:
+        source_after = capture_source_identity(root)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        source_after = {"error": str(exc)}
+    source_unchanged = source_before == source_after
+    if not source_unchanged:
+        receipt["status"] = "failed"
+        receipt["source_error"] = "Checkout changed during verification; rerun on the final source"
+        exit_code = exit_code or 1
+    receipt.update({
+        "schema": "GlossBuildVerificationV2",
+        "scope": "build_and_contracts_only",
+        "started_at": started_at,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "source_before": source_before,
+        "source_after": source_after,
+        "source_unchanged": source_unchanged,
+        "unrun_gates": [gate.name for gate in gates[len(receipt["gates"]):]],
+        "remaining_runtime_gates": ["live_desktop", "live_provider", "package_replay", "native_leak_check"],
+    })
+    return receipt, exit_code
+
+
 def main() -> int:
     args = parse_args()
     root = args.root.resolve()
-    receipt, exit_code = run_gates(
-        build_gates(skip_desktop_compile=args.skip_desktop_compile),
-        root=root,
+    receipt, exit_code = verify_snapshot(
+        root, build_gates(skip_desktop_compile=args.skip_desktop_compile),
     )
     rendered = json.dumps(receipt, separators=(",", ":"), sort_keys=True)
     if args.receipt:

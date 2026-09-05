@@ -2,6 +2,126 @@
 //! JSON interpretation belongs to each provider. Malformed/oversized frames fail
 //! visibly rather than losing tokens. No reconnect or retry is performed here.
 
+use super::{provider_cancelled_error, ChatToken, LlmExecutionContext};
+use crate::error::GlossError;
+use futures::{stream, Stream, StreamExt};
+use std::collections::VecDeque;
+use std::pin::Pin;
+
+/// Shared SSE transport lifecycle. The provider owns JSON interpretation and
+/// its terminal marker. This layer owns ordered delivery, EOF and cancellation.
+pub(super) fn response_stream(
+    response: reqwest::Response,
+    ctx: LlmExecutionContext,
+    provider: &'static str,
+    parse: fn(&str) -> Result<Option<ChatToken>, GlossError>,
+) -> Pin<Box<dyn Stream<Item = Result<ChatToken, GlossError>> + Send>> {
+    let stream = stream::unfold(
+        Some((
+            response.bytes_stream(),
+            SseDecoder::new(),
+            VecDeque::<Result<ChatToken, GlossError>>::new(),
+            ctx,
+        )),
+        move |state| async move {
+            let (mut bytes, mut decoder, mut pending, ctx) = state?;
+            loop {
+                if ctx.is_cancelled() {
+                    return Some((
+                        Err(provider_cancelled_error(
+                            provider,
+                            "before_yield_token",
+                            ctx.attempt_id.as_deref(),
+                        )),
+                        None,
+                    ));
+                }
+                if let Some(token) = pending.pop_front() {
+                    let finished = match &token {
+                        Ok(token) => token.done,
+                        Err(_) => true,
+                    };
+                    let next = if finished {
+                        None
+                    } else {
+                        Some((bytes, decoder, pending, ctx))
+                    };
+                    return Some((token, next));
+                }
+                let next = tokio::select! {
+                    _ = ctx.cancellation.cancelled() => {
+                        return Some((Err(provider_cancelled_error(provider, "reading_stream_chunk", ctx.attempt_id.as_deref())), None));
+                    }
+                    next = bytes.next() => next,
+                };
+                match next {
+                    Some(Ok(chunk)) => {
+                        // Process one line boundary at a time so a later bad
+                        // line cannot erase already completed valid frames.
+                        'frames: for fragment in
+                            chunk.split_inclusive(|byte| *byte == b'\r' || *byte == b'\n')
+                        {
+                            let events = match decoder.push(fragment) {
+                                Ok(events) => events,
+                                Err(error) => {
+                                    pending.push_back(Err(protocol_error(provider, error)));
+                                    break;
+                                }
+                            };
+                            for event in events {
+                                match parse(&event) {
+                                    Ok(Some(token)) => {
+                                        let done = token.done;
+                                        pending.push_back(Ok(token));
+                                        if done {
+                                            break 'frames;
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        pending.push_back(Err(error));
+                                        break 'frames;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        return Some((
+                            Err(GlossError::Provider {
+                                provider: provider.into(),
+                                source: error.into(),
+                            }),
+                            None,
+                        ))
+                    }
+                    None => {
+                        return Some((
+                            Err(GlossError::Provider {
+                                provider: provider.into(),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "Unexpected EOF before provider terminal marker",
+                                )
+                                .into(),
+                            }),
+                            None,
+                        ))
+                    }
+                }
+            }
+        },
+    );
+    Box::pin(stream.fuse())
+}
+
+pub(super) fn protocol_error(provider: &str, message: &str) -> GlossError {
+    GlossError::Provider {
+        provider: provider.into(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, message).into(),
+    }
+}
+
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]

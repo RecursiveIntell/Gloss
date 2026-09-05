@@ -4904,13 +4904,15 @@ mod tests {
         let (_dir, state, notebook_id) = build_state();
         state
             .with_notebook_db_write(&notebook_id, |db| {
-                db.conn().execute_batch(
+                db.conn().execute(
                     "INSERT INTO semantic_memory_links
-                     (chunk_id, sm_document_id, sync_status, sync_error, synced_at) VALUES
-                     ('healthy', 'doc1', 'synced', NULL, '2026-09-05T00:00:00Z'),
-                     ('stale', 'doc2', 'stale', NULL, '2026-09-05T00:00:00Z'),
-                     ('failed', 'doc3', 'failed', 'retained error', '2026-09-05T00:00:01Z'),
-                     ('missing', NULL, 'pending', NULL, '2026-09-05T00:00:00Z');",
+                     (chunk_id, notebook_id, source_id, content_digest, backend_version,
+                      sm_document_id, sync_status, sync_error, synced_at) VALUES
+                     ('healthy', ?1, 'source', 'digest1', 'test', 'doc1', 'synced', NULL, '2026-09-05T00:00:00Z'),
+                     ('stale', ?1, 'source', 'digest2', 'test', 'doc2', 'stale', NULL, '2026-09-05T00:00:00Z'),
+                     ('failed', ?1, 'source', 'digest3', 'test', 'doc3', 'failed', 'retained error', '2026-09-05T00:00:01Z'),
+                     ('missing', ?1, 'source', 'digest4', 'test', NULL, 'pending', NULL, '2026-09-05T00:00:00Z');",
+                    rusqlite::params![notebook_id],
                 )?;
                 Ok(())
             })

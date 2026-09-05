@@ -3,6 +3,7 @@ members = ["src-tauri"]
 default-members = ["src-tauri"]
 exclude = [
     "src-tauri/vendor",
+    "src-tauri/vendor/boundary-compiler",
     "src-tauri/vendor/forge-memory-bridge",
     "src-tauri/vendor/job-queue",
     "src-tauri/vendor/llm-output-parser",

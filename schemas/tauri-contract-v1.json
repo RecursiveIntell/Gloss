@@ -866,6 +866,22 @@
       },
       "response_family": "string"
     },
+    "select_chat_model": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "selectChatModel",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "providerId",
+          "modelId"
+        ]
+      },
+      "response_family": "void"
+    },
     "semantic_memory_backfill_notebook": {
       "registered": true,
       "definition": "src-tauri/src/commands/sources/mod.rs",

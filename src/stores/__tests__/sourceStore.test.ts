@@ -118,6 +118,7 @@ describe('sourceStore', () => {
     vi.mocked(api.listSources)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveA = resolve; }))
       .mockImplementationOnce(() => new Promise((resolve) => { resolveB = resolve; }));
+    useNotebookStore.setState({ activeNotebookId: 'nb-a', activationStatus: 'confirmed' });
     const a = useSourceStore.getState().loadSources('nb-a');
     useNotebookStore.setState({ activeNotebookId: 'nb-b', activationStatus: 'confirmed' });
     const b = useSourceStore.getState().loadSources('nb-b');

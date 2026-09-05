@@ -210,6 +210,7 @@ pub fn run_inner() -> tauri::Result<()> {
             commands::settings::get_settings,
             commands::settings::run_embedding_diagnostics,
             commands::settings::update_setting,
+            commands::settings::select_chat_model,
             commands::settings::get_feature_flags,
             commands::settings::update_feature_flag,
             commands::settings::set_memory_backend_profile,

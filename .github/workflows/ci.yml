@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches:
+      - master
       - main
 
 jobs:
@@ -16,6 +17,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Node
+        # This runs before native dependency installation to fail packaging drift early.
         uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -26,8 +28,16 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Verify vendored source closure
+        run: |
+          python3 validation/validate_vendor_closure.py .
+          python3 -m unittest discover -s validation/tests -v
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Native DB, dense publication and SSE contract tests
+        run: cargo test --locked --manifest-path validation/native_harness/Cargo.toml
 
       - name: Install Linux dependencies
         run: |

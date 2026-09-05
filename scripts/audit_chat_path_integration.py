@@ -82,13 +82,26 @@ def audit(root: pathlib.Path) -> list[str]:
     for marker in ("ChatEvidenceDisclosure", "backend_requested", "backend_used", "fallback_used"):
         require_contains(errors, web_types, marker, "frontend retrieval disclosure type")
 
-    # A stop request is not terminal. Frontend cleanup remains event-driven.
+    # Submitted attempts remain backend-terminal-owned. Preparation has no
+    # backend attempt and may be cancelled locally only under its exact owner
+    # guard, with a synchronous return before the stop IPC can be reached.
     body = stop_streaming_body(store)
     if not body:
         errors.append("frontend cancellation ownership: stopStreaming body not found")
     else:
         require_contains(errors, body, "await api.stopChat", "frontend cancellation request")
         require_contains(errors, body, "phase: 'cancelling'", "frontend cancellation pending state")
+        preparation_guard = "    if (requestedMessageId && get().preparingMessageId === requestedMessageId) {"
+        start = body.find(preparation_guard)
+        end = body.find("\n    }", start) if start >= 0 else -1
+        if start >= 0 and end > start:
+            preparation = body[start:end]
+            if (preparation.rstrip().endswith("return;")
+                    and "await " not in preparation and "api." not in preparation
+                    and end < body.find("await api.stopChat")):
+                body = body[:start] + body[end + len("\n    }"):]
+            else:
+                errors.append("frontend cancellation ownership: preparing cancellation must return synchronously before IPC")
         for forbidden in ("isStreaming: false", "streamingMessageId: null", "streamingNotebookId: null"):
             if forbidden in body:
                 errors.append(f"frontend cancellation ownership: stopStreaming clears terminal state via {forbidden!r}")

@@ -330,8 +330,6 @@ pub async fn set_selected_sources(
 
 /// Options for controlling ingestion behavior during batch imports.
 struct IngestionOpts {
-    /// Save HNSW index to disk after this source
-    save_index: bool,
     /// Run semantic embedding + HNSW indexing for this source.
     embed_chunks: bool,
     /// Queue a background summary job after ingestion
@@ -422,7 +420,6 @@ fn per_second(count: usize, elapsed_ms: u128) -> f64 {
 impl Default for IngestionOpts {
     fn default() -> Self {
         Self {
-            save_index: true,
             embed_chunks: crate::state::NATIVE_SEMANTIC_INDEXING_ENABLED,
             queue_summary: true,
             emit_progress: true,
@@ -543,10 +540,9 @@ fn run_ingestion_inner(
                 emit_status(app_handle, notebook_id, source_id, "embedding", None);
             }
             state.ensure_embedder(Some(app_handle))?;
-            state.ensure_hnsw_index(notebook_id)?;
 
             let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
-            let embeddings = {
+            let (embeddings, metadata) = {
                 let embedder = {
                     let embedder = state
                         .embedder
@@ -557,34 +553,34 @@ fn run_ingestion_inner(
                         .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
                     embedder.clone()
                 };
-                embedder.embed_batch(&chunk_texts)?
+                let metadata = crate::db::notebook_db::EmbeddingIndexMetadata::ready(
+                    crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+                    embedder.provider_id(),
+                    embedder.model_id(),
+                    embedder.model_digest(),
+                    embedder.dims(),
+                );
+                (embedder.embed_batch(&chunk_texts)?, metadata)
             };
 
-            // Add vectors to HNSW index and update DB
-            {
-                let mut indices = state
-                    .hnsw_indices
-                    .lock()
-                    .map_err(|e| GlossError::Other(e.to_string()))?;
-                let index = indices
-                    .get_mut(notebook_id)
-                    .ok_or_else(|| GlossError::Embedding("HNSW index not found".into()))?;
-
-                state.with_notebook_db_write(notebook_id, |db| {
-                    for (i, chunk_data) in chunks.iter().enumerate() {
-                        if let Some(embedding) = embeddings.get(i) {
-                            let label = index.add(embedding)?;
-                            db.update_chunk_embedding(&chunk_data.id, label as i64, "local")?;
-                        }
-                    }
-                    Ok(())
-                })?;
-            }
-
-            // Save HNSW index to disk (skipped during batch imports)
-            if opts.save_index {
-                state.save_hnsw_index(notebook_id)?;
-            }
+            // Inline and queued work share the same durable commit protocol.
+            // Batch imports may not defer bytes past committed chunk mappings.
+            let db_path = state.notebook_db_path(notebook_id)?;
+            let index_path = crate::ingestion::embed::native_dense_artifact_path(
+                db_path
+                    .parent()
+                    .ok_or_else(|| GlossError::Other("Notebook DB has no parent".into()))?,
+            );
+            state.with_notebook_db_write(notebook_id, |db| {
+                crate::ingestion::embed::publish_dense_batch(
+                    db,
+                    &index_path,
+                    &db_chunks,
+                    &embeddings,
+                    &metadata,
+                )
+                .map(|_| ())
+            })?;
         } else if crate::state::NATIVE_SEMANTIC_INDEXING_ENABLED {
             // Deferred indexing is a real queue lane, not a dormant job enum:
             // callers that intentionally skip synchronous embeddings enqueue
@@ -3051,7 +3047,6 @@ pub async fn add_source_folder(
                         &handle,
                         &q,
                         IngestionOpts {
-                            save_index: false,
                             embed_chunks: crate::state::NATIVE_SEMANTIC_INDEXING_ENABLED,
                             queue_summary: true,
                             emit_progress: false,
@@ -3392,6 +3387,10 @@ pub async fn delete_source(
         );
     }
 
+    state.with_notebook_db_write(&notebook_id, |db| {
+        db.delete_source_with_projection_invalidation(&notebook_id, &source_id)
+    })?;
+
     if !old_embedding_ids.is_empty() {
         let removed_count = {
             // Recover from a poisoned lock instead of failing every retry with
@@ -3429,17 +3428,6 @@ pub async fn delete_source(
         }
     }
 
-    state.with_notebook_db_write(&notebook_id, |db| {
-        db.conn().execute(
-            "UPDATE semantic_memory_links
-             SET sync_status = 'stale',
-                 sync_error = 'Gloss source deleted',
-                 synced_at = datetime('now')
-             WHERE notebook_id = ?1 AND source_id = ?2",
-            rusqlite::params![notebook_id, source_id],
-        )?;
-        db.delete_source(&source_id)
-    })?;
     sync_notebook_source_count(&state, &notebook_id)?;
     invalidate_suggested_questions(&state, &notebook_id);
 
@@ -3552,6 +3540,10 @@ fn delete_source_ids_for_notebook(
             );
         }
 
+        state.with_notebook_db_write(notebook_id, |db| {
+            db.delete_source_with_projection_invalidation(notebook_id, source_id)
+        })?;
+
         if !old_embedding_ids.is_empty() {
             let mut indices = state
                 .hnsw_indices
@@ -3571,18 +3563,6 @@ fn delete_source_ids_for_notebook(
                 }
             }
         }
-
-        state.with_notebook_db_write(notebook_id, |db| {
-            db.conn().execute(
-                "UPDATE semantic_memory_links
-                 SET sync_status = 'stale',
-                     sync_error = 'Gloss source deleted',
-                     synced_at = datetime('now')
-                 WHERE notebook_id = ?1 AND source_id = ?2",
-                rusqlite::params![notebook_id, source_id],
-            )?;
-            db.delete_source(source_id)
-        })?;
 
         if let Some(file_path) = source.file_path.as_deref() {
             let sources_dir = notebook_dir.join("sources");
@@ -3713,9 +3693,13 @@ pub async fn retry_source_ingestion(
     app_handle: tauri::AppHandle,
 ) -> Result<(), GlossError> {
     invalidate_suggested_questions(&state, &notebook_id);
-    // Remove old vectors from HNSW index before deleting DB rows
+    // Capture labels, commit canonical reset, then clean up detached vectors
     let old_embedding_ids: Vec<u64> = state.with_notebook_db(&notebook_id, |db| {
         db.get_embedding_ids_for_source(&source_id)
+    })?;
+
+    let source_type = state.with_notebook_db_write(&notebook_id, |db| {
+        db.reset_source_for_reingestion(&notebook_id, &source_id)
     })?;
 
     if !old_embedding_ids.is_empty() {
@@ -3755,24 +3739,6 @@ pub async fn retry_source_ingestion(
             }
         }
     }
-
-    // Reset status and delete old chunks. NOTE: this must use the WRITE pool
-    // connection — the read pool opens SQLite READ_ONLY and writes here used to
-    // fail with "attempt to write a readonly database".
-    let source_type = state.with_notebook_db_write(&notebook_id, |db| {
-        db.conn().execute(
-            "UPDATE semantic_memory_links
-             SET sync_status = 'stale',
-                 sync_error = 'Gloss source reingestion requested',
-                 synced_at = datetime('now')
-             WHERE notebook_id = ?1 AND source_id = ?2",
-            rusqlite::params![notebook_id, source_id],
-        )?;
-        db.update_source_status(&source_id, "pending", None)?;
-        db.delete_chunks_for_source(&source_id)?;
-        let source = db.get_source(&source_id)?;
-        Ok(source.source_type)
-    })?;
 
     // Route based on source type
     match source_type.as_str() {

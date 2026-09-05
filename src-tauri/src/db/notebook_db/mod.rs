@@ -135,12 +135,19 @@ impl EmbeddingIndexMetadata {
     }
 
     pub fn identity_matches(&self, expected: &EmbeddingIndexMetadata) -> bool {
-        self.provider == expected.provider
+        self.derivation_matches(expected)
+            && self.status == EmbeddingIndexMetadataStatus::Ready.as_str()
+    }
+
+    /// Derivation identity is separate from readiness so an interrupted
+    /// Building/Blocked publication can be retried without mixing models.
+    pub fn derivation_matches(&self, expected: &EmbeddingIndexMetadata) -> bool {
+        self.index_id == expected.index_id
+            && self.provider == expected.provider
             && self.model == expected.model
             && self.model_digest == expected.model_digest
             && self.dimensions == expected.dimensions
             && self.schema_version == expected.schema_version
-            && self.status == EmbeddingIndexMetadataStatus::Ready.as_str()
     }
 }
 
@@ -679,6 +686,44 @@ impl NotebookDb {
         Ok(())
     }
 
+    /// Commit canonical deletion before callers touch rebuildable projections.
+    pub fn delete_source_with_projection_invalidation(
+        &self,
+        notebook_id: &str,
+        source_id: &str,
+    ) -> Result<(), GlossError> {
+        self.with_dense_index_transaction(|db| {
+            db.conn.execute(
+                "UPDATE semantic_memory_links SET sync_status = 'stale',
+                 sync_error = 'Gloss source deleted', synced_at = datetime('now')
+                 WHERE notebook_id = ?1 AND source_id = ?2",
+                rusqlite::params![notebook_id, source_id],
+            )?;
+            db.delete_source(source_id)
+        })
+    }
+
+    /// Canonical retry reset is atomic; failed deletion preserves old mappings.
+    pub fn reset_source_for_reingestion(
+        &self,
+        notebook_id: &str,
+        source_id: &str,
+    ) -> Result<String, GlossError> {
+        self.with_dense_index_transaction(|db| {
+            let source_type = db.get_source(source_id)?.source_type;
+            db.conn.execute(
+                "UPDATE semantic_memory_links SET sync_status = 'stale',
+                 sync_error = 'Gloss source reingestion requested', synced_at = datetime('now')
+                 WHERE notebook_id = ?1 AND source_id = ?2",
+                rusqlite::params![notebook_id, source_id],
+            )?;
+            db.update_source_status(source_id, "pending", None)?;
+            db.delete_chunks_for_source(source_id)?;
+            db.update_source_index_status(source_id, Some("missing"), Some("missing"), None)?;
+            Ok(source_type)
+        })
+    }
+
     /// Persist the exact set of selected sources for this notebook.
     /// Wrapped in a transaction so a crash between unselect-all and re-select
     /// cannot leave all sources unselected.
@@ -775,7 +820,33 @@ impl NotebookDb {
         Ok(())
     }
 
-    /// Update chunk embedding_id after HNSW insertion.
+    /// Serialize native artifact writers across pooled and queue connections.
+    /// The caller publishes the artifact before updating mappings. A failed
+    /// mapping/status write rolls the entire batch back, leaving retryable
+    /// unmapped chunks (at worst, harmless orphan vectors in the projection).
+    pub fn with_dense_index_transaction<T>(
+        &self,
+        publish: impl FnOnce(&Self) -> Result<T, GlossError>,
+    ) -> Result<T, GlossError> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let result = publish(self)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn native_embedding_ids(&self) -> Result<Vec<i64>, GlossError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT embedding_id FROM chunks WHERE embedding_id IS NOT NULL")?;
+        let ids = statement.query_map([], |row| row.get(0))?;
+        ids.collect::<Result<Vec<_>, _>>().map_err(GlossError::from)
+    }
+
+    /// Update a mapping only after verified artifact publication, inside the
+    /// native writer transaction. Source readiness requires all its chunks.
     pub fn update_chunk_embedding(
         &self,
         chunk_id: &str,
@@ -795,7 +866,17 @@ impl NotebookDb {
             )
             .optional()?;
         if let Some(source_id) = source_id {
-            self.update_source_index_status(&source_id, None, Some("indexed"), None)?;
+            let incomplete: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chunks WHERE source_id = ?1 AND embedding_id IS NULL)",
+                [&source_id],
+                |row| row.get(0),
+            )?;
+            self.update_source_index_status(
+                &source_id,
+                None,
+                Some(if incomplete { "building" } else { "indexed" }),
+                None,
+            )?;
         }
         Ok(())
     }

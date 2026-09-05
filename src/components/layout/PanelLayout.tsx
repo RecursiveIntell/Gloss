@@ -35,6 +35,7 @@ const LEFT_PANEL_FALLBACK_WIDTH = 320;
 const RIGHT_PANEL_FALLBACK_WIDTH = 560;
 
 export function clampPanelWidth(value: unknown, fallback: number): number {
+  if (value == null || value === '') return fallback;
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, parsed));
@@ -184,7 +185,7 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
         </div>
       ) : null}
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <ChatPanel notebookId={notebookId} />
+        <ChatPanel key={notebookId} notebookId={notebookId} />
       </div>
       {!rightCollapsed ? (
         <div className="gloss-panel relative flex shrink-0 flex-col overflow-hidden border-l border-border" style={{ width: rightWidth }}>
@@ -267,7 +268,7 @@ function InspectorDock({
         ))}
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">
-        {activeTab === "notes" ? <NotesPanel notebookId={notebookId} /> : null}
+        {activeTab === "notes" ? <NotesPanel key={notebookId} notebookId={notebookId} /> : null}
         {activeTab === "studio" ? <StudioPanel notebookId={notebookId} /> : null}
         {activeTab === "evidence" ? <EvidencePanel /> : null}
         {activeTab === "prompt" ? <PromptPanel /> : null}

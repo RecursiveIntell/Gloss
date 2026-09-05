@@ -95,6 +95,7 @@ interface SourceStore {
   sourceListError?: string | null;
   stats: NotebookStats | null;
   loadedNotebookId: string | null;
+  loadEpoch: number;
   loadSources: (notebookId: string) => Promise<void>;
   addSourceFile: (notebookId: string, path: string) => Promise<void>;
   addSourceFiles: (notebookId: string, paths: string[]) => Promise<void>;
@@ -130,12 +131,19 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   sourceListError: null,
   stats: null,
   loadedNotebookId: null,
+  loadEpoch: 0,
 
   loadSources: async (notebookId) => {
-    set({ loadedNotebookId: notebookId, loading: true, sourceListStatus: 'loading', sourceListError: null });
+    // A completed import may refresh after its notebook was deactivated.
+    // It must not invalidate the active notebook's in-flight load epoch.
+    if (useNotebookStore.getState().activeNotebookId !== notebookId) return;
+    const loadEpoch = get().loadEpoch + 1;
+    const selectionAtStart = get().selectedSourceIds;
+    const selectionPendingAtStart = persistSelectedSourcesPending.has(notebookId) || persistSelectedSourcesInFlight.has(notebookId);
+    set({ loadedNotebookId: notebookId, loadEpoch, loading: true, sourceListStatus: 'loading', sourceListError: null });
     try {
       const sources = await api.listSources(notebookId);
-      if (get().loadedNotebookId !== notebookId || useNotebookStore.getState().activeNotebookId !== notebookId) {
+      if (get().loadEpoch !== loadEpoch || get().loadedNotebookId !== notebookId || useNotebookStore.getState().activeNotebookId !== notebookId) {
         return;
       }
       const selectedIds = new Set(sources.filter(s => s.selected).map(s => s.id));
@@ -149,14 +157,14 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
               : 'none';
       set({
         sources,
-        selectedSourceIds: selectedIds,
-        sourceScopeMode,
+        selectedSourceIds: selectionPendingAtStart || get().selectedSourceIds !== selectionAtStart ? get().selectedSourceIds : selectedIds,
+        sourceScopeMode: selectionPendingAtStart || get().selectedSourceIds !== selectionAtStart ? get().sourceScopeMode : sourceScopeMode,
         loading: false,
         sourceListStatus: sources.length === 0 ? 'empty' : 'ready',
         sourceListError: null,
       });
     } catch (e) {
-      if (get().loadedNotebookId !== notebookId || useNotebookStore.getState().activeNotebookId !== notebookId) {
+      if (get().loadEpoch !== loadEpoch || get().loadedNotebookId !== notebookId || useNotebookStore.getState().activeNotebookId !== notebookId) {
         return;
       }
       console.warn('Failed to load sources:', e);
@@ -547,6 +555,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       sourceScopeMode: 'none',
       stats: null,
       loadedNotebookId: null,
+      loadEpoch: get().loadEpoch + 1,
       loading: false,
       sourceListStatus: 'idle',
       sourceListError: null,

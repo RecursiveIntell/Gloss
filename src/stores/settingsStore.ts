@@ -3,13 +3,25 @@ import type { Provider, ModelRecord, FeatureFlagStatus, ExternalToolAvailability
 import * as api from '../lib/tauri';
 import { useToastStore } from './toastStore';
 
+function selectionReadiness(settings: Record<string, string>, models: ModelRecord[], modelsLoaded: boolean): string | null {
+  const modelId = settings.default_model?.trim();
+  if (!modelId) return 'No default model is configured. Select an available model in Settings.';
+  if (!modelsLoaded) return null;
+  const selected = models.find(model => model.id === modelId && model.provider_id === settings.default_provider);
+  return !selected || !selected.available || selected.stale
+    ? `Selected model '${modelId}' is unavailable. Refresh models or select an available model.`
+    : null;
+}
+
 interface SettingsStore {
   providers: Provider[];
   models: ModelRecord[];
+  modelsLoaded: boolean;
   settings: Record<string, string>;
   featureFlags: FeatureFlagStatus[];
   activeModel: string;
   selectionError: string | null;
+  selectionPending: boolean;
   loading: boolean;
   externalTools: Record<string, ExternalToolAvailabilityReceipt>;
   loadSettings: () => Promise<void>;
@@ -29,23 +41,25 @@ interface SettingsStore {
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   providers: [],
   models: [],
+  modelsLoaded: false,
   settings: {},
   featureFlags: [],
   activeModel: '',
   selectionError: null,
+  selectionPending: false,
   loading: false,
   externalTools: {},
 
   loadSettings: async () => {
+    const priorSettings = get().settings;
     try {
       const settings = await api.getSettings();
+      if (get().selectionPending || get().settings !== priorSettings) return;
       const defaultModel = settings['default_model']?.trim() ?? '';
       set({
         settings,
         activeModel: defaultModel,
-        selectionError: defaultModel
-          ? null
-          : 'No default model is configured. Select an available model in Settings.',
+        selectionError: selectionReadiness(settings, get().models, get().modelsLoaded),
       });
     } catch (e) {
       console.warn('Failed to load settings:', e);
@@ -76,19 +90,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   loadModels: async () => {
     try {
       const models = await api.getAllModels();
-      const activeModel = get().activeModel;
-      const selectedProviderId = get().settings['default_provider'];
-      const selectedModel = activeModel
-        ? models.find(
-            (model) =>
-              model.id === activeModel &&
-              (!selectedProviderId || model.provider_id === selectedProviderId)
-          ) ?? models.find((model) => model.id === activeModel)
-        : undefined;
-      const selectionError = activeModel && (!selectedModel || !selectedModel.available || selectedModel.stale)
-        ? `Selected model '${activeModel}' is unavailable. Refresh models or select an available model.`
-        : null;
-      set({ models, selectionError });
+      const selectionError = selectionReadiness({ ...get().settings, default_model: get().activeModel }, models, true);
+      set({ models, modelsLoaded: true, selectionError });
     } catch (e) {
       console.warn('Failed to load models:', e);
       useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load models', duration: 5000 });
@@ -196,22 +199,26 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setActiveModel: (model) => set({ activeModel: model }),
 
   selectModel: async (providerId, modelId) => {
+    if (get().selectionPending) throw new Error('Model selection is already being saved.');
     const model = get().models.find((candidate) => candidate.provider_id === providerId && candidate.id === modelId);
-    if (!model) {
+    if (!model || !model.available || model.stale) {
       const message = `Model ${modelId} is not registered for provider ${providerId}`;
       set({ selectionError: message });
       useToastStore.getState().addToast({ type: 'error', title: 'Invalid model selection', message, duration: 5000 });
       throw new Error(message);
     }
-    // Commit the pair together so no render can observe a provider/model mix.
-    set((state) => ({ activeModel: modelId, selectionError: null, settings: { ...state.settings, default_model: modelId, default_provider: providerId } }));
+    set({ selectionPending: true });
     try {
-      await Promise.all([api.updateSetting('default_model', modelId), api.updateSetting('default_provider', providerId)]);
+      await api.selectChatModel(providerId, modelId);
+      // Project the pair only after the canonical DB transaction acknowledges it.
+      set((state) => ({ activeModel: modelId, selectionError: null, settings: { ...state.settings, default_model: modelId, default_provider: providerId } }));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       set({ selectionError: message });
       useToastStore.getState().addToast({ type: 'error', title: 'Model selection not saved', message, duration: 5000 });
       throw error;
+    } finally {
+      set({ selectionPending: false });
     }
   },
 

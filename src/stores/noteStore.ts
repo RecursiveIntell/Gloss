@@ -2,8 +2,8 @@ import { create } from 'zustand';
 import type { Note } from '../lib/types';
 import * as api from '../lib/tauri';
 import { useToastStore } from './toastStore';
+import { useNotebookStore } from './notebookStore';
 
-const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
 
 function errMsg(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -14,6 +14,8 @@ function errMsg(e: unknown): string {
 interface NoteStore {
   notes: Note[];
   loading: boolean;
+  loadError: string | null;
+  loadEpoch: number;
   loadNotes: (notebookId: string) => Promise<void>;
   createNote: (notebookId: string, title: string, content: string) => Promise<void>;
   saveResponse: (notebookId: string, messageId: string) => Promise<void>;
@@ -26,21 +28,25 @@ interface NoteStore {
 export const useNoteStore = create<NoteStore>((set, get) => ({
   notes: [],
   loading: false,
+  loadError: null,
+  loadEpoch: 0,
 
   loadNotes: async (notebookId) => {
-    set({ loading: true });
+    if (useNotebookStore.getState().activeNotebookId !== notebookId) return;
+    const loadEpoch = get().loadEpoch + 1;
+    set({ loading: true, loadError: null, loadEpoch });
     try {
       const notes = await api.listNotes(notebookId);
-      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      if (useNotebookStore.getState().activeNotebookId !== notebookId || get().loadEpoch !== loadEpoch) {
         return;
       }
       set({ notes, loading: false });
     } catch (e) {
-      if (localStorage.getItem(ACTIVE_NB_KEY) !== notebookId) {
+      if (useNotebookStore.getState().activeNotebookId !== notebookId || get().loadEpoch !== loadEpoch) {
         return;
       }
       console.warn('Failed to load notes:', e);
-      set({ loading: false });
+      set({ loading: false, loadError: errMsg(e) });
     }
   },
 
@@ -128,6 +134,8 @@ export const useNoteStore = create<NoteStore>((set, get) => ({
     set({
       notes: [],
       loading: false,
+      loadError: null,
+      loadEpoch: get().loadEpoch + 1,
     });
   },
 }));

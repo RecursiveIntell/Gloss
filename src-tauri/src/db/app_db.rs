@@ -344,6 +344,28 @@ impl AppDb {
 
     // -- Settings --
 
+    /// Validate and persist the provider/model identity as one atomic setting.
+    /// Callers hold AppState's app_db lock across validation and commit.
+    pub fn select_chat_model(&self, provider_id: &str, model_id: &str) -> Result<(), GlossError> {
+        let enabled = self
+            .list_providers()?
+            .iter()
+            .any(|p| p.id == provider_id && p.enabled);
+        let ready = self
+            .get_all_models()?
+            .iter()
+            .any(|m| m.provider_id == provider_id && m.id == model_id && m.available && !m.stale);
+        if !enabled || !ready {
+            return Err(GlossError::Config(format!(
+                "Model '{model_id}' is unavailable for enabled provider '{provider_id}'"
+            )));
+        }
+        self.set_settings_atomically(&[
+            ("default_provider", provider_id),
+            ("default_model", model_id),
+        ])
+    }
+
     /// Get all settings as key-value pairs.
     pub fn get_settings(&self) -> Result<std::collections::HashMap<String, String>, GlossError> {
         let mut stmt = self.conn.prepare("SELECT key, value FROM settings")?;
@@ -410,6 +432,93 @@ impl AppDb {
             }
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod audit_model_selection_tests {
+    use super::*;
+
+    fn fixture() -> AppDb {
+        let db = AppDb::open(Path::new(":memory:")).unwrap();
+        db.update_provider("openai", true, None).unwrap();
+        db.replace_models(
+            "openai",
+            &[ModelRecord {
+                id: "new".into(),
+                provider_id: "openai".into(),
+                display_name: "New".into(),
+                parameter_size: None,
+                context_window: None,
+                capabilities: None,
+                available: true,
+                stale: false,
+                last_error: None,
+            }],
+        )
+        .unwrap();
+        db.set_settings_atomically(&[("default_provider", "ollama"), ("default_model", "old")])
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn exact_enabled_provider_and_model_commit_together() {
+        let db = fixture();
+        db.select_chat_model("openai", "new").unwrap();
+        assert_eq!(
+            db.get_setting("default_provider").unwrap().as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            db.get_setting("default_model").unwrap().as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn rejected_selection_does_not_change_either_setting() {
+        let db = fixture();
+        assert!(db.select_chat_model("ollama", "new").is_err());
+        db.update_provider("openai", false, None).unwrap();
+        assert!(db.select_chat_model("openai", "new").is_err());
+        db.update_provider("openai", true, None).unwrap();
+        db.conn
+            .execute(
+                "UPDATE models SET stale = 1 WHERE provider_id = 'openai'",
+                [],
+            )
+            .unwrap();
+        assert!(db.select_chat_model("openai", "new").is_err());
+        assert_eq!(
+            db.get_setting("default_provider").unwrap().as_deref(),
+            Some("ollama")
+        );
+        assert_eq!(
+            db.get_setting("default_model").unwrap().as_deref(),
+            Some("old")
+        );
+    }
+
+    #[test]
+    fn second_write_failure_rolls_back_the_provider() {
+        let db = fixture();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_new_model BEFORE INSERT ON settings
+            WHEN NEW.key = 'default_model' AND NEW.value = 'new'
+            BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;",
+            )
+            .unwrap();
+        assert!(db.select_chat_model("openai", "new").is_err());
+        assert_eq!(
+            db.get_setting("default_provider").unwrap().as_deref(),
+            Some("ollama")
+        );
+        assert_eq!(
+            db.get_setting("default_model").unwrap().as_deref(),
+            Some("old")
+        );
     }
 }
 

@@ -22,14 +22,12 @@ interface ChatStore {
   streamingContent: string;
   streamingNotebookId: string | null;
   streamingMessageId: string | null;
+  preparingMessageId: string | null;
   streamingError: string | null;
   streamingStatus: ChatStatusPayload | null;
   pendingEvidence: Record<string, ChatEvidencePayload>;
   /**
-   * Set of assistant message ids that the store will accept chat:token /
-   * chat:evidence / chat:done for. This guards against the token race where
-   * the backend re-assigns a different messageId than the frontend asked for:
-   * the frontend stores BOTH ids so tokens arriving for either are accepted.
+   * Current attempt's accepted assistant ID. Never carry acceptance across attempts.
    */
   pendingMessageIds: Record<string, true>;
   lastChatEventSeq: number;
@@ -39,7 +37,7 @@ interface ChatStore {
   customGoal: string;
   responseLength: string;
   loadConversations: (notebookId: string) => Promise<void>;
-  createConversation: (notebookId: string) => Promise<string>;
+  createConversation: (notebookId: string, requestMessageId?: string) => Promise<string>;
   deleteConversation: (notebookId: string, conversationId: string) => Promise<void>;
   setActiveConversation: (id: string | null) => void;
   loadMessages: (notebookId: string, conversationId: string) => Promise<void>;
@@ -69,6 +67,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   streamingContent: '',
   streamingNotebookId: null,
   streamingMessageId: null,
+  preparingMessageId: null,
   streamingError: null,
   streamingStatus: null,
   pendingEvidence: {},
@@ -93,10 +92,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
-  createConversation: async (notebookId) => {
+  createConversation: async (notebookId, requestMessageId) => {
+    const previousConversationId = get().activeConversationId;
     const id = await api.createConversation(notebookId);
     await get().loadConversations(notebookId);
-    if (useNotebookStore.getState().activeNotebookId !== notebookId) {
+    if ((requestMessageId !== undefined && get().streamingMessageId !== requestMessageId) ||
+        useNotebookStore.getState().activeNotebookId !== notebookId ||
+        get().activeConversationId !== previousConversationId) {
       return id;
     }
     set({ activeConversationId: id, messages: [] });
@@ -189,122 +191,86 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   sendMessage: async (notebookId, query, sourceScope, model) => {
+    if (get().isStreaming || useNotebookStore.getState().activeNotebookId !== notebookId) return;
+    const assistantMessageId = crypto.randomUUID();
+    const ownsRequest = () => get().streamingMessageId === assistantMessageId;
+    // Reserve the single frontend stream before any asynchronous conversation creation.
+    set({
+      isStreaming: true, streamingNotebookId: notebookId,
+      streamingMessageId: assistantMessageId, streamingContent: '',
+      preparingMessageId: assistantMessageId,
+      streamingError: null, streamingStatus: null,
+      pendingMessageIds: { [assistantMessageId]: true }, pendingEvidence: {},
+    });
     let userMsg: Message | null = null;
-    let addedUserMessage = false;
     try {
       let { activeConversationId } = get();
       if (!activeConversationId) {
-        activeConversationId = await get().createConversation(notebookId);
+        activeConversationId = await get().createConversation(notebookId, assistantMessageId);
       }
-
-      const assistantMessageId = crypto.randomUUID();
-
-      // Add user message to local state immediately only after a conversation exists.
-      // If first-conversation creation fails, the prompt remains recoverable in the input
-      // owner and the store exposes a real error instead of throwing out of band.
+      if (!ownsRequest()) return;
+      if (useNotebookStore.getState().activeNotebookId !== notebookId ||
+          get().activeConversationId !== activeConversationId) {
+        set({ isStreaming: false, streamingNotebookId: null, streamingMessageId: null,
+          streamingContent: '', streamingStatus: null, pendingMessageIds: {}, pendingEvidence: {} });
+        return;
+      }
       userMsg = {
-        id: crypto.randomUUID(),
-        conversation_id: activeConversationId,
-        role: 'user',
-        content: query,
-        created_at: new Date().toISOString(),
+        id: crypto.randomUUID(), conversation_id: activeConversationId,
+        role: 'user', content: query, created_at: new Date().toISOString(),
       };
       set((state) => ({
         messages: [...state.messages, userMsg!],
-        isStreaming: true,
-        streamingContent: '',
-        streamingNotebookId: notebookId,
-        streamingMessageId: assistantMessageId,
-        streamingError: null,
+        preparingMessageId: null,
         streamingStatus: {
-          notebook_id: notebookId,
-          conversation_id: activeConversationId,
-          message_id: assistantMessageId,
-          phase: 'queued',
-          message: 'Queued',
-          elapsed_ms: 0,
-          truncated: false,
+          notebook_id: notebookId, conversation_id: activeConversationId,
+          message_id: assistantMessageId, phase: 'queued', message: 'Queued',
+          elapsed_ms: 0, truncated: false,
         },
-        pendingMessageIds: { ...state.pendingMessageIds, [assistantMessageId]: true },
       }));
-      addedUserMessage = true;
-
       const { style, customGoal, responseLength } = get();
       const messageId = await api.sendMessage(
-        notebookId,
-        activeConversationId,
-        query,
-        sourceScope,
-        model,
-        assistantMessageId,
-        style !== 'default' ? style : undefined,
-        customGoal || undefined,
+        notebookId, activeConversationId, query, sourceScope, model, assistantMessageId,
+        style !== 'default' ? style : undefined, customGoal || undefined,
         responseLength !== 'default' ? responseLength : undefined,
       );
-      if (useNotebookStore.getState().activeNotebookId !== notebookId) {
-        // The user switched notebooks while sendMessage was in flight. The
-        // optimistically added user message is for the prior notebook's
-        // conversation and should be removed so the new notebook's message
-        // list is not polluted.
-        set((state) => ({
-          messages: userMsg
-            ? state.messages.filter((m) => m.id !== userMsg!.id)
-            : state.messages,
-          isStreaming: false,
-          streamingContent: '',
-          streamingNotebookId: null,
-          streamingMessageId: null,
-          streamingStatus: null,
-        }));
-        return;
-      }
-      if (get().activeConversationId !== activeConversationId) {
-        set((state) => ({
-          messages: userMsg
-            ? state.messages.filter((m) => m.id !== userMsg!.id)
-            : state.messages,
-          isStreaming: false,
-          streamingContent: '',
-          streamingNotebookId: null,
-          streamingMessageId: null,
-          streamingStatus: null,
-        }));
-        return;
-      }
-      // Accept tokens for EITHER the frontend-assigned id (the common case) or
-      // the backend-reassigned id (in case the backend ever returns a different
-      // one). We track the accepted set in assistantMessageIds so the first
-      // chunk that arrives after a re-assignment is not silently dropped.
+      // Done/error may arrive before the invoke acknowledgement, or a newer
+      // stream may already own the store. Neither case permits late mutation.
+      if (!ownsRequest()) return;
       if (messageId !== assistantMessageId) {
-        set({ streamingMessageId: messageId, pendingMessageIds: { ...get().pendingMessageIds, [messageId]: true } });
-        // Don't roll back the user message — the send succeeded; the backend
-        // chose a different assistant id and we will accept tokens for either.
-      } else {
-        set({ pendingMessageIds: { ...get().pendingMessageIds, [messageId]: true } });
+        get().setStreamingError(notebookId, activeConversationId, assistantMessageId,
+          'Chat protocol error: backend returned a different assistant message ID.');
       }
+      // The acknowledgement is not a terminal event; keep the bound lifecycle.
     } catch (e) {
+      if (!ownsRequest()) return;
       const message = errorMessage(e);
       console.warn('Failed to send message:', e);
-      // Roll back the optimistically added user message so the chat does not
-      // show a prompt that was never persisted. Reload will fetch authoritative
-      // history.
       set((state) => ({
-        messages: addedUserMessage && userMsg
-          ? state.messages.filter((m) => m.id !== userMsg!.id)
-          : state.messages,
-        streamingError: message,
-        isStreaming: false,
-        streamingContent: '',
-        streamingNotebookId: null,
-        streamingMessageId: null,
-        streamingStatus: null,
+        messages: userMsg ? state.messages.filter((m) => m.id !== userMsg!.id) : state.messages,
+        streamingError: useNotebookStore.getState().activeNotebookId === notebookId ? message : null,
+        isStreaming: false, streamingContent: '', streamingNotebookId: null,
+        streamingMessageId: null, streamingStatus: null,
+        pendingMessageIds: {}, pendingEvidence: {},
       }));
     }
   },
 
   stopStreaming: async (notebookId) => {
+    const requestedMessageId = get().streamingMessageId;
+    if (get().streamingNotebookId !== notebookId) return;
+    if (requestedMessageId && get().preparingMessageId === requestedMessageId) {
+      // No backend attempt exists yet. Invalidate this owner synchronously so
+      // a late conversation-creation response cannot submit or activate it.
+      set({ isStreaming: false, preparingMessageId: null,
+        streamingMessageId: null, streamingNotebookId: null,
+        streamingContent: '', streamingStatus: null,
+        pendingMessageIds: {}, pendingEvidence: {} });
+      return;
+    }
     try {
       await api.stopChat(notebookId);
+      if (get().streamingMessageId !== requestedMessageId) return;
       const { isStreaming, streamingMessageId, activeConversationId } = get();
       if (!isStreaming || !streamingMessageId || !activeConversationId) return;
       // The command only acknowledges a cancellation request. The backend
@@ -322,6 +288,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         },
       });
     } catch (error) {
+      if (get().streamingMessageId !== requestedMessageId) return;
       const { activeConversationId, streamingMessageId } = get();
       if (!activeConversationId || !streamingMessageId) return;
       get().setStreamingError(

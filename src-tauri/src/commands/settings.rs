@@ -711,11 +711,29 @@ pub async fn run_embedding_diagnostics(
 }
 
 #[tauri::command]
+pub async fn select_chat_model(
+    provider_id: String,
+    model_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    app_db.select_chat_model(&provider_id, &model_id)
+}
+
+#[tauri::command]
 pub async fn update_setting(
     key: String,
     value: String,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
+    if matches!(key.as_str(), "default_model" | "default_provider") {
+        return Err(GlossError::Config(
+            "Use select_chat_model to update provider and model atomically".into(),
+        ));
+    }
     /// Known setting keys that may be written via update_setting.
     const KNOWN_SETTINGS: &[&str] = &[
         "summary_mode",

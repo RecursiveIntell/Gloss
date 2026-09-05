@@ -1,7 +1,5 @@
 use crate::db::app_db::AppDb;
-use crate::db::notebook_db::{
-    EmbeddingIndexMetadata, EmbeddingIndexMetadataStatus, NotebookDb, NATIVE_HNSW_INDEX_ID,
-};
+use crate::db::notebook_db::{EmbeddingIndexMetadata, NotebookDb, NATIVE_HNSW_INDEX_ID};
 use crate::db::notebook_pool::NotebookDbPools;
 use crate::error::GlossError;
 use crate::features;
@@ -675,264 +673,82 @@ impl AppState {
         Ok(())
     }
 
-    /// Get or create the HNSW index for a notebook.
-    /// Queries the notebook DB for the max embedding_id to avoid label collisions
-    /// after vector deletions (where index.size() < max label ever assigned).
-    ///
-    /// Gathers external data without holding hnsw_indices (avoids lock-ordering
-    /// deadlocks), then creates the index INSIDE the hnsw_indices lock with a
-    /// second contains_key guard to prevent the race where two threads both
-    /// create a usearch Index and one is immediately dropped (corrupts C++ heap).
+    /// Acquire a cache of the published artifact without changing durable status.
     pub fn ensure_hnsw_index(&self, notebook_id: &str) -> Result<(), GlossError> {
-        let expected_metadata: Option<EmbeddingIndexMetadata> = {
+        let expected = {
             let guard = self
                 .embedder
                 .read()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
-            guard.as_ref().map(|embedder| {
-                EmbeddingIndexMetadata::ready(
-                    NATIVE_HNSW_INDEX_ID,
-                    embedder.provider_id(),
-                    embedder.model_id(),
-                    embedder.model_digest(),
-                    embedder.dims(),
-                )
-            })
+            let embedder = guard
+                .as_ref()
+                .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
+            EmbeddingIndexMetadata::ready(
+                NATIVE_HNSW_INDEX_ID,
+                embedder.provider_id(),
+                embedder.model_id(),
+                embedder.model_digest(),
+                embedder.dims(),
+            )
         };
-        let embedder_dim = expected_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.dimensions);
-        let stored_metadata = self.with_notebook_db(notebook_id, |db| {
-            db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
-        })?;
-        // Quick check — avoids unnecessary work if index already loaded.
-        // If the active model identity differs, mark the durable row stale and
-        // drop the cached index instead of querying a wrong-dimension HNSW.
-        {
-            let mut indices = self
-                .hnsw_indices
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            let mut dims = self
-                .hnsw_index_dims
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            if indices.contains_key(notebook_id) {
-                if let Some(expected) = expected_metadata.as_ref() {
-                    let metadata_matches = stored_metadata.as_ref().is_some_and(|stored| {
-                        stored.provider == expected.provider
-                            && stored.model == expected.model
-                            && stored.model_digest == expected.model_digest
-                            && stored.dimensions == expected.dimensions
-                            && stored.schema_version == expected.schema_version
-                            && matches!(stored.status.as_str(), "ready" | "building")
-                    });
-                    if !metadata_matches {
-                        let reason = match stored_metadata.as_ref() {
-                            Some(stored) => format!(
-                                "embedding-index-stale: cached HNSW metadata {}/{}/{:?}/{} does not match active {}/{}/{:?}/{}",
-                                stored.provider,
-                                stored.model,
-                                stored.dimensions,
-                                stored.status,
-                                expected.provider,
-                                expected.model,
-                                expected.dimensions,
-                                expected.status
-                            ),
-                            None => "embedding-index-stale: cached native dense index has no durable metadata".to_string(),
-                        };
-                        indices.remove(notebook_id);
-                        dims.remove(notebook_id);
-                        let _ = self.with_notebook_db_write(notebook_id, |db| {
-                            db.mark_embedding_index_status(
-                                NATIVE_HNSW_INDEX_ID,
-                                EmbeddingIndexMetadataStatus::Stale,
-                                Some(&reason),
-                            )
-                        });
-                        return Err(GlossError::Embedding(reason));
-                    }
-                }
-                let cached = dims.get(notebook_id).copied();
-                if embedder_dim.is_some() && cached != embedder_dim {
-                    let reason = format!(
-                        "embedding-index-stale: cached HNSW dimensions {:?} do not match active embedder dimensions {:?}",
-                        cached, embedder_dim
-                    );
-                    tracing::warn!(
-                        notebook_id,
-                        cached_dims = ?cached,
-                        embedder_dims = ?embedder_dim,
-                        "HNSW dim mismatch; dropping cached index"
-                    );
-                    indices.remove(notebook_id);
-                    dims.remove(notebook_id);
-                    let _ = self.with_notebook_db_write(notebook_id, |db| {
-                        db.mark_embedding_index_status(
-                            NATIVE_HNSW_INDEX_ID,
-                            EmbeddingIndexMetadataStatus::Stale,
-                            Some(&reason),
-                        )
-                    });
-                    return Err(GlossError::Embedding(reason));
-                }
-                if indices.contains_key(notebook_id) {
-                    return Ok(());
-                }
-            }
-        }
-        // hnsw_indices released here — safe to gather notebook metadata without
-        // nested lock risk.
-
-        // Gather data needed for index creation (requires other locks)
-        let nb_dir = {
-            let app_db = self
-                .app_db
-                .lock()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            let nb = app_db.get_notebook(notebook_id)?;
-            PathBuf::from(nb.directory)
-        };
-
-        let max_embedding_id = self.with_notebook_db(notebook_id, |db| db.max_embedding_id())?;
-
-        // Re-acquire hnsw_indices and create the index INSIDE the lock.
-        // Critical: the second contains_key check prevents the race where two
-        // threads both passed the first check. Without this, two usearch C++
-        // Index objects get created and one is immediately dropped, corrupting
-        // the C++ heap (manifests as "free(): corrupted unsorted chunks").
+        let db_path = self.notebook_db_path(notebook_id)?;
+        let index_path = crate::ingestion::embed::native_dense_artifact_path(
+            db_path
+                .parent()
+                .ok_or_else(|| GlossError::Other("Notebook DB has no parent".into()))?,
+        );
         let mut indices = self
             .hnsw_indices
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        if indices.contains_key(notebook_id) {
-            return Ok(()); // Another thread beat us — nothing to drop
+        let stored = self.with_notebook_db(notebook_id, |db| {
+            db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
+        })?;
+        if !stored
+            .as_ref()
+            .is_some_and(|stored| stored.identity_matches(&expected))
+        {
+            indices.remove(notebook_id);
+            self.hnsw_index_dims
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?
+                .remove(notebook_id);
+            return Err(GlossError::Embedding(
+                "Native dense index is not ready for the configured embedding identity".into(),
+            ));
         }
-
-        let index_path = crate::ingestion::embed::native_dense_artifact_path(&nb_dir);
-        let Some(expected_metadata) = expected_metadata else {
-            let reason = "embedding-index-blocked: native dense index cannot open without an initialized embedder".to_string();
-            self.with_notebook_db_write(notebook_id, |db| {
-                db.mark_embedding_index_status(
-                    NATIVE_HNSW_INDEX_ID,
-                    EmbeddingIndexMetadataStatus::Blocked,
-                    Some(&reason),
-                )
-            })?;
-            return Err(GlossError::Embedding(reason));
-        };
-        let Some(dim) = expected_metadata.dimensions else {
-            let reason = "embedding-index-blocked: native dense index cannot open without probed embedding dimensions".to_string();
-            self.with_notebook_db_write(notebook_id, |db| {
-                db.mark_embedding_index_status(
-                    NATIVE_HNSW_INDEX_ID,
-                    EmbeddingIndexMetadataStatus::Blocked,
-                    Some(&reason),
-                )
-            })?;
-            return Err(GlossError::Embedding(reason));
-        };
-        if index_path.exists() || max_embedding_id.is_some() {
-            let stale_reason = match stored_metadata.as_ref() {
-                Some(stored) if stored.identity_matches(&expected_metadata) => None,
-                Some(stored) => Some(format!(
-                    "embedding-index-stale: stored provider/model/dim metadata {}/{}/{:?} does not match active {}/{}/{:?}",
-                    stored.provider,
-                    stored.model,
-                    stored.dimensions,
-                    expected_metadata.provider,
-                    expected_metadata.model,
-                    expected_metadata.dimensions
-                )),
-                None => Some(
-                    "embedding-index-stale: existing native dense index has no durable metadata"
-                        .to_string(),
-                ),
-            };
-            if let Some(reason) = stale_reason {
-                self.with_notebook_db_write(notebook_id, |db| {
-                    db.mark_embedding_index_status(
-                        NATIVE_HNSW_INDEX_ID,
-                        EmbeddingIndexMetadataStatus::Stale,
-                        Some(&reason),
-                    )
-                })?;
-                return Err(GlossError::Embedding(reason));
+        if let Some(index) = indices.get(notebook_id) {
+            if !index.has_pending_changes() && index.is_current(&index_path)? {
+                return Ok(());
             }
         }
-        let index = if index_path.exists() {
-            tracing::debug!(
-                notebook_id,
-                ?max_embedding_id,
-                dim,
-                "Loading existing HNSW index"
-            );
-            HnswIndex::load_with_hwm(&index_path, max_embedding_id.unwrap_or(0), dim)?
-        } else {
-            std::fs::create_dir_all(nb_dir.join("embeddings"))?;
-            tracing::debug!(notebook_id, dim, "Creating new HNSW index");
-            HnswIndex::new(dim)?
-        };
-
-        indices.insert(notebook_id.to_string(), index);
-        let mut building_metadata = expected_metadata.clone();
-        building_metadata.status = EmbeddingIndexMetadataStatus::Building.as_str().to_string();
-        building_metadata.status_reason = Some(
-            "native dense artifact will become ready after atomic save and reload verification"
-                .to_string(),
-        );
-        self.with_notebook_db_write(notebook_id, |db| {
-            db.upsert_embedding_index_metadata(&building_metadata)
+        let index = self.with_notebook_db(notebook_id, |db| {
+            crate::ingestion::dense::load_published_dense_index(db, &index_path, &expected)
         })?;
-        // Track the dim so future ensure_hnsw_index calls can detect mismatches.
-        let mut dims = self
-            .hnsw_index_dims
+        indices.insert(notebook_id.to_string(), index);
+        self.hnsw_index_dims
             .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        dims.insert(notebook_id.to_string(), dim);
+            .map_err(|e| GlossError::Other(e.to_string()))?
+            .insert(notebook_id.to_string(), expected.dimensions.unwrap_or(0));
         Ok(())
     }
 
-    /// Save the HNSW index for a notebook to disk.
+    /// Persist detached-vector cleanup without promoting publication metadata.
     pub fn save_hnsw_index(&self, notebook_id: &str) -> Result<(), GlossError> {
-        let expected_metadata: Option<EmbeddingIndexMetadata> = {
-            let guard = self
-                .embedder
-                .read()
-                .map_err(|e| GlossError::Other(e.to_string()))?;
-            guard.as_ref().map(|embedder| {
-                EmbeddingIndexMetadata::ready(
-                    NATIVE_HNSW_INDEX_ID,
-                    embedder.provider_id(),
-                    embedder.model_id(),
-                    embedder.model_digest(),
-                    embedder.dims(),
-                )
-            })
-        };
+        let db_path = self.notebook_db_path(notebook_id)?;
+        let index_path = crate::ingestion::embed::native_dense_artifact_path(
+            db_path
+                .parent()
+                .ok_or_else(|| GlossError::Other("Notebook DB has no parent".into()))?,
+        );
         let indices = self
             .hnsw_indices
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-
         if let Some(index) = indices.get(notebook_id) {
-            let nb_dir = {
-                let app_db = self
-                    .app_db
-                    .lock()
-                    .map_err(|e| GlossError::Other(e.to_string()))?;
-                let nb = app_db.get_notebook(notebook_id)?;
-                PathBuf::from(nb.directory)
-            };
-            let index_path = crate::ingestion::embed::native_dense_artifact_path(&nb_dir);
-            let hwm = self
-                .with_notebook_db(notebook_id, |db| db.max_embedding_id())?
-                .unwrap_or(0);
-            index.save_atomic_verified(&index_path, hwm)?;
-            if let Some(metadata) = expected_metadata {
+            if index.has_pending_changes() {
                 self.with_notebook_db_write(notebook_id, |db| {
-                    db.upsert_embedding_index_metadata(&metadata)
+                    crate::ingestion::dense::publish_dense_cleanup(db, &index_path, index)
                 })?;
             }
         }

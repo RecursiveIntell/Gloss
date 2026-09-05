@@ -412,6 +412,10 @@ export async function getSettings(): Promise<Record<string, string>> {
   return invoke("get_settings");
 }
 
+export async function selectChatModel(providerId: string, modelId: string): Promise<void> {
+  return invoke("select_chat_model", { providerId, modelId });
+}
+
 export async function runEmbeddingDiagnostics(): Promise<EmbeddingDiagnosticsReceipt> {
   return invoke("run_embedding_diagnostics");
 }

@@ -12,11 +12,11 @@ export function PromptPanel() {
   const isStreaming = useChatStore((s) => s.isStreaming);
   const streamingContent = useChatStore((s) => s.streamingContent);
 
-  const lastAssistantWithEvidence = [...messages]
+  const lastAssistant = [...messages]
     .reverse()
-    .find((m) => m.role === "assistant" && m.citations?.evidence);
+    .find((m) => m.role === "assistant");
 
-  const evidence = lastAssistantWithEvidence?.citations?.evidence;
+  const evidence = lastAssistant?.citations?.evidence;
   const promptReceipt: PromptReceiptV1 | undefined = evidence?.prompt_receipt ?? undefined;
   const decodingReceipt: DecodingSettingsReceiptV1 | undefined = evidence?.decoding_settings_receipt ?? undefined;
   const generationReceipt: GenerationReceiptV1 | undefined = evidence?.generation_receipt ?? undefined;
@@ -41,6 +41,10 @@ export function PromptPanel() {
 
   return (
     <div className="p-3 space-y-3 text-xs overflow-y-auto h-full">
+      <div role="status" className="text-text-muted">
+        {isStreaming ? "Showing the previous completed response; the current prompt is not yet available." : "Showing the latest assistant response."}
+      </div>
+      {lastAssistant && <CopyableLabel label="Message ID" value={lastAssistant.id} />}
       {/* Prompt Receipt */}
       {promptReceipt && (
         <Section title="Prompt Receipt">
@@ -175,7 +179,10 @@ function KVRow({ label, value, warn, mono }: { label: string; value: string; war
 function CopyableLabel({ label, value }: { label: string; value: string }) {
   const [copied, setCopied] = useState(false);
   const mountedRef = useRef(true);
-  useEffect(() => () => { mountedRef.current = false; }, []);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(value);

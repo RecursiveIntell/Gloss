@@ -70,6 +70,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const sourceListStatus = useSourceStore((s) => s.sourceListStatus);
   const sourceListError = useSourceStore((s) => s.sourceListError);
   const selectModel = useSettingsStore((s) => s.selectModel);
+  const selectionPending = useSettingsStore((s) => s.selectionPending);
 
   const [input, setInput] = useState("");
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
@@ -98,11 +99,14 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   }, [notebookId, activeConversationId, replayChatEvents, rehydrateConversation]);
 
   const handleSend = async () => {
-    if (!input.trim() || isStreaming) return;
+    if (!input.trim() || isStreaming || selectionPending) return;
     const query = input.trim();
     setInput("");
     setEditingUserMessageId(null);
     await sendMessage(notebookId, query, getSourceScope(), activeModel);
+    if (useChatStore.getState().streamingError) {
+      setInput((current) => current || query);
+    }
   };
 
   const handleSuggestionClick = (question: string) => {
@@ -255,7 +259,9 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           )}
         </div>
         <select
-          value={`${settings["default_provider"] || models.find((model) => model.id === activeModel)?.provider_id || ""}::${activeModel}`}
+          value={`${settings["default_provider"] || ""}::${activeModel}`}
+          disabled={isStreaming || selectionPending}
+          aria-label="Chat model and provider"
           onChange={(e) => {
             const [nextProvider, ...modelParts] = e.target.value.split("::");
             const nextModel = modelParts.join("::");
@@ -263,6 +269,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           }}
           className="min-w-0 max-w-[320px] rounded-full border border-border bg-bg-tertiary px-3 py-1 text-xs text-text focus:border-accent focus:outline-none"
         >
+          {!models.some((m) => m.provider_id === settings["default_provider"] && m.id === activeModel) && (
+            <option value={`${settings["default_provider"] || ""}::${activeModel}`} disabled>
+              {activeModel ? `${activeModel} (unavailable)` : "Select a model"}
+            </option>
+          )}
           {models.length > 0 ? (
             models.map((m) => (
               <option

@@ -9,7 +9,8 @@ interface NotesPanelProps {
 }
 
 export function NotesPanel({ notebookId }: NotesPanelProps) {
-  const { notes, createNote, updateNote, togglePin, deleteNote } = useNoteStore();
+  const { notes, loading, loadError, loadNotes, createNote, updateNote, togglePin, deleteNote } = useNoteStore();
+  const [saving, setSaving] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [newContent, setNewContent] = useState("");
@@ -19,11 +20,16 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
 
   const handleCreate = async () => {
-    if (!newContent.trim()) return;
-    await createNote(notebookId, newTitle || "Untitled Note", newContent);
-    setNewTitle("");
-    setNewContent("");
-    setShowCreate(false);
+    if (!newContent.trim() || saving) return;
+    setSaving(true);
+    try {
+      await createNote(notebookId, newTitle || "Untitled Note", newContent);
+      setNewTitle("");
+      setNewContent("");
+      setShowCreate(false);
+    } catch {
+      // The store reports persistence failures. Keep the unsaved draft intact.
+    } finally { setSaving(false); }
   };
 
   const startEditing = (noteId: string, title?: string, content?: string) => {
@@ -39,9 +45,14 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
   };
 
   const handleSaveEdit = async () => {
-    if (!editingNoteId) return;
-    await updateNote(notebookId, editingNoteId, editTitle || "Untitled Note", editContent);
-    cancelEditing();
+    if (!editingNoteId || saving) return;
+    setSaving(true);
+    try {
+      await updateNote(notebookId, editingNoteId, editTitle || "Untitled Note", editContent);
+      cancelEditing();
+    } catch {
+      // Preserve edits for explicit retry; the store already shows the error.
+    } finally { setSaving(false); }
   };
 
   const parseCitations = (citations?: unknown): Citation[] => {
@@ -56,9 +67,15 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
 
   return (
     <div className="flex h-full flex-col">
+      {loading && <p role="status" className="p-2 text-xs text-text-muted">Loading notes…</p>}
+      {loadError && <div role="alert" className="p-2 text-xs text-error">
+        Notes could not be refreshed: {loadError}{" "}
+        <button onClick={() => void loadNotes(notebookId)} className="underline">Retry</button>
+      </div>}
       <div className="flex items-center justify-end border-b border-border p-2">
         <button
           onClick={() => setShowCreate(!showCreate)}
+          disabled={saving}
           className="rounded border border-border p-1 text-text-secondary hover:bg-bg-tertiary hover:text-text"
           title="Create note"
         >
@@ -71,12 +88,14 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
           <input
             type="text"
             value={newTitle}
+            disabled={saving}
             onChange={(e) => setNewTitle(e.target.value)}
             placeholder="Title..."
             className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
           />
           <textarea
             value={newContent}
+            disabled={saving}
             onChange={(e) => setNewContent(e.target.value)}
             placeholder="Write your note..."
             rows={4}
@@ -84,6 +103,7 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
           />
           <button
             onClick={handleCreate}
+            disabled={saving || !newContent.trim()}
             className="w-full py-1 text-xs bg-accent text-white rounded hover:bg-accent-hover"
           >
             Save Note
@@ -108,11 +128,13 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
                     <input
                       type="text"
                       value={editTitle}
+                      disabled={saving}
                       onChange={(e) => setEditTitle(e.target.value)}
                       className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
                     />
                     <textarea
                       value={editContent}
+                      disabled={saving}
                       onChange={(e) => setEditContent(e.target.value)}
                       rows={5}
                       className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent resize-none"
@@ -120,6 +142,7 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
                     <div className="flex items-center gap-1">
                       <button
                         onClick={handleSaveEdit}
+                        disabled={saving}
                         className="inline-flex items-center gap-1 px-2 py-1 text-[10px] bg-accent text-white rounded hover:bg-accent-hover"
                       >
                         <Save className="w-3 h-3" />
@@ -127,6 +150,7 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
                       </button>
                       <button
                         onClick={cancelEditing}
+                        disabled={saving}
                         className="inline-flex items-center gap-1 px-2 py-1 text-[10px] bg-bg-tertiary text-text-secondary rounded hover:text-text"
                       >
                         <X className="w-3 h-3" />
@@ -172,7 +196,7 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
                   </button>
                 )}
                 <button
-                  onClick={() => togglePin(notebookId, note.id)}
+                  onClick={() => void togglePin(notebookId, note.id).catch(() => undefined)}
                   className="p-0.5 rounded hover:bg-bg-tertiary"
                 >
                   {note.pinned ? (
@@ -182,7 +206,8 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
                   )}
                 </button>
                 <button
-                  onClick={() => deleteNote(notebookId, note.id)}
+                  onClick={() => void deleteNote(notebookId, note.id).catch(() => undefined)}
+                  aria-label={`Delete note ${note.title || 'Untitled'}`}
                   className="p-0.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
                 >
                   <Trash2 className="w-3 h-3" />
@@ -193,7 +218,7 @@ export function NotesPanel({ notebookId }: NotesPanelProps) {
           );
         })}
 
-        {notes.length === 0 && (
+        {notes.length === 0 && !loading && !loadError && (
           <p className="text-xs text-text-muted text-center mt-4 px-2">
             No notes yet. Create one or save a chat response.
           </p>

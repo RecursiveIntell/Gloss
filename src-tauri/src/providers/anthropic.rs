@@ -168,7 +168,7 @@ impl LlmProvider for AnthropicProvider {
             let byte_stream = resp.bytes_stream();
 
             let stream = stream::unfold(
-                (byte_stream, Vec::<u8>::new(), ctx.clone()),
+                (byte_stream, super::sse::SseDecoder::new(), ctx.clone()),
                 |(mut byte_stream, mut buffer, ctx)| async move {
                     loop {
                         let next = tokio::select! {
@@ -188,57 +188,34 @@ impl LlmProvider for AnthropicProvider {
                                         (byte_stream, buffer, ctx),
                                     ));
                                 }
-                                buffer.extend_from_slice(&bytes);
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
-                                // Process complete SSE lines
-                                while let Some(newline_pos) =
-                                    buffer.iter().position(|&b| b == b'\n')
-                                {
-                                    let owned: String =
-                                        match std::str::from_utf8(&buffer[..newline_pos]) {
-                                            Ok(s) => s.trim().to_string(),
-                                            Err(_) => {
-                                                buffer.drain(..=newline_pos);
-                                                continue;
-                                            }
-                                        };
-                                    buffer.drain(..=newline_pos);
-                                    let line = owned.as_str();
-
-                                    if line.is_empty() || line.starts_with(':') {
-                                        continue;
-                                    }
-                                    if let Some(data) = line.strip_prefix("data: ") {
-                                        if let Ok(val) =
-                                            serde_json::from_str::<serde_json::Value>(data)
-                                        {
-                                            let event_type = val
-                                                .get("type")
-                                                .and_then(|t| t.as_str())
-                                                .unwrap_or("");
-
-                                            match event_type {
-                                                "content_block_delta" => {
-                                                    let text = val
-                                                        .get("delta")
-                                                        .and_then(|d| d.get("text"))
-                                                        .and_then(|t| t.as_str())
-                                                        .unwrap_or("")
-                                                        .to_string();
-                                                    tokens.push(Ok(ChatToken {
-                                                        token: text,
-                                                        done: false,
-                                                    }));
-                                                }
-                                                "message_stop" => {
-                                                    tokens.push(Ok(ChatToken {
-                                                        token: String::new(),
-                                                        done: true,
-                                                    }));
-                                                }
-                                                _ => {}
-                                            }
+                                let events = match buffer.push(&bytes) {
+                                    Ok(events) => events,
+                                    Err(error) => return Some((
+                                        stream::iter(vec![Err(GlossError::Provider { provider: "anthropic".into(), source: anyhow::anyhow!(error) })]),
+                                        (byte_stream, buffer, ctx),
+                                    )),
+                                };
+                                for data in events {
+                                    let val: serde_json::Value = match serde_json::from_str(&data) {
+                                        Ok(val) => val,
+                                        Err(error) => {
+                                            tokens.push(Err(GlossError::Provider { provider: "anthropic".into(), source: anyhow::anyhow!("Invalid JSON in SSE event: {}", error) })); break;
                                         }
+                                    };
+                                    if let Some(error) = val.get("error") {
+                                        let message = error.as_str().or_else(|| error.get("message").and_then(|v| v.as_str())).unwrap_or("Provider reported a streaming error");
+                                        let bounded: String = message.chars().take(512).collect();
+                                        tokens.push(Err(GlossError::Provider { provider: "anthropic".into(), source: anyhow::anyhow!("Provider stream error: {}", bounded) })); break;
+                                    }
+                                    match val.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                                        "content_block_delta" => tokens.push(Ok(ChatToken {
+                                            token: val.get("delta").and_then(|v| v.get("text")).and_then(|v| v.as_str()).unwrap_or("").to_string(), done: false,
+                                        })),
+                                        "message_stop" => {
+                                            tokens.push(Ok(ChatToken { token: String::new(), done: true })); break;
+                                        }
+                                        _ => {} // metadata, usage, and ping events carry no text
                                     }
                                 }
 

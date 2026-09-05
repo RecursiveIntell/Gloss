@@ -475,20 +475,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const configuredProviderId = settings["default_provider"] ?? "ollama";
   const activeModelRow = models.find(
     (model) => model.id === activeModel && model.provider_id === configuredProviderId
-  ) ?? models.find((model) => model.id === activeModel);
+  );
   const activeProviderId = activeModelRow?.provider_id ?? configuredProviderId;
 
-  useEffect(() => {
-    if (!open || models.length === 0) return;
-    const summaryModel = settings["summary_model"];
-    if (summaryModel && !summaryModels.some((model) => model.id === summaryModel)) {
-      void updateSetting("summary_model", "");
-    }
-    const visionModel = settings["vision_model"];
-    if (visionModel && !visionModels.some((model) => model.id === visionModel)) {
-      void updateSetting("vision_model", "");
-    }
-  }, [models, open, settings, summaryModels, updateSetting, visionModels]);
+  // Discovery is a cache, not authority to erase configured model intent.
 
   const handleProviderSave = async (updates: Record<string, string>) => {
     if (updates["ollama_url"]) {

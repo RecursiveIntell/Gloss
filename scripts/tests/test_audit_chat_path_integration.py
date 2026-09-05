@@ -62,6 +62,28 @@ class ChatPathIntegrationAuditTests(unittest.TestCase):
         errors = audit.audit(root)
         self.assertTrue(any("replay-backed terminal contract" in error for error in errors), errors)
 
+    def test_rejects_preparing_cleanup_without_exact_owner_guard(self) -> None:
+        audit = load_audit_module()
+        root = self.make_repo_copy()
+        store = root / "src/stores/chatStore.ts"
+        store.write_text(store.read_text(encoding="utf-8").replace(
+            "requestedMessageId && get().preparingMessageId === requestedMessageId",
+            "requestedMessageId", 1,
+        ), encoding="utf-8")
+        errors = audit.audit(root)
+        self.assertTrue(any("clears terminal state" in error for error in errors), errors)
+
+    def test_rejects_preparing_cleanup_that_can_fall_through_to_ipc(self) -> None:
+        audit = load_audit_module()
+        root = self.make_repo_copy()
+        store = root / "src/stores/chatStore.ts"
+        store.write_text(store.read_text(encoding="utf-8").replace(
+            "      return;\n    }\n    try {\n      await api.stopChat",
+            "    }\n    try {\n      await api.stopChat", 1,
+        ), encoding="utf-8")
+        errors = audit.audit(root)
+        self.assertTrue(any("must return synchronously" in error for error in errors), errors)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -45,10 +45,12 @@ export function StatusBar() {
     : !selectedModelAvailable
       ? activeModelRecord?.last_error || "Selected model unavailable"
       : null;
+  // A saved URL/model/profile change invalidates prior health even when the
+  // provider ID stays the same. Cleanup advances the health store's epoch.
   useEffect(() => {
     startHealthPolling(activeNotebookId, activeProviderId);
     return stopHealthPolling;
-  }, [activeNotebookId, activeProviderId, startHealthPolling, stopHealthPolling]);
+  }, [activeNotebookId, activeProviderId, settings, startHealthPolling, stopHealthPolling]);
 
   // Listen for embedding model status events
   useEffect(() => {

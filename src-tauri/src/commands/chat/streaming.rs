@@ -162,8 +162,8 @@ pub(crate) async fn stream_chat_response<R: tauri::Runtime>(
         message_id: message_id.to_string(),
         prompt_digest: request_digest.clone(),
         context_payload_digest,
-        capture_state: "captured_digest_only".to_string(),
-        redaction_state: "content_not_stored_in_receipt".to_string(),
+        capture_state: "captured_system_prompt".to_string(),
+        redaction_state: "system_prompt_stored_other_content_digest_only".to_string(),
         system_prompt_digest: digest_text(&system_prompt),
         system_prompt_text: Some(system_prompt.clone()),
         user_turn_digest,
@@ -1039,6 +1039,18 @@ mod tests {
         .expect("done frame must complete without waiting for EOF");
 
         assert_eq!(result.full_response, "hello world");
+        assert_eq!(result.generation_receipt.status, "completed");
+        assert_eq!(result.prompt_receipt.capture_state, "captured_system_prompt");
+        assert_eq!(
+            result.prompt_receipt.redaction_state,
+            "system_prompt_stored_other_content_digest_only"
+        );
+        let captured_prompt = result.prompt_receipt.system_prompt_text.as_ref().unwrap();
+        assert!(!captured_prompt.is_empty());
+        assert_eq!(
+            result.prompt_receipt.system_prompt_digest,
+            digest_text(captured_prompt)
+        );
         assert!(result.generation_receipt.done_frame_seen);
         assert!(!result.generation_receipt.eof_seen);
         assert_eq!(

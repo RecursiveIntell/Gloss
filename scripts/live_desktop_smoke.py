@@ -426,7 +426,7 @@ class IntegratedWorkflow:
         self.ui.wait(lambda: self.ui.execute("return document.getElementById(arguments[0])?.getClientRects().length>0", [drawer_id]), label="message evidence disclosure")
         values = self.ui.execute("""const r=document.getElementById(arguments[0]); const g=r.querySelector('.grid'); return Object.fromEntries(Array.from(g.children).map(e=>[e.children[0].textContent.replace(/:\\s*$/, '').trim(), e.children[1].textContent.trim()]));""", [drawer_id])
         require_scope_evidence(values, selected, excluded, retrieval, degraded=degraded)
-        self.check(values.get("Generation") == "complete", "rendered generation receipt is complete")
+        self.check(values.get("Generation") == "completed", "rendered generation receipt is complete")
         self.scope_checks.append(values)
         self.ui.snapshot(f"evidence-{len(self.scope_checks)}", self.root)
         return values
@@ -507,15 +507,17 @@ class IntegratedWorkflow:
         self.case_id = "chat_cancel_and_retry"
         self.focus_chat()
         before = self.answer_id()
+        saved_answer = self.last_answer()
         self.ui.fill('textarea[aria-label="Chat message"]', "Write a long numbered list of 100 detailed facts about oceanography. /no_think")
         self.ui.click('button[aria-label="Send message"]')
         self.ui.wait(lambda: self.ui.find_visible('button[aria-label="Stop generation"]') and self.ui.execute("return Array.from(document.querySelectorAll('.gloss-assistant-bubble pre')).some(e=>e.innerText.trim().length>0)"), timeout=180, label="actual streamed model tokens before cancellation")
         self.ui.snapshot("stream-before-cancel", self.root)
         self.ui.click('button[aria-label="Stop generation"]')
-        self.ui.wait(lambda: not self.ui.find_visible('button[aria-label="Stop generation"]') and self.answer_id() and self.answer_id() != before, label="cancelled partial response persisted")
-        self.inspector("Receipt")
-        self.ui.wait(lambda: re.search(r"cancel", self.ui.text("#inspector-panel-receipt"), re.I), label="cancelled terminal receipt")
-        self.ui.snapshot("cancelled-receipt", self.root)
+        self.ui.wait(lambda: not self.ui.find_visible('button[aria-label="Stop generation"]') and self.ui.find_visible('[role="alert"]', "Chat cancelled by user"), label="explicit cancelled terminal event")
+        self.check(self.answer_id() == before, "cancelled generation is not presented as a completed assistant answer")
+        self.ui.snapshot("cancelled-terminal", self.root)
+        self.restart(name)
+        self.ui.wait(lambda: self.last_answer() == saved_answer and self.answer_id() == before, label="prior saved answer preserved after cancellation and restart")
         self.focus_chat()
         # Edit-and-rerun is the explicit UI retry action, bounded to a short
         # replacement prompt so completion rather than a second cancel is proven.
@@ -526,7 +528,7 @@ class IntegratedWorkflow:
         self.ui.wait(lambda: self.answer_id() and self.answer_id() != previous and not self.ui.find_visible('button[aria-label="Stop generation"]'), timeout=180, label="explicit edit-and-rerun complete")
         self.check("RETRY_GLOSS" in self.last_answer(), "explicit retry produced a completed model response")
         self.evidence(0, 0, False)
-        self.record(self.case_id, "Observed real streamed tokens, stopped through the UI, inspected the cancelled terminal receipt, then used Edit and rerun for a successful explicit retry.")
+        self.record(self.case_id, "Observed real streamed tokens, stopped through the UI, saw the explicit cancellation alert without a new completed answer, restarted and verified the prior saved answer, then used Edit and rerun for a successful explicit retry.")
 
         self.case_id = "folder_import_scope"
         folder = self.root / "folder-fixture"

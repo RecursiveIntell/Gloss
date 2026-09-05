@@ -51,12 +51,14 @@ jobs:
           retention-days: 14
 
   desktop-baseline:
-    # This enforces the real native startup/persistence baseline only. The full
-    # desktop acceptance receipt intentionally remains blocked for unrun cases.
+    # Preserve the startup/persistence baseline, then require integrated native
+    # UI cases against isolated real Ollama models. Each receipt retains its scope.
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -80,6 +82,7 @@ jobs:
             pkg-config \
             webkit2gtk-driver \
             xauth \
+            xdotool \
             xvfb
       - run: npm ci
       - name: Install pinned Tauri native WebDriver
@@ -89,6 +92,11 @@ jobs:
         run: |
           dbus-run-session -- xvfb-run -a python3 scripts/live_desktop_smoke.py \
             --repo . --require-baseline --output .codex-run-receipts/desktop-baseline
+      - name: Require real-model integrated native desktop workflow
+        timeout-minutes: 50
+        run: |
+          dbus-run-session -- xvfb-run -a python3 scripts/live_ollama_canary.py \
+            --repo . --desktop --output .codex-run-receipts/desktop-ollama-workflow
       - name: Preserve native desktop evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -97,6 +105,69 @@ jobs:
           path: .codex-run-receipts/desktop-baseline/
           include-hidden-files: true
           if-no-files-found: warn
+          retention-days: 14
+
+      - name: Preserve integrated desktop and real-model evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-ollama-workflow-${{ github.sha }}
+          path: .codex-run-receipts/desktop-ollama-workflow/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-package:
+    # Build the configured AppImage and replay the extracted package through the
+    # real native driver. This job does not sign or publish a release.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-package
+          cache-on-failure: true
+      - name: Install Linux package and native replay dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            dbus-x11 \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            pkg-config \
+            squashfs-tools \
+            webkit2gtk-driver \
+            xauth \
+            xvfb
+      - run: npm ci
+      - name: Install pinned Tauri native WebDriver
+        run: cargo install tauri-driver --version 2.0.6 --locked
+      - name: Build and replay the actual AppImage
+        run: |
+          dbus-run-session -- xvfb-run -a python3 validation/gloss_installer_smoke_gate.py \
+            --repo . --build --receipt .codex-run-receipts/linux-package/receipt.json
+      - name: Preserve package and replay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-package-${{ github.sha }}
+          path: .codex-run-receipts/linux-package/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 14
 
   frontend:

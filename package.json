@@ -19,7 +19,7 @@
     "tauri:dev:release": "tauri dev --features semantic-memory-turbo-quant",
     "tauri:build:sm": "tauri build --features semantic-memory-backend",
     "tauri:build:sm-tq": "tauri build --features semantic-memory-turbo-quant",
-    "tauri:build:release": "bash scripts/build-appimage.sh --force",
+    "tauri:build:release": "bash scripts/build-appimage.sh",
     "check:sm-tq-profile": "python3 scripts/check_gloss_sm_tq_fix.py .",
     "test:tauri:sm": "cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-backend",
     "test:tauri:sm-tq": "cargo test --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant",

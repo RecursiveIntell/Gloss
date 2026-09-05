@@ -331,15 +331,14 @@ fn publish_dense_batch_with(
                 "Native dense configuration was invalidated; explicit rebuild required".into(),
             ));
         }
-        if path.exists() || db.max_embedding_id()?.is_some() {
-            if !stored
+        if (path.exists() || db.max_embedding_id()?.is_some())
+            && !stored
                 .as_ref()
                 .is_some_and(|stored| stored.derivation_matches(metadata))
-            {
-                return Err(GlossError::Embedding(
-                    "Native dense identity mismatch; explicit rebuild required".into(),
-                ));
-            }
+        {
+            return Err(GlossError::Embedding(
+                "Native dense identity mismatch; explicit rebuild required".into(),
+            ));
         }
         let mut building = metadata.clone();
         building.status = EmbeddingIndexMetadataStatus::Building.as_str().into();

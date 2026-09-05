@@ -278,28 +278,6 @@ pub(crate) fn cancel_jobs_not_matching_active_notebook(
     })
 }
 
-pub(crate) fn has_jobs_for_notebook_epoch(
-    queue: &Arc<QueueManager>,
-    notebook_id: &str,
-    epoch: u64,
-) -> bool {
-    match queue.list_jobs_with_data() {
-        Ok(jobs) => jobs.into_iter().any(|(_job_id, status, data_json)| {
-            if !matches!(status.as_str(), "pending" | "processing") {
-                return false;
-            }
-            match serde_json::from_str::<GlossJob>(&data_json) {
-                Ok(job) => job.notebook_id() == notebook_id && job.epoch() == epoch,
-                Err(_) => false,
-            }
-        }),
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to inspect queue jobs for dedup");
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,6 @@
 use crate::db::notebook_db::NotebookDb;
 use crate::error::GlossError;
 use crate::ingestion::chunk::chunk_text_with_title;
-use crate::providers::LlmProvider;
 use crate::redaction::redact_path;
 use crate::tool_invocation::{
     run_tool_output_receipt, run_tool_status_receipt, ToolInvocationReceiptV1,
@@ -13,11 +12,11 @@ use std::sync::Arc;
 use tauri_queue::{JobContext, JobHandler, JobResult, QueueError, QueueManager};
 
 pub mod queue_policy;
+pub use queue_policy::GlossJob;
 pub(crate) use queue_policy::{
     cancel_disallowed_auto_summaries, cancel_jobs_matching,
-    cancel_jobs_not_matching_active_notebook, cancel_summary_jobs, has_jobs_for_notebook_epoch,
+    cancel_jobs_not_matching_active_notebook, cancel_summary_jobs,
 };
-pub use queue_policy::{GlossJob, JobResourcePolicy};
 
 impl JobHandler for GlossJob {
     async fn execute(&self, ctx: &JobContext) -> Result<JobResult, QueueError> {
@@ -34,13 +33,15 @@ impl JobHandler for GlossJob {
             } => {
                 execute_summarize(
                     ctx,
-                    *explicit_requested,
-                    notebook_id,
-                    source_id,
-                    source_title,
-                    data_dir,
-                    ollama_url,
-                    model,
+                    SummaryRequest {
+                        explicit_requested: *explicit_requested,
+                        notebook_id,
+                        source_id,
+                        source_title,
+                        data_dir,
+                        ollama_url,
+                        model,
+                    },
                 )
                 .await
             }
@@ -829,16 +830,29 @@ fn audio_metadata_description(
     )
 }
 
+struct SummaryRequest<'a> {
+    explicit_requested: bool,
+    notebook_id: &'a str,
+    source_id: &'a str,
+    source_title: &'a str,
+    data_dir: &'a str,
+    ollama_url: &'a str,
+    model: &'a str,
+}
+
 async fn execute_summarize(
     ctx: &JobContext,
-    explicit_requested: bool,
-    notebook_id: &str,
-    source_id: &str,
-    source_title: &str,
-    data_dir: &str,
-    ollama_url: &str,
-    model: &str,
+    request: SummaryRequest<'_>,
 ) -> Result<JobResult, QueueError> {
+    let SummaryRequest {
+        explicit_requested,
+        notebook_id,
+        source_id,
+        source_title,
+        data_dir,
+        ollama_url,
+        model,
+    } = request;
     let db_path = PathBuf::from(data_dir)
         .join("notebooks")
         .join(notebook_id)

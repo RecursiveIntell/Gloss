@@ -302,6 +302,8 @@ export async function sendMessage(
   style?: string,
   customGoal?: string,
   responseLength?: string,
+  historyBeforeUserMessageId?: string,
+  userMessageId?: string,
 ): Promise<string> {
   return invoke("send_message", {
     notebookId,
@@ -313,6 +315,8 @@ export async function sendMessage(
     style,
     customGoal,
     responseLength,
+    historyBeforeUserMessageId,
+    userMessageId,
   });
 }
 

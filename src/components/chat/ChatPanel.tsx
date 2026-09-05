@@ -3,6 +3,7 @@ import { useChatStore } from "../../stores/chatStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useNoteStore } from "../../stores/noteStore";
+import { useNotebookStore } from "../../stores/notebookStore";
 import { Virtuoso } from "react-virtuoso";
 import { SourceViewerModal } from "../sources/SourceViewerModal";
 import {
@@ -75,11 +76,26 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const selectionPending = useSettingsStore((s) => s.selectionPending);
   const selectionError = useSettingsStore((s) => s.selectionError);
 
-  const [input, setInput] = useState("");
+  const emptyDraft = {
+    notebookId, conversationId: activeConversationId, input: "",
+    editingUserMessageId: null as string | null, restoreToken: null as object | null,
+  };
+  const [storedDraft, setDraft] = useState(emptyDraft);
+  let draft = storedDraft;
+  if (draft.notebookId !== notebookId || draft.conversationId !== activeConversationId) {
+    // A first send may create its own conversation. Explicit selection actions
+    // clear the token before switching; every other context change drops it.
+    draft = {
+      ...emptyDraft,
+      restoreToken: draft.notebookId === notebookId && draft.conversationId === null
+        ? draft.restoreToken : null,
+    };
+    setDraft(draft);
+  }
+  const { input, editingUserMessageId } = draft;
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
-  const [editingUserMessageId, setEditingUserMessageId] = useState<string | null>(null);
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -104,20 +120,30 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const handleSend = async () => {
     if (!input.trim() || isStreaming || selectionPending) return;
     const query = input.trim();
-    setInput("");
-    setEditingUserMessageId(null);
-    await sendMessage(notebookId, query, getSourceScope(), activeModel);
+    const historyBeforeUserMessageId = editingUserMessageId ?? undefined;
+    const restoreToken = {};
+    const notebookActivation = useNotebookStore.getState().activationRequestId;
+    setDraft({ ...emptyDraft, restoreToken });
+    await sendMessage(notebookId, query, getSourceScope(), activeModel, historyBeforeUserMessageId);
     if (useChatStore.getState().streamingError) {
-      setInput((current) => current || query);
+      setDraft((current) => {
+        const notebook = useNotebookStore.getState();
+        const conversationId = useChatStore.getState().activeConversationId;
+        if (current.restoreToken !== restoreToken || current.notebookId !== notebookId ||
+            notebook.activeNotebookId !== notebookId || notebook.activationRequestId !== notebookActivation ||
+            (current.conversationId !== null && current.conversationId !== conversationId)) return current;
+        return { ...current, conversationId, input: query, editingUserMessageId: historyBeforeUserMessageId ?? null, restoreToken: null };
+      });
     }
   };
 
   const handleSuggestionClick = (question: string) => {
-    setInput(question);
+    setDraft({ ...emptyDraft, input: question });
   };
 
   const handleDeleteConversation = async () => {
     if (!activeConversationId) return;
+    setDraft(emptyDraft);
     await deleteConversation(notebookId, activeConversationId);
   };
 
@@ -151,18 +177,19 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       .reverse()
       .find((message) => message.role === "user");
     if (priorUser) {
-      await sendMessage(notebookId, priorUser.content, getSourceScope(), activeModel);
+      setDraft((current) => ({ ...current, restoreToken: null }));
+      await sendMessage(notebookId, priorUser.content, getSourceScope(), activeModel, priorUser.id);
     }
   };
 
   const handleContinue = async () => {
     if (isStreaming || selectionPending) return;
+    setDraft((current) => ({ ...current, restoreToken: null }));
     await sendMessage(notebookId, "Continue from the previous partial answer.", getSourceScope(), activeModel);
   };
 
   const handleEditUserMessage = (message: Message) => {
-    setInput(message.content);
-    setEditingUserMessageId(message.id);
+    setDraft({ ...emptyDraft, input: message.content, editingUserMessageId: message.id });
   };
 
   const toggleEvidence = (messageId: string) => {
@@ -223,7 +250,10 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       <div className="gloss-panel-header flex shrink-0 flex-wrap items-center gap-2 px-4 py-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <button
-            onClick={() => createConversation(notebookId)}
+            onClick={() => {
+              setDraft(emptyDraft);
+              return createConversation(notebookId);
+            }}
             disabled={isStreaming}
             className="flex items-center gap-1 rounded border border-accent/35 bg-accent/15 px-2 py-1 text-xs text-accent hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -237,6 +267,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
               onChange={(e) => {
                 const id = e.target.value;
                 if (id) {
+                  setDraft(emptyDraft);
                   setActiveConversation(id);
                   loadMessages(notebookId, id);
                 }
@@ -508,7 +539,10 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             aria-label="Chat message"
             aria-describedby="gloss-chat-shortcuts"
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              const value = e.target.value;
+              setDraft((current) => ({ ...current, input: value, restoreToken: null }));
+            }}
             onKeyDown={(e) => {
               if (shouldSubmitChat(e.key, e.shiftKey, e.nativeEvent.isComposing, e.keyCode)) {
                 e.preventDefault();
@@ -532,7 +566,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         <p id="gloss-chat-shortcuts" className="mt-1 text-[10px] text-text-muted">Enter to send · Shift+Enter for a new line</p>
         {editingUserMessageId && (
           <div className="mx-auto mt-1 max-w-[900px] text-[10px] text-text-muted">
-            Editing a previous question; sending will rerun it as a new turn.
+            Rerun uses the conversation before this question. All saved turns are retained.
           </div>
         )}
       </div>

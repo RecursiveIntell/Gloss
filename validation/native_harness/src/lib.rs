@@ -3,6 +3,8 @@
 #![allow(dead_code)]
 #[path = "../../../src-tauri/src/db/app_db.rs"]
 pub mod app_db;
+#[path = "../../../src-tauri/src/commands/chat/history.rs"]
+pub mod chat_history;
 #[path = "../../../src-tauri/src/error.rs"]
 pub mod error;
 #[path = "../../../src-tauri/src/memory/types.rs"]

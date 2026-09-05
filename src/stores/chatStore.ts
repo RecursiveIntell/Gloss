@@ -43,7 +43,7 @@ interface ChatStore {
   loadMessages: (notebookId: string, conversationId: string) => Promise<void>;
   rehydrateConversation: (notebookId: string, conversationId: string) => Promise<void>;
   replayChatEvents: (notebookId: string, conversationId: string) => Promise<void>;
-  sendMessage: (notebookId: string, query: string, sourceScope: SourceScope, model: string) => Promise<void>;
+  sendMessage: (notebookId: string, query: string, sourceScope: SourceScope, model: string, historyBeforeUserMessageId?: string) => Promise<void>;
   stopStreaming: (notebookId: string) => Promise<void>;
   attachAssistantEvidence: (notebookId: string, conversationId: string, messageId: string, payload: ChatEvidencePayload) => void;
   appendToken: (notebookId: string, conversationId: string, messageId: string, token: string) => void;
@@ -190,7 +190,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
-  sendMessage: async (notebookId, query, sourceScope, model) => {
+  sendMessage: async (notebookId, query, sourceScope, model, historyBeforeUserMessageId) => {
     if (get().isStreaming || useNotebookStore.getState().activeNotebookId !== notebookId) return;
     const assistantMessageId = crypto.randomUUID();
     const ownsRequest = () => get().streamingMessageId === assistantMessageId;
@@ -233,6 +233,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         notebookId, activeConversationId, query, sourceScope, model, assistantMessageId,
         style !== 'default' ? style : undefined, customGoal || undefined,
         responseLength !== 'default' ? responseLength : undefined,
+        historyBeforeUserMessageId, userMsg.id,
       );
       // Done/error may arrive before the invoke acknowledgement, or a newer
       // stream may already own the store. Neither case permits late mutation.

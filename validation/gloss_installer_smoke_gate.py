@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build and replay Linux AppImage payload and native UI from a clean boundary.
 
-This does not publish a release or certify signing, other distributions, or the
-full packaged provider workflow. Missing capabilities remain blocked.
+With --require-integrated, the hosted real-model canary drives the extracted
+AppRun through all current native acceptance cases. This does not publish a
+release or certify signing or other distributions. Missing capabilities block.
 """
 from __future__ import annotations
 
@@ -26,7 +27,9 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 from source_snapshot import capture_source_identity
 from gloss_desktop_smoke_harness import file_sha256
-from live_desktop_smoke import result_exit_code
+from live_desktop_smoke import load_prebuilt_config, result_exit_code
+from live_ollama_canary import (CANARY_SCHEMA, desktop_configuration,
+                                validate_desktop_receipt, validate_models)
 
 
 class PackageBlocked(Exception):
@@ -41,7 +44,8 @@ def evidence(path: Path, root: Path) -> dict:
     return {"path": str(path.relative_to(root)), "sha256": file_sha256(path)}
 
 
-def run_command(command: list[str], cwd: Path, log: Path, timeout: int) -> dict:
+def run_command(command: list[str], cwd: Path, log: Path, timeout: int,
+                cooperative_cleanup: bool = False) -> dict:
     started = now()
     timed_out = False
     with log.open("w") as output:
@@ -52,11 +56,18 @@ def run_command(command: list[str], cwd: Path, log: Path, timeout: int) -> dict:
         except subprocess.TimeoutExpired:
             timed_out = True
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                if cooperative_cleanup:
+                    # The direct canary leader must unwind its separate service
+                    # and active-command sessions before extraction is removed.
+                    process.terminate()
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
             try:
-                process.wait(timeout=10)
+                # Canary command + service cleanup each permit 5s TERM + 5s
+                # KILL/join. Allow both plus bounded receipt finalization.
+                process.wait(timeout=30 if cooperative_cleanup else 10)
             except subprocess.TimeoutExpired:
                 pass
             # The leader may exit on TERM while an owned descendant ignores
@@ -141,10 +152,45 @@ def require_packaged_baseline(receipt: dict, source: dict, artifact_sha256: str)
         raise ValueError("Packaged desktop receipt does not bind this AppImage")
 
 
+def require_packaged_workflow(output: Path, source: dict, prebuilt: dict) -> Path:
+    """Bind the existing canary and native acceptance owners to this package."""
+    hosted = json.loads((output / "receipt.json").read_text())
+    if (not isinstance(hosted, dict)
+            or hosted.get("schema") != CANARY_SCHEMA or hosted.get("status") != "pass"
+            or hosted.get("source") != source or hosted.get("source_after") != source
+            or hosted.get("prebuilt_config") != prebuilt
+            or hosted.get("desktop_requested") is not True
+            or hosted.get("desktop_status") != "pass"
+            or hosted.get("live_service_exercised") is not True):
+        raise ValueError("Packaged real-model canary is incomplete or belongs to another source/build")
+    models = hosted.get("models")
+    if not isinstance(models, dict) or not all(isinstance(model, dict) for model in models.values()):
+        raise ValueError("Packaged canary model identities are missing")
+    configuration = desktop_configuration(validate_models({"models": list(models.values())}))
+    if json.loads((output / "desktop-ollama-config.json").read_text()) != configuration:
+        raise ValueError("Packaged desktop configuration differs from the owned pinned models")
+    desktop = output / "desktop" / "LIVE_DESKTOP_SMOKE_RECEIPT.json"
+    child = json.loads(desktop.read_text())
+    if not isinstance(child, dict):
+        raise ValueError("Packaged desktop receipt is not an object")
+    validate_desktop_receipt(child, source, configuration, prebuilt)
+    descriptor = {**evidence(desktop, output), "integrated_status": child["integrated_status"],
+                  "full_acceptance_status": child["status"]}
+    if hosted.get("desktop_receipt") != descriptor:
+        raise ValueError("Packaged canary does not bind the current native child receipt")
+    for field, name in (("binary", "gloss"), ("launcher", "packaged-AppRun"), ("log", "build.log")):
+        observed = child["build"][field]
+        if observed.get("path") != name or observed.get("sha256") != file_sha256(desktop.parent / name):
+            raise ValueError(f"Packaged desktop {field} evidence changed or selected another file")
+    return desktop
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--build", action="store_true", help="Required: rebuild from this clean source")
+    parser.add_argument("--require-integrated", action="store_true",
+                        help="Require all native acceptance cases on this AppImage using owned real models on a GitHub-hosted runner.")
     parser.add_argument("--receipt", type=Path, help="New output path; historical run receipts are never used")
     args = parser.parse_args()
     repo = args.repo.resolve()
@@ -166,8 +212,11 @@ def main() -> int:
     logs = output / f"evidence-{run_id}"
     logs.mkdir()
     receipt = {"schema": "GlossInstallerSmokeReceiptV2", "run_id": run_id,
-               "scope": "linux_appimage_payload_and_native_baseline", "started_at": now(),
+               "scope": ("linux_appimage_payload_and_integrated_native_workflow" if args.require_integrated
+                         else "linux_appimage_payload_and_native_baseline"), "started_at": now(),
                "status": "blocked", "package_smoke_passed": False,
+               "integrated_requested": args.require_integrated,
+               "integrated_status": "pending" if args.require_integrated else "not_requested",
                "installed_launch_exercised": False, "release_grade": False,
                "release_blocker": True, "commands": [], "failures": [],
                "platform": {"system": platform.system(), "machine": platform.machine(),
@@ -192,7 +241,10 @@ def main() -> int:
         receipt["configured_targets"] = targets
         if [str(target).lower() for target in targets] != ["appimage"]:
             raise PackageBlocked("This gate requires the AppImage-only configured release profile")
-        missing = [tool for tool in ("npm", "cargo", "mksquashfs", "tauri-driver", "WebKitWebDriver", "dbus-run-session")
+        required_tools = ("npm", "cargo", "mksquashfs", "tauri-driver", "WebKitWebDriver", "dbus-run-session")
+        if args.require_integrated:
+            required_tools += ("xdotool",)
+        missing = [tool for tool in required_tools
                    if shutil.which(tool) is None]
         if missing or not os.environ.get("DISPLAY"):
             raise PackageBlocked(f"Missing package replay capabilities: tools={missing}, DISPLAY={bool(os.environ.get('DISPLAY'))}")
@@ -230,18 +282,32 @@ def main() -> int:
                         "build_command": build["command"], "build_log": str(build_log), "build_exit_code": 0}
             manifest = logs / "prebuilt-config.json"
             manifest.write_text(json.dumps(prebuilt, indent=2) + "\n")
-            desktop_output = output / "desktop-replay"
+            desktop_output = output / ("real-model-workflow" if args.require_integrated else "desktop-replay")
             desktop_log = logs / "desktop-replay.log"
-            replay = run_command(["dbus-run-session", "--", sys.executable, str(repo / "scripts/live_desktop_smoke.py"),
-                                  "--repo", str(repo), "--prebuilt-config", str(manifest),
-                                  "--require-baseline", "--output", str(desktop_output)],
-                                 extraction, desktop_log, 600)
+            if args.require_integrated:
+                # Inherit the required outer DBus session; directly own the
+                # canary leader so it can cooperate with timeout cancellation.
+                command = [sys.executable, str(repo / "scripts/live_ollama_canary.py"),
+                           "--repo", str(repo), "--desktop", "--prebuilt-config", str(manifest),
+                           "--output", str(desktop_output)]
+            else:
+                command = ["dbus-run-session", "--", sys.executable, str(repo / "scripts/live_desktop_smoke.py"),
+                           "--repo", str(repo), "--prebuilt-config", str(manifest),
+                           "--require-baseline", "--output", str(desktop_output)]
+            replay = run_command(command, extraction, desktop_log, 3300 if args.require_integrated else 600,
+                                 cooperative_cleanup=args.require_integrated)
             replay["log"] = evidence(desktop_log, output)
             receipt["commands"].append(replay)
             if replay["exit_code"] != 0:
                 raise ValueError("Extracted AppImage native desktop replay failed")
-            desktop_receipt = desktop_output / "LIVE_DESKTOP_SMOKE_RECEIPT.json"
-            require_packaged_baseline(json.loads(desktop_receipt.read_text()), source, receipt["artifact"]["sha256"])
+            if args.require_integrated:
+                if load_prebuilt_config(manifest, source) != prebuilt:
+                    raise ValueError("Extracted package manifest changed during real-model replay")
+                desktop_receipt = require_packaged_workflow(desktop_output, source, prebuilt)
+                receipt["canary_receipt"] = evidence(desktop_output / "receipt.json", output)
+            else:
+                desktop_receipt = desktop_output / "LIVE_DESKTOP_SMOKE_RECEIPT.json"
+                require_packaged_baseline(json.loads(desktop_receipt.read_text()), source, receipt["artifact"]["sha256"])
             receipt["desktop_receipt"] = evidence(desktop_receipt, output)
         if file_sha256(archive) != receipt["artifact"]["sha256"]:
             raise ValueError("AppImage artifact changed during package replay")
@@ -266,6 +332,10 @@ def main() -> int:
                 receipt["status"] = "fail"
                 receipt["package_smoke_passed"] = False
                 receipt["failures"].append(f"Could not recheck source identity: {error}")
+        if args.require_integrated:
+            receipt["integrated_status"] = receipt["status"]
+            if receipt["status"] == "pass":
+                receipt["remaining_blockers"] = ["Signing and non-Linux/non-Ubuntu distribution compatibility are not certified."]
         receipt["finished_at"] = now()
         receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
         print(json.dumps({"status": receipt["status"], "receipt": str(receipt_path), "failures": receipt["failures"]}, indent=2))

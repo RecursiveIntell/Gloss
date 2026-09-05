@@ -32,6 +32,7 @@ use tauri_queue::QueueManager;
 
 mod emit;
 mod gates;
+mod history;
 pub(crate) mod receipts;
 mod streaming;
 mod types;
@@ -40,6 +41,7 @@ mod types;
 // functions that remain in this file.
 use emit::{emit_chat_error, emit_chat_evidence, emit_chat_status, ChatTerminalEmitter};
 use gates::acquire_gate_with_epoch;
+use history::{history_before_rerun, resolve_user_message_id};
 use receipts::{chat_attempt_trace_snapshot, new_chat_attempt_trace, record_chat_attempt_trace};
 
 // Pull in types from the types submodule.
@@ -1139,6 +1141,8 @@ pub async fn send_message(
     style: Option<String>,
     custom_goal: Option<String>,
     response_length: Option<String>,
+    history_before_user_message_id: Option<String>,
+    user_message_id: Option<String>,
     state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
     app_handle: tauri::AppHandle,
@@ -1146,6 +1150,18 @@ pub async fn send_message(
     let message_id = message_id
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let user_message_id = resolve_user_message_id(user_message_id, &message_id)?;
+    // Reject an invalid edit target before accepting an attempt or preempting
+    // background work. Retain this validated request-only prefix; ordinary
+    // sends still load their full history at the existing context boundary.
+    let rerun_history = match history_before_user_message_id.as_deref() {
+        Some(target) => Some(history_before_rerun(
+            state.with_notebook_db(&notebook_id, |db| db.load_messages(&conversation_id))?,
+            &conversation_id,
+            Some(target),
+        )?),
+        None => None,
+    };
     let (trace_memory_backend, trace_memory_fallback) = {
         let app_db = state
             .app_db
@@ -1187,7 +1203,6 @@ pub async fn send_message(
     // Register before *any* normal user-turn side effect. The lease clears the
     // registration on every pre-stream error path; ownership transfers to the
     // spawned stream task only after context construction succeeds.
-    let user_message_id = uuid::Uuid::new_v4().to_string();
     let active_chat_attempt_lease = match state.lease_active_chat_attempt(
         &notebook_id,
         &conversation_id,
@@ -1377,7 +1392,10 @@ pub async fn send_message(
     let effective_response_length = response_length
         .filter(|r| !r.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
-    let history = state.with_notebook_db(&notebook_id, |db| db.load_messages(&conversation_id))?;
+    let history = match rerun_history {
+        Some(history) => history,
+        None => state.with_notebook_db(&notebook_id, |db| db.load_messages(&conversation_id))?,
+    };
 
     // Store user message
     let user_msg = Message {

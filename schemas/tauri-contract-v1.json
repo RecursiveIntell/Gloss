@@ -1009,7 +1009,9 @@
           "messageId",
           "style",
           "customGoal",
-          "responseLength"
+          "responseLength",
+          "historyBeforeUserMessageId",
+          "userMessageId"
         ]
       },
       "response_family": "string"

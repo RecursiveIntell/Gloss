@@ -1066,6 +1066,118 @@ mod tests {
         );
     }
 
+    struct HistoryCapturingProvider {
+        captured: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for HistoryCapturingProvider {
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, GlossError> {
+            Ok(Vec::new())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            context: LlmExecutionContext,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatToken, GlossError>> + Send>>,
+            GlossError,
+        > {
+            *self.captured.lock().unwrap() = request
+                .messages
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect();
+            ScriptedDoneProvider.chat(request, context).await
+        }
+
+        async fn health_check(&self) -> Result<bool, GlossError> {
+            Ok(true)
+        }
+
+        fn provider_type(&self) -> crate::providers::ProviderType {
+            crate::providers::ProviderType::Ollama
+        }
+    }
+
+    #[tokio::test]
+    async fn edited_turn_sends_retained_history_then_replacement_query_exactly_once() {
+        let data_dir = tempdir().unwrap();
+        let state = AppState::initialize_for_test(data_dir.path()).unwrap();
+        state.set_active_notebook(Some("notebook-1".to_string()), Some(7));
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
+            "notebook-1",
+            "conversation-1",
+            "message-1",
+            "scripted-model",
+            None,
+            None,
+            Some("none".to_string()),
+        )));
+        let make_message = |id: &str, role: &str, content: &str| Message {
+            id: id.to_string(),
+            conversation_id: "conversation-1".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            citations: None,
+            model_used: None,
+            tokens_prompt: None,
+            tokens_response: None,
+            created_at: String::new(),
+        };
+        let saved = vec![
+            make_message("greeting", "user", "HELLO_GLOSS"),
+            make_message("answer", "assistant", "HELLO_GLOSS"),
+            make_message("cancelled", "user", "Write 100 ocean facts"),
+            make_message("later", "user", "Later question"),
+        ];
+        let history =
+            super::super::history_before_rerun(saved.clone(), "conversation-1", Some("cancelled"))
+                .unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = HistoryCapturingProvider {
+            captured: Arc::clone(&captured),
+        };
+        let query = "Reply with exactly RETRY_GLOSS. /no_think";
+        let scope = SourceScope::Explicit(Vec::new()).resolve(&[]);
+        let result = stream_chat_response(
+            app.handle(),
+            &provider,
+            "notebook-1",
+            7,
+            "conversation-1",
+            "message-1",
+            query,
+            "scripted-model",
+            &history,
+            None,
+            "balanced",
+            "normal",
+            &scope,
+            &[],
+            None,
+            &trace,
+            data_dir.path(),
+            LlmExecutionContext::uncancellable(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![
+                ("user".to_string(), "HELLO_GLOSS".to_string()),
+                ("assistant".to_string(), "HELLO_GLOSS".to_string()),
+                ("user".to_string(), query.to_string()),
+            ]
+        );
+        assert_eq!(result.prompt_receipt.user_turn_digest, digest_text(query));
+        assert_eq!(saved.len(), 4);
+        assert_eq!(saved[2].content, "Write 100 ocean facts");
+    }
+
     #[tokio::test]
     async fn scripted_provider_start_timeout_records_its_typed_phase() {
         let (result, events, trace) = run_scripted_failure(

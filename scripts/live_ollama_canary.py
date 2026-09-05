@@ -19,6 +19,7 @@ from pathlib import Path
 import platform
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,36 @@ def now() -> str:
 def sha256(path: Path) -> str:
     with path.open("rb") as file:
         return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def read_owned_json(path: Path, evidence: Path) -> tuple[dict, str]:
+    """Share one bounded reader between diagnostic input and parent summaries."""
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            raise ValueError(message)
+
+    bound = 2 * 1024 * 1024
+    root = evidence.absolute()
+    require(root.resolve() == root and not root.is_symlink(), "Linked evidence root")
+    relative = path.absolute().relative_to(root)
+    require(".." not in relative.parts, "Outside evidence root")
+    for count in range(len(relative.parts) + 1):
+        component = root.joinpath(*relative.parts[:count])
+        info = component.lstat()
+        require(not stat.S_ISLNK(info.st_mode), "Linked evidence ancestor or file")
+        if count < len(relative.parts):
+            require(stat.S_ISDIR(info.st_mode), "Non-directory evidence ancestor")
+    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "Evidence must be a single-link regular file")
+    require(info.st_size <= bound, "Evidence exceeds diagnostic bound")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        require((opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino)
+                and stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1
+                and opened.st_size <= bound, "Evidence identity changed before read")
+        raw = stream.read(bound + 1)
+    require(len(raw) <= bound, "Evidence exceeds diagnostic bound")
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
 
 
 def validate_release(archive: Path, checksums: Path) -> dict:
@@ -217,6 +248,76 @@ def validate_desktop_receipt(child: dict, source: dict, configuration: dict,
             raise ValueError("Packaged desktop receipt changed its archive, launcher, binary or build proof")
 
 
+def failed_turn_summary(result: dict) -> dict:
+    """Keep decisive synthetic observations available when artifact GET fails."""
+    verified = result.get("verified_request", {})
+    material = verified.get("request_material", {})
+    messages = material.get("messages", [])
+    query = messages[-1].get("content", "") if messages else ""
+    return {"status": result.get("status"), "error": str(result.get("error", ""))[:1000],
+        "source_sha256": result.get("source", {}).get("source_sha256"),
+        "request_material_sha256": verified.get("request_material_sha256"),
+        "user_turn_sha256": hashlib.sha256(query.encode()).hexdigest() if messages else None,
+        "current_query": query[:2000], "current_query_truncated": len(query) > 2000,
+        "model": material.get("model"),
+        "observations": [{"label": call.get("label"), "status": call.get("status"),
+            "request_sha256": call.get("request_sha256"),
+            "answer": str(call.get("answer", ""))[:3000],
+            "answer_truncated": len(str(call.get("answer", ""))) > 3000,
+            "answer_sha256": call.get("answer_sha256"),
+            "raw_response_sha256": call.get("raw_response_sha256"),
+            "error": str(call.get("error", ""))[:1000]} for call in result.get("calls", [])[:2]]}
+
+
+def run_desktop_with_diagnostic(run, command: list[str], root: Path, output: Path,
+                                owned: OwnedProcesses, receipt: dict, save) -> None:
+    """Observe a failed turn on the owned service; never change desktop acceptance."""
+    try:
+        run("native-desktop-workflow", command, 1200)
+    except CanaryCancelled:
+        raise
+    except Exception as original:
+        diagnostic = {"status": "pending", "original_error": str(original)}
+        receipt["failure_diagnostic"] = diagnostic
+        result_path = output / "failed-turn-diagnostic" / "receipt.json"
+        try:
+            if owned.cancel_signal is not None:
+                diagnostic["status"] = "skipped_cancelled"
+            else:
+                save()
+                run("failed-turn-diagnostic", [sys.executable,
+                    str(root / "scripts" / "diagnose_failed_ollama_turn.py"),
+                    "--repo", str(root), "--evidence", str(output)], 190)
+                diagnostic["status"] = "completed"
+        except CanaryCancelled as error:
+            diagnostic.update({"status": "cancelled", "error": str(error)})
+        except Exception as error:
+            diagnostic.update({"status": "error", "error": str(error)})
+        finally:
+            result = diagnostic
+            try:
+                result, result_digest = read_owned_json(result_path, output)
+                diagnostic.update(path=str(result_path.relative_to(output)), sha256=result_digest)
+                if diagnostic["status"] == "completed":
+                    diagnostic["status"] = result["status"]
+            except Exception as error:
+                diagnostic["summary_error"] = str(error)
+                if diagnostic["status"] == "completed":
+                    diagnostic.update(status="error", error="Could not read owned diagnostic receipt")
+            try:
+                summary = failed_turn_summary(result)
+                summary["command_status"] = diagnostic["status"]
+                print("FAILED_TURN_DIAGNOSTIC " + json.dumps(summary, ensure_ascii=False), flush=True)
+            except Exception as error:
+                diagnostic["summary_error"] = str(error)
+            try:
+                save()
+            except Exception as error:
+                # Evidence I/O must not replace the failure that caused it.
+                diagnostic["save_error"] = str(error)
+        raise
+
+
 def execute(root: Path, output: Path, desktop: bool = False,
             prebuilt_config: Path | None = None) -> int:
     output.mkdir(parents=True, exist_ok=False)
@@ -367,7 +468,8 @@ def execute(root: Path, output: Path, desktop: bool = False,
                             "--require-integrated"]
                         if prebuilt_config is not None:
                             desktop_command.extend(["--prebuilt-config", str(prebuilt_config)])
-                        run("native-desktop-workflow", desktop_command, 1200)
+                        run_desktop_with_diagnostic(run, desktop_command, root, output,
+                                                    owned, receipt, save)
                         desktop_receipt = desktop_output / "LIVE_DESKTOP_SMOKE_RECEIPT.json"
                         child = json.loads(desktop_receipt.read_text())
                         validate_desktop_receipt(child, receipt["source"], configuration, prebuilt)

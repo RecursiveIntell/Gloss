@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 from datetime import datetime, timezone
+import hashlib
 import http.client
 import json
 import ipaddress
@@ -20,6 +21,8 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -38,6 +41,190 @@ BASELINE_CASES = ("startup_idle", "notebook_crud_restart")
 OLLAMA_CONFIG_SCHEMA = "gloss-desktop-ollama-config/v1"
 ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
 MESSAGE_EVIDENCE_SELECTOR = '.gloss-assistant-bubble button[title="Evidence"][aria-controls^="evidence-"]'
+
+
+def collect_desktop_failure_evidence(root: Path) -> dict:
+    """Read bounded canonical records from this run's disposable profile only.
+
+    Saved receipts and rows are observations, not an inferred provider request.
+    Incomplete evidence must not be used to guess a retry history or pass a gate.
+    """
+    result = {"schema": "GlossDesktopFailureProfileV1", "status": "absent",
+              "truncated": False, "notebooks": []}
+    root = root.absolute()
+
+    def owned(path: Path, directory: bool = False):
+        if root.is_symlink() or root.resolve() != root or not path.is_relative_to(root):
+            raise ValueError("unsafe_profile_path")
+        for part in (root, *[root.joinpath(*path.relative_to(root).parts[:i])
+                             for i in range(1, len(path.relative_to(root).parts) + 1)]):
+            if part.is_symlink():
+                raise ValueError("unsafe_profile_path")
+        info = path.stat()
+        if not path.resolve().is_relative_to(root):
+            raise ValueError("unsafe_profile_path")
+        if directory:
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError("unsafe_profile_path")
+        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("unsafe_profile_path")
+        return info
+
+    def decode(raw):
+        if not raw:
+            return None
+        if len(raw) > 32768:
+            result["truncated"] = True
+            raise ValueError("receipt_limit")
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("invalid_receipt_object")
+        return value
+
+    try:
+        if not root.exists() and not root.is_symlink():
+            return result
+        owned(root, directory=True)
+        base = root / "profile" / "data" / "gloss" / "notebooks"
+        # Check components even when the final path is absent (including broken links).
+        for component in (root / "profile", root / "profile/data", root / "profile/data/gloss", base):
+            if component.is_symlink():
+                raise ValueError("unsafe_profile_path")
+            if not component.exists():
+                return result
+            owned(component, directory=True)
+        with os.scandir(base) as entries:
+            candidates = []
+            for index, entry in enumerate(entries):
+                if index == 16:
+                    result["truncated"] = True
+                    break
+                if entry.is_symlink():
+                    raise ValueError("unsafe_profile_path")
+                try:
+                    if str(uuid.UUID(entry.name)) != entry.name:
+                        continue
+                except ValueError:
+                    continue
+                candidates.append(Path(entry.path))
+        if len(candidates) > 4:
+            result["truncated"] = True
+        for directory in sorted(candidates)[:4]:
+            owned(directory, directory=True)
+            database = directory / "notebook.db"
+            if not database.exists() and not database.is_symlink():
+                continue
+            database_bytes = owned(database).st_size
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar = database.with_name(database.name + suffix)
+                if sidecar.exists() or sidecar.is_symlink():
+                    database_bytes += owned(sidecar).st_size
+            if database_bytes > 64 * 1024 * 1024:
+                result["truncated"] = True
+                continue
+            notebook = {"notebook_id": directory.name, "messages": []}
+            result["notebooks"].append(notebook)
+            connection = None
+            try:
+                with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0.2) as connection:
+                    connection.execute("PRAGMA query_only=ON")
+                    connection.execute("PRAGMA trusted_schema=OFF")
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 131072)
+                    deadline = time.monotonic() + 1
+                    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                    # A stored view cannot redirect the collector into settings or other tables.
+                    connection.set_authorizer(lambda action, first, second, _db, _trigger:
+                        sqlite3.SQLITE_OK if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_TRANSACTION)
+                        or action == sqlite3.SQLITE_READ and first in ("messages", "prompt_receipts")
+                        or action == sqlite3.SQLITE_FUNCTION and second in ("substr", "length", "count")
+                        else sqlite3.SQLITE_DENY)
+                    connection.execute("BEGIN")
+                    latest = connection.execute("SELECT conversation_id FROM messages ORDER BY rowid DESC LIMIT 1").fetchone()
+                    if latest is None:
+                        continue
+                    conversation = latest[0]
+                    notebook["conversation_id"] = conversation
+                    notebook["message_count"] = connection.execute("SELECT count(*) FROM messages WHERE conversation_id=?", (conversation,)).fetchone()[0]
+                    notebook["messages_truncated"] = notebook["message_count"] > 16
+                    result["truncated"] |= notebook["messages_truncated"]
+                    rows = connection.execute(
+                        "SELECT rowid,id,conversation_id,role,created_at,substr(content,1,512),length(content),"
+                        "substr(citations,1,32769),model_used FROM messages WHERE conversation_id=? ORDER BY created_at ASC LIMIT 16",
+                        (conversation,)).fetchall()
+                    for row in rows:
+                        content = row[5]
+                        truncated = len(content) != row[6]
+                        result["truncated"] |= truncated
+                        notebook["messages"].append(dict(zip(
+                            ("rowid", "id", "conversation_id", "role", "created_at"), row[:5]),
+                            content=content, content_truncated=truncated,
+                            content_sha256=None if truncated else hashlib.sha256(content.encode()).hexdigest()))
+                    assistants = [row for row in rows if row[3] == "assistant"]
+                    if not assistants:
+                        continue
+                    assistant = max(assistants, key=lambda row: row[0])
+                    saved = {"message_id": assistant[1], "conversation_id": conversation,
+                             "notebook_id": directory.name, "model": assistant[8]}
+                    notebook["latest_assistant"] = saved
+                    evidence = (decode(assistant[7]) or {}).get("evidence", {})
+                    if not isinstance(evidence, dict):
+                        raise ValueError("invalid_evidence_object")
+                    try:
+                        canonical = connection.execute(
+                            "SELECT substr(raw_receipt_json,1,32769) FROM prompt_receipts WHERE message_id=? AND conversation_id=? LIMIT 2",
+                            (assistant[1], conversation)).fetchall()
+                    except sqlite3.OperationalError as error:
+                        if "no such table: prompt_receipts" not in str(error):
+                            raise
+                        canonical = []
+                    if len(canonical) > 1:
+                        raise ValueError("ambiguous_prompt_receipt")
+                    prompt = decode(canonical[0][0]) if canonical else evidence.get("prompt_receipt")
+                    saved["prompt_receipt_source"] = "prompt_receipts" if canonical else "messages.citations.evidence"
+                    if not isinstance(prompt, dict) or any(prompt.get(key) != value for key, value in
+                            (("message_id", assistant[1]), ("conversation_id", conversation), ("notebook_id", directory.name))):
+                        raise ValueError("missing_or_mismatched_prompt_receipt")
+                    keys = ("schema", "receipt_id", "notebook_id", "conversation_id", "message_id", "prompt_digest",
+                            "context_payload_digest", "system_prompt_digest", "user_turn_digest", "system_prompt_text", "source_passage_count")
+                    saved["prompt_receipt"] = {key: prompt[key] for key in keys if key in prompt}
+                    for key, fields in (
+                        ("decoding_settings_receipt", ("schema", "provider", "model", "effective")),
+                        ("prompt_budget_receipt", ("model_context_window", "message_count", "source_passage_count", "prompt_digest",
+                                                   "system_prompt_chars", "estimated_prompt_tokens", "context_budgeted"))):
+                        value = evidence.get(key)
+                        if isinstance(value, dict):
+                            saved[key] = {field: value[field] for field in fields if field in value}
+                    decoding = saved.get("decoding_settings_receipt", {}).get("effective")
+                    if isinstance(decoding, dict):
+                        saved["decoding_settings_receipt"]["effective"] = {key: decoding[key] for key in
+                            ("temperature", "top_p", "top_k", "min_p", "repeat_penalty", "max_tokens") if key in decoding}
+            except (OSError, sqlite3.Error, ValueError, TypeError) as error:
+                notebook["capture_error"] = type(error).__name__
+                result["status"] = "partial"
+            finally:
+                if connection is not None:
+                    connection.close()
+        if result["notebooks"] and result["status"] == "absent":
+            result["status"] = "ok"
+    except (OSError, ValueError) as error:
+        result["status"] = "rejected" if isinstance(error, ValueError) else "error"
+        result["capture_error"] = type(error).__name__
+    if len(json.dumps(result).encode()) > 8192:
+        # Retain ordering and counts when text alone exhausts the output budget.
+        result.update(status="partial", truncated=True, capture_error="serialized_evidence_limit")
+        for notebook in result["notebooks"]:
+            for message in notebook["messages"]:
+                if message["content"]:
+                    message.update(content="", content_truncated=True, content_sha256=None)
+            prompt = notebook.get("latest_assistant", {}).get("prompt_receipt", {})
+            if prompt.get("system_prompt_text"):
+                prompt.update(system_prompt_text="", system_prompt_truncated=True)
+    if len(json.dumps(result).encode()) > 8192:
+        return {"schema": result["schema"], "status": "partial", "truncated": True,
+                "notebooks": [], "capture_error": "serialized_evidence_limit"}
+    if result["truncated"] and result["status"] in ("ok", "absent"):
+        result["status"] = "partial"
+    return result
 
 
 def load_ollama_config(path: Path) -> dict:
@@ -918,6 +1105,10 @@ def main() -> int:
         if driver_log:
             driver_log.flush()
             details["driver_log_tail"] = (root / "driver.log").read_text(errors="replace")[-6000:]
+        try:
+            details["owned_profile_evidence"] = collect_desktop_failure_evidence(root)
+        except Exception as capture_error:
+            details["owned_profile_evidence"] = {"status": "error", "capture_error": type(capture_error).__name__}
         (root / "failure.json").write_text(json.dumps(details, indent=2) + "\n")
         print("NATIVE_DESKTOP_FAILURE " + json.dumps(details), flush=True)
     finally:

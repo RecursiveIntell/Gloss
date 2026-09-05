@@ -163,14 +163,22 @@ class WebDriver:
             headers={"Content-Type": "application/json"},
             method=method,
         )
+        observation = {"at": now(), "method": method, "path": path, "request": payload}
+        self.trace.append(observation)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 result = json.load(response)
         except urllib.error.HTTPError as error:
-            raise RuntimeError(f"WebDriver {method} {path}: {error.read().decode(errors='replace')}") from error
+            detail = error.read().decode(errors="replace")
+            observation["error"] = f"HTTP {error.code}: {detail}"
+            raise RuntimeError(f"WebDriver {method} {path}: {detail}") from error
+        except Exception as error:
+            # A failed POST may already have acted. Preserve the attempted
+            # command and propagate the failure without replaying the mutation.
+            observation["error"] = f"{type(error).__name__}: {error}"
+            raise
         value = result.get("value")
-        self.trace.append({"at": now(), "method": method, "path": path, "request": payload,
-                           "response": "PNG captured" if path.endswith("/screenshot") else value})
+        observation["response"] = "PNG captured" if path.endswith("/screenshot") else value
         if isinstance(value, dict) and value.get("error"):
             raise RuntimeError(f"WebDriver: {value}")
         return value
@@ -744,7 +752,7 @@ def main() -> int:
         driver.wait(lambda: driver.find_visible('button[aria-current="page"]:not(:disabled)', name), label="created and activated notebook")
         driver.stop()
         driver.start(application)
-        driver.wait(lambda: driver.find_visible("button", name), label="notebook button after restart")
+        driver.wait(lambda: driver.find_visible('button[aria-current="page"]:not(:disabled)', name), label="confirmed active notebook after restart")
         row = driver.execute("return Array.from(document.querySelectorAll('button')).find(e => e.textContent === arguments[0]).parentElement", [name])
         driver.call("POST", "/actions", {"actions": [{"type": "pointer", "id": "mouse", "parameters": {"pointerType": "mouse"}, "actions": [
             {"type": "pointerMove", "duration": 100, "origin": row, "x": 0, "y": 0}]}]})
@@ -783,6 +791,9 @@ def main() -> int:
                 details["capture_error"] = str(capture_error)
         if build_log.is_file():
             details["build_log_tail"] = build_log.read_text(errors="replace")[-8000:]
+        if driver_log:
+            driver_log.flush()
+            details["driver_log_tail"] = (root / "driver.log").read_text(errors="replace")[-6000:]
         (root / "failure.json").write_text(json.dumps(details, indent=2) + "\n")
         print("NATIVE_DESKTOP_FAILURE " + json.dumps(details), flush=True)
     finally:

@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import copy
+import http.client
+import http.server
 import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 SPEC = importlib.util.spec_from_file_location("live_desktop_smoke", Path(__file__).resolve().parents[1] / "live_desktop_smoke.py")
@@ -142,6 +145,36 @@ class RuntimeConfigPolicyTests(unittest.TestCase):
         for change in ({"Fallback": "no"}, {"Fallback": "yes"}, {"Fallback": "semantic_memory_timeout"},
                        {"Backend used": "native-dense"}, {"Scope": "all (3 selected, 0 excluded, 0 invalid)"}):
             with self.assertRaises(RuntimeError): driver.require_scope_evidence({**values, **change}, 1, 2, True, degraded=True)
+
+
+class WebDriverTransportEvidenceTests(unittest.TestCase):
+    def test_disconnected_mutation_is_recorded_and_never_replayed(self):
+        received = []
+
+        class ClosingHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append((self.path, self.rfile.read(int(self.headers["Content-Length"]))))
+                self.close_connection = True
+
+            def log_message(self, *_args):
+                pass
+
+        with http.server.HTTPServer(("127.0.0.1", 0), ClosingHandler) as server:
+            server.timeout = 2
+            worker = threading.Thread(target=server.handle_request, daemon=True)
+            worker.start()
+            client = driver.WebDriver(server.server_port)
+            path = "/session/fixture/element/delete-control/click"
+            with self.assertRaises(http.client.RemoteDisconnected):
+                client.request("POST", path, {})
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(received, [(path, b"{}")])
+        self.assertEqual(len(client.trace), 1)
+        self.assertEqual(client.trace[0]["path"], path)
+        self.assertEqual(client.trace[0]["request"], {})
+        self.assertIn("RemoteDisconnected", client.trace[0]["error"])
+        self.assertNotIn("response", client.trace[0])
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ from source_snapshot import capture_source_identity
 BASELINE_CASES = ("startup_idle", "notebook_crud_restart")
 OLLAMA_CONFIG_SCHEMA = "gloss-desktop-ollama-config/v1"
 ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
+MESSAGE_EVIDENCE_SELECTOR = '.gloss-assistant-bubble button[title="Evidence"][aria-controls^="evidence-"]'
 
 
 def load_ollama_config(path: Path) -> dict:
@@ -399,7 +400,7 @@ class IntegratedWorkflow:
     def answer_id(self) -> str | None:
         # The list is virtualized: rendered row counts are not monotonic.
         # Observe the last actual message's existing disclosure target instead.
-        return self.ui.execute("return Array.from(document.querySelectorAll('button[title=\"Evidence\"]')).at(-1)?.getAttribute('aria-controls') || null")
+        return self.ui.execute("return Array.from(document.querySelectorAll(arguments[0])).at(-1)?.getAttribute('aria-controls') || null", [MESSAGE_EVIDENCE_SELECTOR])
 
     def last_answer(self) -> str:
         return self.ui.execute("return Array.from(document.querySelectorAll('.gloss-assistant-bubble .prose')).at(-1)?.innerText || ''")
@@ -418,10 +419,12 @@ class IntegratedWorkflow:
         return answer
 
     def evidence(self, selected: int, excluded: int, retrieval: bool, *, degraded: bool = False) -> dict:
-        button = self.ui.find_visible('button[title="Evidence"]', last=True)
+        button = self.ui.find_visible(MESSAGE_EVIDENCE_SELECTOR, last=True)
+        drawer_id = self.ui.execute("return arguments[0].getAttribute('aria-controls')", [button])
         if not self.ui.execute("return arguments[0].getAttribute('aria-expanded')==='true'", [button]):
             self.ui.click_ref(button)
-        values = self.ui.execute("""const r=Array.from(document.querySelectorAll('[aria-label="Answer evidence"]')).at(-1); const g=r.querySelector('.grid'); return Object.fromEntries(Array.from(g.children).map(e=>[e.children[0].textContent.replace(/:\\s*$/, '').trim(), e.children[1].textContent.trim()]));""")
+        self.ui.wait(lambda: self.ui.execute("return document.getElementById(arguments[0])?.getClientRects().length>0", [drawer_id]), label="message evidence disclosure")
+        values = self.ui.execute("""const r=document.getElementById(arguments[0]); const g=r.querySelector('.grid'); return Object.fromEntries(Array.from(g.children).map(e=>[e.children[0].textContent.replace(/:\\s*$/, '').trim(), e.children[1].textContent.trim()]));""", [drawer_id])
         require_scope_evidence(values, selected, excluded, retrieval, degraded=degraded)
         self.check(values.get("Generation") == "complete", "rendered generation receipt is complete")
         self.scope_checks.append(values)

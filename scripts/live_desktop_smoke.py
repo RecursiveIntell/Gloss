@@ -464,24 +464,77 @@ class IntegratedWorkflow:
         if not shutil.which("xdotool"):
             raise BaselineBlocked("xdotool is required to observe the real native folder chooser")
         self.sources()
-        self.ui.click_text("Folder")
-        def native(*args: str) -> str:
-            result = subprocess.run(["xdotool", *args], capture_output=True, text=True, timeout=10, check=True)
-            self.ui.trace.append({"at": now(), "native_ui_command": ["xdotool", *args], "stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode})
+        def native(*args: str, timeout: float = 10, allow_absent: bool = False) -> str:
+            command = ["xdotool", *args]
+            entry = {"at": now(), "native_ui_command": command, "timeout_seconds": timeout}
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                entry.update(exit_code=None, error=str(error), timed_out=isinstance(error, subprocess.TimeoutExpired))
+                for field in ("stdout", "stderr"):
+                    value = getattr(error, field, "") or ""
+                    entry[field] = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+                self.ui.trace.append(entry)
+                raise
+            entry.update(stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode)
+            self.ui.trace.append(entry)
+            # xdotool search returns 1 with empty output when no window matches.
+            # Other failures, including mutations, are recorded and never replayed.
+            if result.returncode and not (allow_absent and result.returncode == 1
+                                          and not result.stdout.strip() and not result.stderr.strip()):
+                raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
             return result.stdout.strip()
+
+        def visible_dialogs(timeout: float = 2) -> set[str]:
+            found = native("search", "--onlyvisible", "--name", "Select|Open|Choose",
+                           timeout=timeout, allow_absent=True).splitlines()
+            self.check(all(re.fullmatch(r"[1-9]\d*", item) and int(item) > 1 for item in found),
+                       "native chooser search returned window identifiers")
+            return set(found)
+
         # Keyboard selection operates on the actual GTK chooser opened by the
         # Folder button. No dialog result, file path, store or IPC is injected.
-        native("search", "--sync", "--onlyvisible", "--name", "Select|Open|Choose")
-        name = native("getwindowfocus", "getwindowname")
-        self.check(bool(re.search(r"select|open|choose", name, re.I)), f"native folder chooser focused: {name}")
-        native("key", "--clearmodifiers", "ctrl+l")
-        native("type", "--clearmodifiers", "--delay", "1", str(folder))
-        native("key", "--clearmodifiers", "Return")
+        previous = visible_dialogs()
+        self.ui.click_text("Folder")
+        deadline = time.monotonic() + 10
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("native folder chooser did not appear within 10 seconds")
+            candidates = visible_dialogs(min(2, remaining)) - previous
+            self.check(len(candidates) <= 1, "native folder chooser identity is unambiguous")
+            if candidates:
+                dialog = candidates.pop()
+                break
+            time.sleep(min(0.1, remaining))
+        name = native("getwindowname", dialog)
+        self.check(bool(re.search(r"select|open|choose", name, re.I)), f"native folder chooser identified: {dialog} {name}")
+        # Xvfb has no EWMH window manager. Set focus on the discovered dialog
+        # directly, then inspect raw X focus without WM_CLASS parent traversal.
+        native("windowfocus", "--sync", dialog)
+
+        def key_action(*args: str):
+            self.check(native("getwindowfocus", "-f") == dialog,
+                       f"native folder chooser {dialog} retains keyboard focus")
+            native(*args)
+
+        key_action("key", "--clearmodifiers", "ctrl+l")
+        key_action("type", "--clearmodifiers", "--delay", "1", str(folder))
+        key_action("key", "--clearmodifiers", "Return")
         time.sleep(0.3)
         # GTK may navigate to the directory first. Activating the dialog's
-        # default action after navigation selects that directory.
-        if re.search(r"select|open|choose", native("getwindowfocus", "getwindowname"), re.I):
-            native("key", "--clearmodifiers", "Return")
+        # default action is a separate step only while that same chooser remains
+        # visible and focused. A failed command is never retried.
+        if dialog in visible_dialogs():
+            key_action("key", "--clearmodifiers", "Return")
+        deadline = time.monotonic() + 5
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("native folder chooser did not close after confirmation")
+            if dialog not in visible_dialogs(min(2, remaining)):
+                break
+            time.sleep(min(0.1, remaining))
 
     def run(self, name: str):
         self.create_notebook(name)

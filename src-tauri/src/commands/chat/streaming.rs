@@ -893,6 +893,27 @@ mod tests {
         Vec<ChatStreamEventV1>,
         ChatAttemptTraceV1,
     ) {
+        // Only the phase under test gets a short deadline. A one-millisecond
+        // provider-start budget can expire during synchronous trace writes
+        // before an immediate provider is polled, masking later-phase cases.
+        let mut timeouts = crate::providers::LlmPhaseTimeouts {
+            provider_start: Duration::from_secs(5),
+            first_token: Duration::from_secs(5),
+            stream_idle: Duration::from_secs(5),
+        };
+        match &mode {
+            ScriptedFailureMode::ProviderStartNeverReturns => {
+                timeouts.provider_start = Duration::from_millis(1);
+            }
+            ScriptedFailureMode::FirstTokenNeverArrives => {
+                timeouts.first_token = Duration::from_millis(1);
+            }
+            ScriptedFailureMode::IdleAfterFirstToken => {
+                timeouts.stream_idle = Duration::from_millis(1);
+            }
+            ScriptedFailureMode::ProviderReturnsError | ScriptedFailureMode::CancelDuringStream => {
+            }
+        }
         let data_dir = tempdir().expect("temporary state directory");
         let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
         state.set_active_notebook(Some("notebook-1".to_string()), Some(7));
@@ -926,14 +947,7 @@ mod tests {
             None,
             &trace,
             data_dir.path(),
-            LlmExecutionContext::new(
-                cancellation,
-                crate::providers::LlmPhaseTimeouts {
-                    provider_start: Duration::from_millis(1),
-                    first_token: Duration::from_millis(1),
-                    stream_idle: Duration::from_millis(1),
-                },
-            ),
+            LlmExecutionContext::new(cancellation, timeouts),
         )
         .await;
         let events =

@@ -1,13 +1,120 @@
 use super::{
-    provider_cancelled_error, provider_http_error, ChatRequest, ChatToken, LlmExecutionContext,
+    provider_cancelled_error, provider_http_failure, ChatRequest, ChatToken, LlmExecutionContext,
     LlmProvider, ModelInfo, ProviderType,
 };
 use crate::error::GlossError;
 use async_trait::async_trait;
 use futures::stream::{self, Stream};
-use futures::StreamExt;
 use std::pin::Pin;
 use zeroize::Zeroize;
+
+fn parse_stream_event(data: &str) -> Result<Option<ChatToken>, GlossError> {
+    let value: serde_json::Value = serde_json::from_str(data)
+        .map_err(|_| super::sse::protocol_error("anthropic", "Invalid JSON in SSE event"))?;
+    if let Some(error) = value.get("error") {
+        let message = error
+            .as_str()
+            .or_else(|| error.get("message").and_then(|message| message.as_str()))
+            .unwrap_or("Provider reported a streaming error");
+        return Err(super::sse::protocol_error(
+            "anthropic",
+            &format!(
+                "Provider stream error: {}",
+                super::sanitize_provider_error_body(message)
+            ),
+        ));
+    }
+    let kind = value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| super::sse::protocol_error("anthropic", "SSE event is missing type"))?;
+    match kind {
+        "message_stop" => Ok(Some(ChatToken {
+            token: String::new(),
+            done: true,
+        })),
+        "content_block_delta" => {
+            let delta = value
+                .get("delta")
+                .and_then(|value| value.as_object())
+                .ok_or_else(|| {
+                    super::sse::protocol_error("anthropic", "Content delta is missing delta object")
+                })?;
+            let kind = delta
+                .get("type")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    super::sse::protocol_error("anthropic", "Content delta is missing delta type")
+                })?;
+            if kind != "text_delta" {
+                return Ok(None); // thinking, signatures and tool JSON are not answer text
+            }
+            let text = delta
+                .get("text")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    super::sse::protocol_error("anthropic", "Text delta is missing text string")
+                })?;
+            Ok(Some(ChatToken {
+                token: text.to_string(),
+                done: false,
+            }))
+        }
+        "error" => Err(super::sse::protocol_error(
+            "anthropic",
+            "Provider sent malformed error event",
+        )),
+        // The API explicitly permits added event types. Metadata, usage and ping
+        // events do not constitute completion; only message_stop does.
+        _ => Ok(None),
+    }
+}
+
+fn parse_response(body: &serde_json::Value) -> Result<ChatToken, GlossError> {
+    let error = |message| super::sse::protocol_error("anthropic", message);
+    if body.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+        return Err(error("Non-stream response is missing message type"));
+    }
+    if !body
+        .get("stop_reason")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|reason| !reason.is_empty())
+    {
+        return Err(error(
+            "Non-stream response is missing a terminal stop_reason",
+        ));
+    }
+    let blocks = body
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| error("Non-stream response is missing content array"))?;
+    let mut text = String::new();
+    let mut saw_text = false;
+    for block in blocks {
+        let kind = block
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| error("Non-stream content block is missing type"))?;
+        if kind == "text" {
+            text.push_str(
+                block
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| error("Non-stream text block is missing text string"))?,
+            );
+            saw_text = true;
+        }
+        // Thinking, signatures and tool blocks are not answer text. Other
+        // typed blocks can coexist with text without discarding the answer.
+    }
+    if !saw_text {
+        return Err(error("Non-stream response has no text content block"));
+    }
+    Ok(ChatToken {
+        token: text,
+        done: true,
+    })
+}
 
 /// Anthropic LLM provider.
 pub struct AnthropicProvider {
@@ -151,127 +258,20 @@ impl LlmProvider for AnthropicProvider {
         };
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            // F3: bound the error body to ~1KB so a hostile / misconfigured
-            // server can't fill the logs with megabytes of HTML or stack
-            // traces. Use bytes (cheap) instead of text (allocates).
-            let text = {
-                match resp.bytes().await {
-                    Ok(b) => String::from_utf8_lossy(&b[..b.len().min(1024)]).to_string(),
-                    Err(_) => String::new(),
-                }
-            };
-            return Err(provider_http_error("anthropic", status, &text));
+            return Err(provider_http_failure("anthropic", resp, &ctx).await);
         }
 
         if request.stream {
-            let byte_stream = resp.bytes_stream();
-
-            let stream = stream::unfold(
-                (byte_stream, super::sse::SseDecoder::new(), ctx.clone()),
-                |(mut byte_stream, mut buffer, ctx)| async move {
-                    loop {
-                        let next = tokio::select! {
-                            _ = ctx.cancellation.cancelled() => {
-                                return Some((
-                                    stream::iter(vec![Err(provider_cancelled_error("anthropic", "reading_stream_chunk", ctx.attempt_id.as_deref()))]),
-                                    (byte_stream, buffer, ctx),
-                                ));
-                            }
-                            next = byte_stream.next() => next,
-                        };
-                        match next {
-                            Some(Ok(bytes)) => {
-                                if ctx.is_cancelled() {
-                                    return Some((
-                                        stream::iter(vec![Err(provider_cancelled_error("anthropic", "before_yield_token", ctx.attempt_id.as_deref()))]),
-                                        (byte_stream, buffer, ctx),
-                                    ));
-                                }
-                                let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
-                                let events = match buffer.push(&bytes) {
-                                    Ok(events) => events,
-                                    Err(error) => return Some((
-                                        stream::iter(vec![Err(GlossError::Provider { provider: "anthropic".into(), source: anyhow::anyhow!(error) })]),
-                                        (byte_stream, buffer, ctx),
-                                    )),
-                                };
-                                for data in events {
-                                    let val: serde_json::Value = match serde_json::from_str(&data) {
-                                        Ok(val) => val,
-                                        Err(error) => {
-                                            tokens.push(Err(GlossError::Provider { provider: "anthropic".into(), source: anyhow::anyhow!("Invalid JSON in SSE event: {}", error) })); break;
-                                        }
-                                    };
-                                    if let Some(error) = val.get("error") {
-                                        let message = error.as_str().or_else(|| error.get("message").and_then(|v| v.as_str())).unwrap_or("Provider reported a streaming error");
-                                        let bounded: String = message.chars().take(512).collect();
-                                        tokens.push(Err(GlossError::Provider { provider: "anthropic".into(), source: anyhow::anyhow!("Provider stream error: {}", bounded) })); break;
-                                    }
-                                    match val.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-                                        "content_block_delta" => tokens.push(Ok(ChatToken {
-                                            token: val.get("delta").and_then(|v| v.get("text")).and_then(|v| v.as_str()).unwrap_or("").to_string(), done: false,
-                                        })),
-                                        "message_stop" => {
-                                            tokens.push(Ok(ChatToken { token: String::new(), done: true })); break;
-                                        }
-                                        _ => {} // metadata, usage, and ping events carry no text
-                                    }
-                                }
-
-                                if !tokens.is_empty() {
-                                    if ctx.is_cancelled() {
-                                        return Some((
-                                            stream::iter(vec![Err(provider_cancelled_error("anthropic", "before_yield_token", ctx.attempt_id.as_deref()))]),
-                                            (byte_stream, buffer, ctx),
-                                        ));
-                                    }
-                                    return Some((stream::iter(tokens), (byte_stream, buffer, ctx)));
-                                }
-                            }
-                            Some(Err(e)) => {
-                                return Some((
-                                    stream::iter(vec![Err(GlossError::Provider {
-                                        provider: "anthropic".into(),
-                                        source: e.into(),
-                                    })]),
-                                    (byte_stream, buffer, ctx),
-                                ));
-                            }
-                            None => {
-                                return None;
-                            }
-                        }
-                    }
-                },
-            )
-            .flatten();
-
-            Ok(Box::pin(stream))
+            Ok(super::sse::response_stream(
+                resp,
+                ctx,
+                "anthropic",
+                parse_stream_event,
+            ))
         } else {
-            let body: serde_json::Value = tokio::select! {
-                _ = ctx.cancellation.cancelled() => {
-                    return Err(provider_cancelled_error("anthropic", "reading_non_stream_response", ctx.attempt_id.as_deref()));
-                }
-                result = resp.json() => result.map_err(|e| GlossError::Provider {
-                provider: "anthropic".into(),
-                source: e.into(),
-                })?
-            };
-            ctx.check_cancelled("anthropic", "before_terminal_frame")?;
-
-            let content = body
-                .get("content")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("text"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            Ok(Box::pin(stream::iter(vec![Ok(ChatToken {
-                token: content,
-                done: true,
-            })])))
+            let body = super::bounded_json_response("anthropic", resp, &ctx).await?;
+            let token = parse_response(&body)?;
+            Ok(Box::pin(stream::iter(vec![Ok(token)])))
         }
     }
 

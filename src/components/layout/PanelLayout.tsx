@@ -65,6 +65,21 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
   const [leftCollapsed, setLeftCollapsed] = useState(() => localStorage.getItem("gloss:layout:leftCollapsed") !== "0");
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem("gloss:layout:rightCollapsed") !== "0");
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("notes");
+  const layoutRef = useRef<HTMLDivElement>(null);
+  const [layoutWidth, setLayoutWidth] = useState(0);
+  const compact = layoutWidth > 0 && layoutWidth < leftWidth + rightWidth + 480;
+
+  useEffect(() => {
+    const host = layoutRef.current;
+    if (!host) return;
+    const observer = new ResizeObserver(([entry]) => setLayoutWidth(entry.contentRect.width));
+    observer.observe(host);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (compact && !leftCollapsed && !rightCollapsed) setLeftCollapsed(true);
+  }, [compact, leftCollapsed, rightCollapsed]);
 
   useEffect(() => {
     loadSources(notebookId);
@@ -141,17 +156,23 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
   }, []);
 
   return (
-    <div className="flex flex-1 overflow-hidden">
+    <div ref={layoutRef} className="relative flex min-h-0 flex-1 overflow-hidden">
       <div className="gloss-rail flex shrink-0 flex-col items-center gap-1 border-r py-2">
         <RailAction
           label={leftCollapsed ? "Open sources" : "Close sources"}
           active={!leftCollapsed}
           count={stats?.source_count ?? 0}
-          onClick={() => setLeftCollapsed((collapsed) => !collapsed)}
+          onClick={() => {
+            if (compact && leftCollapsed) setRightCollapsed(true);
+            setLeftCollapsed((collapsed) => !collapsed);
+          }}
         >
           {leftCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <FileText className="h-4 w-4" />}
         </RailAction>
-        <RailAction label="Chat canvas" active={false}>
+        <RailAction label="Focus chat message" active={false} onClick={() => {
+          if (compact) { setLeftCollapsed(true); setRightCollapsed(true); }
+          document.getElementById("gloss-chat-composer")?.focus();
+        }}>
           <MessageSquare className="h-4 w-4" />
         </RailAction>
         <div className="flex-1" />
@@ -162,7 +183,9 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
         )}
       </div>
       {!leftCollapsed ? (
-        <div className="gloss-panel relative flex shrink-0 flex-col overflow-hidden border-r border-border" style={{ width: leftWidth }}>
+        <div className="gloss-panel relative flex shrink-0 flex-col overflow-hidden border-r border-border" style={compact
+          ? { width: leftWidth, maxWidth: "calc(100% - 2 * var(--rail-w))", position: "absolute", left: "var(--rail-w)", top: 0, bottom: 0, zIndex: 30 }
+          : { width: leftWidth }}>
           <DrawerHeader
             title="Sources"
             subtitle={`${stats?.source_count ?? 0} sources · ${stats?.chunk_count ?? 0} chunks`}
@@ -187,8 +210,10 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <ChatPanel key={notebookId} notebookId={notebookId} />
       </div>
-      {!rightCollapsed ? (
-        <div className="gloss-panel relative flex shrink-0 flex-col overflow-hidden border-l border-border" style={{ width: rightWidth }}>
+      <div style={{ display: rightCollapsed ? "none" : "contents" }}>
+        <div className="gloss-panel relative flex shrink-0 flex-col overflow-hidden border-l border-border" style={compact
+          ? { width: rightWidth, maxWidth: "calc(100% - 2 * var(--rail-w))", position: "absolute", right: "var(--rail-w)", top: 0, bottom: 0, zIndex: 30 }
+          : { width: rightWidth }}>
           <DrawerHeader
             title="Inspector Dock"
             subtitle={`${notes.length} saved notes`}
@@ -213,13 +238,16 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
             onKeyDown={(event) => resizeWithKeyboard("right", event)}
           />
         </div>
-      ) : null}
+      </div>
       <div className="gloss-rail flex shrink-0 flex-col items-center gap-1 border-l py-2">
         <RailAction
-          label={rightCollapsed ? "Open notes" : "Close notes"}
+          label={rightCollapsed ? "Open inspector" : "Close inspector"}
           active={!rightCollapsed}
           count={notes.length}
-          onClick={() => setRightCollapsed((collapsed) => !collapsed)}
+          onClick={() => {
+            if (compact && rightCollapsed) setLeftCollapsed(true);
+            setRightCollapsed((collapsed) => !collapsed);
+          }}
         >
           {rightCollapsed ? <PanelRightOpen className="h-4 w-4" /> : <StickyNote className="h-4 w-4" />}
         </RailAction>
@@ -237,6 +265,11 @@ function InspectorDock({
   activeTab: InspectorTab;
   onTabChange: (tab: InspectorTab) => void;
 }) {
+  const [visitedTabs, setVisitedTabs] = useState<Set<InspectorTab>>(() => new Set([activeTab]));
+  const activateTab = (tab: InspectorTab) => {
+    setVisitedTabs((previous) => new Set([...previous, tab]));
+    onTabChange(tab);
+  };
   const tabs = [
     { id: "notes", label: "Notes", icon: <StickyNote className="h-3.5 w-3.5" /> },
     { id: "studio", label: "Studio", icon: <Sparkles className="h-3.5 w-3.5" /> },
@@ -247,18 +280,43 @@ function InspectorDock({
     { id: "memory", label: "Memory", icon: <Database className="h-3.5 w-3.5" /> },
     { id: "sources", label: "Sources", icon: <PanelLeftOpen className="h-3.5 w-3.5" /> },
   ] as const;
+  const panels: Record<InspectorTab, ReactNode> = {
+    notes: <NotesPanel key={notebookId} notebookId={notebookId} />,
+    studio: <StudioPanel notebookId={notebookId} />,
+    evidence: <EvidencePanel />,
+    prompt: <PromptPanel />,
+    receipt: <ReceiptPanel />,
+    diagnostics: <DiagnosticsPanel notebookId={notebookId} />,
+    memory: <MemoryPanel />,
+    sources: <SourcesPanel notebookId={notebookId} />,
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div className="flex border-b border-border bg-bg-secondary/70">
+      <div role="tablist" aria-label="Inspector" className="flex shrink-0 overflow-x-auto border-b border-border bg-bg-secondary/70">
         {tabs.map((tab) => (
           <button
             key={tab.id}
             type="button"
+            role="tab"
+            id={`inspector-tab-${tab.id}`}
+            aria-controls={`inspector-panel-${tab.id}`}
+            aria-selected={activeTab === tab.id}
+            tabIndex={activeTab === tab.id ? 0 : -1}
             title={tab.label}
             aria-label={`Inspector tab: ${tab.label}`}
-            onClick={() => onTabChange(tab.id)}
-            className={`flex h-9 flex-1 items-center justify-center gap-1 text-[11px] ${
+            onClick={() => activateTab(tab.id)}
+            onKeyDown={(event) => {
+              const index = tabs.findIndex((candidate) => candidate.id === tab.id);
+              const next = event.key === "ArrowRight" ? (index + 1) % tabs.length
+                : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
+                : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
+              if (next === null) return;
+              event.preventDefault();
+              activateTab(tabs[next].id);
+              document.getElementById(`inspector-tab-${tabs[next].id}`)?.focus();
+            }}
+            className={`flex h-9 shrink-0 items-center justify-center gap-1 px-2 text-[11px] focus-visible:outline focus-visible:outline-accent ${
               activeTab === tab.id ? "bg-bg-tertiary text-text" : "text-text-muted hover:text-text"
             }`}
           >
@@ -267,16 +325,12 @@ function InspectorDock({
           </button>
         ))}
       </div>
-      <div className="min-h-0 flex-1 overflow-hidden">
-        {activeTab === "notes" ? <NotesPanel key={notebookId} notebookId={notebookId} /> : null}
-        {activeTab === "studio" ? <StudioPanel notebookId={notebookId} /> : null}
-        {activeTab === "evidence" ? <EvidencePanel /> : null}
-        {activeTab === "prompt" ? <PromptPanel /> : null}
-        {activeTab === "receipt" ? <ReceiptPanel /> : null}
-        {activeTab === "diagnostics" ? <DiagnosticsPanel notebookId={notebookId} /> : null}
-        {activeTab === "memory" ? <MemoryPanel /> : null}
-        {activeTab === "sources" ? <SourcesPanel notebookId={notebookId} /> : null}
-      </div>
+      {tabs.map((tab) => (
+        <div key={tab.id} role="tabpanel" id={`inspector-panel-${tab.id}`} aria-labelledby={`inspector-tab-${tab.id}`}
+          hidden={activeTab !== tab.id} tabIndex={0} className="min-h-0 flex-1 overflow-hidden">
+          {(visitedTabs.has(tab.id) || activeTab === tab.id) ? panels[tab.id] : null}
+        </div>
+      ))}
     </div>
   );
 }
@@ -298,6 +352,8 @@ function RailAction({
     <button
       type="button"
       title={label}
+      aria-label={label}
+      aria-pressed={active}
       onClick={onClick}
       className={`gloss-rail-button ${active ? "gloss-rail-button-active" : ""}`}
     >
@@ -331,6 +387,7 @@ function DrawerHeader({
         onClick={onClose}
         className="rounded border border-border p-1 text-text-muted hover:bg-bg-tertiary hover:text-text"
         title={`Close ${title.toLowerCase()}`}
+        aria-label={`Close ${title.toLowerCase()}`}
       >
         {closeSide === "left" ? (
           <PanelLeftClose className="h-3.5 w-3.5" />

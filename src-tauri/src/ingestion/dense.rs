@@ -79,6 +79,11 @@ impl HnswIndex {
     }
 
     pub fn add(&mut self, vector: &[f32]) -> Result<u64, GlossError> {
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(GlossError::Embedding(
+                "HNSW vector contains a nonfinite value".into(),
+            ));
+        }
         if vector.len() != self.dims {
             return Err(GlossError::Embedding(format!(
                 "HNSW add dimension mismatch: vector has {} dims, index expects {}",
@@ -320,21 +325,20 @@ fn publish_dense_batch_with(
         let stored = db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)?;
         if stored
             .as_ref()
-            .is_some_and(|stored| stored.status == "stale")
+            .is_some_and(|stored| stored.status == "stale" || native_rebuild_owns(stored))
         {
             return Err(GlossError::Embedding(
                 "Native dense configuration was invalidated; explicit rebuild required".into(),
             ));
         }
-        if path.exists() || db.max_embedding_id()?.is_some() {
-            if !stored
+        if (path.exists() || db.max_embedding_id()?.is_some())
+            && !stored
                 .as_ref()
                 .is_some_and(|stored| stored.derivation_matches(metadata))
-            {
-                return Err(GlossError::Embedding(
-                    "Native dense identity mismatch; explicit rebuild required".into(),
-                ));
-            }
+        {
+            return Err(GlossError::Embedding(
+                "Native dense identity mismatch; explicit rebuild required".into(),
+            ));
         }
         let mut building = metadata.clone();
         building.status = EmbeddingIndexMetadataStatus::Building.as_str().into();
@@ -344,10 +348,11 @@ fn publish_dense_batch_with(
     })?;
     let result = db.with_dense_index_transaction(|db| {
         let stored = db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)?;
-        if !stored
-            .as_ref()
-            .is_some_and(|stored| stored.status != "stale" && stored.derivation_matches(metadata))
-        {
+        if !stored.as_ref().is_some_and(|stored| {
+            stored.status != "stale"
+                && !native_rebuild_owns(stored)
+                && stored.derivation_matches(metadata)
+        }) {
             return Err(GlossError::Embedding(
                 "Native dense identity changed before publication; retry required".into(),
             ));
@@ -380,7 +385,9 @@ fn publish_dense_batch_with(
             // Do not erase a settings invalidation or overwrite another
             // writer's successful publication while reporting this failure.
             if current.as_ref().is_some_and(|current| {
-                current.status == "building" && current.derivation_matches(metadata)
+                current.status == "building"
+                    && !native_rebuild_owns(current)
+                    && current.derivation_matches(metadata)
             }) {
                 db.mark_embedding_index_status(
                     NATIVE_HNSW_INDEX_ID,
@@ -392,6 +399,182 @@ fn publish_dense_batch_with(
         })?;
     }
     result
+}
+
+fn native_rebuild_owns(metadata: &crate::db::notebook_db::EmbeddingIndexMetadata) -> bool {
+    metadata.status == "building"
+        && metadata
+            .status_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("native-rebuild:"))
+}
+
+pub struct NativeDenseRebuild {
+    pub id: String,
+    pub chunks: Vec<crate::db::notebook_db::Chunk>,
+    metadata: crate::db::notebook_db::EmbeddingIndexMetadata,
+    embedding_failures: Vec<(String, Option<String>)>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct NativeDenseRebuildReceipt {
+    pub schema: &'static str,
+    pub rebuild_id: String,
+    pub status: &'static str,
+    pub chunks_indexed: usize,
+    pub sources_recovered: usize,
+    pub provider: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub artifact_sha256: String,
+    pub previous_artifact_quarantined: bool,
+}
+
+/// Explicit operator retry may supersede an abandoned rebuild. The durable
+/// token prevents older workers and queue batches from publishing over it.
+pub fn begin_dense_rebuild(
+    db: &crate::db::notebook_db::NotebookDb,
+    expected: &crate::db::notebook_db::EmbeddingIndexMetadata,
+) -> Result<NativeDenseRebuild, GlossError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    db.with_dense_index_transaction(|db| {
+        let chunks = db.native_rebuild_chunks()?;
+        let mut metadata = expected.clone();
+        metadata.status = "building".into();
+        metadata.status_reason = Some(format!("native-rebuild:{id}"));
+        db.upsert_embedding_index_metadata(&metadata)?;
+        let embedding_failures = db.native_embedding_failures()?;
+        Ok(NativeDenseRebuild {
+            id,
+            chunks,
+            metadata,
+            embedding_failures,
+        })
+    })
+}
+
+impl NativeDenseRebuild {
+    /// Batch inference is outside the SQLite writer transaction. Only the
+    /// projection is built; canonical mappings remain untouched until commit.
+    pub fn build(
+        &self,
+        mut embed: impl FnMut(&[crate::db::notebook_db::Chunk]) -> Result<Vec<Vec<f32>>, GlossError>,
+    ) -> Result<HnswIndex, GlossError> {
+        let mut index = HnswIndex::new(
+            self.metadata
+                .dimensions
+                .ok_or_else(|| GlossError::Embedding("Missing embedding dimensions".into()))?,
+        )?;
+        for chunks in self.chunks.chunks(64) {
+            let vectors = embed(chunks)?;
+            if vectors.len() != chunks.len() {
+                return Err(GlossError::Embedding(
+                    "Rebuild embedding count does not match chunk count".into(),
+                ));
+            }
+            for vector in vectors {
+                index.add(&vector)?;
+            }
+        }
+        Ok(index)
+    }
+
+    fn still_owns(&self, db: &crate::db::notebook_db::NotebookDb) -> Result<bool, GlossError> {
+        Ok(db
+            .embedding_index_metadata(crate::db::notebook_db::NATIVE_HNSW_INDEX_ID)?
+            .is_some_and(|current| {
+                current.derivation_matches(&self.metadata)
+                    && current.status == "building"
+                    && current.status_reason == self.metadata.status_reason
+            }))
+    }
+
+    /// Failure leaves the projection visibly unavailable and preserves an
+    /// intervening settings invalidation or a newer rebuild's ownership.
+    pub fn fail(
+        &self,
+        db: &crate::db::notebook_db::NotebookDb,
+        reason: &str,
+    ) -> Result<(), GlossError> {
+        db.with_dense_index_transaction(|db| {
+            if self.still_owns(db)? {
+                db.mark_embedding_index_status(
+                    crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+                    crate::db::notebook_db::EmbeddingIndexMetadataStatus::Blocked,
+                    Some(reason),
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Caller holds the app configuration lock while this commits. Exact
+    /// canonical snapshot + ownership checks reject source/config changes.
+    /// The previous artifact is retained in quarantine before replacement.
+    pub fn publish(
+        &self,
+        db: &crate::db::notebook_db::NotebookDb,
+        path: &Path,
+        index: &HnswIndex,
+    ) -> Result<NativeDenseRebuildReceipt, GlossError> {
+        let result = db.with_dense_index_transaction(|db| {
+            if !self.still_owns(db)? || db.native_rebuild_chunks()? != self.chunks {
+                return Err(GlossError::Embedding(
+                    "Notebook or embedding configuration changed during rebuild; retry required"
+                        .into(),
+                ));
+            }
+            if index.size() != self.chunks.len()
+                || index.dims != self.metadata.dimensions.unwrap_or(0)
+            {
+                return Err(GlossError::Embedding(
+                    "Incomplete native rebuild candidate".into(),
+                ));
+            }
+            let previous_artifact_quarantined = path.exists();
+            let digest = if path.exists() {
+                let backup = path.with_file_name(format!("chunks.usearch.{}.quarantine", self.id));
+                std::fs::copy(path, &backup)?;
+                std::fs::File::open(&backup)?.sync_all()?;
+                Some(HnswIndex::artifact_digest(path)?)
+            } else {
+                None
+            };
+            index.published_digest.set(digest);
+            index.save_atomic_verified(path, self.chunks.len().saturating_sub(1) as i64)?;
+            for (label, chunk) in self.chunks.iter().enumerate() {
+                db.update_chunk_embedding(&chunk.id, label as i64, &self.metadata.model)?;
+            }
+            let sources_recovered =
+                db.close_rebuilt_embedding_failures(&self.embedding_failures)?;
+            let mut ready = self.metadata.clone();
+            ready.status = "ready".into();
+            ready.status_reason = Some(format!("native-rebuild:{} committed", self.id));
+            db.upsert_embedding_index_metadata(&ready)?;
+            Ok(NativeDenseRebuildReceipt {
+                schema: "gloss-native-dense-rebuild/v1",
+                rebuild_id: self.id.clone(),
+                status: "ready",
+                chunks_indexed: self.chunks.len(),
+                sources_recovered,
+                provider: ready.provider,
+                model: ready.model,
+                dimensions: index.dims,
+                artifact_sha256: format!("{:x}", Sha256::digest(std::fs::read(path)?)),
+                previous_artifact_quarantined,
+            })
+        });
+        if let Err(error) = &result {
+            self.fail(
+                db,
+                &format!(
+                    "native-rebuild:{} failed; previous artifact retained if present: {error}",
+                    self.id
+                ),
+            )?;
+        }
+        result
+    }
 }
 
 #[cfg(test)]
@@ -461,6 +644,226 @@ mod audit_dense_tests {
         }
         // Failed reads did not turn retryable state into configuration Stale.
         publish_dense_batch(&db, &path, &chunks, &[vec![1.0, 0.0, 0.0]], &metadata()).unwrap();
+    }
+
+    #[test]
+    fn explicit_rebuild_changes_dimensions_preserves_chunks_and_quarantines_old_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let path = native_dense_artifact_path(dir.path());
+        let chunks = batch_fixture(&db, "a", 2);
+        publish_dense_batch(
+            &db,
+            &path,
+            &chunks,
+            &vec![vec![1.0, 0.0, 0.0]; 2],
+            &metadata(),
+        )
+        .unwrap();
+        let old_bytes = std::fs::read(&path).unwrap();
+        let mut changed = metadata();
+        changed.model = "new-model".into();
+        changed.dimensions = Some(2);
+        let rebuild = begin_dense_rebuild(&db, &changed).unwrap();
+        assert!(load_published_dense_index(&db, &path, &changed).is_err());
+        let candidate = rebuild
+            .build(|batch| Ok(vec![vec![0.0, 1.0]; batch.len()]))
+            .unwrap();
+        let receipt = rebuild.publish(&db, &path, &candidate).unwrap();
+        assert_eq!(receipt.chunks_indexed, 2);
+        assert_eq!(receipt.dimensions, 2);
+        assert!(receipt.previous_artifact_quarantined);
+        assert_eq!(
+            std::fs::read(path.with_file_name(format!("chunks.usearch.{}.quarantine", rebuild.id)))
+                .unwrap(),
+            old_bytes
+        );
+        let stored = db.native_rebuild_chunks().unwrap();
+        for (before, after) in chunks.iter().zip(stored) {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.content, after.content);
+            assert_eq!(after.embedding_model.as_deref(), Some("new-model"));
+        }
+        assert_eq!(
+            load_published_dense_index(&db, &path, &changed)
+                .unwrap()
+                .size(),
+            2
+        );
+    }
+
+    #[test]
+    fn rebuild_rejects_source_mutation_and_old_queue_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let path = native_dense_artifact_path(dir.path());
+        let chunks = batch_fixture(&db, "a", 1);
+        let rebuild = begin_dense_rebuild(&db, &metadata()).unwrap();
+        assert!(
+            publish_dense_batch(&db, &path, &chunks, &[vec![1.0, 0.0, 0.0]], &metadata()).is_err()
+        );
+        assert!(rebuild.still_owns(&db).unwrap());
+        let candidate = rebuild
+            .build(|batch| Ok(vec![vec![1.0, 0.0, 0.0]; batch.len()]))
+            .unwrap();
+        batch_fixture(&db, "new", 1);
+        assert!(rebuild.publish(&db, &path, &candidate).is_err());
+        assert!(!path.exists());
+        assert!(db.native_embedding_ids().unwrap().is_empty());
+        assert_eq!(
+            db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
+                .unwrap()
+                .unwrap()
+                .status,
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn rebuild_mapping_failure_retains_quarantine_and_restart_retry_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("notebook.db");
+        let db = NotebookDb::open(&db_path).unwrap();
+        let path = native_dense_artifact_path(dir.path());
+        let chunks = batch_fixture(&db, "a", 2);
+        publish_dense_batch(
+            &db,
+            &path,
+            &chunks,
+            &vec![vec![1.0, 0.0, 0.0]; 2],
+            &metadata(),
+        )
+        .unwrap();
+        let before = db.native_rebuild_chunks().unwrap();
+        let rebuild = begin_dense_rebuild(&db, &metadata()).unwrap();
+        let candidate = rebuild
+            .build(|batch| Ok(vec![vec![0.0, 1.0, 0.0]; batch.len()]))
+            .unwrap();
+        db.conn().execute_batch("CREATE TRIGGER fail_rebuild AFTER UPDATE OF embedding_id ON chunks WHEN NEW.id = 'a-1' BEGIN SELECT RAISE(ABORT, 'injected rebuild mapping failure'); END;").unwrap();
+        assert!(rebuild.publish(&db, &path, &candidate).is_err());
+        assert_eq!(db.native_rebuild_chunks().unwrap(), before);
+        assert!(path
+            .with_file_name(format!("chunks.usearch.{}.quarantine", rebuild.id))
+            .exists());
+        assert!(load_published_dense_index(&db, &path, &metadata()).is_err());
+        db.conn()
+            .execute_batch("DROP TRIGGER fail_rebuild")
+            .unwrap();
+        drop(db);
+        let db = NotebookDb::connect(&db_path).unwrap();
+        let retry = begin_dense_rebuild(&db, &metadata()).unwrap();
+        let candidate = retry
+            .build(|batch| Ok(vec![vec![1.0, 0.0, 0.0]; batch.len()]))
+            .unwrap();
+        retry.publish(&db, &path, &candidate).unwrap();
+        assert_eq!(
+            load_published_dense_index(&db, &path, &metadata())
+                .unwrap()
+                .size(),
+            2
+        );
+    }
+
+    #[test]
+    fn interrupted_rebuild_is_superseded_without_old_worker_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let path = native_dense_artifact_path(dir.path());
+        batch_fixture(&db, "a", 1);
+        let first = begin_dense_rebuild(&db, &metadata()).unwrap();
+        let stale = first
+            .build(|batch| Ok(vec![vec![1.0, 0.0, 0.0]; batch.len()]))
+            .unwrap();
+        let retry = begin_dense_rebuild(&db, &metadata()).unwrap();
+        assert!(first.publish(&db, &path, &stale).is_err());
+        assert!(retry.still_owns(&db).unwrap());
+        let candidate = retry
+            .build(|batch| Ok(vec![vec![0.0, 1.0, 0.0]; batch.len()]))
+            .unwrap();
+        retry.publish(&db, &path, &candidate).unwrap();
+        assert!(first.publish(&db, &path, &stale).is_err());
+        assert_eq!(
+            db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
+                .unwrap()
+                .unwrap()
+                .status,
+            "ready"
+        );
+    }
+
+    #[test]
+    fn invalidated_rebuild_cannot_erase_settings_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let path = native_dense_artifact_path(dir.path());
+        batch_fixture(&db, "a", 1);
+        let rebuild = begin_dense_rebuild(&db, &metadata()).unwrap();
+        let candidate = rebuild
+            .build(|batch| Ok(vec![vec![1.0, 0.0, 0.0]; batch.len()]))
+            .unwrap();
+        db.mark_embedding_index_status(
+            NATIVE_HNSW_INDEX_ID,
+            crate::db::notebook_db::EmbeddingIndexMetadataStatus::Stale,
+            Some("settings changed"),
+        )
+        .unwrap();
+        assert!(rebuild.publish(&db, &path, &candidate).is_err());
+        assert_eq!(
+            db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
+                .unwrap()
+                .unwrap()
+                .status,
+            "stale"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn rebuild_rejects_nonnative_floats_before_any_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        batch_fixture(&db, "a", 1);
+        let rebuild = begin_dense_rebuild(&db, &metadata()).unwrap();
+        assert!(rebuild
+            .build(|_| Ok(vec![vec![f32::NAN, 0.0, 0.0]]))
+            .is_err());
+        assert!(rebuild.build(|_| Ok(vec![])).is_err());
+        assert!(db.native_embedding_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebuild_closes_only_matching_embedding_failures_and_preserves_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
+        let path = native_dense_artifact_path(dir.path());
+        for source in ["embedding", "extraction", "changed"] {
+            batch_fixture(&db, source, 1);
+            db.update_source_status(source, "error", Some("original failure"))
+                .unwrap();
+        }
+        for source in ["embedding", "changed"] {
+            db.update_source_index_status(
+                source,
+                None,
+                Some("blocked"),
+                Some("native embedding failed"),
+            )
+            .unwrap();
+        }
+        let rebuild = begin_dense_rebuild(&db, &metadata()).unwrap();
+        db.update_source_status("changed", "error", Some("new extraction failure"))
+            .unwrap();
+        let candidate = rebuild
+            .build(|batch| Ok(vec![vec![1.0, 0.0, 0.0]; batch.len()]))
+            .unwrap();
+        let receipt = rebuild.publish(&db, &path, &candidate).unwrap();
+        assert_eq!(receipt.sources_recovered, 1);
+        assert_eq!(db.get_source("embedding").unwrap().status, "ready");
+        assert_eq!(db.get_source("extraction").unwrap().status, "error");
+        assert_eq!(
+            db.get_source("changed").unwrap().error_message.as_deref(),
+            Some("new extraction failure")
+        );
     }
 
     #[test]

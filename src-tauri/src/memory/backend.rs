@@ -482,7 +482,7 @@ pub fn unavailable_status(active_backend: String, diagnostic: String) -> MemoryB
         available: true,
         semantic_memory_feature_enabled: cfg!(feature = "semantic-memory-backend"),
         semantic_memory_available: false,
-        semantic_memory_path: Some("src-tauri/vendor/semantic-memory".to_string()),
+        semantic_memory_path: None,
         index_sync_status: "unavailable".to_string(),
         sync_status: "unavailable".to_string(),
         last_sync_at: None,

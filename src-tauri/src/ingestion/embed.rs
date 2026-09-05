@@ -10,8 +10,7 @@ pub use super::dense::{native_dense_artifact_path, publish_dense_batch, HnswInde
 /// Embedding backend: local CPU candle (Nomic v1.5) or external Ollama.
 ///
 /// The candle path never touches ONNX/ort and uses the CPU unconditionally —
-/// it is the automatic fallback whenever no Ollama server is configured or
-/// reachable.
+/// it is selected only by explicit local configuration.
 pub enum EmbeddingBackend {
     NomicV15(Box<NomicV15Embedder>),
     Ollama {
@@ -59,7 +58,7 @@ fn snapshot_has_model_files(snapshot: &Path) -> bool {
 
 /// True when the local candle model's files are present in either the hf-hub
 /// cache or the legacy `data_dir/models` cache. This is what makes the CPU
-/// candle fallback work without download consent when the model already exists.
+/// local Candle loading work without download consent when the model already exists.
 pub fn candle_model_is_cached(hf_home: &Path, legacy_cache: &Path) -> bool {
     [
         hf_cache_repo_dir(hf_home),
@@ -243,6 +242,7 @@ pub struct EmbeddingService {
     backend: EmbeddingBackend,
     dims: usize,
     model_id: String,
+    pub configured_identity: Option<crate::ingestion::embedding_contract::NativeEmbeddingConfig>,
 }
 
 impl EmbeddingService {
@@ -313,58 +313,30 @@ impl EmbeddingService {
             backend: EmbeddingBackend::NomicV15(Box::new(model)),
             dims: 768,
             model_id: CANDLE_EMBEDDING_MODEL.to_string(),
+            configured_identity: None,
         })
     }
 
-    /// Build the embedder from app settings with an automatic CPU-candle
-    /// fallback:
-    ///
-    /// - `provider == "ollama"` and reachable → Ollama `/api/embed`
-    /// - otherwise (unset, "fastembed", "native", or an unreachable Ollama) →
-    ///   the in-process CPU candle embedder (Nomic v1.5 MoE, 768d),
-    ///   downloading the model on first use when consent is enabled.
-    pub fn from_configured_provider(
-        provider: Option<&str>,
-        url: Option<&str>,
-        model: Option<&str>,
-        timeout_secs: Option<u64>,
+    /// Construct exactly the configured backend. Provider failures are visible;
+    /// no network or model failure authorizes substitution or model downloads.
+    pub fn from_config(
+        config: &crate::ingestion::embedding_contract::NativeEmbeddingConfig,
         cache_dir: &Path,
-        download_consent: bool,
     ) -> Result<Self, GlossError> {
-        let wants_ollama = provider
-            .map(|p| p.trim().eq_ignore_ascii_case("ollama"))
-            .unwrap_or(false);
-
-        if wants_ollama {
-            let base_url = url
-                .unwrap_or("http://localhost:11434")
-                .trim()
-                .trim_end_matches('/');
-            let ollama_model = model.unwrap_or("bge-m3").trim();
-            match Self::new_ollama(base_url, ollama_model, timeout_secs.unwrap_or(60)) {
-                Ok(service) => {
-                    tracing::info!(
-                        url = %base_url,
-                        model = %ollama_model,
-                        "Ollama embedding backend ready"
-                    );
-                    return Ok(service);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Ollama embedding backend unavailable; falling back to local CPU candle"
-                    );
-                }
+        let mut service = match config.provider.as_str() {
+            "ollama" => Self::new_ollama(
+                &config.url,
+                &config.model,
+                config.timeout_secs,
+                config.allow_lan,
+            )?,
+            "fastembed" | "native" => {
+                Self::new_with_download_policy(cache_dir, false, config.download_consent)?
             }
-        } else {
-            tracing::info!(
-                provider = %provider.unwrap_or("auto"),
-                "Using local CPU candle embedding backend"
-            );
-        }
-
-        Self::new_with_download_policy(cache_dir, false, download_consent)
+            _ => return Err(GlossError::Config("Unsupported embedding provider".into())),
+        };
+        service.configured_identity = Some(config.clone());
+        Ok(service)
     }
 
     /// Ollama path — crash-isolated, preferred when explicitly configured.
@@ -378,13 +350,18 @@ impl EmbeddingService {
     /// poisoned AppState locks and cascaded into "poisoned lock: another task
     /// failed inside" on every subsequent import — fixed by never touching
     /// reqwest::blocking here.
-    pub fn new_ollama(url: &str, model: &str, timeout_secs: u64) -> Result<Self, GlossError> {
-        let timeout = std::time::Duration::from_secs(timeout_secs.clamp(2, 300));
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| GlossError::Embedding(format!("HTTP client build failed: {e}")))?;
+    pub fn new_ollama(
+        url: &str,
+        model: &str,
+        timeout_secs: u64,
+        allow_lan: bool,
+    ) -> Result<Self, GlossError> {
+        let client = crate::ingestion::embedding_contract::ollama_client(
+            url,
+            model,
+            timeout_secs,
+            allow_lan,
+        )?;
 
         let service = Self {
             backend: EmbeddingBackend::Ollama {
@@ -394,6 +371,7 @@ impl EmbeddingService {
             },
             dims: 0,
             model_id: format!("ollama:{model}"),
+            configured_identity: None,
         };
         let dims = service.probe_dimension()?;
         Ok(Self { dims, ..service })
@@ -411,7 +389,15 @@ impl EmbeddingService {
         match &self.backend {
             EmbeddingBackend::NomicV15(model) => model.embed(texts),
             EmbeddingBackend::Ollama { client, url, model } => {
-                ollama_embed_sync(client, url, model, texts)
+                let vectors = crate::ingestion::embedding_contract::ollama_embed_sync(
+                    client, url, model, texts,
+                )?;
+                if self.dims > 0 && vectors.iter().any(|vector| vector.len() != self.dims) {
+                    return Err(GlossError::Embedding(
+                        "Embedding model dimensions changed; explicit rebuild required".into(),
+                    ));
+                }
+                Ok(vectors)
             }
         }
     }
@@ -438,6 +424,10 @@ impl EmbeddingService {
         hasher.update(self.model_id.as_bytes());
         hasher.update(b"\0");
         hasher.update(self.dims.to_string().as_bytes());
+        if let EmbeddingBackend::Ollama { url, .. } = &self.backend {
+            hasher.update(b"\0");
+            hasher.update(url.as_bytes());
+        }
         Some(format!("{:x}", hasher.finalize()))
     }
 
@@ -465,92 +455,6 @@ impl EmbeddingService {
             "current embedding backend does not support cross-encoder reranking".into(),
         ))
     }
-}
-
-/// Run an Ollama `/api/embed` request on the async reqwest client from both
-/// sync and async callers without panicking. The old `reqwest::blocking`
-/// client panicked ("Cannot drop a runtime in a context where blocking is not
-/// allowed") whenever it was used or dropped inside a tokio async context —
-/// which is how `ensure_embedder` and the import path call it. This mirrors
-/// the semantic-memory adapter's proven `block_on_probe` pattern:
-/// `block_in_place` inside an existing runtime, a throwaway current-thread
-/// runtime otherwise.
-fn ollama_embed_sync(
-    client: &reqwest::Client,
-    url: &str,
-    model: &str,
-    texts: &[&str],
-) -> Result<Vec<Vec<f32>>, GlossError> {
-    let future = ollama_embed_request(client, url, model, texts);
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-        Err(_) => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    GlossError::Embedding(format!("Ollama embed runtime build failed: {e}"))
-                })?;
-            runtime.block_on(future)
-        }
-    }
-}
-
-async fn ollama_embed_request(
-    client: &reqwest::Client,
-    url: &str,
-    model: &str,
-    texts: &[&str],
-) -> Result<Vec<Vec<f32>>, GlossError> {
-    let body = serde_json::json!({
-        "model": model,
-        "input": texts,
-    });
-    let response = client
-        .post(format!("{url}/api/embed"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| GlossError::Embedding(format!("Ollama embed request failed: {e}")))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<could not read body>".to_string());
-        return Err(GlossError::Embedding(format!(
-            "Ollama embed returned HTTP {status}: {body_text}"
-        )));
-    }
-
-    let parsed: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| GlossError::Embedding(format!("Ollama embed JSON parse failed: {e}")))?;
-
-    let embeddings_array = parsed
-        .get("embeddings")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            GlossError::Embedding("Ollama embed response missing \"embeddings\" array".into())
-        })?;
-
-    let mut out = Vec::with_capacity(embeddings_array.len());
-    for emb in embeddings_array {
-        let vector = emb
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-                    .collect::<Vec<f32>>()
-            })
-            .ok_or_else(|| {
-                GlossError::Embedding("Ollama embed entry is not a numeric array".into())
-            })?;
-        out.push(vector);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -687,7 +591,8 @@ mod tests {
             }
         });
 
-        let service = EmbeddingService::new_ollama(&format!("http://{addr}"), "bge-m3", 5).unwrap();
+        let service =
+            EmbeddingService::new_ollama(&format!("http://{addr}"), "bge-m3", 5, false).unwrap();
         assert_eq!(service.dims(), 3);
         assert_eq!(service.provider_id(), "ollama");
 

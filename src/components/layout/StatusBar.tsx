@@ -1,4 +1,4 @@
-import { useSettingsStore } from "../../stores/settingsStore";
+import { findSelectedModel, useSettingsStore } from "../../stores/settingsStore";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useNotebookStore } from "../../stores/notebookStore";
 import { useToastStore } from "../../stores/toastStore";
@@ -23,23 +23,19 @@ export function StatusBar() {
   const settings = useSettingsStore((s) => s.settings);
   const stats = useSourceStore((s) => s.stats);
   const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
-  const chatConnected = useHealthStore((s) => s.chatConnected === true);
+  const chatConnected = useHealthStore((s) => s.chatConnected);
   const backgroundConnected = useHealthStore((s) => s.backgroundConnected);
   const [embeddingStatus, setEmbeddingStatus] = useState<string | null>(null);
   const queueStatus = useHealthStore((s) => s.queueStatus);
   const memoryStatus = useHealthStore((s) => s.memoryStatus);
   const profileStatus = useHealthStore((s) => s.profileStatus);
   const startHealthPolling = useHealthStore((s) => s.startPolling);
+  const stopHealthPolling = useHealthStore((s) => s.stopPolling);
   const [generating, setGenerating] = useState(false);
   const [healthOpen, setHealthOpen] = useState(false);
   const selectedProviderId = settings["default_provider"] || null;
-  const activeModelRecord =
-    models.find(
-      (model) =>
-        model.id === activeModel &&
-        (!selectedProviderId || model.provider_id === selectedProviderId),
-    ) ?? models.find((model) => model.id === activeModel);
-  const activeProviderId = activeModelRecord?.provider_id ?? selectedProviderId;
+  const activeModelRecord = findSelectedModel(models, selectedProviderId, activeModel);
+  const activeProviderId = selectedProviderId;
   const selectedModelPresent = Boolean(activeModelRecord);
   const selectedModelAvailable = Boolean(
     activeModelRecord && activeModelRecord.available && !activeModelRecord.stale,
@@ -49,9 +45,10 @@ export function StatusBar() {
     : !selectedModelAvailable
       ? activeModelRecord?.last_error || "Selected model unavailable"
       : null;
-  const backgroundProviderId = queueStatus?.summary_backend.provider_id ?? null;
-
-  useEffect(() => { startHealthPolling(activeNotebookId, activeProviderId, backgroundProviderId); }, [activeNotebookId, activeProviderId, backgroundProviderId, startHealthPolling]);
+  useEffect(() => {
+    startHealthPolling(activeNotebookId, activeProviderId);
+    return stopHealthPolling;
+  }, [activeNotebookId, activeProviderId, startHealthPolling, stopHealthPolling]);
 
   // Listen for embedding model status events
   useEffect(() => {
@@ -85,9 +82,6 @@ export function StatusBar() {
     if (!activeNotebookId || generating) return;
     setGenerating(true);
     try {
-      if (queueStatus?.paused) {
-        await api.resumeSummaries();
-      }
       const result = await api.regenerateMissingSummaries(activeNotebookId);
       if (result.queued === 0 && result.diagnostics.length > 0) {
         useToastStore.getState().addToast({
@@ -121,7 +115,7 @@ export function StatusBar() {
   const isManualMode = queueStatus?.mode === "manual" || isPaused;
   const needsSummaries = !isProcessing && missingSummaries > 0;
   const summaryBackendReady = queueStatus?.summary_backend.ready ?? false;
-  const canGenerate = needsSummaries && summaryBackendReady && backgroundConnected;
+  const canGenerate = needsSummaries && summaryBackendReady && backgroundConnected === true;
   const summaryDiagnostic = queueStatus?.summary_backend.diagnostic ?? null;
   const memoryBackendLabel = memoryStatus
     ? memoryStatus.backend_used !== memoryStatus.active_backend
@@ -133,7 +127,9 @@ export function StatusBar() {
     memoryStatus?.diagnostic ||
     memoryStatus?.semantic_memory_path ||
     undefined;
-  const backgroundStatus = !summaryBackendReady
+  const backgroundStatus = !queueStatus || backgroundConnected === null
+    ? "Not checked"
+    : !summaryBackendReady
     ? "Config error"
     : backgroundConnected
       ? "Ready"
@@ -141,16 +137,16 @@ export function StatusBar() {
   const summaryModelLabel = queueStatus?.summary_backend.model ?? "Not configured";
 
   return (
-    <div className="gloss-mono flex h-[var(--statusbar-h)] items-center gap-4 border-t border-border bg-bg-secondary px-3 text-[10px] text-text-muted">
+    <div className="gloss-mono flex min-h-[var(--statusbar-h)] shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-t border-border bg-bg-secondary px-3 py-1 text-[10px] text-text-muted">
       <div className="flex items-center gap-1.5">
         {chatConnected ? (
           <Wifi className="w-3 h-3 text-success" />
-        ) : (
+        ) : chatConnected === false ? (
           <WifiOff className="w-3 h-3 text-error" />
-        )}
+        ) : <Loader2 className="w-3 h-3 text-text-muted" />}
         <span>
           {activeProviderId
-            ? chatConnected
+            ? chatConnected === null ? "Provider not checked" : chatConnected
               ? "Provider reachable"
               : "Provider unreachable"
             : "Provider unknown"}

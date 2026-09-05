@@ -1687,6 +1687,7 @@ pub async fn send_message(
                 app_db.get_setting("semantic_memory_embedding_url")?,
                 app_db.get_setting("semantic_memory_embedding_model")?,
                 app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+                crate::providers::lan_local_providers_allowed(&app_db),
                 setting_is_enabled(app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?),
                 features::turbo_quant_active(&app_db)?,
                 setting_is_enabled(
@@ -1987,8 +1988,18 @@ pub async fn send_message(
                     None,
                 );
 
-                let preview_result = tokio::time::timeout(
-                    semantic_memory_search_timeout,
+                let preview_result = tokio::time::timeout(semantic_memory_search_timeout, async {
+                    let _inference =
+                        crate::ingestion::native_gates::acquire(&state.gpu_gate, &state.llm_gate)
+                            .await?;
+                    if crate::commands::sources::semantic_memory_runtime_config_from_state(&state)?
+                        != semantic_memory_runtime_config
+                    {
+                        return Err(GlossError::Embedding(
+                            "Semantic embedding configuration changed while waiting; retry retrieval"
+                                .into(),
+                        ));
+                    }
                     semantic_memory_adapter::search_preview(
                         &state.data_dir,
                         &notebook_id,
@@ -1997,8 +2008,9 @@ pub async fn send_message(
                         preview_request,
                         Some(semantic_memory_runtime_config.clone()),
                         semantic_embedding_metadata,
-                    ),
-                )
+                    )
+                    .await
+                })
                 .await;
 
                 match preview_result {

@@ -427,6 +427,20 @@ export async function updateSetting(
   return invoke("update_setting", { key, value });
 }
 
+export interface EmbeddingSettings {
+  provider: string;
+  url: string;
+  model: string;
+  timeout_secs: number;
+  download_consent: boolean;
+  search_timeout_ms: number;
+  chunk_target_tokens: number;
+}
+
+export async function updateEmbeddingSettings(config: EmbeddingSettings): Promise<string[]> {
+  return invoke("update_embedding_settings", { config });
+}
+
 export async function getFeatureFlags(): Promise<FeatureFlagStatus[]> {
   return invoke("get_feature_flags");
 }
@@ -502,6 +516,23 @@ export async function semanticMemoryRebuildVectorArtifacts(
   notebookId: string
 ): Promise<Record<string, unknown> | null> {
   return invoke("semantic_memory_rebuild_vector_artifacts", { notebookId });
+}
+
+export interface NativeDenseRebuildReceipt {
+  schema: "gloss-native-dense-rebuild/v1";
+  rebuild_id: string;
+  status: "ready";
+  chunks_indexed: number;
+  sources_recovered: number;
+  provider: string;
+  model: string;
+  dimensions: number;
+  artifact_sha256: string;
+  previous_artifact_quarantined: boolean;
+}
+
+export async function nativeDenseRebuild(notebookId: string): Promise<NativeDenseRebuildReceipt> {
+  return invoke("native_dense_rebuild", { notebookId });
 }
 
 export async function getSemanticMemoryProfileStatus(

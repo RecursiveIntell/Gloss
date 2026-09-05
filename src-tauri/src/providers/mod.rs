@@ -1,8 +1,14 @@
 pub mod anthropic;
+mod background;
+pub use background::{
+    background_provider_for_dispatch, model_has_vision_capability, validate_background_dispatch,
+};
 pub mod llamacpp;
 pub mod ollama;
 pub mod openai;
 mod sse;
+#[cfg(test)]
+mod test_http;
 
 use crate::db::app_db::{AppDb, ModelRecord, Provider};
 use crate::error::GlossError;
@@ -37,34 +43,18 @@ fn read_setting_flag(app_db: &crate::db::app_db::AppDb, key: &str) -> bool {
 }
 
 fn is_rfc1918_host(host: &str) -> bool {
-    // 10.0.0.0/8
-    if host.starts_with("10.") || host.starts_with("10:") {
-        return true;
+    // URL host_str retains brackets around IPv6 literals. Parse the complete
+    // address so a DNS name like 10.example.com cannot acquire a LAN grant.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_private(),
+        // IPv6 unique-local fc00::/7 is the explicitly supported LAN range.
+        Ok(std::net::IpAddr::V6(ip)) => ip.segments()[0] & 0xfe00 == 0xfc00,
+        Err(_) => false,
     }
-    // 172.16.0.0/12
-    if host.starts_with("172.") {
-        let parts: Vec<&str> = host.split('.').collect();
-        if parts.len() >= 2 {
-            if let Ok(second_octet) = parts[1].parse::<u8>() {
-                if (16..=31).contains(&second_octet) {
-                    return true;
-                }
-            }
-        }
-    }
-    // 192.168.0.0/16
-    if host.starts_with("192.168.") {
-        return true;
-    }
-    // IPv6 private: fc00::/7
-    if host.starts_with("fc")
-        || host.starts_with("fd")
-        || host.starts_with("fc00")
-        || host.starts_with("fd00")
-    {
-        return true;
-    }
-    false
 }
 
 pub fn lan_local_providers_allowed(app_db: &crate::db::app_db::AppDb) -> bool {
@@ -370,15 +360,21 @@ pub fn validate_embedding_url(
 ///
 /// A single client is reused across provider instances and chat turns so the
 /// connection pool survives across uses and avoids repeated TCP handshakes.
-pub fn build_shared_client() -> reqwest::Client {
+pub fn build_shared_client() -> Result<reqwest::Client, GlossError> {
     reqwest::Client::builder()
+        // The validated endpoint is the entire egress grant. Neither a redirect
+        // nor environment proxy settings may silently change its destination.
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(90))
         .timeout(std::time::Duration::from_secs(300))
         .pool_max_idle_per_host(8)
         .tcp_keepalive(std::time::Duration::from_secs(60))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .map_err(|error| {
+            GlossError::Config(format!("Cannot initialize provider HTTP client: {error}"))
+        })
 }
 
 fn validate_base_url_inner(
@@ -426,7 +422,11 @@ fn validate_base_url_inner(
             ))
         })?
         .to_ascii_lowercase();
-    let is_loopback = LOCAL_EGRESS_HOSTS.contains(&host.as_str());
+    let literal_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(&host);
+    let is_loopback = LOCAL_EGRESS_HOSTS.contains(&literal_host);
     let is_lan = is_rfc1918_host(&host);
     let (allowed, egress_class, policy, cloud_opt_in_required, lan_opt_in_applied) =
         match provider_type {
@@ -540,7 +540,11 @@ pub fn sanitize_provider_error_body(body: &str) -> String {
         }
         redact_next = redacts_following;
         if out.len() >= 240 {
-            out.truncate(240);
+            let mut boundary = 240;
+            while !out.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            out.truncate(boundary);
             out.push_str("...");
             break;
         }
@@ -562,6 +566,93 @@ pub fn provider_http_error(provider: &str, status: reqwest::StatusCode, body: &s
             sanitize_provider_error_body(body)
         ),
     }
+}
+
+/// Bound full JSON responses before deserialization, with the same cancellation
+/// and typed protocol failures used by streaming transports.
+pub(super) async fn bounded_json_response(
+    provider: &str,
+    mut response: reqwest::Response,
+    ctx: &LlmExecutionContext,
+) -> Result<serde_json::Value, GlossError> {
+    const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                return Err(provider_cancelled_error(provider, "reading_non_stream_response", ctx.attempt_id.as_deref()));
+            }
+            result = response.chunk() => result.map_err(|error| GlossError::Provider {
+                provider: provider.into(), source: error.into(),
+            })?,
+        };
+        let Some(chunk) = next else { break };
+        if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
+            return Err(sse::protocol_error(
+                provider,
+                "Non-stream response exceeds 8 MiB limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    ctx.check_cancelled(provider, "before_terminal_frame")?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| sse::protocol_error(provider, "Invalid JSON in non-stream response"))?;
+    if !body.is_object() {
+        return Err(sse::protocol_error(
+            provider,
+            "Non-stream response must be an object",
+        ));
+    }
+    if let Some(error) = body.get("error") {
+        let message = error
+            .as_str()
+            .or_else(|| error.get("message").and_then(serde_json::Value::as_str))
+            .unwrap_or("Provider reported an error in a successful HTTP response");
+        return Err(sse::protocol_error(
+            provider,
+            &format!(
+                "Provider response error: {}",
+                sanitize_provider_error_body(message)
+            ),
+        ));
+    }
+    Ok(body)
+}
+
+/// Read only the bounded diagnostic prefix, and preserve cancellation while a
+/// failing server is still sending its body. Redirects are rejected immediately.
+pub async fn provider_http_failure(
+    provider: &str,
+    mut response: reqwest::Response,
+    ctx: &LlmExecutionContext,
+) -> GlossError {
+    let status = response.status();
+    if status.is_redirection() {
+        return provider_http_error(
+            provider,
+            status,
+            "Provider redirect rejected. Configure the final endpoint explicitly in Settings.",
+        );
+    }
+    let mut prefix = Vec::with_capacity(1024);
+    while prefix.len() < 1024 {
+        let next = tokio::select! {
+            _ = ctx.cancellation.cancelled() => {
+                return provider_cancelled_error(provider, "reading_error_response", ctx.attempt_id.as_deref());
+            }
+            next = response.chunk() => next,
+        };
+        match next {
+            Ok(Some(bytes)) => {
+                let remaining = 1024 - prefix.len();
+                prefix.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    provider_http_error(provider, status, &String::from_utf8_lossy(&prefix))
 }
 
 fn redact_url_for_error(url: &str) -> String {
@@ -615,7 +706,7 @@ fn redact_url_for_error(url: &str) -> String {
 
 /// Construct a boxed LlmProvider from a config.
 pub fn build_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>, GlossError> {
-    let shared_client = build_shared_client();
+    let shared_client = build_shared_client()?;
     match config.provider_type {
         ProviderType::OpenAI | ProviderType::Anthropic => {
             let api_key = config
@@ -798,7 +889,7 @@ impl ModelRegistry {
         let allow_lan = lan_local_providers_allowed(app_db);
         let allow_custom_cloud_endpoints = custom_cloud_endpoints_allowed(app_db);
         let providers = app_db.list_providers()?;
-        let shared_client = build_shared_client();
+        let shared_client = build_shared_client()?;
         let ollama = provider_row(&providers, ProviderType::Ollama)
             .filter(|row| row.enabled)
             .and_then(|row| {
@@ -1629,6 +1720,57 @@ mod tests {
     }
 
     #[test]
+    fn lan_grant_requires_ip_literal_and_cannot_match_public_dns_prefixes() {
+        for host in [
+            "10.example.com",
+            "172.16.example.com",
+            "192.168.example.com",
+            "fc.example.com",
+            "fd.example.com",
+            "10.0.0.1.evil.test",
+            "192.168.999.1",
+        ] {
+            assert!(!is_rfc1918_host(host), "{host} is not a LAN IP");
+            assert!(
+                validate_provider_base_url(
+                    ProviderType::Ollama,
+                    &format!("http://{host}:11434"),
+                    true,
+                    false
+                )
+                .is_err(),
+                "{host} cannot acquire a LAN grant"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_literals_preserve_loopback_and_explicit_ula_scope() {
+        let loopback =
+            validate_provider_base_url(ProviderType::Ollama, "http://[::1]:11434", false, false)
+                .unwrap();
+        assert_eq!(loopback.egress_class, "local_loopback");
+        for host in ["[fc00::1]", "[fd12:3456::1]"] {
+            assert!(is_rfc1918_host(host));
+            let url = format!("http://{host}:11434");
+            assert!(validate_provider_base_url(ProviderType::Ollama, &url, false, false).is_err());
+            assert_eq!(
+                validate_provider_base_url(ProviderType::Ollama, &url, true, false)
+                    .unwrap()
+                    .egress_class,
+                "local_lan"
+            );
+        }
+        assert!(validate_provider_base_url(
+            ProviderType::Ollama,
+            "http://[2001:4860:4860::8888]:11434",
+            true,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
     fn provider_error_body_redacts_bearer_value_after_authorization_header() {
         let raw_value = "abcdefghijklmnopqrstuvwxyzABCDEF0123456789";
         let sanitized = sanitize_provider_error_body(&format!(
@@ -1648,5 +1790,444 @@ mod tests {
         assert!(!sanitized.contains("sk-test"));
         assert!(!sanitized.contains("api_key=abc"));
         assert!(sanitized.len() <= 243);
+    }
+
+    #[test]
+    fn provider_error_body_utf8_bound_cannot_panic() {
+        let sanitized = sanitize_provider_error_body(&format!("x{}", "🦀".repeat(100)));
+        assert!(sanitized.len() <= 243);
+        assert!(sanitized.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn actual_providers_reject_redirects_without_forwarding_prompts_or_keys() {
+        for status in [
+            "301 Moved Permanently",
+            "302 Found",
+            "303 See Other",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+        ] {
+            for provider_type in [
+                ProviderType::Ollama,
+                ProviderType::OpenAI,
+                ProviderType::Anthropic,
+                ProviderType::LlamaCpp,
+            ] {
+                let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let location = format!(
+                    "Location: http://{}/unapproved\r\n",
+                    target.local_addr().unwrap()
+                );
+                let (url, fixture) = super::test_http::respond(status, Vec::new(), &location).await;
+                // Only the origin is granted by this fixture. The distinct target
+                // listener witnesses any redirect request, including rewritten GETs.
+                if matches!(provider_type, ProviderType::Ollama | ProviderType::LlamaCpp) {
+                    validate_provider_base_url(provider_type, &url, false, false).unwrap();
+                }
+                let client = build_shared_client().unwrap();
+                let provider: Box<dyn LlmProvider> = match provider_type {
+                    ProviderType::Ollama => Box::new(ollama::OllamaProvider::new(&url, client)),
+                    ProviderType::OpenAI => {
+                        Box::new(openai::OpenAIProvider::new(&url, "fixture-api-key", client))
+                    }
+                    ProviderType::Anthropic => Box::new(anthropic::AnthropicProvider::new(
+                        &url,
+                        "fixture-api-key",
+                        client,
+                    )),
+                    ProviderType::LlamaCpp => {
+                        Box::new(llamacpp::LlamaCppProvider::new(&url, client))
+                    }
+                };
+                let error = match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    provider.chat(mock_chat_request(), LlmExecutionContext::uncancellable()),
+                )
+                .await
+                .expect("redirect rejection must not connect to or await the target")
+                {
+                    Ok(_) => panic!("redirect must be a visible provider error"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains("redirect rejected"),
+                    "{provider_type:?} {status}: {error}"
+                );
+                let request = fixture.await.unwrap();
+                assert!(String::from_utf8_lossy(&request).contains("hello"));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), target.accept())
+                        .await
+                        .is_err(),
+                    "unapproved redirect target received a connection"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_http_error_reads_only_bounded_prefix_without_waiting_for_eof() {
+        let (url, fixture) =
+            super::test_http::hold_open("500 Internal Server Error", vec![b'x'; 1024]).await;
+        let provider = ollama::OllamaProvider::new(&url, build_shared_client().unwrap());
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.chat(mock_chat_request(), LlmExecutionContext::uncancellable()),
+        )
+        .await;
+        fixture.abort();
+        let error = match result.expect("bounded error prefix must not wait for EOF") {
+            Ok(_) => panic!("500 response must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("500"));
+        assert!(error.to_string().len() < 400);
+    }
+
+    #[tokio::test]
+    async fn provider_http_error_body_observes_cancellation() {
+        let (url, fixture) =
+            super::test_http::hold_open("500 Internal Server Error", vec![b'x'; 32]).await;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let response = build_shared_client()
+            .unwrap()
+            .post(&url)
+            .body("fixture")
+            .send()
+            .await
+            .unwrap();
+        let task = tokio::spawn({
+            let ctx = LlmExecutionContext::default_with_token(cancellation.clone());
+            async move { provider_http_failure("ollama", response, &ctx).await }
+        });
+        // Response headers have arrived. Cancellation must interrupt the bounded
+        // error-body reader while the server holds its remaining bytes open.
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), task).await;
+        fixture.abort();
+        let error = result
+            .expect("cancel must interrupt error-body read")
+            .unwrap();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn actual_non_stream_providers_reject_error_malformed_and_wrong_schema() {
+        for kind in [
+            ProviderType::OpenAI,
+            ProviderType::LlamaCpp,
+            ProviderType::Anthropic,
+        ] {
+            let mut invalid = vec![
+                b"{}".to_vec(),
+                b"[]".to_vec(),
+                b"null".to_vec(),
+                b"{invalid}".to_vec(),
+                b"{\"error\":{\"message\":\"failed\"}}".to_vec(),
+                b"{\"content\":\"wrong\",\"choices\":{}}".to_vec(),
+                b"\xff".to_vec(),
+            ];
+            if kind == ProviderType::Anthropic {
+                invalid.extend([
+                    r#"{"type":"message","stop_reason":"end_turn","content":[{"type":"text","text":7}]}"#,
+                    r#"{"type":"message","stop_reason":null,"content":[{"type":"text","text":"partial"}]}"#,
+                    r#"{"type":"message","stop_reason":"end_turn","content":[]}"#,
+                ].map(|value| value.as_bytes().to_vec()));
+            } else {
+                invalid.extend(
+                    [
+                        r#"{"choices":[{"finish_reason":"stop","message":{"content":7}}]}"#,
+                        r#"{"choices":[{"message":{"content":"partial"}}]}"#,
+                        r#"{"choices":[{"finish_reason":"stop","message":{}}]}"#,
+                    ]
+                    .map(|value| value.as_bytes().to_vec()),
+                );
+            }
+            for body in invalid {
+                let (url, fixture) = super::test_http::respond("200 OK", body, "").await;
+                let mut request = mock_chat_request();
+                request.stream = false;
+                assert!(
+                    sse_fixture_provider(kind, &url)
+                        .chat(request, LlmExecutionContext::uncancellable())
+                        .await
+                        .is_err(),
+                    "{kind:?} must reject invalid non-stream body"
+                );
+                fixture.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_non_stream_providers_preserve_text_blocks_and_refusals() {
+        for kind in [
+            ProviderType::OpenAI,
+            ProviderType::LlamaCpp,
+            ProviderType::Anthropic,
+        ] {
+            let body = if kind == ProviderType::Anthropic {
+                r#"{"type":"message","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"private"},{"type":"text","text":"你好 "},{"type":"text","text":"🦀"}]}"#
+            } else {
+                r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"你好 🦀"}}]}"#
+            };
+            let (url, fixture) =
+                super::test_http::respond("200 OK", body.as_bytes().to_vec(), "").await;
+            let mut request = mock_chat_request();
+            request.stream = false;
+            let mut stream = sse_fixture_provider(kind, &url)
+                .chat(request, LlmExecutionContext::uncancellable())
+                .await
+                .unwrap();
+            let token = stream.next().await.unwrap().unwrap();
+            assert_eq!(token.token, "你好 🦀");
+            assert!(token.done);
+            assert!(stream.next().await.is_none());
+            fixture.await.unwrap();
+        }
+        for kind in [ProviderType::OpenAI, ProviderType::LlamaCpp] {
+            let body = r#"{"choices":[{"finish_reason":"stop","message":{"content":null,"refusal":"Cannot answer this request"}}]}"#;
+            let (url, fixture) =
+                super::test_http::respond("200 OK", body.as_bytes().to_vec(), "").await;
+            let mut request = mock_chat_request();
+            request.stream = false;
+            let mut stream = sse_fixture_provider(kind, &url)
+                .chat(request, LlmExecutionContext::uncancellable())
+                .await
+                .unwrap();
+            assert_eq!(
+                stream.next().await.unwrap().unwrap().token,
+                "Cannot answer this request"
+            );
+            fixture.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_non_stream_providers_bound_body_and_observe_cancellation() {
+        for kind in [
+            ProviderType::OpenAI,
+            ProviderType::LlamaCpp,
+            ProviderType::Anthropic,
+        ] {
+            let (url, fixture) =
+                super::test_http::hold_open("200 OK", vec![b'x'; 8 * 1024 * 1024 + 1]).await;
+            let mut request = mock_chat_request();
+            request.stream = false;
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                sse_fixture_provider(kind, &url)
+                    .chat(request, LlmExecutionContext::uncancellable()),
+            )
+            .await;
+            fixture.abort();
+            let error = match result.expect("oversized response fails before EOF") {
+                Ok(_) => panic!("oversized body accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("8 MiB"), "{error}");
+
+            let (url, fixture) = super::test_http::hold_open("200 OK", b"{".to_vec()).await;
+            let cancellation = CancellationToken::new();
+            let mut request = mock_chat_request();
+            request.stream = false;
+            let provider = sse_fixture_provider(kind, &url);
+            let ctx = LlmExecutionContext::default_with_token(cancellation.clone());
+            let task = tokio::spawn(async move { provider.chat(request, ctx).await });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancellation.cancel();
+            let result = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            fixture.abort();
+            let error = match result {
+                Ok(_) => panic!("cancelled body accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("cancelled"));
+        }
+    }
+
+    fn sse_fixture_provider(kind: ProviderType, url: &str) -> Box<dyn LlmProvider> {
+        let client = build_shared_client().unwrap();
+        match kind {
+            ProviderType::OpenAI => Box::new(openai::OpenAIProvider::new(url, "fixture", client)),
+            ProviderType::Anthropic => {
+                Box::new(anthropic::AnthropicProvider::new(url, "fixture", client))
+            }
+            ProviderType::LlamaCpp => Box::new(llamacpp::LlamaCppProvider::new(url, client)),
+            _ => panic!("only SSE providers belong in this fixture"),
+        }
+    }
+
+    fn sse_text_fixture(kind: ProviderType) -> &'static str {
+        match kind {
+            ProviderType::Anthropic => "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"kept 你好 🦀\"}}\n\n",
+            _ => "data: {\"choices\":[{\"delta\":{\"content\":\"kept 你好 🦀\"},\"finish_reason\":null}]}\n\n",
+        }
+    }
+
+    fn sse_terminal_fixture(kind: ProviderType) -> &'static str {
+        match kind {
+            ProviderType::Anthropic => "data: {\"type\":\"message_stop\"}\n\n",
+            _ => "data: [DONE]\n\n",
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_sse_providers_report_typed_eof_and_preserve_partial_tokens() {
+        for kind in [
+            ProviderType::OpenAI,
+            ProviderType::LlamaCpp,
+            ProviderType::Anthropic,
+        ] {
+            for incomplete_terminal in [false, true] {
+                let mut body = sse_text_fixture(kind).to_string();
+                if incomplete_terminal {
+                    body.push_str(sse_terminal_fixture(kind).trim_end());
+                }
+                let (url, fixture) =
+                    super::test_http::respond("200 OK", body.into_bytes(), "").await;
+                let mut stream = sse_fixture_provider(kind, &url)
+                    .chat(mock_chat_request(), LlmExecutionContext::uncancellable())
+                    .await
+                    .unwrap();
+                assert_eq!(stream.next().await.unwrap().unwrap().token, "kept 你好 🦀");
+                let error = stream.next().await.unwrap().unwrap_err();
+                let GlossError::Provider { source, .. } = error else {
+                    panic!("must remain provider error")
+                };
+                assert_eq!(
+                    source.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                );
+                assert!(stream.next().await.is_none());
+                assert!(stream.next().await.is_none());
+                fixture.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_sse_providers_fuse_on_errors_without_erasing_earlier_frames() {
+        for kind in [
+            ProviderType::OpenAI,
+            ProviderType::LlamaCpp,
+            ProviderType::Anthropic,
+        ] {
+            for error_frame in [
+                b"data: {invalid}\n\n".as_slice(),
+                b"data: {\"error\":{\"message\":\"broken\"}}\n\n",
+                b"data: \xff\n\n",
+                b"data: []\n\n",
+            ] {
+                let mut body = sse_text_fixture(kind).as_bytes().to_vec();
+                body.extend_from_slice(error_frame);
+                body.extend_from_slice(sse_terminal_fixture(kind).as_bytes());
+                let (url, fixture) = super::test_http::hold_open("200 OK", body).await;
+                let mut stream = sse_fixture_provider(kind, &url)
+                    .chat(mock_chat_request(), LlmExecutionContext::uncancellable())
+                    .await
+                    .unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(2), async {
+                    assert_eq!(stream.next().await.unwrap().unwrap().token, "kept 你好 🦀");
+                    assert!(stream.next().await.unwrap().is_err());
+                    assert!(stream.next().await.is_none());
+                    assert!(stream.next().await.is_none());
+                })
+                .await;
+                fixture.abort();
+                result.expect("error fuses actual provider stream without waiting for EOF");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_sse_providers_fuse_on_terminal_marker_without_waiting_for_eof() {
+        for kind in [
+            ProviderType::OpenAI,
+            ProviderType::LlamaCpp,
+            ProviderType::Anthropic,
+        ] {
+            let body = format!(
+                "{}{}{}",
+                sse_text_fixture(kind),
+                sse_terminal_fixture(kind),
+                sse_text_fixture(kind)
+            );
+            let (url, fixture) = super::test_http::hold_open("200 OK", body.into_bytes()).await;
+            let mut stream = sse_fixture_provider(kind, &url)
+                .chat(mock_chat_request(), LlmExecutionContext::uncancellable())
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                assert_eq!(stream.next().await.unwrap().unwrap().token, "kept 你好 🦀");
+                assert!(stream.next().await.unwrap().unwrap().done);
+                assert!(stream.next().await.is_none());
+                assert!(stream.next().await.is_none());
+            })
+            .await;
+            fixture.abort();
+            result.expect("terminal marker fuses actual provider stream without waiting for EOF");
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_sse_providers_cancel_before_delivering_buffered_tokens() {
+        for kind in [
+            ProviderType::OpenAI,
+            ProviderType::LlamaCpp,
+            ProviderType::Anthropic,
+        ] {
+            let body = format!(
+                "{}{}{}",
+                sse_text_fixture(kind),
+                sse_text_fixture(kind),
+                sse_terminal_fixture(kind)
+            );
+            let (url, fixture) = super::test_http::respond("200 OK", body.into_bytes(), "").await;
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let ctx = LlmExecutionContext::default_with_token(cancellation.clone());
+            let mut stream = sse_fixture_provider(kind, &url)
+                .chat(mock_chat_request(), ctx)
+                .await
+                .unwrap();
+            assert_eq!(stream.next().await.unwrap().unwrap().token, "kept 你好 🦀");
+            cancellation.cancel();
+            assert!(stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled"));
+            assert!(stream.next().await.is_none());
+            fixture.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_openai_compatible_providers_accept_finish_reason_terminal_frame() {
+        for kind in [ProviderType::OpenAI, ProviderType::LlamaCpp] {
+            let terminal = "data: {\"choices\":[{\"delta\":{\"content\":\"final\"},\"finish_reason\":\"stop\"}]}\n\n";
+            let (url, fixture) =
+                super::test_http::hold_open("200 OK", terminal.as_bytes().to_vec()).await;
+            let mut stream = sse_fixture_provider(kind, &url)
+                .chat(mock_chat_request(), LlmExecutionContext::uncancellable())
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let token = stream.next().await.unwrap().unwrap();
+                assert_eq!(token.token, "final");
+                assert!(token.done);
+                assert!(stream.next().await.is_none());
+            })
+            .await;
+            fixture.abort();
+            result.expect("finish_reason is a provider terminal marker");
+        }
     }
 }

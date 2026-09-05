@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useNotebookStore } from "../../stores/notebookStore";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { BookOpen, Plus, Trash2, Settings, Pencil, Save, X, Download, Upload, Loader2 } from "lucide-react";
@@ -22,6 +22,7 @@ export function NotebookSidebar() {
   const deleteNotebook = useNotebookStore((s: NotebookStoreState) => s.deleteNotebook);
   const loadNotebooks = useNotebookStore((s: NotebookStoreState) => s.loadNotebooks);
   const activationStatus = useNotebookStore((s: NotebookStoreState) => s.activationStatus);
+  const activationError = useNotebookStore((s: NotebookStoreState) => s.activationError);
   const addToast = useToastStore((s) => s.addToast);
   const [newName, setNewName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
@@ -29,35 +30,86 @@ export function NotebookSidebar() {
   const [editingNotebookId, setEditingNotebookId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
   const [portableBusy, setPortableBusy] = useState<"export" | "import" | null>(null);
+  const mutationPending = useRef(false);
+  const [mutation, setMutation] = useState<"create" | "rename" | "delete" | null>(null);
+  const [operationError, setOperationError] = useState<string | null>(null);
+  const [deleteConfirmationId, setDeleteConfirmationId] = useState<string | null>(null);
+  const busy = mutation !== null || portableBusy !== null || activationStatus === "pending";
 
   const handleCreate = async () => {
-    if (!newName.trim()) return;
+    if (!newName.trim() || mutationPending.current || portableBusy || activationStatus === "pending") return;
+    mutationPending.current = true;
+    setMutation("create");
+    setOperationError(null);
     try {
       await createNotebook(newName.trim());
       setNewName("");
       setShowCreate(false);
     } catch (e) {
-      console.warn('Failed to create notebook:', e);
+      setOperationError(`Notebook creation did not finish: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      mutationPending.current = false;
+      setMutation(null);
     }
   };
 
   const startRename = (id: string, name: string) => {
+    if (mutationPending.current || portableBusy || editingNotebookId || activationStatus === "pending") return;
+    setOperationError(null);
+    setDeleteConfirmationId(null);
     setEditingNotebookId(id);
     setEditingName(name);
   };
 
   const cancelRename = () => {
+    if (mutationPending.current) return;
     setEditingNotebookId(null);
     setEditingName("");
   };
 
   const handleRename = async (id: string) => {
-    if (!editingName.trim()) return;
+    if (!editingName.trim() || id !== editingNotebookId || mutationPending.current || portableBusy || activationStatus === "pending") return;
+    mutationPending.current = true;
+    setMutation("rename");
+    setOperationError(null);
     try {
       await renameNotebook(id, editingName.trim());
-      cancelRename();
+      setEditingNotebookId(null);
+      setEditingName("");
     } catch (e) {
-      console.warn("Failed to rename notebook:", e);
+      setOperationError(`Could not rename notebook: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      mutationPending.current = false;
+      setMutation(null);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    if (deleteConfirmationId !== id || mutationPending.current || portableBusy || activationStatus === "pending") return;
+    const notebook = notebooks.find((candidate) => candidate.id === id);
+    if (!notebook) return;
+    mutationPending.current = true;
+    setMutation("delete");
+    setOperationError(null);
+    try {
+      await deleteNotebook(id);
+      setDeleteConfirmationId(null);
+    } catch (e) {
+      setOperationError(`Could not delete “${notebook.name}”: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      mutationPending.current = false;
+      setMutation(null);
+    }
+  };
+
+  const handleActivate = async (id: string) => {
+    if (busy) return;
+    setOperationError(null);
+    setDeleteConfirmationId(null);
+    try {
+      await setActive(id);
+    } catch (error) {
+      setOperationError(`Could not open notebook: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
@@ -133,7 +185,10 @@ export function NotebookSidebar() {
           </p>
         </div>
         <button
-          onClick={() => setShowCreate(!showCreate)}
+          onClick={() => { setDeleteConfirmationId(null); setOperationError(null); setShowCreate(!showCreate); }}
+          disabled={busy}
+          aria-label={showCreate ? "Close notebook draft" : "Create notebook"}
+          aria-expanded={showCreate}
           className="rounded border border-border p-1 text-text-secondary hover:bg-bg-tertiary hover:text-text"
           title="Create notebook"
         >
@@ -141,18 +196,31 @@ export function NotebookSidebar() {
         </button>
       </div>
 
+      {(operationError || activationError) && <p role="alert" className="break-words border-b border-border px-3 py-2 text-xs text-error">{operationError || `Could not activate notebook: ${activationError}`}</p>}
+      {mutation && <p role="status" className="px-3 py-2 text-xs text-text-muted">{mutation === "create" ? "Creating notebook…" : mutation === "rename" ? "Saving notebook name…" : "Deleting notebook…"}</p>}
+
       {showCreate && (
         <div className="border-b border-border p-2">
           <input
             type="text"
             value={newName}
+            disabled={busy}
             onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleCreate()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+                e.preventDefault();
+                void handleCreate();
+              }
+            }}
             placeholder="Notebook name..."
             className="w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-sm text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
             aria-label="New notebook name"
             autoFocus
           />
+          <button onClick={() => void handleCreate()} disabled={busy || !newName.trim()}
+            className="mt-2 w-full rounded bg-accent px-2 py-1 text-xs text-white disabled:opacity-50">
+            {mutation === "create" ? "Creating…" : "Create notebook"}
+          </button>
         </div>
       )}
 
@@ -175,23 +243,26 @@ export function NotebookSidebar() {
         {notebooks.map((nb) => (
           <div
             key={nb.id}
-            onClick={() => setActive(nb.id)}
-            className={`group flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm ${
+            className={`group rounded px-2 py-1.5 text-sm ${
               activeNotebookId === nb.id
                 ? "border border-accent/35 bg-accent/15 text-accent"
                 : "border border-transparent text-text-secondary hover:bg-bg-tertiary hover:text-text"
             }`}
           >
+            <div className="flex items-center gap-2">
             <BookOpen className="w-4 h-4 shrink-0" />
             {editingNotebookId === nb.id ? (
               <input
                 type="text"
                 value={editingName}
+                disabled={busy}
+                aria-label={`Rename notebook ${nb.name}`}
                 onClick={(e) => e.stopPropagation()}
                 onChange={(e) => setEditingName(e.target.value)}
                 onKeyDown={(e) => {
                   e.stopPropagation();
-                  if (e.key === "Enter") {
+                  if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+                    e.preventDefault();
                     void handleRename(nb.id);
                   } else if (e.key === "Escape") {
                     cancelRename();
@@ -201,13 +272,17 @@ export function NotebookSidebar() {
                 autoFocus
               />
             ) : (
-              <span className="truncate flex-1">{nb.name}</span>
+              <button className="min-w-0 flex-1 truncate text-left disabled:opacity-50" disabled={busy}
+                aria-current={activeNotebookId === nb.id ? "page" : undefined}
+                onClick={() => void handleActivate(nb.id)}>{nb.name}</button>
             )}
             <span className="gloss-mono text-[10px] text-text-muted">{nb.source_count}</span>
             {editingNotebookId === nb.id ? (
               <>
                 <button
                   onClick={(e) => { e.stopPropagation(); void handleRename(nb.id); }}
+                  disabled={busy || !editingName.trim()}
+                  aria-label={`Save notebook name ${nb.name}`}
                   className="rounded p-0.5 text-text-muted hover:bg-accent/20 hover:text-accent"
                   title="Save name"
                 >
@@ -215,6 +290,8 @@ export function NotebookSidebar() {
                 </button>
                 <button
                   onClick={(e) => { e.stopPropagation(); cancelRename(); }}
+                  disabled={busy}
+                  aria-label="Cancel notebook rename"
                   className="rounded p-0.5 text-text-muted hover:bg-bg-tertiary hover:text-text"
                   title="Cancel rename"
                 >
@@ -225,20 +302,31 @@ export function NotebookSidebar() {
               <>
                 <button
                   onClick={(e) => { e.stopPropagation(); startRename(nb.id, nb.name); }}
-                  className="hidden rounded p-0.5 text-text-muted hover:bg-bg-tertiary hover:text-text group-hover:block"
+                  disabled={busy || editingNotebookId !== null}
+                  aria-label={`Rename notebook ${nb.name}`}
+                  className="rounded p-0.5 text-text-muted hover:bg-bg-tertiary hover:text-text disabled:opacity-50"
                   title="Rename notebook"
                 >
                   <Pencil className="w-3 h-3" />
                 </button>
                 <button
-                  onClick={(e) => { e.stopPropagation(); deleteNotebook(nb.id); }}
-                  className="hidden rounded p-0.5 text-text-muted hover:bg-error/20 hover:text-error group-hover:block"
+                  onClick={() => { setOperationError(null); setDeleteConfirmationId(nb.id); }}
+                  disabled={busy || editingNotebookId !== null}
+                  aria-label={`Delete notebook ${nb.name}`}
+                  aria-expanded={deleteConfirmationId === nb.id}
+                  className="rounded p-0.5 text-text-muted hover:bg-error/20 hover:text-error disabled:opacity-50"
                   title="Delete notebook"
                 >
                   <Trash2 className="w-3 h-3" />
                 </button>
               </>
             )}
+            </div>
+            {deleteConfirmationId === nb.id && <NotebookDeleteConfirmation name={nb.name} sourceCount={nb.source_count}
+              pending={mutation === "delete"}
+              disabled={busy}
+              onCancel={() => { if (!mutationPending.current) setDeleteConfirmationId(null); }}
+              onConfirm={() => void handleDelete(nb.id)} />}
           </div>
         ))}
 
@@ -254,7 +342,7 @@ export function NotebookSidebar() {
         <div className="mb-1 grid grid-cols-2 gap-1">
           <button
             onClick={() => void handleImportNotebook()}
-            disabled={portableBusy !== null}
+            disabled={busy}
             className="flex items-center justify-center rounded border border-transparent px-2 py-1.5 text-text-secondary hover:border-border hover:bg-bg-tertiary hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
             title="Import notebook package"
           >
@@ -262,7 +350,7 @@ export function NotebookSidebar() {
           </button>
           <button
             onClick={() => void handleExportNotebook()}
-            disabled={!activeNotebookId || portableBusy !== null}
+            disabled={!activeNotebookId || busy}
             className="flex items-center justify-center rounded border border-transparent px-2 py-1.5 text-text-secondary hover:border-border hover:bg-bg-tertiary hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
             title="Export active notebook"
           >
@@ -281,4 +369,19 @@ export function NotebookSidebar() {
       <SettingsDialog open={showSettings} onClose={() => setShowSettings(false)} />
     </div>
   );
+}
+
+export function NotebookDeleteConfirmation({ name, sourceCount, pending, disabled = pending, onCancel, onConfirm }: {
+  name: string; sourceCount: number; pending: boolean; disabled?: boolean; onCancel: () => void; onConfirm: () => void;
+}) {
+  return <div role="group" aria-label={`Confirm deletion of notebook ${name}`} className="mt-2 space-y-2 rounded border border-error/40 bg-error/5 p-2"
+    onKeyDown={(event) => { if (event.key === "Escape" && !disabled) { event.preventDefault(); onCancel(); } }}>
+    <p className="break-words text-xs text-text-secondary">Delete “{name}” and its {sourceCount} sources, chats and notes? This cannot be undone. Export it first if you need a backup.</p>
+    <div className="flex flex-wrap gap-2">
+      <button type="button" onClick={onCancel} disabled={disabled} autoFocus aria-label="Cancel notebook deletion"
+        className="rounded border border-border px-2 py-1 text-xs text-text-secondary disabled:opacity-50">Cancel</button>
+      <button type="button" onClick={onConfirm} disabled={disabled} aria-label={`Confirm delete notebook ${name}`}
+        className="rounded border border-error/40 px-2 py-1 text-xs text-error disabled:opacity-50">{pending ? "Deleting…" : "Delete notebook"}</button>
+    </div>
+  </div>;
 }

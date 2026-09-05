@@ -3,11 +3,18 @@ import type { Provider, ModelRecord, FeatureFlagStatus, ExternalToolAvailability
 import * as api from '../lib/tauri';
 import { useToastStore } from './toastStore';
 
+let settingsWriteTail: Promise<void> = Promise.resolve();
+
+export function findSelectedModel(models: ModelRecord[], providerId: string | null | undefined, modelId: string): ModelRecord | undefined {
+  if (!providerId || !modelId) return undefined;
+  return models.find(model => model.id === modelId && model.provider_id === providerId);
+}
+
 function selectionReadiness(settings: Record<string, string>, models: ModelRecord[], modelsLoaded: boolean): string | null {
   const modelId = settings.default_model?.trim();
   if (!modelId) return 'No default model is configured. Select an available model in Settings.';
   if (!modelsLoaded) return null;
-  const selected = models.find(model => model.id === modelId && model.provider_id === settings.default_provider);
+  const selected = findSelectedModel(models, settings.default_provider, modelId);
   return !selected || !selected.available || selected.stale
     ? `Selected model '${modelId}' is unavailable. Refresh models or select an available model.`
     : null;
@@ -30,6 +37,7 @@ interface SettingsStore {
   loadModels: () => Promise<void>;
   refreshModels: () => Promise<void>;
   updateSetting: (key: string, value: string) => Promise<void>;
+  applyEmbeddingSettings: (config: api.EmbeddingSettings) => Promise<string[]>;
   updateFeatureFlag: (id: string, enabled: boolean) => Promise<void>;
   updateProvider: (id: string, enabled: boolean, baseUrl?: string, apiKey?: string) => Promise<void>;
   setActiveModel: (model: string) => void;
@@ -111,58 +119,29 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     }
   },
 
-  updateSetting: async (key, value) => {
-    // Snapshot the prior value so we can roll back on failure.
-    const prior = get().settings[key];
-    const priorConfigured = get().settings[`${key}_configured`];
-    // Optimistic local commit so the UI is responsive while the IPC is in
-    // flight. On failure we restore the prior value below.
-    set((state) => {
-      const nextSettings = { ...state.settings };
-      if (key === 'openai_api_key' || key === 'anthropic_api_key') {
-        nextSettings[key] = '';
-        nextSettings[`${key}_configured`] = value.trim() ? '1' : '0';
-      } else {
-        nextSettings[key] = value;
+  updateSetting: (key, value) => {
+    // Keep canonical write order. Values enter the UI only after persistence;
+    // an older rejection can never roll back a later acknowledged setting.
+    const operation = settingsWriteTail.then(async () => {
+      try {
+        await api.updateSetting(key, value);
+        set((state) => {
+          const settings = { ...state.settings };
+          if (key === 'openai_api_key' || key === 'anthropic_api_key') {
+            settings[key] = '';
+            settings[key + '_configured'] = value.trim() ? '1' : '0';
+          } else { settings[key] = value; }
+          return { settings };
+        });
+        if (key === 'memory_backend') await get().loadFeatureFlags();
+      } catch (err) {
+        useToastStore.getState().addToast({ type: 'error', title: 'Setting not saved', message: key + ': ' + String(err), duration: 5000 });
+        throw err;
       }
-      return { settings: nextSettings };
     });
-    try {
-      await api.updateSetting(key, value);
-    } catch (err) {
-      console.warn("Failed to update setting:", key, err);
-      // Restore the prior value so the UI does not show a phantom setting
-      // that was never persisted. Reload will overwrite with the authoritative
-      // value on next load.
-      set((state) => {
-        const nextSettings = { ...state.settings };
-        if (prior === undefined) {
-          delete nextSettings[key];
-        } else {
-          nextSettings[key] = prior;
-        }
-        if (key === 'openai_api_key' || key === 'anthropic_api_key') {
-          if (priorConfigured === undefined) {
-            delete nextSettings[`${key}_configured`];
-          } else {
-            nextSettings[`${key}_configured`] = priorConfigured;
-          }
-        }
-        return { settings: nextSettings };
-      });
-      useToastStore.getState().addToast({
-        type: 'error',
-        title: 'Setting not saved',
-        message: `${key}: ${err instanceof Error ? err.message : String(err)}`,
-        duration: 5000,
-      });
-      throw err;
-    }
-    if (key === 'memory_backend') {
-      await get().loadFeatureFlags();
-    }
+    settingsWriteTail = operation.catch(() => {});
+    return operation;
   },
-
   updateFeatureFlag: async (id, enabled) => {
     try {
       const featureFlags = await api.updateFeatureFlag(id, enabled);
@@ -194,6 +173,24 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       });
       throw err;
     }
+  },
+
+  applyEmbeddingSettings: (config) => {
+    const operation = settingsWriteTail.then(async () => {
+      const warnings = await api.updateEmbeddingSettings(config);
+      set((state) => ({ settings: { ...state.settings,
+        semantic_memory_embedding_provider: config.provider,
+        semantic_memory_embedding_url: config.url,
+        semantic_memory_embedding_model: config.model,
+        semantic_memory_embedding_timeout_secs: String(config.timeout_secs),
+        fastembed_download_consent: String(config.download_consent),
+        semantic_memory_search_timeout_ms: String(config.search_timeout_ms),
+        chunk_target_tokens: String(config.chunk_target_tokens),
+      } }));
+      return warnings;
+    });
+    settingsWriteTail = operation.then(() => {}, () => {});
+    return operation;
   },
 
   setActiveModel: (model) => set({ activeModel: model }),

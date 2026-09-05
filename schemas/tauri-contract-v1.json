@@ -701,6 +701,21 @@
       },
       "response_family": "MemoryBackendStatus"
     },
+    "native_dense_rebuild": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "nativeDenseRebuild",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "NativeDenseRebuildReceipt"
+    },
     "pause_summaries": {
       "registered": true,
       "definition": "src-tauri/src/commands/sources/mod.rs",
@@ -1108,6 +1123,21 @@
         ]
       },
       "response_family": "void"
+    },
+    "update_embedding_settings": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "updateEmbeddingSettings",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "config"
+        ]
+      },
+      "response_family": "string[]"
     },
     "update_feature_flag": {
       "registered": true,

@@ -71,6 +71,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const sourceListError = useSourceStore((s) => s.sourceListError);
   const selectModel = useSettingsStore((s) => s.selectModel);
   const selectionPending = useSettingsStore((s) => s.selectionPending);
+  const selectionError = useSettingsStore((s) => s.selectionError);
 
   const [input, setInput] = useState("");
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
@@ -141,7 +142,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   };
 
   const handleRegenerate = async (messageId: string) => {
-    if (isStreaming) return;
+    if (isStreaming || selectionPending) return;
     const messageIndex = messages.findIndex((m: Message) => m.id === messageId);
     const priorUser = [...messages]
       .slice(0, messageIndex)
@@ -153,7 +154,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   };
 
   const handleContinue = async () => {
-    if (isStreaming) return;
+    if (isStreaming || selectionPending) return;
     await sendMessage(notebookId, "Continue from the previous partial answer.", getSourceScope(), activeModel);
   };
 
@@ -217,8 +218,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
-      <div className="gloss-panel-header flex items-center justify-between gap-3 px-4 py-2">
-        <div className="flex items-center gap-2">
+      <div className="gloss-panel-header flex shrink-0 flex-wrap items-center gap-2 px-4 py-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           <button
             onClick={() => createConversation(notebookId)}
             disabled={isStreaming}
@@ -228,6 +229,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           </button>
           {conversations.length > 0 && (
             <select
+              aria-label="Conversation"
               value={activeConversationId || ""}
               disabled={isStreaming}
               onChange={(e) => {
@@ -267,7 +269,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             const nextModel = modelParts.join("::");
             if (nextProvider) void selectModel(nextProvider, nextModel).catch(() => undefined);
           }}
-          className="min-w-0 max-w-[320px] rounded-full border border-border bg-bg-tertiary px-3 py-1 text-xs text-text focus:border-accent focus:outline-none"
+          className="min-w-0 max-w-full basis-48 grow rounded-full border border-border bg-bg-tertiary px-3 py-1 text-xs text-text focus:border-accent focus:outline-none"
         >
           {!models.some((m) => m.provider_id === settings["default_provider"] && m.id === activeModel) && (
             <option value={`${settings["default_provider"] || ""}::${activeModel}`} disabled>
@@ -303,6 +305,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           disabled={isStreaming}
           className="rounded-full border border-border bg-bg-tertiary px-2 py-1 text-xs text-text focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
           title="Conversational style"
+          aria-label="Conversational style"
         >
           <option value="default">Default</option>
           <option value="learning_guide">Learning Guide</option>
@@ -314,6 +317,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             value={customGoal}
             onChange={(e) => setCustomGoal(e.target.value)}
             placeholder="Custom goal (e.g. You are a code reviewer...)"
+            aria-label="Custom conversation goal"
             disabled={isStreaming}
             className="min-w-[180px] rounded-full border border-border bg-bg-tertiary px-2 py-1 text-xs text-text placeholder:text-text-muted focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
           />
@@ -324,12 +328,19 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           disabled={isStreaming}
           className="rounded-full border border-border bg-bg-tertiary px-2 py-1 text-xs text-text focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
           title="Response length"
+          aria-label="Response length"
         >
           <option value="default">Default Length</option>
           <option value="short">Short</option>
           <option value="long">Long</option>
         </select>
       </div>
+
+      {(selectionPending || selectionError) && (
+        <p role={selectionError ? "alert" : "status"} className={`px-4 py-2 text-xs ${selectionError ? "text-error" : "text-text-muted"}`}>
+          {selectionPending ? "Saving model selection…" : selectionError}
+        </p>
+      )}
 
       <div className="border-b border-border bg-bg-secondary/80 px-4 py-2">
         <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -381,7 +392,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       </div>
 
       {/* Messages */}
-      <div className="gloss-chat-scroll flex-1 space-y-4 overflow-y-auto px-5 py-4">
+      <div className="gloss-chat-scroll min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
         {messages.length === 0 && !isStreaming && (
           <div className="mt-12 w-full text-center">
             <MessageSquare className="mx-auto mb-3 h-10 w-10 text-text-muted" />
@@ -408,8 +419,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         <MessageRowContext.Provider
           value={useMemo(
             () => ({
-              activeModel,
               isStreaming,
+              selectionPending,
               savingMessageId,
               expandedEvidence,
               onCopy: handleCopy,
@@ -421,8 +432,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
               onSetActiveCitation: setActiveCitation,
             }),
             [
-              activeModel,
               isStreaming,
+              selectionPending,
               savingMessageId,
               expandedEvidence,
               handleCopy,
@@ -451,7 +462,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
 
         {isStreaming && !streamingContent && (
           <div className="flex w-full justify-start">
-            <div className="gloss-assistant-bubble flex items-center gap-2 px-3 py-2 text-sm text-text-secondary">
+            <div role="status" className="gloss-assistant-bubble flex items-center gap-2 px-3 py-2 text-sm text-text-secondary">
               <Loader2 className="w-4 h-4 text-text-muted animate-spin" />
               <span>{streamingStatusLabel}</span>
             </div>
@@ -477,7 +488,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
 
         {streamingError && (
           <div className="flex w-full justify-start">
-            <div className="flex max-w-[82%] items-start gap-2 rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+            <div role="alert" className="flex max-w-[82%] items-start gap-2 rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
               <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
               <span>{streamingError}</span>
             </div>
@@ -489,18 +500,26 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       {/* Input */}
       <div className="gloss-input-dock px-5 py-3">
         <div className="gloss-input-shell flex w-full items-center gap-2 p-2">
-          <input
-            type="text"
+          <textarea
+            id="gloss-chat-composer"
+            rows={2}
+            aria-label="Chat message"
+            aria-describedby="gloss-chat-shortcuts"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}
+            onKeyDown={(e) => {
+              if (shouldSubmitChat(e.key, e.shiftKey, e.nativeEvent.isComposing, e.keyCode)) {
+                e.preventDefault();
+                void handleSend();
+              }
+            }}
             placeholder="Ask about your sources..."
             disabled={isStreaming}
-            className="flex-1 rounded bg-transparent px-2 py-1.5 text-sm text-text placeholder:text-text-muted focus:outline-none disabled:opacity-50"
+            className="min-w-0 max-h-48 flex-1 resize-y rounded bg-transparent px-2 py-1.5 text-sm text-text placeholder:text-text-muted focus:outline-none disabled:opacity-50"
           />
           <button
             onClick={isStreaming ? handleStop : handleSend}
-            disabled={!isStreaming && !input.trim()}
+            disabled={!isStreaming && (!input.trim() || selectionPending)}
             className="rounded-lg bg-accent p-2 text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
             title={isStreaming ? "Stop generation" : editingUserMessageId ? "Rerun edited message" : "Send"}
             aria-label={isStreaming ? "Stop generation" : editingUserMessageId ? "Rerun edited message" : "Send message"}
@@ -508,6 +527,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             {isStreaming ? <StopCircle className="w-4 h-4" /> : <Send className="w-4 h-4" />}
           </button>
         </div>
+        <p id="gloss-chat-shortcuts" className="mt-1 text-[10px] text-text-muted">Enter to send · Shift+Enter for a new line</p>
         {editingUserMessageId && (
           <div className="mx-auto mt-1 max-w-[900px] text-[10px] text-text-muted">
             Editing a previous question; sending will rerun it as a new turn.
@@ -523,6 +543,17 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       />
     </div>
   );
+}
+
+export function shouldSubmitChat(key: string, shiftKey: boolean, isComposing: boolean, keyCode?: number): boolean {
+  return key === "Enter" && !shiftKey && !isComposing && keyCode !== 229;
+}
+
+export function capturedModelLabel(message: Message): string {
+  const receipt = message.citations?.evidence?.generation_receipt;
+  const model = message.model_used || receipt?.model;
+  if (!model) return "Model not captured";
+  return receipt?.model === model && receipt.provider ? `${model} · ${receipt.provider}` : model;
 }
 
 function parseAssistantPayload(raw: unknown): ChatEvidencePayload {
@@ -545,8 +576,8 @@ function parseAssistantPayload(raw: unknown): ChatEvidencePayload {
 }
 
 type MessageRowContextValue = {
-  activeModel: string;
   isStreaming: boolean;
+  selectionPending: boolean;
   savingMessageId: string | null;
   expandedEvidence: Set<string>;
   onCopy: (content: string) => void;
@@ -574,8 +605,8 @@ const MessageRow = memo(function MessageRow({
   msg: Message;
 }) {
   const {
-    activeModel,
     isStreaming,
+    selectionPending,
     savingMessageId,
     expandedEvidence,
     onCopy,
@@ -606,7 +637,7 @@ const MessageRow = memo(function MessageRow({
             <div className="mb-2 flex items-center gap-2 text-[11px] text-text-muted">
               <span className="gloss-serif text-sm text-text-secondary">Gloss</span>
               <span>·</span>
-              <span className="gloss-mono">{activeModel}</span>
+              <span className="gloss-mono">{capturedModelLabel(msg)}</span>
             </div>
             <div className="prose prose-invert prose-sm max-w-none">
               <ReactMarkdown>{msg.content}</ReactMarkdown>
@@ -622,7 +653,7 @@ const MessageRow = memo(function MessageRow({
               </button>
               <button
                 onClick={() => void onRegenerate(msg.id)}
-                disabled={isStreaming}
+                disabled={isStreaming || selectionPending}
                 className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-bg-secondary hover:text-text disabled:opacity-60"
                 title="Regenerate"
               >
@@ -675,7 +706,7 @@ const MessageRow = memo(function MessageRow({
             <div className="mt-1 flex justify-end">
               <button
                 onClick={onContinue}
-                disabled={isStreaming}
+                disabled={isStreaming || selectionPending}
                 className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-white/80 hover:bg-white/10 disabled:opacity-60"
                 title="Continue generation"
               >

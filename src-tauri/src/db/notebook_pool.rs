@@ -19,7 +19,7 @@ use log::{info, warn};
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Maximum number of read connections the pool will create for a single
 /// notebook database.  Configurable at pool construction time.
@@ -35,16 +35,14 @@ pub const DEFAULT_MAX_READ_CONNS: usize = 4;
 /// a connection, wrap it as a `NotebookDb`, invoke a caller-supplied closure,
 /// and return the connection to the pool.  This is the recommended API.
 ///
-/// For advanced use cases where you need to hold a connection across multiple
-/// calls, `acquire_read()` and `acquire_write()` return RAII guard types that
-/// deref to `&Connection`.
+/// Write callbacks retain the exclusive mutex guard for their entire lifetime.
 #[allow(dead_code)]
 pub struct NotebookDbPool {
     db_path: PathBuf,
     max_read_conns: usize,
     /// The single write connection.  Guarded by a `Mutex` so only one writer
     /// at a time — exactly what SQLite needs.
-    write_conn: Mutex<Option<Connection>>,
+    write_conn: Mutex<Connection>,
     /// Pool of read connections.  When a reader is done it pushes the
     /// connection back; when the pool is empty we open a new one up to
     /// `max_read_conns`.  Connections opened past that limit are opened and
@@ -83,7 +81,7 @@ impl NotebookDbPool {
         Ok(Self {
             db_path: db_path.to_path_buf(),
             max_read_conns: max_read_conns.max(1),
-            write_conn: Mutex::new(Some(write_conn)),
+            write_conn: Mutex::new(write_conn),
             read_conns: Mutex::new(Vec::new()),
             read_conn_count: Mutex::new(0),
         })
@@ -112,24 +110,38 @@ impl NotebookDbPool {
     /// Only one writer may hold the connection at a time.  The connection is
     /// released when the closure returns.
     ///
-    /// **Panic safety:** the closure runs under `catch_unwind` so a panicking
-    /// write can never strand the connection outside the pool (which
-    /// previously left the slot empty and made every later write fail with
-    /// "write connection not available" until the app restarted — the
-    /// root cause of bulk `Retry Failed` failures after any panic in
-    /// ingestion).
+    /// The original connection stays behind the guard throughout the callback
+    /// and transaction cleanup. Contending writers wait on that same guard.
+    /// Callback errors and panics roll back any unfinished transaction before
+    /// another caller may use the connection. Already committed changes are
+    /// owned by the callback and are not undone by this cleanup.
     pub fn write<F, T>(&self, f: F) -> Result<T, GlossError>
     where
         F: FnOnce(&NotebookDb) -> Result<T, GlossError>,
     {
         info!("[notebook-pool] write acquire for {:?}", self.db_path);
         let conn = self.take_write_conn()?;
+        if !conn.is_autocommit() {
+            return Err(GlossError::Other(
+                "notebook writer is blocked by an unfinished transaction after failed cleanup"
+                    .into(),
+            ));
+        }
         let db = NotebookDb::from_conn_ref(&conn);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(db)));
-        // ALWAYS return the connection, even if the closure panicked.
-        self.return_write_conn(conn);
+        let unfinished_transaction = !conn.is_autocommit();
+        if unfinished_transaction {
+            conn.execute_batch("ROLLBACK").map_err(|error| {
+                GlossError::Other(format!(
+                    "notebook writer transaction cleanup failed: {error}"
+                ))
+            })?;
+        }
         info!("[notebook-pool] write release for {:?}", self.db_path);
         match result {
+            Ok(Ok(_)) if unfinished_transaction => Err(GlossError::Other(
+                "notebook write left an uncommitted transaction and was rolled back".into(),
+            )),
             Ok(inner) => inner,
             Err(payload) => {
                 let msg = payload
@@ -138,7 +150,7 @@ impl NotebookDbPool {
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "<non-string panic>".to_string());
                 warn!(
-                    "[notebook-pool] write closure panicked for {:?}; connection returned to pool (panic: {})",
+                    "[notebook-pool] write closure panicked for {:?}; transaction cleanup completed (panic: {})",
                     self.db_path, msg
                 );
                 Err(GlossError::Other(format!(
@@ -223,32 +235,14 @@ impl NotebookDbPool {
     }
 
     /// Take the write connection (blocks until available).
-    fn take_write_conn(&self) -> Result<Connection, GlossError> {
+    fn take_write_conn(&self) -> Result<MutexGuard<'_, Connection>, GlossError> {
         info!(
             "[notebook-pool] acquiring write conn for {:?}",
             self.db_path
         );
-        let mut slot = self
-            .write_conn
+        self.write_conn
             .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        slot.take().ok_or_else(|| {
-            warn!(
-                "[notebook-pool] write conn not available for {:?}",
-                self.db_path
-            );
-            GlossError::Other("write connection not available".into())
-        })
-    }
-
-    /// Return the write connection to its slot.
-    fn return_write_conn(&self, conn: Connection) {
-        info!(
-            "[notebook-pool] releasing write conn for {:?}",
-            self.db_path
-        );
-        let mut slot = self.write_conn.lock().unwrap_or_else(|e| e.into_inner());
-        *slot = Some(conn);
+            .map_err(|e| GlossError::Other(e.to_string()))
     }
 
     fn open_read_conn(&self) -> Result<Connection, GlossError> {
@@ -324,11 +318,8 @@ impl NotebookDbPools {
             .map_err(|e| GlossError::Other(e.to_string()))?;
 
         // Another thread might have inserted between our first check and now.
-        pools
-            .entry(notebook_id.to_string())
-            .or_insert_with(|| pool.clone());
-
-        Ok(pool)
+        let canonical_pool = pools.entry(notebook_id.to_string()).or_insert(pool);
+        Ok(Arc::clone(canonical_pool))
     }
 
     /// Remove a pool from the registry (e.g. when a notebook is deleted).
@@ -402,28 +393,187 @@ mod tests {
         );
 
         // The write connection must still be available for a second write.
-        let ok: Result<i64, GlossError> = pool.write(|db| {
-            db.conn()
-                .execute(
-                    "UPDATE _meta SET value = 'recovered' WHERE key = 'test'",
+        let ok: i64 = pool
+            .write(|db| Ok(db.conn().query_row("SELECT 42", [], |row| row.get(0))?))
+            .unwrap();
+        assert_eq!(ok, 42);
+    }
+
+    #[test]
+    fn concurrent_writer_waits_for_active_write_and_then_succeeds() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = tempdir().unwrap();
+        let pool = Arc::new(NotebookDbPool::new(&dir.path().join("writers.db")).unwrap());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_pool = Arc::clone(&pool);
+        let first = std::thread::spawn(move || {
+            first_pool.write(|db| {
+                db.conn().execute(
+                    "INSERT INTO _meta(key, value) VALUES('first', 'committed')",
                     [],
-                )
-                .map_err(GlossError::from)
-                .map(|_| 42i64)
+                )?;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
         });
-        // The _meta table is empty, so UPDATE affects 0 rows — that's fine.
-        // The point: the closure ran (connection was available). If the
-        // connection had been stranded we'd get "write connection not
-        // available" (or a poisoned lock) instead.
-        match &ok {
-            Ok(_) => {}
-            Err(e) => {
-                let s = format!("{e}");
-                assert!(
-                    !s.contains("not available") && !s.contains("poisoned"),
-                    "write connection was stranded after panic: {s}"
-                );
-            }
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let second_pool = Arc::clone(&pool);
+        let second = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            let result = second_pool.write(|db| {
+                db.conn().execute(
+                    "INSERT INTO _meta(key, value) VALUES('second', 'committed')",
+                    [],
+                )?;
+                Ok(())
+            });
+            result_tx
+                .send(result.map_err(|error| error.to_string()))
+                .unwrap();
+        });
+        attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        let returned_while_first_owned_connection = early.is_ok();
+        release_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        let result =
+            early.unwrap_or_else(|_| result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        second.join().unwrap();
+        assert!(
+            !returned_while_first_owned_connection,
+            "second writer returned before first released its connection: {result:?}"
+        );
+        result.unwrap();
+        let count: i64 = pool
+            .read(|db| {
+                Ok(db.conn().query_row(
+                    "SELECT COUNT(*) FROM _meta WHERE key IN ('first', 'second')",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn panic_rolls_back_uncommitted_work_before_reusing_writer() {
+        let dir = tempdir().unwrap();
+        let pool = NotebookDbPool::new(&dir.path().join("panic.db")).unwrap();
+        let failed: Result<(), GlossError> = pool.write(|db| {
+            db.conn().execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO _meta(key,value) VALUES('uncommitted','value')",
+            )?;
+            panic!("injected writer panic");
+        });
+        assert!(failed.is_err());
+        pool.write(|db| {
+            assert!(
+                db.conn().is_autocommit(),
+                "prior callback left its transaction attached to the shared writer"
+            );
+            let count: i64 = db.conn().query_row(
+                "SELECT COUNT(*) FROM _meta WHERE key='uncommitted'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 0);
+            db.conn().execute(
+                "INSERT INTO _meta(key,value) VALUES('recovered','value')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn error_rolls_back_uncommitted_work_and_preserves_original_error() {
+        let dir = tempdir().unwrap();
+        let pool = NotebookDbPool::new(&dir.path().join("error.db")).unwrap();
+        let failed: Result<(), GlossError> = pool.write(|db| {
+            db.conn().execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO _meta(key,value) VALUES('uncommitted','value')",
+            )?;
+            Err(GlossError::Config("injected callback failure".into()))
+        });
+        assert!(
+            matches!(failed, Err(GlossError::Config(message)) if message == "injected callback failure")
+        );
+        pool.write(|db| {
+            assert!(db.conn().is_autocommit());
+            let count: i64 = db.conn().query_row(
+                "SELECT COUNT(*) FROM _meta WHERE key='uncommitted'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 0);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn successful_callback_cannot_leave_a_transaction_for_the_next_writer() {
+        let dir = tempdir().unwrap();
+        let pool = NotebookDbPool::new(&dir.path().join("uncommitted.db")).unwrap();
+        let failed = pool.write(|db| {
+            db.conn().execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO _meta(key,value) VALUES('uncommitted','value')",
+            )?;
+            Ok(())
+        });
+        assert!(failed.unwrap_err().to_string().contains("rolled back"));
+        pool.write(|db| {
+            assert!(db.conn().is_autocommit());
+            let count: i64 = db.conn().query_row(
+                "SELECT COUNT(*) FROM _meta WHERE key='uncommitted'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 0);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn simultaneous_first_access_returns_the_same_registered_pool() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("canonical.db");
+        drop(NotebookDbPool::new(&db_path).unwrap());
+        let pools = Arc::new(NotebookDbPools::new(dir.path()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let pools = Arc::clone(&pools);
+            let barrier = Arc::clone(&barrier);
+            let path = db_path.clone();
+            handles.push(std::thread::spawn(move || {
+                pools
+                    .get_or_create("nb", || {
+                        barrier.wait();
+                        Ok(path)
+                    })
+                    .unwrap()
+            }));
         }
+        let first = handles.remove(0).join().unwrap();
+        let second = handles.remove(0).join().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "racing first access returned a noncanonical writer pool"
+        );
+        let canonical = pools
+            .get_or_create("nb", || {
+                panic!("existing pool must not resolve a path again")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &canonical));
     }
 }

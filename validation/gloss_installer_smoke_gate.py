@@ -1,495 +1,275 @@
 #!/usr/bin/env python3
-"""Build and validate Gloss Linux installer artifacts for the current run."""
+"""Build and replay Linux AppImage payload and native UI from a clean boundary.
+
+This does not publish a release or certify signing, other distributions, or the
+full packaged provider workflow. Missing capabilities remain blocked.
+"""
 from __future__ import annotations
 
 import argparse
-import hashlib
+from datetime import datetime, timezone
 import json
-import re
-import shutil
 import os
+from pathlib import Path
+import platform
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
-import tarfile
 import tempfile
-from datetime import datetime, timezone
-from pathlib import Path
+import time
+import uuid
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+from source_snapshot import capture_source_identity
+from gloss_desktop_smoke_harness import file_sha256
+from live_desktop_smoke import result_exit_code
 
 
-def _run(repo: Path, command: list[str]) -> dict:
-    completed = subprocess.run(
-        command,
-        cwd=repo,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    return {
-        "command": " ".join(command),
-        "exit_code": completed.returncode,
-        "stdout_tail": completed.stdout[-6000:],
-        "stderr_tail": completed.stderr[-6000:],
-    }
+class PackageBlocked(Exception):
+    """A required capability or source boundary is unavailable."""
 
 
-def _run_env(repo: Path, command: list[str], env: dict[str, str]) -> dict:
-    completed = subprocess.run(
-        command,
-        cwd=repo,
-        env={**os.environ, **env},
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    return {
-        "command": " ".join(command),
-        "exit_code": completed.returncode,
-        "stdout_tail": completed.stdout[-6000:],
-        "stderr_tail": completed.stderr[-6000:],
-    }
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _launch_for_window(repo: Path, command: list[str], env: dict[str, str], timeout_seconds: int) -> dict:
-    proc = subprocess.Popen(
-        command,
-        cwd=repo,
-        env={**os.environ, **env},
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+def evidence(path: Path, root: Path) -> dict:
+    return {"path": str(path.relative_to(root)), "sha256": file_sha256(path)}
+
+
+def run_command(command: list[str], cwd: Path, log: Path, timeout: int) -> dict:
+    started = now()
     timed_out = False
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+    with log.open("w") as output:
+        process = subprocess.Popen(command, cwd=cwd, stdout=output,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            stdout, stderr = proc.communicate(timeout=4)
+            code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            timed_out = True
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            stdout, stderr = proc.communicate(timeout=4)
-    return {
-        "command": " ".join(command),
-        "exit_code": proc.returncode,
-        "timed_out": timed_out,
-        "stdout_tail": (stdout or "")[-6000:],
-        "stderr_tail": (stderr or "")[-6000:],
-    }
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            # The leader may exit on TERM while an owned descendant ignores
+            # it. Always close the group, then join the leader before return.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=10)
+            code = None
+            output.write(f"\nCommand exceeded {timeout} seconds\n")
+    if code != 0:
+        # Hosted artifact downloads can be unavailable; retain a bounded useful
+        # failure tail in the job log while keeping the complete log on disk.
+        with log.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 32 * 1024))
+            tail = stream.read().decode("utf-8", errors="replace")
+        print(f"Failed command log tail ({log.name}, last 32 KiB):\n{tail}", flush=True)
+    return {"command": command, "cwd": str(cwd), "started_at": started,
+            "finished_at": now(), "exit_code": code, "timed_out": timed_out,
+            "status": "pass" if code == 0 else "fail"}
 
 
-def _read_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+def require_elf(path: Path) -> None:
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"Expected a regular ELF file: {path}")
+    with path.open("rb") as stream:
+        if stream.read(4) != b"\x7fELF":
+            raise ValueError(f"Not an ELF executable: {path}")
+    if not os.access(path, os.X_OK):
+        raise ValueError(f"Executable permission missing: {path}")
 
 
-def _current_run(repo: Path) -> str | None:
-    text = (repo / "docs/codex-runs/CURRENT_RUN.md").read_text(encoding="utf-8", errors="replace")
-    match = re.search(r"Current run:\s*`?([^`\n]+)`?", text)
-    return match.group(1).strip() if match else None
+def select_fresh_artifact(bundle: Path, started_ns: int) -> Path:
+    artifacts = [path for path in bundle.glob("*.AppImage")
+                 if path.is_file() and not path.is_symlink()
+                 and path.stat().st_mtime_ns >= started_ns]
+    if len(artifacts) != 1:
+        raise ValueError(f"Expected exactly one newly built AppImage, found {len(artifacts)}")
+    require_elf(artifacts[0])
+    return artifacts[0]
 
 
-def _sha256(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+def validate_payload(root: Path, product: str) -> dict:
+    if not root.is_dir():
+        raise ValueError("AppImage extraction did not produce squashfs-root")
+    for path in root.rglob("*"):
+        if path.is_symlink() and not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError(f"AppImage symlink escapes payload: {path.relative_to(root)}")
+    application = root / "AppRun"
+    if not application.is_file() or not os.access(application, os.X_OK):
+        raise ValueError("AppImage is missing an executable AppRun")
+    binary = root / "usr/bin/gloss"
+    require_elf(binary)
+    desktops = list(root.glob("*.desktop"))
+    if len(desktops) != 1:
+        raise ValueError("Expected one root desktop entry in AppImage")
+    fields = dict(line.split("=", 1) for line in desktops[0].read_text().splitlines()
+                  if "=" in line and not line.lstrip().startswith("#"))
+    if fields.get("Type") != "Application" or fields.get("Name") != product:
+        raise ValueError("AppImage desktop entry does not identify Gloss")
+    if not fields.get("Exec") or Path(shlex.split(fields["Exec"])[0]).name != "gloss":
+        raise ValueError("AppImage desktop entry does not launch gloss")
+    icon = fields.get("Icon", "")
+    if not icon or "/" in icon or not any(path.is_file() for suffix in ("png", "svg", "xpm")
+                                            for path in root.rglob(f"{icon}.{suffix}")):
+        raise ValueError("AppImage desktop icon is missing")
+    return {"application": str(application.absolute()), "application_sha256": file_sha256(application),
+            "binary": str(binary.resolve()), "binary_sha256": file_sha256(binary),
+            "desktop_entry": str(desktops[0].relative_to(root)),
+            "payload_files": sorted(str(path.relative_to(root)) for path in root.rglob("*")
+                                    if path.is_file())}
 
 
-def _newest(paths: list[Path]) -> Path | None:
-    existing = [path for path in paths if path.exists()]
-    return max(existing, key=lambda path: path.stat().st_mtime) if existing else None
-
-
-def _tool(name: str) -> dict:
-    path = shutil.which(name)
-    return {"name": name, "path": path, "available": path is not None}
-
-
-def _safe_tar_extract(archive: Path, destination: Path) -> list[str]:
-    with tarfile.open(archive, "r:*") as tar:
-        names = tar.getnames()
-        for name in names:
-            pure = Path(name)
-            if pure.is_absolute() or ".." in pure.parts:
-                raise ValueError(f"unsafe tar member: {name}")
-        tar.extractall(destination)
-        return names
-
-
-def _read_first(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
-
-
-def _validate_desktop_file(text: str) -> list[str]:
-    failures: list[str] = []
-    required = {
-        "Type=Application",
-        "Name=Gloss",
-        "Exec=gloss",
-        "Icon=gloss",
-        "Terminal=false",
-    }
-    for marker in required:
-        if marker not in text:
-            failures.append(f"desktop file missing {marker}")
-    return failures
-
-
-def _validate_extracted_payload(root: Path, prefix: str) -> tuple[list[str], list[str]]:
-    failures: list[str] = []
-    files = sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file())
-    prefix = prefix.strip("/")
-    base = f"{prefix}/" if prefix else ""
-    expected_binary = f"{base}usr/bin/gloss"
-    expected_desktop = f"{base}usr/share/applications/Gloss.desktop"
-    if expected_binary not in files:
-        failures.append(f"payload missing {expected_binary}")
-    if expected_desktop not in files:
-        failures.append(f"payload missing {expected_desktop}")
-    icon_files = [file for file in files if file.endswith("/apps/gloss.png")]
-    if len(icon_files) < 3:
-        failures.append("payload missing expected hicolor app icons")
-    desktop_text = _read_first(root / expected_desktop)
-    failures.extend(_validate_desktop_file(desktop_text))
-    return failures, files
-
-
-def _validate_rpm(repo: Path, artifact: Path) -> dict:
-    result = {
-        "target": "rpm",
-        "artifact": str(artifact.relative_to(repo)),
-        "artifact_sha256": _sha256(artifact),
-        "artifact_size_bytes": artifact.stat().st_size,
-        "status": "pass",
-        "failures": [],
-        "commands": [],
-        "payload_files": [],
-    }
-    for command in [
-        ["rpm", "-qip", str(artifact)],
-        ["rpm", "-K", str(artifact)],
-        ["rpm", "-qlp", str(artifact)],
-        ["rpm", "-qpR", str(artifact)],
-    ]:
-        command_result = _run(repo, command)
-        result["commands"].append(command_result)
-        if command_result["exit_code"] != 0:
-            result["failures"].append(f"{command_result['command']} exited {command_result['exit_code']}")
-    with tempfile.TemporaryDirectory(prefix="gloss-rpm-smoke-") as tmp:
-        tmp_path = Path(tmp)
-        extract = _run(
-            repo,
-            [
-                "bash",
-                "-lc",
-                f"rpm2cpio {str(artifact)!r} | (cd {str(tmp_path)!r} && cpio -idmu >/dev/null)",
-            ],
-        )
-        result["commands"].append(extract)
-        if extract["exit_code"] != 0:
-            result["failures"].append("rpm payload extraction failed")
-        else:
-            failures, files = _validate_extracted_payload(tmp_path, "")
-            result["failures"].extend(failures)
-            result["payload_files"] = files
-    if result["failures"]:
-        result["status"] = "fail"
-    return result
-
-
-def _validate_deb(repo: Path, artifact: Path) -> dict:
-    result = {
-        "target": "deb",
-        "artifact": str(artifact.relative_to(repo)),
-        "artifact_sha256": _sha256(artifact),
-        "artifact_size_bytes": artifact.stat().st_size,
-        "status": "pass",
-        "failures": [],
-        "commands": [],
-        "control": {},
-        "payload_files": [],
-        "validation_mode": "dpkg-deb" if shutil.which("dpkg-deb") else "ar_tar_fallback",
-    }
-    with tempfile.TemporaryDirectory(prefix="gloss-deb-smoke-") as tmp:
-        tmp_path = Path(tmp)
-        if shutil.which("dpkg-deb"):
-            for command in [
-                ["dpkg-deb", "--field", str(artifact)],
-                ["dpkg-deb", "--contents", str(artifact)],
-            ]:
-                command_result = _run(repo, command)
-                result["commands"].append(command_result)
-                if command_result["exit_code"] != 0:
-                    result["failures"].append(
-                        f"{command_result['command']} exited {command_result['exit_code']}"
-                    )
-            extract = _run(repo, ["dpkg-deb", "-x", str(artifact), str(tmp_path / "data")])
-            result["commands"].append(extract)
-        else:
-            extract = subprocess.run(
-                ["ar", "x", str(artifact)],
-                cwd=tmp_path,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            result["commands"].append(
-                {
-                    "command": f"ar x {artifact}",
-                    "exit_code": extract.returncode,
-                    "stdout_tail": extract.stdout[-6000:],
-                    "stderr_tail": extract.stderr[-6000:],
-                }
-            )
-            if extract.returncode == 0:
-                try:
-                    control_dir = tmp_path / "control"
-                    data_dir = tmp_path / "data"
-                    control_dir.mkdir()
-                    data_dir.mkdir()
-                    _safe_tar_extract(tmp_path / "control.tar.gz", control_dir)
-                    _safe_tar_extract(tmp_path / "data.tar.gz", data_dir)
-                except Exception as exc:  # noqa: BLE001 - receipt should include exact extraction failure.
-                    result["failures"].append(f"deb ar/tar extraction failed: {exc}")
-            else:
-                result["failures"].append("deb ar extraction failed")
-        control_text = _read_first(tmp_path / "control/control")
-        for line in control_text.splitlines():
-            if ":" in line:
-                key, value = line.split(":", 1)
-                result["control"][key.strip()] = value.strip()
-        if result["control"].get("Package") != "gloss":
-            result["failures"].append("deb control Package is not gloss")
-        if result["control"].get("Architecture") not in {"amd64", "x86_64"}:
-            result["failures"].append("deb control Architecture is not amd64/x86_64")
-        data_root = tmp_path / "data"
-        if data_root.exists():
-            failures, files = _validate_extracted_payload(data_root, "")
-            result["failures"].extend(failures)
-            result["payload_files"] = files
-        else:
-            result["failures"].append("deb payload was not extracted")
-    if result["failures"]:
-        result["status"] = "fail"
-    return result
-
-
-def _launch_extracted_package(repo: Path, rpm_artifact: Path | None) -> dict:
-    result = {
-        "schema": "GlossInstalledPackageLaunchSmokeV1",
-        "status": "blocked",
-        "source_target": "rpm",
-        "source_artifact": str(rpm_artifact.relative_to(repo)) if rpm_artifact else None,
-        "isolated_home": True,
-        "private_dbus_session": shutil.which("dbus-run-session") is not None,
-        "display_available": bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
-        "launch_timeout_seconds": 8,
-        "exit_code": None,
-        "stayed_alive_until_timeout": False,
-        "created_app_databases": False,
-        "stdout_tail": "",
-        "stderr_tail": "",
-        "failures": [],
-    }
-    required_tools = ["rpm2cpio", "cpio"]
-    missing = [tool for tool in required_tools if shutil.which(tool) is None]
-    if shutil.which("dbus-run-session") is None:
-        missing.append("dbus-run-session")
-    if missing:
-        result["failures"].append(f"missing launch tooling: {missing}")
-        return result
-    if rpm_artifact is None:
-        result["failures"].append("missing rpm artifact for installed launch extraction")
-        return result
-    if not result["display_available"]:
-        result["failures"].append("no DISPLAY or WAYLAND_DISPLAY available for installed launch")
-        return result
-
-    with tempfile.TemporaryDirectory(prefix="gloss-installed-launch-") as tmp:
-        tmp_path = Path(tmp)
-        extract = _run(
-            repo,
-            [
-                "bash",
-                "-lc",
-                f"rpm2cpio {str(rpm_artifact)!r} | (cd {str(tmp_path)!r} && cpio -idmu >/dev/null)",
-            ],
-        )
-        if extract["exit_code"] != 0:
-            result["failures"].append("rpm extraction for installed launch failed")
-            result["extract_command"] = extract
-            return result
-        for name in ["home", "config", "cache", "data", "runtime"]:
-            (tmp_path / name).mkdir(parents=True, exist_ok=True)
-        (tmp_path / "runtime").chmod(0o700)
-        binary = tmp_path / "usr/bin/gloss"
-        if not binary.exists():
-            result["failures"].append("extracted installed launch binary missing")
-            return result
-        env = {
-            "HOME": str(tmp_path / "home"),
-            "XDG_CONFIG_HOME": str(tmp_path / "config"),
-            "XDG_CACHE_HOME": str(tmp_path / "cache"),
-            "XDG_DATA_HOME": str(tmp_path / "data"),
-            "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
-            "WEBKIT_DISABLE_DMABUF_RENDERER": "1",
-        }
-        command = [
-            "dbus-run-session",
-            "--",
-            str(binary),
-        ]
-        launch = _launch_for_window(repo, command, env, int(result["launch_timeout_seconds"]))
-        result["exit_code"] = launch["exit_code"]
-        result["stdout_tail"] = launch["stdout_tail"]
-        result["stderr_tail"] = launch["stderr_tail"]
-        result["stayed_alive_until_timeout"] = launch["timed_out"] is True
-        data_dir = tmp_path / "data/gloss"
-        result["created_app_databases"] = (data_dir / "gloss.db").exists() and (data_dir / "queue.db").exists()
-        lowered = f"{launch['stdout_tail']}\n{launch['stderr_tail']}".lower()
-        fatal_markers = ["thread 'main' panicked", "segmentation fault", "traceback", "webkit process crashed"]
-        for marker in fatal_markers:
-            if marker in lowered:
-                result["failures"].append(f"fatal launch marker present: {marker}")
-        if not result["stayed_alive_until_timeout"]:
-            result["failures"].append(f"installed launch exited before timeout with code {launch['exit_code']}")
-        if not result["created_app_databases"]:
-            result["failures"].append("installed launch did not create isolated app databases")
-    result["status"] = "pass" if not result["failures"] else "fail"
-    return result
+def require_packaged_baseline(receipt: dict, source: dict, artifact_sha256: str) -> None:
+    if result_exit_code(receipt, require_baseline=True) != 0:
+        raise ValueError("Packaged native startup and notebook restart baseline did not pass")
+    if receipt.get("source") != source:
+        raise ValueError("Packaged desktop receipt belongs to another source snapshot")
+    if receipt.get("prebuilt_config", {}).get("artifact_sha256") != artifact_sha256:
+        raise ValueError("Packaged desktop receipt does not bind this AppImage")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--repo", default=".")
-    parser.add_argument("--build", action="store_true")
-    parser.add_argument("--receipt")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, default=Path.cwd())
+    parser.add_argument("--build", action="store_true", help="Required: rebuild from this clean source")
+    parser.add_argument("--receipt", type=Path, help="New output path; historical run receipts are never used")
     args = parser.parse_args()
-
-    repo = Path(args.repo).resolve()
-    run_id = _current_run(repo)
-    if not run_id:
-        print(json.dumps({"ok": False, "failures": ["missing current run id"]}, indent=2))
-        return 1
-    receipt_path = (
-        Path(args.receipt).resolve()
-        if args.receipt
-        else repo / "docs" / "codex-runs" / run_id / "INSTALLER_SMOKE_RECEIPT.json"
-    )
-    tauri_conf = _read_json(repo / "src-tauri/tauri.conf.json")
-    targets = tauri_conf.get("bundle", {}).get("targets", [])
-    if isinstance(targets, str):
-        targets = [targets]
-    build_command = _run(repo, ["npm", "run", "tauri:build:release"]) if args.build else None
-
-    tools = {name: _tool(name) for name in ["rpm", "rpm2cpio", "cpio", "dpkg-deb", "ar", "tar", "appimagetool", "linuxdeploy"]}
-    failures: list[str] = []
-    if build_command and build_command["exit_code"] != 0:
-        failures.append("tauri release bundle build failed")
-
-    target_results: list[dict] = []
-    rpm_artifact: Path | None = None
-    if "rpm" in targets:
-        missing_tools = [name for name in ["rpm", "rpm2cpio", "cpio"] if not tools[name]["available"]]
-        artifact = _newest(list((repo / "target/release/bundle/rpm").glob("*.rpm")))
-        rpm_artifact = artifact
-        if missing_tools:
-            target_results.append({"target": "rpm", "status": "blocked", "failures": [f"missing tools: {missing_tools}"]})
-            failures.append("rpm smoke missing required tooling")
-        elif artifact is None:
-            target_results.append({"target": "rpm", "status": "blocked", "failures": ["missing rpm artifact"]})
-            failures.append("rpm artifact missing")
-        else:
-            target_results.append(_validate_rpm(repo, artifact))
-    if "deb" in targets:
-        missing_tools = [name for name in ["ar", "tar"] if not tools[name]["available"]]
-        artifact = _newest(list((repo / "target/release/bundle/deb").glob("*.deb")))
-        if missing_tools and not tools["dpkg-deb"]["available"]:
-            target_results.append({"target": "deb", "status": "blocked", "failures": [f"missing tools: {missing_tools}"]})
-            failures.append("deb smoke missing required tooling")
-        elif artifact is None:
-            target_results.append({"target": "deb", "status": "blocked", "failures": ["missing deb artifact"]})
-            failures.append("deb artifact missing")
-        else:
-            target_results.append(_validate_deb(repo, artifact))
-    if "appimage" in [str(t).lower() for t in targets]:
-        appimage_artifact = _newest(list((repo / "target/release/bundle/appimage").glob("*.AppImage")))
-        if appimage_artifact is None:
-            target_results.append({"target": "appimage", "status": "blocked", "failures": ["missing AppImage artifact"]})
-            failures.append("appimage artifact missing")
-        else:
-            appimage_sha = _sha256(appimage_artifact)
-            appimage_size = appimage_artifact.stat().st_size
-            # Basic smoke: verify it's a valid ELF with the right size range
-            if appimage_size < 10_000_000:
-                target_results.append({"target": "appimage", "status": "fail", "failures": [f"AppImage too small ({appimage_size} bytes)"]})
-                failures.append("appimage smoke failed")
-            else:
-                target_results.append({
-                    "target": "appimage",
-                    "status": "pass",
-                    "artifact": str(appimage_artifact.relative_to(repo)),
-                    "artifact_sha256": appimage_sha,
-                    "artifact_size_bytes": appimage_size,
-                    "failures": [],
-                })
-
-    for target_result in target_results:
-        if target_result.get("status") != "pass":
-            failures.extend(f"{target_result.get('target')} smoke: {failure}" for failure in target_result.get("failures", []))
-    launch_result = _launch_extracted_package(repo, rpm_artifact) if rpm_artifact is not None else {
-        "schema": "GlossInstalledPackageLaunchSmokeV1",
-        "status": "skipped",
-        "source_target": "none",
-        "source_artifact": None,
-        "failures": [],
-    }
-    if launch_result.get("status") not in {"pass", "skipped"}:
-        failures.extend(f"installed launch smoke: {failure}" for failure in launch_result.get("failures", []))
-
-    unsupported_targets = []
-
-    payload = {
-        "schema": "GlossInstallerSmokeReceiptV1",
-        "run_id": run_id,
-        "recorded_utc": datetime.now(timezone.utc).isoformat(),
-        "status": "fail" if failures else "pass",
-        "configured_targets": targets,
-        "package_smoke_passed": not failures,
-        "installed_launch_exercised": launch_result.get("status") == "pass",
-        "release_grade": False,
-        "release_blocker": True,
-        "release_decision": "configured_linux_package_and_installed_launch_smoke_passed_workflow_missing"
-        if not failures
-        else "configured_linux_package_smoke_failed",
-        "build_command": build_command,
-        "tools": tools,
-        "target_results": target_results,
-        "installed_launch_result": launch_result,
-        "unsupported_targets": unsupported_targets,
-        "failures": failures,
-        "remaining_blockers": [
-            "Installed package GUI workflow smoke beyond launch is not exercised.",
-            "AppImage is not configured because appimagetool/linuxdeploy are missing.",
-            "Live desktop GUI workflow smoke remains separate from installer payload smoke.",
-        ],
-    }
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({"ok": not failures, "receipt": str(receipt_path), "failures": failures}, indent=2))
-    return 0 if not failures else 1
+    repo = args.repo.resolve()
+    run_id = str(uuid.uuid4())
+    receipt_path = (args.receipt or repo / ".codex-run-receipts" / f"installer-{run_id}" / "receipt.json").resolve()
+    if receipt_path.exists():
+        print("Refusing to overwrite an existing package receipt", file=sys.stderr)
+        return 2
+    if receipt_path.is_relative_to(repo / "docs"):
+        print("Package receipts must not overwrite historical documentation", file=sys.stderr)
+        return 2
+    if receipt_path.is_relative_to(repo) and subprocess.run(
+        ["git", "check-ignore", "--quiet", "--", str(receipt_path)], cwd=repo, check=False,
+    ).returncode != 0:
+        print("Use an ignored evidence directory or an output outside the repository", file=sys.stderr)
+        return 2
+    output = receipt_path.parent
+    output.mkdir(parents=True, exist_ok=True)
+    logs = output / f"evidence-{run_id}"
+    logs.mkdir()
+    receipt = {"schema": "GlossInstallerSmokeReceiptV2", "run_id": run_id,
+               "scope": "linux_appimage_payload_and_native_baseline", "started_at": now(),
+               "status": "blocked", "package_smoke_passed": False,
+               "installed_launch_exercised": False, "release_grade": False,
+               "release_blocker": True, "commands": [], "failures": [],
+               "platform": {"system": platform.system(), "machine": platform.machine(),
+                            "kernel": platform.release()},
+               "unsupported_profiles": ["rpm", "deb", "linux-arm64", "macos", "windows"],
+               "remaining_blockers": ["Full packaged provider/import/recovery workflow is not exercised by the baseline.",
+                                      "Signing and non-Linux/non-Ubuntu distribution compatibility are not certified."]}
+    try:
+        if sys.platform == "linux":
+            receipt["platform"]["os_release"] = platform.freedesktop_os_release()
+        source = capture_source_identity(repo)
+        receipt["source_before"] = source
+        if not source["worktree_clean"]:
+            raise PackageBlocked("Package evidence requires a clean committed source snapshot")
+        if not args.build:
+            raise PackageBlocked("Pass --build; an existing artifact alone has no current build proof")
+        if sys.platform != "linux" or platform.machine() not in ("x86_64", "AMD64"):
+            raise PackageBlocked("This gate currently supports Linux x86_64 AppImage only")
+        config = json.loads((repo / "src-tauri/tauri.conf.json").read_text())
+        targets = config.get("bundle", {}).get("targets", [])
+        targets = [targets] if isinstance(targets, str) else targets
+        receipt["configured_targets"] = targets
+        if [str(target).lower() for target in targets] != ["appimage"]:
+            raise PackageBlocked("This gate requires the AppImage-only configured release profile")
+        missing = [tool for tool in ("npm", "cargo", "mksquashfs", "tauri-driver", "WebKitWebDriver", "dbus-run-session")
+                   if shutil.which(tool) is None]
+        if missing or not os.environ.get("DISPLAY"):
+            raise PackageBlocked(f"Missing package replay capabilities: tools={missing}, DISPLAY={bool(os.environ.get('DISPLAY'))}")
+        metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"], cwd=repo))
+        bundle = Path(metadata["target_directory"]) / "release/bundle/appimage"
+        build_log = logs / "build.log"
+        started_ns = time.time_ns()
+        build = run_command(["npm", "run", "tauri:build:release"], repo, build_log, 3600)
+        build["log"] = evidence(build_log, output)
+        receipt["commands"].append(build)
+        if build["exit_code"] != 0:
+            raise ValueError("Canonical locked AppImage build failed")
+        if capture_source_identity(repo) != source:
+            raise ValueError("Source changed during AppImage build")
+        artifact = select_fresh_artifact(bundle, started_ns)
+        archive = output / artifact.name
+        if archive.exists():
+            raise ValueError("Refusing to overwrite an existing AppImage evidence artifact")
+        shutil.copy2(artifact, archive)
+        receipt["artifact"] = evidence(archive, output)
+        receipt["artifact"]["size_bytes"] = archive.stat().st_size
+        with tempfile.TemporaryDirectory(prefix="gloss-appimage-replay-") as temporary:
+            extraction = Path(temporary)
+            extract_log = logs / "extract.log"
+            extract = run_command([str(archive), "--appimage-extract"], extraction, extract_log, 120)
+            extract["log"] = evidence(extract_log, output)
+            receipt["commands"].append(extract)
+            if extract["exit_code"] != 0:
+                raise ValueError("AppImage clean extraction failed")
+            payload = validate_payload(extraction / "squashfs-root", config["productName"])
+            receipt["payload"] = payload
+            prebuilt = {"schema": "gloss-desktop-prebuilt/v1", "source": source,
+                        **{key: payload[key] for key in ("application", "application_sha256", "binary", "binary_sha256")},
+                        "artifact_sha256": receipt["artifact"]["sha256"],
+                        "build_command": build["command"], "build_log": str(build_log), "build_exit_code": 0}
+            manifest = logs / "prebuilt-config.json"
+            manifest.write_text(json.dumps(prebuilt, indent=2) + "\n")
+            desktop_output = output / "desktop-replay"
+            desktop_log = logs / "desktop-replay.log"
+            replay = run_command(["dbus-run-session", "--", sys.executable, str(repo / "scripts/live_desktop_smoke.py"),
+                                  "--repo", str(repo), "--prebuilt-config", str(manifest),
+                                  "--require-baseline", "--output", str(desktop_output)],
+                                 extraction, desktop_log, 600)
+            replay["log"] = evidence(desktop_log, output)
+            receipt["commands"].append(replay)
+            if replay["exit_code"] != 0:
+                raise ValueError("Extracted AppImage native desktop replay failed")
+            desktop_receipt = desktop_output / "LIVE_DESKTOP_SMOKE_RECEIPT.json"
+            require_packaged_baseline(json.loads(desktop_receipt.read_text()), source, receipt["artifact"]["sha256"])
+            receipt["desktop_receipt"] = evidence(desktop_receipt, output)
+        if file_sha256(archive) != receipt["artifact"]["sha256"]:
+            raise ValueError("AppImage artifact changed during package replay")
+        receipt["installed_launch_exercised"] = True
+        receipt["package_smoke_passed"] = True
+        receipt["status"] = "pass"
+    except PackageBlocked as error:
+        receipt["failures"].append(str(error))
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        receipt["status"] = "fail"
+        receipt["failures"].append(str(error))
+    finally:
+        if "source_before" in receipt:
+            try:
+                receipt["source_after"] = capture_source_identity(repo)
+                receipt["source_unchanged"] = receipt["source_after"] == receipt["source_before"]
+                if not receipt["source_unchanged"]:
+                    receipt["status"] = "fail"
+                    receipt["package_smoke_passed"] = False
+                    receipt["failures"].append("Source changed during package validation")
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                receipt["status"] = "fail"
+                receipt["package_smoke_passed"] = False
+                receipt["failures"].append(f"Could not recheck source identity: {error}")
+        receipt["finished_at"] = now()
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+        print(json.dumps({"status": receipt["status"], "receipt": str(receipt_path), "failures": receipt["failures"]}, indent=2))
+    return 0 if receipt["status"] == "pass" else 2 if receipt["status"] == "blocked" else 1
 
 
 if __name__ == "__main__":

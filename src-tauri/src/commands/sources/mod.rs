@@ -38,6 +38,112 @@ use tauri_queue::{QueueJob, QueueManager, QueuePriority};
 
 // Profile status is owned by settings.rs through get_semantic_memory_profile_status.
 
+/// Explicit repair of the derived native index. Canonical chunks are retained.
+#[tauri::command]
+pub async fn native_dense_rebuild(
+    notebook_id: String,
+    app_handle: tauri::AppHandle,
+) -> Result<crate::ingestion::dense::NativeDenseRebuildReceipt, GlossError> {
+    tokio::task::spawn_blocking(move || {
+        let state = app_handle.state::<AppState>();
+        // The worker owns both permits until it actually finishes, including
+        // when a caller drops the IPC future while blocking work is running.
+        let _inference =
+            crate::ingestion::native_gates::acquire_blocking(&state.gpu_gate, &state.llm_gate)?;
+        state.ensure_embedder_guarded(Some(&app_handle), &_inference)?;
+        let _ingestion = ActiveCounterGuard::new(&state.ingestion_active, "ingestion_active");
+        let service = state
+            .embedder
+            .read()
+            .map_err(|e| GlossError::Other(e.to_string()))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
+        let config = service
+            .configured_identity
+            .as_ref()
+            .ok_or_else(|| GlossError::Embedding("Embedding configuration is missing".into()))?;
+        let metadata = crate::db::notebook_db::EmbeddingIndexMetadata::ready(
+            crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+            service.provider_id(),
+            service.model_id(),
+            service.model_digest(),
+            service.dims(),
+        );
+        let db_path = state.notebook_db_path(&notebook_id)?;
+        let path = crate::ingestion::dense::native_dense_artifact_path(
+            db_path
+                .parent()
+                .ok_or_else(|| GlossError::Other("Notebook path is missing".into()))?,
+        );
+        let db = crate::db::notebook_db::NotebookDb::connect(&db_path)?;
+        let ensure_current_notebook = |app_db: &crate::db::app_db::AppDb| {
+            if PathBuf::from(app_db.get_notebook(&notebook_id)?.directory).join("notebook.db")
+                != db_path
+            {
+                return Err(GlossError::Embedding(
+                    "Notebook location changed during rebuild; retry required".into(),
+                ));
+            }
+            Ok(())
+        };
+        let rebuild = {
+            let app_db = state
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            ensure_current_notebook(&app_db)?;
+            if &crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&app_db)?
+                != config
+            {
+                return Err(GlossError::Embedding(
+                    "Embedding configuration changed; retry required".into(),
+                ));
+            }
+            crate::ingestion::dense::begin_dense_rebuild(&db, &metadata)?
+        };
+        let result = (|| {
+            let candidate = rebuild.build(|chunks| {
+                service.embed_batch(
+                    &chunks
+                        .iter()
+                        .map(|chunk| chunk.content.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            })?;
+            let app_db = state
+                .app_db
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?;
+            ensure_current_notebook(&app_db)?;
+            if &crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&app_db)?
+                != config
+            {
+                return Err(GlossError::Embedding(
+                    "Embedding configuration changed during rebuild; retry required".into(),
+                ));
+            }
+            rebuild.publish(&db, &path, &candidate)
+        })();
+        if let Err(error) = &result {
+            rebuild.fail(&db, &error.to_string())?;
+        }
+        state
+            .hnsw_indices
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?
+            .remove(&notebook_id);
+        state
+            .hnsw_index_dims
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?
+            .remove(&notebook_id);
+        result
+    })
+    .await
+    .map_err(|e| GlossError::Other(format!("Native rebuild task failed: {e}")))?
+}
+
 /// Read the configured chunk target tokens from app_db settings.
 fn read_chunk_target_tokens(state: &AppState) -> usize {
     state
@@ -535,52 +641,99 @@ fn run_ingestion_inner(
         state.with_notebook_db_write(notebook_id, |db| db.insert_chunks(&db_chunks))?;
 
         if opts.embed_chunks {
-            // 4. Embed chunks + add to HNSW
-            if opts.emit_progress {
-                emit_status(app_handle, notebook_id, source_id, "embedding", None);
-            }
-            state.ensure_embedder(Some(app_handle))?;
+            let dense_result = (|| -> Result<(), GlossError> {
+                // 4. Embed chunks + add to HNSW
+                if opts.emit_progress {
+                    emit_status(app_handle, notebook_id, source_id, "embedding", None);
+                }
+                let _inference = crate::ingestion::native_gates::acquire_blocking(
+                    &state.gpu_gate,
+                    &state.llm_gate,
+                )?;
+                state.ensure_embedder_guarded(Some(app_handle), &_inference)?;
 
-            let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
-            let (embeddings, metadata) = {
-                let embedder = {
-                    let embedder = state
-                        .embedder
-                        .read()
-                        .map_err(|e| GlossError::Other(e.to_string()))?;
-                    let embedder = embedder
-                        .as_ref()
-                        .ok_or_else(|| GlossError::Embedding("Embedder not initialized".into()))?;
-                    embedder.clone()
+                let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+                let (embeddings, metadata, embedding_config) = {
+                    let embedder = {
+                        let embedder = state
+                            .embedder
+                            .read()
+                            .map_err(|e| GlossError::Other(e.to_string()))?;
+                        let embedder = embedder.as_ref().ok_or_else(|| {
+                            GlossError::Embedding("Embedder not initialized".into())
+                        })?;
+                        embedder.clone()
+                    };
+                    let metadata = crate::db::notebook_db::EmbeddingIndexMetadata::ready(
+                        crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+                        embedder.provider_id(),
+                        embedder.model_id(),
+                        embedder.model_digest(),
+                        embedder.dims(),
+                    );
+                    let config = embedder.configured_identity.clone().ok_or_else(|| {
+                        GlossError::Embedding("Embedding configuration is missing".into())
+                    })?;
+                    (embedder.embed_batch(&chunk_texts)?, metadata, config)
                 };
-                let metadata = crate::db::notebook_db::EmbeddingIndexMetadata::ready(
-                    crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
-                    embedder.provider_id(),
-                    embedder.model_id(),
-                    embedder.model_digest(),
-                    embedder.dims(),
-                );
-                (embedder.embed_batch(&chunk_texts)?, metadata)
-            };
 
-            // Inline and queued work share the same durable commit protocol.
-            // Batch imports may not defer bytes past committed chunk mappings.
-            let db_path = state.notebook_db_path(notebook_id)?;
-            let index_path = crate::ingestion::embed::native_dense_artifact_path(
-                db_path
-                    .parent()
-                    .ok_or_else(|| GlossError::Other("Notebook DB has no parent".into()))?,
-            );
-            state.with_notebook_db_write(notebook_id, |db| {
-                crate::ingestion::embed::publish_dense_batch(
-                    db,
-                    &index_path,
-                    &db_chunks,
-                    &embeddings,
-                    &metadata,
-                )
-                .map(|_| ())
-            })?;
+                // Inline and queued work share the same durable commit protocol.
+                // Batch imports may not defer bytes past committed chunk mappings.
+                let publication_pool = state.notebook_pools.get_or_create(notebook_id, || {
+                    let app_db = state
+                        .app_db
+                        .lock()
+                        .map_err(|e| GlossError::Other(e.to_string()))?;
+                    let notebook = app_db.get_notebook(notebook_id)?;
+                    Ok(PathBuf::from(notebook.directory).join("notebook.db"))
+                })?;
+                let db_path = publication_pool.db_path();
+                let index_path = crate::ingestion::embed::native_dense_artifact_path(
+                    db_path
+                        .parent()
+                        .ok_or_else(|| GlossError::Other("Notebook DB has no parent".into()))?,
+                );
+                let app_db = state
+                    .app_db
+                    .lock()
+                    .map_err(|e| GlossError::Other(e.to_string()))?;
+                if PathBuf::from(app_db.get_notebook(notebook_id)?.directory).join("notebook.db")
+                    != db_path
+                {
+                    return Err(GlossError::Embedding(
+                        "Notebook location changed during ingestion; retry required".into(),
+                    ));
+                }
+                if crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&app_db)?
+                    != embedding_config
+                {
+                    return Err(GlossError::Embedding(
+                        "Embedding configuration changed during ingestion; retry required".into(),
+                    ));
+                }
+                publication_pool.write(|db| {
+                    crate::ingestion::embed::publish_dense_batch(
+                        db,
+                        &index_path,
+                        &db_chunks,
+                        &embeddings,
+                        &metadata,
+                    )
+                    .map(|_| ())
+                })?;
+                Ok(())
+            })();
+            if let Err(error) = dense_result {
+                state.with_notebook_db_write(notebook_id, |db| {
+                    db.update_source_index_status(
+                        source_id,
+                        None,
+                        Some("blocked"),
+                        Some(&error.to_string()),
+                    )
+                })?;
+                return Err(error);
+            }
         } else if crate::state::NATIVE_SEMANTIC_INDEXING_ENABLED {
             // Deferred indexing is a real queue lane, not a dormant job enum:
             // callers that intentionally skip synchronous embeddings enqueue
@@ -683,7 +836,7 @@ fn run_ingestion_inner(
 }
 
 #[cfg(feature = "semantic-memory-backend")]
-fn semantic_memory_runtime_config_from_state(
+pub(crate) fn semantic_memory_runtime_config_from_state(
     state: &AppState,
 ) -> Result<semantic_memory_adapter::SemanticMemoryRuntimeConfig, GlossError> {
     let app_db = state
@@ -719,6 +872,7 @@ fn semantic_memory_runtime_config_from_app_db(
         embedding_url,
         app_db.get_setting("semantic_memory_embedding_model")?,
         app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+        crate::providers::lan_local_providers_allowed(app_db),
         crate::commands::chat::setting_is_enabled(
             app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
         ),
@@ -741,7 +895,7 @@ fn maybe_auto_project_semantic_memory(
     state: &AppState,
     app_handle: &tauri::AppHandle,
 ) -> Result<(), GlossError> {
-    let runtime_config = {
+    let read_runtime_config = || {
         let app_db = state
             .app_db
             .lock()
@@ -750,11 +904,21 @@ fn maybe_auto_project_semantic_memory(
             app_db.get_setting(features::SEMANTIC_MEMORY_AUTO_PROJECT)?,
         ) || !features::semantic_memory_preview_active(&app_db)?
         {
-            return Ok(());
+            return Ok::<_, GlossError>(None);
         }
-        semantic_memory_runtime_config_from_app_db(&app_db)?
+        semantic_memory_runtime_config_from_app_db(&app_db).map(Some)
     };
+    if read_runtime_config()?.is_none() {
+        return Ok(());
+    }
 
+    let _inference =
+        crate::ingestion::native_gates::acquire_blocking(&state.gpu_gate, &state.llm_gate)?;
+    // Inference can wait behind chat; honor configuration and consent changes
+    // made while waiting instead of sending source text to the old endpoint.
+    let Some(runtime_config) = read_runtime_config()? else {
+        return Ok(());
+    };
     emit_status(
         app_handle,
         notebook_id,
@@ -899,37 +1063,8 @@ fn normalize_setting(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn has_vision_capability(model: &ModelRecord) -> bool {
-    if let Some(capabilities) = model.capabilities.as_deref() {
-        if capabilities
-            .split(',')
-            .map(|cap| cap.trim().to_ascii_lowercase())
-            .any(|cap| matches!(cap.as_str(), "vision" | "image" | "multimodal"))
-        {
-            return true;
-        }
-    }
-
-    let fingerprint = format!(
-        "{} {}",
-        model.id.to_ascii_lowercase(),
-        model.display_name.to_ascii_lowercase()
-    );
-    [
-        "llava",
-        "bakllava",
-        "moondream",
-        "minicpm-v",
-        "qwen-vl",
-        "qwen2-vl",
-        "qwen2.5-vl",
-        "gemma3",
-        "gemma4",
-        "vision",
-        "vl",
-    ]
-    .iter()
-    .any(|needle| fingerprint.contains(needle))
+pub(crate) fn has_vision_capability(model: &ModelRecord) -> bool {
+    crate::providers::model_has_vision_capability(model)
 }
 
 fn vector_artifact_receipt_fields(
@@ -1054,42 +1189,24 @@ fn record_retrieval_probe_receipt(
     })
 }
 
-type LatestRetrievalProbeTurboProof = (
-    String,
-    bool,
-    usize,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
-
 fn latest_retrieval_probe_turbo_proof(
-    state: &AppState,
+    connection: &rusqlite::Connection,
     notebook_id: &str,
-) -> Result<Option<LatestRetrievalProbeTurboProof>, GlossError> {
-    state.with_notebook_db(notebook_id, |db| {
-        db.conn()
-            .query_row(
-                "SELECT receipt_id, exact_rerank, exact_rerank_count, candidate_backend,
-                        artifact_generation_id, vector_artifact_manifest_digest
-                 FROM semantic_memory_retrieval_probe_receipts
-                 WHERE notebook_id = ?1
-                 ORDER BY recorded_at DESC LIMIT 1",
-                [notebook_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)? == 1,
-                        row.get::<_, i64>(2)?.max(0) as usize,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(GlossError::Database)
+) -> Result<Option<serde_json::Value>, GlossError> {
+    let raw = connection
+        .query_row(
+            "SELECT raw_receipt_json FROM semantic_memory_retrieval_probe_receipts
+             WHERE notebook_id = ?1 ORDER BY recorded_at DESC, rowid DESC LIMIT 1",
+            [notebook_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    raw.map(|value| {
+        serde_json::from_str(&value).map_err(|error| {
+            GlossError::Other(format!("Invalid stored retrieval receipt: {error}"))
+        })
     })
+    .transpose()
 }
 
 fn resolve_background_job_config(
@@ -1125,10 +1242,20 @@ fn resolve_background_job_config_from_db(
             )
         })?;
 
+    if configured_model.is_none()
+        && app_db
+            .get_setting("default_provider")
+            .map_err(|e| e.to_string())?
+            .as_deref()
+            != Some("ollama")
+    {
+        return Err(format!("Background {} requires an Ollama model. Select an available Ollama model in Settings instead of using the chat model.", kind.label()));
+    }
+
     let models = app_db.get_all_models().map_err(|e| e.to_string())?;
     let model_record = models
         .iter()
-        .find(|model| model.id == selected_model && model.available && !model.stale)
+        .find(|model| model.id == selected_model && model.provider_id == "ollama" && model.available && !model.stale)
         .ok_or_else(|| {
             format!(
                 "Background {} model '{}' is not available in the model registry. Refresh models or choose a compatible Ollama model.",
@@ -1155,9 +1282,16 @@ fn resolve_background_job_config_from_db(
     }
 
     let base_url = app_db
-        .get_setting("ollama_url")
+        .get_provider_url("ollama")
         .map_err(|e| e.to_string())?
         .unwrap_or_else(|| "http://localhost:11434".to_string());
+    crate::providers::validate_background_dispatch(
+        app_db,
+        kind.setting_key(),
+        &base_url,
+        &selected_model,
+    )
+    .map_err(|error| error.to_string())?;
 
     Ok(BackgroundJobConfig {
         provider_id,
@@ -1206,9 +1340,34 @@ pub(crate) fn queue_summary_job(
     source_id: &str,
     source_title: &str,
 ) -> Result<bool, String> {
-    let config = resolve_background_job_config(state, BackgroundJobKind::Summary)?;
+    queue_summary_job_with_intent(queue, state, notebook_id, source_id, source_title, false)
+}
+
+fn queue_summary_job_with_intent(
+    queue: &Arc<QueueManager>,
+    state: &AppState,
+    notebook_id: &str,
+    source_id: &str,
+    source_title: &str,
+    explicit_requested: bool,
+) -> Result<bool, String> {
+    // Keep mode admission and queue publication under the same application
+    // configuration lock used by Pause, so an old auto job cannot slip in.
+    let app_db = state.app_db.lock().map_err(|error| error.to_string())?;
+    if !jobs::queue_policy::summary_allowed_by_mode(&app_db, explicit_requested)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(false);
+    }
+    if jobs::queue_policy::has_summary_for_source(queue, notebook_id, source_id)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(false);
+    }
+    let config = resolve_background_job_config_from_db(&app_db, BackgroundJobKind::Summary)?;
 
     let job = QueueJob::new(GlossJob::SummarizeSource {
+        explicit_requested,
         epoch: queue_epoch_for_notebook(state, notebook_id),
         notebook_id: notebook_id.to_string(),
         source_id: source_id.to_string(),
@@ -3899,14 +4058,12 @@ pub async fn run_retrieval_probe(
         .unwrap_or_else(|| serde_json::json!({}));
     let candidate_backend = receipt_string(&raw_receipt, "candidate_backend");
     let vector_candidates = semantic.map(|result| result.candidates.len()).unwrap_or(0);
-    let tq_candidates = if candidate_backend
-        .as_deref()
-        .is_some_and(|backend| backend.contains("turbo_quant"))
-    {
-        vector_candidates
-    } else {
-        0
-    };
+    let tq_candidates =
+        if crate::memory::turbo_quant_proof::has_fresh_turbo_quant_proof(&raw_receipt) {
+            vector_candidates
+        } else {
+            0
+        };
     let mut degradation_markers = semantic
         .map(|result| result.degradation_markers.clone())
         .unwrap_or_default();
@@ -3956,7 +4113,7 @@ pub async fn regenerate_missing_summaries(
     state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
 ) -> Result<QueueSummariesResponse, GlossError> {
-    Ok(auto_queue_notebook_summaries(&state, &queue, &notebook_id))
+    Ok(queue_notebook_summaries(&state, &queue, &notebook_id, true))
 }
 
 /// Auto-queue missing summaries for a notebook. Used by both the
@@ -3971,19 +4128,15 @@ pub(crate) fn auto_queue_notebook_summaries(
     queue: &Arc<QueueManager>,
     notebook_id: &str,
 ) -> QueueSummariesResponse {
-    let epoch = queue_epoch_for_notebook(state, notebook_id);
-    if jobs::has_jobs_for_notebook_epoch(queue, notebook_id, epoch) {
-        tracing::debug!(
-            notebook_id,
-            epoch,
-            "Skipping auto-queue: notebook already has pending or processing jobs"
-        );
-        return QueueSummariesResponse {
-            queued: 0,
-            diagnostics: Vec::new(),
-        };
-    }
+    queue_notebook_summaries(state, queue, notebook_id, false)
+}
 
+fn queue_notebook_summaries(
+    state: &AppState,
+    queue: &Arc<QueueManager>,
+    notebook_id: &str,
+    explicit_requested: bool,
+) -> QueueSummariesResponse {
     let sources =
         match state.with_notebook_db(notebook_id, |db| db.list_source_headers_needing_summary()) {
             Ok(s) => s,
@@ -3999,7 +4152,14 @@ pub(crate) fn auto_queue_notebook_summaries(
     let mut queued = 0u32;
     let mut diagnostics = Vec::new();
     for source in &sources {
-        match queue_summary_job(queue, state, notebook_id, &source.id, &source.title) {
+        match queue_summary_job_with_intent(
+            queue,
+            state,
+            notebook_id,
+            &source.id,
+            &source.title,
+            explicit_requested,
+        ) {
             Ok(true) => queued += 1,
             Ok(false) => {}
             Err(diagnostic) => push_diagnostic(&mut diagnostics, diagnostic),
@@ -4034,9 +4194,14 @@ pub async fn pause_summaries(
     state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
 ) -> Result<(), GlossError> {
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|error| GlossError::Other(error.to_string()))?;
+    app_db.set_setting("summary_mode", SUMMARY_MODE_MANUAL)?;
     state.summary_paused.store(true, Ordering::SeqCst);
-    persist_summary_mode(&state, SUMMARY_MODE_MANUAL)?;
-    let cancelled = jobs::cancel_jobs_matching(&queue, |_job, status| status == "processing");
+    let cancelled =
+        jobs::cancel_summary_jobs(&queue).map_err(|error| GlossError::Other(error.to_string()))?;
     tracing::info!("Summary generation paused by user");
     if cancelled > 0 {
         tracing::info!(cancelled, "Cancelled in-flight background jobs for pause");
@@ -4050,8 +4215,8 @@ pub async fn resume_summaries(
     state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
 ) -> Result<(), GlossError> {
-    state.summary_paused.store(false, Ordering::SeqCst);
     persist_summary_mode(&state, SUMMARY_MODE_AUTO)?;
+    state.summary_paused.store(false, Ordering::SeqCst);
     let cancelled = jobs::cancel_jobs_not_matching_active_notebook(
         &queue,
         state.get_active_notebook_id().as_deref(),
@@ -4292,7 +4457,7 @@ pub async fn memory_backend_status(
         available: true,
         semantic_memory_feature_enabled,
         semantic_memory_available,
-        semantic_memory_path: Some("src-tauri/vendor/semantic-memory".to_string()),
+        semantic_memory_path: None,
         index_sync_status: index_sync_status.clone(),
         sync_status: index_sync_status,
         last_sync_at: None,
@@ -4326,6 +4491,8 @@ pub async fn semantic_memory_reindex_source(
 ) -> Result<crate::memory::IndexSourceReceipt, GlossError> {
     #[cfg(feature = "semantic-memory-backend")]
     {
+        let _inference =
+            crate::ingestion::native_gates::acquire(&state.gpu_gate, &state.llm_gate).await?;
         let db_path = state.notebook_db_path(&notebook_id)?;
         let runtime_config = semantic_memory_runtime_config_from_state(&state)?;
         semantic_memory_adapter::reindex_source(
@@ -4371,6 +4538,8 @@ pub async fn semantic_memory_backfill_notebook(
 
     #[cfg(feature = "semantic-memory-backend")]
     {
+        let _inference =
+            crate::ingestion::native_gates::acquire(&state.gpu_gate, &state.llm_gate).await?;
         let sources = state.with_notebook_db(&notebook_id, |db| db.list_sources())?;
         let runtime_config = semantic_memory_runtime_config_from_state(&state)?;
         let db_path = state.notebook_db_path(&notebook_id)?;
@@ -4469,6 +4638,8 @@ pub async fn semantic_memory_rebuild_vector_artifacts(
 ) -> Result<Option<serde_json::Value>, GlossError> {
     #[cfg(feature = "semantic-memory-turbo-quant")]
     {
+        let _inference =
+            crate::ingestion::native_gates::acquire(&state.gpu_gate, &state.llm_gate).await?;
         let mut runtime_config = semantic_memory_runtime_config_from_state(&state)?;
         runtime_config.turbo_quant_enabled = true;
         let receipt = semantic_memory_adapter::rebuild_vector_artifacts(
@@ -4497,65 +4668,75 @@ pub async fn semantic_memory_vector_artifact_status(
     notebook_id: String,
     state: State<'_, AppState>,
 ) -> Result<VectorArtifactStatus, GlossError> {
-    let (runtime_turbo_quant_enabled, last_status) = {
+    #[cfg(feature = "semantic-memory-backend")]
+    let runtime_config = semantic_memory_runtime_config_from_state(&state)?;
+    let runtime_turbo_quant_enabled = {
         let app_db = state
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        let runtime = features::turbo_quant_active(&app_db)?;
-        drop(app_db);
-        let statuses = state.with_notebook_db(&notebook_id, |db| {
-            db.list_semantic_memory_projection_statuses(&notebook_id)
-        })?;
-        (runtime, statuses.into_iter().next())
+        features::turbo_quant_active(&app_db)?
     };
-    let latest_probe = latest_retrieval_probe_turbo_proof(&state, &notebook_id)?;
-    let exact_rerank = latest_probe
-        .as_ref()
-        .map(|(_, exact, _, _, _, _)| *exact)
-        .unwrap_or_default();
-    let exact_rerank_count = latest_probe
-        .as_ref()
-        .map(|(_, _, count, _, _, _)| *count)
-        .unwrap_or_default();
-    let probe_candidate_backend = latest_probe
-        .as_ref()
-        .and_then(|(_, _, _, backend, _, _)| backend.clone());
-    let probe_generation_id = latest_probe
-        .as_ref()
-        .and_then(|(_, _, _, _, generation_id, _)| generation_id.clone());
-    let probe_manifest_digest = latest_probe
-        .as_ref()
-        .and_then(|(_, _, _, _, _, digest)| digest.clone());
+    let (statuses, source_chunk_counts, latest_probe, embedding_metadata) = state.with_notebook_db(&notebook_id, |db| {
+        // One read snapshot binds source counts, projection identity and proof.
+        let snapshot = db.conn().unchecked_transaction()?;
+        let statuses = db.list_semantic_memory_projection_statuses(&notebook_id)?;
+        let mut statement = db.conn().prepare(
+            "SELECT c.source_id, COUNT(*) FROM chunks c JOIN sources s ON s.id = c.source_id GROUP BY c.source_id ORDER BY c.source_id"
+        )?;
+        let source_ids = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let latest_probe = latest_retrieval_probe_turbo_proof(db.conn(), &notebook_id)?;
+        let metadata = db.embedding_index_metadata(crate::db::notebook_db::SEMANTIC_MEMORY_INDEX_ID)?;
+        snapshot.commit()?;
+        Ok((statuses, source_ids, latest_probe, metadata))
+    })?;
+    #[cfg(feature = "semantic-memory-backend")]
+    let embedding_current = embedding_metadata.as_ref().is_some_and(|metadata| {
+        semantic_memory_adapter::embedding_metadata_matches_config(&runtime_config, metadata)
+    });
+    #[cfg(not(feature = "semantic-memory-backend"))]
+    let embedding_current = {
+        let _ = embedding_metadata;
+        false
+    };
+    let mut proof = crate::memory::turbo_quant_proof::projection_artifact_proof(
+        &source_chunk_counts,
+        &statuses,
+        latest_probe.as_ref(),
+    );
+    if !embedding_current {
+        proof.probe_matches = false;
+        proof.generation_id = None;
+        proof.manifest_digest = None;
+        proof.stale_sources = proof.stale_sources.max(source_chunk_counts.len());
+    }
+    let proven_probe = latest_probe.as_ref().filter(|_| proof.probe_matches);
     Ok(VectorArtifactStatus {
         compiled_turbo_quant: cfg!(feature = "semantic-memory-turbo-quant"),
         runtime_turbo_quant_enabled,
-        candidate_backend: probe_candidate_backend.or_else(|| {
-            runtime_turbo_quant_enabled.then(|| "turbo_quant_candidate_then_exact_f32".to_string())
-        }),
-        artifact_generation_id: last_status
-            .as_ref()
-            .and_then(|status| status.artifact_generation_id.clone())
-            .or(probe_generation_id),
-        vector_artifact_manifest_digest: last_status
-            .as_ref()
-            .and_then(|status| status.vector_artifact_manifest_digest.clone())
-            .or(probe_manifest_digest),
-        vector_artifact_missing_count: if runtime_turbo_quant_enabled && last_status.is_none() {
-            1
-        } else {
-            0
-        },
-        vector_artifact_stale_count: last_status
-            .as_ref()
-            .is_some_and(|status| status.status == "artifact_stale")
-            as usize,
-        exact_rerank,
-        exact_rerank_count,
-        last_receipt_id: last_status
-            .as_ref()
-            .and_then(|status| status.last_receipt_id.clone()),
-        last_error: last_status.and_then(|status| status.last_error),
+        candidate_backend: proven_probe
+            .and_then(|receipt| receipt_string(receipt, "candidate_backend")),
+        artifact_generation_id: proof.generation_id,
+        vector_artifact_manifest_digest: proof.manifest_digest,
+        vector_artifact_missing_count: proof.missing_sources,
+        vector_artifact_stale_count: proof.stale_sources,
+        exact_rerank: proof.probe_matches,
+        exact_rerank_count: proven_probe
+            .map(|receipt| receipt_usize(receipt, "exact_rerank_count"))
+            .unwrap_or(0),
+        last_receipt_id: proven_probe.and_then(|receipt| receipt_string(receipt, "receipt_id")),
+        last_error: (!embedding_current)
+            .then(|| "Embedding settings or index identity changed; reindex and run a new retrieval probe".to_string())
+            .or_else(|| statuses
+            .iter()
+            .find_map(|status| status.last_error.clone()))
+            .or_else(|| {
+                (!proof.probe_matches).then(|| {
+                    "Current artifacts need a successful retrieval probe for this generation"
+                        .to_string()
+                })
+            }),
     })
 }
 
@@ -4566,6 +4747,10 @@ async fn compare_memory_backends(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<MemoryBackendComparison, GlossError> {
+    #[cfg(feature = "semantic-memory-backend")]
+    let _inference =
+        crate::ingestion::native_gates::acquire(&state.gpu_gate, &state.llm_gate).await?;
+
     let request = MemorySearchRequest {
         notebook_id: notebook_id.clone(),
         source_scope,
@@ -4588,6 +4773,7 @@ async fn compare_memory_backends(
             app_db.get_setting("semantic_memory_embedding_url")?,
             app_db.get_setting("semantic_memory_embedding_model")?,
             app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
+            crate::providers::lan_local_providers_allowed(&app_db),
             crate::commands::chat::setting_is_enabled(
                 app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
             ),
@@ -4793,6 +4979,70 @@ mod tests {
     }
 
     #[test]
+    fn explicit_summary_request_preserves_manual_mode_and_payload_authority() {
+        let (dir, state, notebook_id) = build_state();
+        state
+            .with_notebook_db_write(&notebook_id, |db| {
+                db.insert_source(&ready_source("manual-source"))
+            })
+            .unwrap();
+        {
+            let db = state.app_db.lock().unwrap();
+            db.set_settings_atomically(&[
+                ("summary_mode", SUMMARY_MODE_MANUAL),
+                ("default_provider", "ollama"),
+                ("default_model", "fixture"),
+            ])
+            .unwrap();
+            db.replace_models(
+                "ollama",
+                &[ModelRecord {
+                    id: "fixture".into(),
+                    provider_id: "ollama".into(),
+                    display_name: "Fixture".into(),
+                    parameter_size: None,
+                    context_window: None,
+                    capabilities: Some("chat".into()),
+                    available: true,
+                    stale: false,
+                    last_error: None,
+                }],
+            )
+            .unwrap();
+        }
+        let queue = build_queue(&dir);
+        assert_eq!(
+            auto_queue_notebook_summaries(&state, &queue, &notebook_id).queued,
+            0
+        );
+        assert!(queue.list_jobs().unwrap().is_empty());
+        assert_eq!(
+            queue_notebook_summaries(&state, &queue, &notebook_id, true).queued,
+            1
+        );
+        let rows = queue.list_jobs_with_data().unwrap();
+        let job: GlossJob = serde_json::from_str(&rows[0].2).unwrap();
+        assert!(matches!(
+            job,
+            GlossJob::SummarizeSource {
+                explicit_requested: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            state
+                .app_db
+                .lock()
+                .unwrap()
+                .get_setting("summary_mode")
+                .unwrap()
+                .as_deref(),
+            Some(SUMMARY_MODE_MANUAL)
+        );
+        assert!(state.summary_paused.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn auto_queue_reports_zero_when_background_config_is_invalid() {
         let (dir, state, notebook_id) = build_state();
         state
@@ -4801,6 +5051,9 @@ mod tests {
 
         {
             let app_db = state.app_db.lock().unwrap();
+            app_db
+                .set_setting("summary_mode", SUMMARY_MODE_AUTO)
+                .unwrap();
             app_db.set_setting("default_model", "gpt-4o-mini").unwrap();
             app_db.set_setting("default_provider", "openai").unwrap();
             app_db

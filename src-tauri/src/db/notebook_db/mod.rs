@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Per-notebook database handle (notebook.db).
+#[repr(transparent)]
 pub struct NotebookDb {
     conn: Connection,
 }
@@ -56,7 +57,7 @@ pub struct SourceSummaryCandidate {
     pub title: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Chunk {
     pub id: String,
     pub source_id: String,
@@ -367,7 +368,7 @@ impl NotebookDb {
     /// is sound.  The returned reference borrows the input reference and
     /// therefore cannot outlive it.
     pub fn from_conn_ref(conn: &Connection) -> &Self {
-        // SAFETY: `NotebookDb` is `#[repr(C)]`-compatible with a single
+        // SAFETY: `NotebookDb` is `#[repr(transparent)]` with a single
         // `Connection` field.  A reference to the field is therefore also a
         // valid reference to the whole struct.  The lifetime is tied to the
         // input reference, so no dangling can occur.
@@ -681,6 +682,7 @@ impl NotebookDb {
 
     /// Delete a source and its chunks (cascade).
     pub fn delete_source(&self, source_id: &str) -> Result<(), GlossError> {
+        self.invalidate_turbo_quant_projection_identity()?;
         self.conn
             .execute("DELETE FROM sources WHERE id = ?1", [source_id])?;
         Ok(())
@@ -764,6 +766,9 @@ impl NotebookDb {
 
     /// Insert a chunk.
     pub fn insert_chunk(&self, chunk: &Chunk) -> Result<i64, GlossError> {
+        // Invalidate before canonical mutation. If insertion fails, remaining
+        // artifacts may need a rebuild but can never retain false freshness.
+        self.invalidate_turbo_quant_projection_identity()?;
         self.conn.execute(
             "INSERT INTO chunks (id, source_id, chunk_index, content, token_count,
                                  start_offset, end_offset, metadata, embedding_id, embedding_model)
@@ -788,6 +793,9 @@ impl NotebookDb {
     /// each chunk row independently.
     pub fn insert_chunks(&self, chunks: &[Chunk]) -> Result<(), GlossError> {
         let tx = self.conn.unchecked_transaction()?;
+        if !chunks.is_empty() {
+            self.invalidate_turbo_quant_projection_identity()?;
+        }
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO chunks (id, source_id, chunk_index, content, token_count,
@@ -843,6 +851,59 @@ impl NotebookDb {
             .prepare("SELECT embedding_id FROM chunks WHERE embedding_id IS NOT NULL")?;
         let ids = statement.query_map([], |row| row.get(0))?;
         ids.collect::<Result<Vec<_>, _>>().map_err(GlossError::from)
+    }
+
+    /// Exact canonical snapshot for a whole-notebook native rebuild.
+    pub fn native_rebuild_chunks(&self) -> Result<Vec<Chunk>, GlossError> {
+        let mut statement = self.conn.prepare("SELECT id, source_id, chunk_index, content, token_count, start_offset, end_offset, metadata, embedding_id, embedding_model FROM chunks ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            Ok(Chunk {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                chunk_index: row.get(2)?,
+                content: row.get(3)?,
+                token_count: row.get(4)?,
+                start_offset: row.get(5)?,
+                end_offset: row.get(6)?,
+                metadata: row.get(7)?,
+                embedding_id: row.get(8)?,
+                embedding_model: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(GlossError::from)
+    }
+
+    /// Only failures explicitly classified by the native embedding stage may
+    /// be closed by rebuilding a projection. File/extraction errors stay open.
+    pub fn native_embedding_failures(&self) -> Result<Vec<(String, Option<String>)>, GlossError> {
+        let mut statement = self.conn.prepare("SELECT s.id, s.error_message FROM sources s JOIN source_processing_state ps ON ps.source_id=s.id WHERE s.status='error' AND ps.fts_index_status='indexed' AND ps.dense_index_status='blocked' AND EXISTS(SELECT 1 FROM chunks c WHERE c.source_id=s.id) ORDER BY s.id")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(GlossError::from)
+    }
+
+    pub fn close_rebuilt_embedding_failures(
+        &self,
+        expected: &[(String, Option<String>)],
+    ) -> Result<usize, GlossError> {
+        let mut recovered = 0;
+        for (id, error) in expected {
+            let source = self.get_source(id)?;
+            if source.status != "error" || &source.error_message != error {
+                continue;
+            }
+            let incomplete: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chunks WHERE source_id=?1 AND embedding_id IS NULL)",
+                [id],
+                |row| row.get(0),
+            )?;
+            if !incomplete {
+                self.update_source_status(id, "ready", None)?;
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
     }
 
     /// Update a mapping only after verified artifact publication, inside the
@@ -1424,6 +1485,9 @@ impl NotebookDb {
                  last_error = ?5,
                  status = CASE
                     WHEN status = 'synced' AND (?3 IS NULL OR ?4 IS NULL) THEN 'artifact_stale'
+                    WHEN status = 'artifact_stale' AND ?3 IS NOT NULL AND ?4 IS NOT NULL
+                         AND healthy_link_count >= chunk_count AND degraded_link_count = 0
+                         AND projected_chunk_count >= chunk_count THEN 'synced'
                     ELSE status
                  END,
                  updated_at = datetime('now')
@@ -2496,6 +2560,9 @@ impl NotebookDb {
         status: EmbeddingIndexMetadataStatus,
         reason: Option<&str>,
     ) -> Result<(), GlossError> {
+        if index_id == SEMANTIC_MEMORY_INDEX_ID && status != EmbeddingIndexMetadataStatus::Ready {
+            self.invalidate_turbo_quant_projection_identity()?;
+        }
         self.conn.execute(
             "INSERT INTO embedding_index_metadata
              (index_id, provider, model, model_digest, dimensions, schema_version,
@@ -2517,8 +2584,23 @@ impl NotebookDb {
 
     /// Delete all chunks for a source.
     pub fn delete_chunks_for_source(&self, source_id: &str) -> Result<(), GlossError> {
+        self.invalidate_turbo_quant_projection_identity()?;
         self.conn
             .execute("DELETE FROM chunks WHERE source_id = ?1", [source_id])?;
+        Ok(())
+    }
+
+    /// Canonical corpus changes invalidate every derived artifact generation.
+    /// NotebookDb owns one notebook, so this cannot widen to other notebooks.
+    fn invalidate_turbo_quant_projection_identity(&self) -> Result<(), GlossError> {
+        self.conn.execute(
+            "UPDATE semantic_memory_projection_status
+             SET artifact_generation_id = NULL, vector_artifact_manifest_digest = NULL,
+                 status = CASE WHEN status = 'synced' THEN 'artifact_stale' ELSE status END,
+                 updated_at = datetime('now')
+             WHERE artifact_generation_id IS NOT NULL OR vector_artifact_manifest_digest IS NOT NULL",
+            [],
+        )?;
         Ok(())
     }
 

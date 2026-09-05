@@ -90,12 +90,12 @@ jobs:
         run: cargo install tauri-driver --version 2.0.6 --locked
       - name: Require native desktop baseline
         run: |
-          dbus-run-session -- xvfb-run -a python3 scripts/live_desktop_smoke.py \
+          xvfb-run -a dbus-run-session -- python3 scripts/live_desktop_smoke.py \
             --repo . --require-baseline --output .codex-run-receipts/desktop-baseline
       - name: Require real-model integrated native desktop workflow
         timeout-minutes: 50
         run: |
-          dbus-run-session -- xvfb-run -a python3 scripts/live_ollama_canary.py \
+          xvfb-run -a dbus-run-session -- python3 scripts/live_ollama_canary.py \
             --repo . --desktop --output .codex-run-receipts/desktop-ollama-workflow
       - name: Preserve native desktop evidence
         if: always()
@@ -158,7 +158,7 @@ jobs:
         run: cargo install tauri-driver --version 2.0.6 --locked
       - name: Build and replay the actual AppImage
         run: |
-          dbus-run-session -- xvfb-run -a python3 validation/gloss_installer_smoke_gate.py \
+          xvfb-run -a dbus-run-session -- python3 validation/gloss_installer_smoke_gate.py \
             --repo . --build --receipt .codex-run-receipts/linux-package/receipt.json
       - name: Preserve package and replay evidence
         if: always()

@@ -55,7 +55,7 @@ main/master pushes and manual workflow dispatch. It uses an isolated D-Bus sessi
 and Xvfb, installs the native WebKit driver, then runs:
 
 ```bash
-dbus-run-session -- xvfb-run -a python3 scripts/live_desktop_smoke.py \
+xvfb-run -a dbus-run-session -- python3 scripts/live_desktop_smoke.py \
   --repo . --require-baseline --output .codex-run-receipts/desktop-baseline
 ```
 
@@ -78,7 +78,7 @@ installed chat/embedding model names and complete model digests, and keeps that
 runtime alive while the UI runs:
 
 ```bash
-dbus-run-session -- xvfb-run -a python3 scripts/live_ollama_canary.py \
+xvfb-run -a dbus-run-session -- python3 scripts/live_ollama_canary.py \
   --repo . --desktop --output .codex-run-receipts/ollama-desktop
 ```
 

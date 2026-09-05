@@ -4302,10 +4302,10 @@ fn link_status_for_notebook(
         ) = db.conn().query_row(
             "SELECT
                 COUNT(*),
-                SUM(CASE WHEN sync_status = 'synced' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN sync_status = 'stale' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN sync_status = 'failed' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN sm_document_id IS NULL THEN 1 ELSE 0 END),
+                COALESCE(SUM(CASE WHEN sync_status = 'synced' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN sync_status = 'stale' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN sync_status = 'failed' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN sm_document_id IS NULL THEN 1 ELSE 0 END), 0),
                 (SELECT sync_error FROM semantic_memory_links
                  WHERE sync_error IS NOT NULL AND sync_error != ''
                  ORDER BY synced_at DESC LIMIT 1)
@@ -4882,6 +4882,48 @@ mod tests {
         };
 
         (dir, state, notebook_id)
+    }
+
+    #[test]
+    fn link_status_handles_an_empty_notebook_without_null_counts() {
+        let (_dir, state, notebook_id) = build_state();
+        let status = link_status_for_notebook(&state, &notebook_id).unwrap();
+        assert_eq!(status.notebook_id, notebook_id);
+        assert_eq!(status.total_links, 0);
+        assert_eq!(status.synced_links, 0);
+        assert_eq!(status.stale_links, 0);
+        assert_eq!(status.failed_links, 0);
+        assert_eq!(status.missing_document_links, 0);
+        assert_eq!(status.degraded_links, 0);
+        assert_eq!(status.reason_codes, vec!["semantic_memory_links_missing"]);
+        assert!(status.last_sync_error.is_none());
+    }
+
+    #[test]
+    fn link_status_preserves_populated_counts_and_failure_evidence() {
+        let (_dir, state, notebook_id) = build_state();
+        state
+            .with_notebook_db_write(&notebook_id, |db| {
+                db.conn().execute_batch(
+                    "INSERT INTO semantic_memory_links
+                     (chunk_id, sm_document_id, sync_status, sync_error, synced_at) VALUES
+                     ('healthy', 'doc1', 'synced', NULL, '2026-09-05T00:00:00Z'),
+                     ('stale', 'doc2', 'stale', NULL, '2026-09-05T00:00:00Z'),
+                     ('failed', 'doc3', 'failed', 'retained error', '2026-09-05T00:00:01Z'),
+                     ('missing', NULL, 'pending', NULL, '2026-09-05T00:00:00Z');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let status = link_status_for_notebook(&state, &notebook_id).unwrap();
+        assert_eq!(status.total_links, 4);
+        assert_eq!(status.synced_links, 1);
+        assert_eq!(status.stale_links, 1);
+        assert_eq!(status.failed_links, 1);
+        assert_eq!(status.missing_document_links, 1);
+        assert_eq!(status.degraded_links, 3);
+        assert_eq!(status.reason_codes, vec!["semantic_memory_links_degraded"]);
+        assert_eq!(status.last_sync_error.as_deref(), Some("retained error"));
     }
 
     fn build_queue(dir: &TempDir) -> Arc<QueueManager> {

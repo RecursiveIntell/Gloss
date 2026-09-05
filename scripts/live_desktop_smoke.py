@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 from datetime import datetime, timezone
+import http.client
 import json
 import ipaddress
 import os
@@ -24,7 +25,6 @@ import sys
 import time
 import traceback
 import urllib.error
-import urllib.request
 import urllib.parse
 import uuid
 
@@ -152,31 +152,33 @@ def free_port() -> int:
 
 class WebDriver:
     def __init__(self, port: int):
-        self.endpoint = f"http://127.0.0.1:{port}"
+        self.port = port
         self.session: str | None = None
         self.trace: list[dict] = []
 
     def request(self, method: str, path: str, payload: dict | None = None):
-        request = urllib.request.Request(
-            self.endpoint + path,
-            data=json.dumps(payload).encode() if payload is not None else None,
-            headers={"Content-Type": "application/json"},
-            method=method,
-        )
+        # urllib forces Connection: close, which the Tauri proxy forwards to
+        # its pooled native WebDriver connection. Use an explicit loopback
+        # connection without that hop-by-hop header or ambient proxy settings.
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         observation = {"at": now(), "method": method, "path": path, "request": payload}
         self.trace.append(observation)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                result = json.load(response)
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode(errors="replace")
-            observation["error"] = f"HTTP {error.code}: {detail}"
-            raise RuntimeError(f"WebDriver {method} {path}: {detail}") from error
+            connection.request(method, path,
+                               body=json.dumps(payload).encode() if payload is not None else None,
+                               headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            body = response.read()
+            if response.status >= 400:
+                raise RuntimeError(f"WebDriver {method} {path}: HTTP {response.status}: {body.decode(errors='replace')}")
+            result = json.loads(body)
         except Exception as error:
             # A failed POST may already have acted. Preserve the attempted
             # command and propagate the failure without replaying the mutation.
             observation["error"] = f"{type(error).__name__}: {error}"
             raise
+        finally:
+            connection.close()
         value = result.get("value")
         observation["response"] = "PNG captured" if path.endswith("/screenshot") else value
         if isinstance(value, dict) and value.get("error"):
@@ -373,6 +375,12 @@ class IntegratedWorkflow:
         self.ui.click_ref(self.ui.execute("return document.querySelector('input[aria-label=\"Ollama server URL\"]').parentElement.querySelector('button')"))
         self.ui.wait(lambda: self.ui.execute("return document.querySelector('input[aria-label=\"Ollama server URL\"]').parentElement.querySelector('button').disabled"), label="Ollama URL saved")
         self.ui.select('select:has(option[value="gloss-local"])', "gloss-local")
+        def profile_applied():
+            text = self.ui.text()
+            self.check("Memory profile not applied" not in text and "Memory profile blocked" not in text,
+                       "memory profile Apply succeeded")
+            return "Memory profile applied" in text
+        self.ui.wait(profile_applied, label="acknowledged memory profile Apply")
         self.embedding_settings(self.config["embedding_model"])
         self.close_settings()
         self.ui.click('button[title="Refresh model list from providers"]')
@@ -737,7 +745,7 @@ def main() -> int:
             try:
                 driver.request("GET", "/status")
                 break
-            except urllib.error.URLError:
+            except (urllib.error.URLError, OSError):
                 if time.monotonic() >= deadline:
                     raise RuntimeError("tauri-driver startup timed out")
                 time.sleep(0.2)

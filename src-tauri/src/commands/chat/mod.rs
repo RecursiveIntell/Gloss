@@ -769,9 +769,11 @@ pub(crate) fn provider_decoding_capability(
             }
         }
         providers::ProviderType::Anthropic => ProviderDecodingCapabilityV1 {
-            supports_temperature: true,
-            supports_top_p: true,
-            supports_top_k: true,
+            // The current Anthropic adapter omits sampling controls to retain
+            // compatibility with models that reject non-default parameters.
+            supports_temperature: false,
+            supports_top_p: false,
+            supports_top_k: false,
             supports_min_p: false,
             supports_repeat_penalty: false,
         },
@@ -822,9 +824,22 @@ pub(crate) fn effective_decoding_settings(
         "repeat_penalty": requested_repeat_penalty,
     });
     let mut unsupported_fields = Vec::new();
-    let temperature = parse_optional_f32(requested["temperature"].as_str().map(str::to_string))
-        .unwrap_or(DEFAULT_CHAT_TEMPERATURE)
-        .clamp(0.0, 2.0);
+    let temperature = if capability.supports_temperature {
+        parse_optional_f32(requested["temperature"].as_str().map(str::to_string))
+            .unwrap_or(DEFAULT_CHAT_TEMPERATURE)
+            .clamp(0.0, 2.0)
+    } else {
+        if requested["temperature"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            unsupported_fields.push("temperature".to_string());
+        }
+        // Anthropic omits this field: record its documented Messages API
+        // default, not the saved value that never reaches the provider.
+        // https://platform.claude.com/docs/en/api/messages/create
+        1.0
+    };
     let top_p = if capability.supports_top_p {
         parse_optional_f32(requested["top_p"].as_str().map(str::to_string))
     } else {
@@ -3423,6 +3438,159 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream;
     use tokio::sync::{oneshot, Mutex as AsyncMutex};
+
+    #[test]
+    fn decoding_receipt_anthropic_preserves_requested_settings_without_claiming_application() {
+        let data_dir = tempfile::tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        {
+            let app_db = state.app_db.lock().expect("app database lock");
+            for (key, value) in [
+                ("generation_temperature", "0.7"),
+                ("generation_top_p", "0.8"),
+                ("generation_top_k", "40"),
+                ("generation_min_p", "0.05"),
+                ("generation_repeat_penalty", "1.1"),
+            ] {
+                app_db
+                    .set_setting(key, value)
+                    .expect("saved decoding setting");
+            }
+        }
+        let receipt = effective_decoding_settings(
+            &state,
+            providers::ProviderType::Anthropic,
+            "claude-test-model",
+            512,
+        )
+        .expect("decoding receipt");
+
+        assert_eq!(receipt.provider, "anthropic");
+        assert_eq!(receipt.model, "claude-test-model");
+        assert_eq!(receipt.effective.max_tokens, 512);
+        assert_eq!(receipt.effective.temperature, 1.0);
+        assert_eq!(receipt.effective.top_p, None);
+        assert_eq!(receipt.effective.top_k, None);
+        assert_eq!(receipt.effective.min_p, None);
+        assert_eq!(receipt.effective.repeat_penalty, None);
+        assert_eq!(
+            receipt.requested,
+            serde_json::json!({
+                "temperature": "0.7", "top_p": "0.8", "top_k": "40",
+                "min_p": "0.05", "repeat_penalty": "1.1",
+            })
+        );
+        assert_eq!(
+            receipt.unsupported_fields,
+            ["temperature", "top_p", "top_k", "min_p", "repeat_penalty"]
+        );
+        assert!(!receipt.provider_capability.supports_temperature);
+        assert!(!receipt.provider_capability.supports_top_p);
+        assert!(!receipt.provider_capability.supports_top_k);
+        assert!(!receipt.provider_capability.supports_min_p);
+        assert!(!receipt.provider_capability.supports_repeat_penalty);
+        assert_eq!(
+            state
+                .app_db
+                .lock()
+                .expect("app database lock")
+                .get_setting("generation_temperature")
+                .expect("saved setting"),
+            Some("0.7".to_string())
+        );
+    }
+
+    #[test]
+    fn decoding_receipt_anthropic_absent_or_blank_knobs_use_default_without_unsupported_requests() {
+        let data_dir = tempfile::tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        // AppDb migrations seed generation_temperature=0.7. Remove the seeded
+        // values explicitly so this fixture actually exercises absent keys.
+        state
+            .app_db
+            .lock()
+            .expect("app database lock")
+            .conn()
+            .execute(
+                "DELETE FROM settings WHERE key IN ('generation_temperature', 'generation_top_p', \
+                 'generation_top_k', 'generation_min_p', 'generation_repeat_penalty')",
+                [],
+            )
+            .expect("remove seeded decoding settings in fixture");
+        for saved in [None, Some(" \t")] {
+            if let Some(value) = saved {
+                let app_db = state.app_db.lock().expect("app database lock");
+                for key in [
+                    "generation_temperature",
+                    "generation_top_p",
+                    "generation_top_k",
+                    "generation_min_p",
+                    "generation_repeat_penalty",
+                ] {
+                    app_db
+                        .set_setting(key, value)
+                        .expect("blank decoding setting");
+                }
+            }
+            let receipt = effective_decoding_settings(
+                &state,
+                providers::ProviderType::Anthropic,
+                "claude-test-model",
+                512,
+            )
+            .expect("decoding receipt");
+            assert_eq!(receipt.requested["temperature"], serde_json::json!(saved));
+            assert_eq!(receipt.effective.temperature, 1.0);
+            assert!(receipt.unsupported_fields.is_empty());
+            assert!(!receipt.provider_capability.supports_temperature);
+        }
+    }
+
+    #[test]
+    fn decoding_receipt_other_providers_keep_saved_temperature_and_supported_sampling() {
+        let data_dir = tempfile::tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        {
+            let app_db = state.app_db.lock().expect("app database lock");
+            for (key, value) in [
+                ("generation_temperature", "0.35"),
+                ("generation_top_p", "0.8"),
+                ("generation_top_k", "40"),
+                ("generation_min_p", "0.05"),
+                ("generation_repeat_penalty", "1.1"),
+            ] {
+                app_db
+                    .set_setting(key, value)
+                    .expect("saved decoding setting");
+            }
+        }
+        for provider in [
+            providers::ProviderType::Ollama,
+            providers::ProviderType::OpenAI,
+            providers::ProviderType::LlamaCpp,
+        ] {
+            let receipt = effective_decoding_settings(&state, provider, "test-model", 512)
+                .expect("decoding receipt");
+            assert_eq!(receipt.effective.temperature, 0.35);
+            assert_eq!(receipt.effective.top_p, Some(0.8));
+            assert!(receipt.provider_capability.supports_temperature);
+            assert!(receipt.provider_capability.supports_top_p);
+            if matches!(provider, providers::ProviderType::Ollama) {
+                assert_eq!(receipt.effective.top_k, Some(40));
+                assert_eq!(receipt.effective.min_p, Some(0.05));
+                assert_eq!(receipt.effective.repeat_penalty, Some(1.1));
+                assert!(receipt.unsupported_fields.is_empty());
+            } else {
+                assert_eq!(receipt.effective.top_k, None);
+                assert_eq!(receipt.effective.min_p, None);
+                assert_eq!(receipt.effective.repeat_penalty, None);
+                assert_eq!(
+                    receipt.unsupported_fields,
+                    ["top_k", "min_p", "repeat_penalty"]
+                );
+            }
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum ScriptedLifecycleMode {

@@ -30,6 +30,10 @@ class NativeChooserFixture:
         self.timeout_action = None
         self.lose_focus_after_location_shortcut = False
         self.clock = 0.0
+        self.focused_at = None
+        self.entry_opened_at = None
+        self.typed_at = None
+        self.path_input = ""
 
     def find_visible(self, *_args):
         return False
@@ -68,6 +72,7 @@ class NativeChooserFixture:
         if action == "windowfocus":
             assert command[2:] == ["--sync", self.dialog]
             self.focus = self.dialog
+            self.focused_at = self.clock
         elif action == "getwindowfocus":
             # Reproduce the no-WM failure for the old WM_CLASS-traversing call.
             if command[2:] != ["-f"]:
@@ -75,11 +80,17 @@ class NativeChooserFixture:
             return subprocess.CompletedProcess(command, 0, self.focus, "")
         elif action in ("key", "type"):
             assert self.focus == self.dialog
+            if action == "key" and command[-1] == "slash":
+                self.entry_opened_at = self.clock
+                self.path_input = "/"
+            if action == "type":
+                self.typed_at = self.clock
+                self.path_input += command[-1]
             if action == "key" and command[-1] == "Return":
                 self.returns += 1
                 if self.returns >= self.close_after:
                     self.focus = "1"
-            if command[-1] == "ctrl+l" and self.lose_focus_after_location_shortcut:
+            if command[-1] == "slash" and self.lose_focus_after_location_shortcut:
                 self.focus = "12345"
         else:
             raise AssertionError(f"Unexpected native operation: {command}")
@@ -105,7 +116,10 @@ class NativeFolderChooserTests(unittest.TestCase):
         self.assertEqual(self.native.returns, 1)
         self.assertIn(["xdotool", "getwindowname", self.native.dialog], self.native.commands)
         self.assertIn(["xdotool", "windowfocus", "--sync", self.native.dialog], self.native.commands)
-        self.assertIn(["xdotool", "type", "--clearmodifiers", "--delay", "1", str(self.folder)], self.native.commands)
+        self.assertIn(["xdotool", "key", "--clearmodifiers", "slash"], self.native.commands)
+        self.assertIn(["xdotool", "type", "--clearmodifiers", "--delay", "1", str(self.folder)[1:]], self.native.commands)
+        self.assertEqual(self.native.path_input, str(self.folder))
+        self.assertFalse(any("ctrl+l" in command for command in self.native.commands))
         self.assertTrue(all(command[2:] == ["-f"] for command in self.native.commands if command[1] == "getwindowfocus"))
         self.assertFalse(any(command[1] == "windowactivate" for command in self.native.commands))
 
@@ -115,6 +129,19 @@ class NativeFolderChooserTests(unittest.TestCase):
         self.workflow.folder(self.folder)
         self.assertGreaterEqual(self.native.clock, 0.6)
         self.assertEqual(sum(command[1] == "windowfocus" for command in self.native.commands), 1)
+
+    def test_native_location_entry_settles_before_the_path_is_typed_once(self):
+        self.workflow.folder(self.folder)
+        self.assertGreaterEqual(self.native.entry_opened_at - self.native.focused_at, 0.25)
+        self.assertGreaterEqual(self.native.typed_at - self.native.entry_opened_at, 0.25)
+        self.assertEqual(sum(command[1] == "type" for command in self.native.commands), 1)
+        self.assertLessEqual(self.native.clock, 0.8)
+
+    def test_relative_path_fails_before_opening_or_mutating_the_chooser(self):
+        with self.assertRaisesRegex(RuntimeError, "absolute path"):
+            self.workflow.folder(Path("relative/folder"))
+        self.assertFalse(self.native.opened)
+        self.assertEqual(self.native.commands, [])
 
     def test_multiple_new_dialogs_fail_before_focus_or_keyboard_mutation(self):
         self.native.extra = {"2097962"}
@@ -175,7 +202,7 @@ class NativeFolderChooserTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "did not close"):
             self.workflow.folder(self.folder)
         self.assertEqual(self.native.returns, 2)
-        self.assertLessEqual(self.native.clock, 5.4)
+        self.assertLessEqual(self.native.clock, 5.9)
 
 
 if __name__ == "__main__":

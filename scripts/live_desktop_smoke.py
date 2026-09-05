@@ -375,6 +375,9 @@ class IntegratedWorkflow:
         self.ui.fill('input[aria-label="Ollama server URL"]', self.config["base_url"])
         self.ui.click_ref(self.ui.execute("return document.querySelector('input[aria-label=\"Ollama server URL\"]').parentElement.querySelector('button')"))
         self.ui.wait(lambda: self.ui.execute("return document.querySelector('input[aria-label=\"Ollama server URL\"]').parentElement.querySelector('button').disabled"), label="Ollama URL saved")
+        self.ui.fill('input[aria-label="Chat temperature"]', "0")
+        self.ui.click_text("Apply chat temperature")
+        self.ui.wait(lambda: self.ui.execute("return Array.from(document.querySelectorAll('button')).some(e=>e.textContent==='Apply chat temperature' && e.disabled)"), label="chat temperature Apply acknowledged")
         self.ui.select('select:has(option[value="gloss-local"])', "gloss-local")
         def profile_applied():
             text = self.ui.text()
@@ -388,11 +391,12 @@ class IntegratedWorkflow:
         self.ui.select('select[aria-label="Chat model and provider"]', "ollama::" + self.config["chat_model"])
         self.ui.select('select[aria-label="Response length"]', "short")
         self.ui.select('select[aria-label="Conversational style"]', "custom")
-        self.ui.fill('input[aria-label="Custom conversation goal"]', "Be concise. Quote exact source facts and cite them using [1]. /no_think")
+        self.ui.fill('input[aria-label="Custom conversation goal"]', "Be concise. When sources are provided, quote exact source facts and cite them using [1]. /no_think")
         self.ui.wait(lambda: "Saving model selection" not in self.ui.text(), label="chat model saved")
         self.settings()
         for label, expected in (("Ollama server URL", self.config["base_url"]), ("Embedding URL", self.config["base_url"]),
-                                ("Embedding model", self.config["embedding_model"]), ("Embedding timeout seconds", "60")):
+                                ("Embedding model", self.config["embedding_model"]), ("Embedding timeout seconds", "60"),
+                                ("Chat temperature", "0")):
             self.check(self.ui.execute("return document.querySelector(arguments[0]).value", [f'input[aria-label="{label}"]']) == expected, f"reopened {label} matches applied value")
         self.ui.snapshot("applied-settings", self.root)
         self.close_settings()
@@ -427,6 +431,7 @@ class IntegratedWorkflow:
         values = self.ui.execute("""const r=document.getElementById(arguments[0]); const g=r.querySelector('.grid'); return Object.fromEntries(Array.from(g.children).map(e=>[e.children[0].textContent.replace(/:\\s*$/, '').trim(), e.children[1].textContent.trim()]));""", [drawer_id])
         require_scope_evidence(values, selected, excluded, retrieval, degraded=degraded)
         self.check(values.get("Generation") == "completed", "rendered generation receipt is complete")
+        self.check(values.get("Temperature") == "0", "rendered effective chat temperature matches the applied setting")
         self.scope_checks.append(values)
         self.ui.snapshot(f"evidence-{len(self.scope_checks)}", self.root)
         return values
@@ -461,6 +466,7 @@ class IntegratedWorkflow:
         self.ui.wait(lambda: not self.ui.find_visible('textarea[placeholder="Paste text here..."]'), label="paste accepted")
 
     def folder(self, folder: Path):
+        self.check(folder.is_absolute(), "native folder selection requires an absolute path")
         if not shutil.which("xdotool"):
             raise BaselineBlocked("xdotool is required to observe the real native folder chooser")
         self.sources()
@@ -512,14 +518,22 @@ class IntegratedWorkflow:
         # Xvfb has no EWMH window manager. Set focus on the discovered dialog
         # directly, then inspect raw X focus without WM_CLASS parent traversal.
         native("windowfocus", "--sync", dialog)
+        time.sleep(0.25)
 
         def key_action(*args: str):
             self.check(native("getwindowfocus", "-f") == dialog,
                        f"native folder chooser {dialog} retains keyboard focus")
             native(*args)
 
-        key_action("key", "--clearmodifiers", "ctrl+l")
-        key_action("type", "--clearmodifiers", "--delay", "1", str(folder))
+        # GTK's slash shortcut initializes folder browsing from the initial
+        # Recent view. Ctrl+L can expose an entry with no current folder and a
+        # disabled Open button. Let the native entry realize before typing;
+        # the slash key supplies the absolute path's first character.
+        key_action("key", "--clearmodifiers", "slash")
+        time.sleep(0.25)
+        self.ui.trace.append({"at": now(), "native_folder_path_entry": "slash",
+                              "window_settle_seconds": 0.25, "entry_settle_seconds": 0.25})
+        key_action("type", "--clearmodifiers", "--delay", "1", str(folder)[1:])
         key_action("key", "--clearmodifiers", "Return")
         time.sleep(0.3)
         # GTK may navigate to the directory first. Activating the dialog's
@@ -548,6 +562,9 @@ class IntegratedWorkflow:
         self.restart(name)
         self.ui.wait(lambda: greeting == self.last_answer(), label="exact chat content after restart")
         self.check(self.ui.execute("return document.querySelector('select[aria-label=\"Chat model and provider\"]').value") == "ollama::" + self.config["chat_model"], "exact provider/model restored after restart")
+        self.settings()
+        self.check(self.ui.execute("return document.querySelector('input[aria-label=\"Chat temperature\"]').value") == "0", "applied chat temperature survives native restart")
+        self.close_settings()
         self.record(self.case_id, "Restarted the actual native process and observed identical persisted assistant content and the selected Ollama model.")
 
         self.case_id = "model_dropdown_and_prompt"

@@ -759,7 +759,7 @@ function StreamingMessage({ content }: { content: string }) {
 }
 
 
-function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDisclosure }) {
+export function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDisclosure }) {
   const degraded = evidence.fallback_used || evidence.degradation_markers.length > 0 || evidence.citation_invalid_count > 0;
   return (
     <div id={id} role="region" aria-label="Answer evidence" className="mt-2 rounded border border-border/70 bg-bg-secondary p-2 text-[10px] text-text-secondary">
@@ -791,7 +791,12 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
         <EvidenceRow label="Index" value={evidence.index_status} />
         <EvidenceRow label="Links" value={evidence.link_status} />
         {evidence.decoding_settings_receipt && (
-          <EvidenceRow label="Temperature" value={`${evidence.decoding_settings_receipt.effective.temperature}`} />
+          <EvidenceRow
+            label="Temperature"
+            value={evidence.decoding_settings_receipt.provider_capability.supports_temperature === false
+              ? "Provider default"
+              : `${evidence.decoding_settings_receipt.effective.temperature}`}
+          />
         )}
         {evidence.prompt_receipt && (
           <EvidenceRow label="Prompt" value={evidence.prompt_receipt.capture_state} />

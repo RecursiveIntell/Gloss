@@ -21,6 +21,7 @@ pub fn native_dense_artifact_path(notebook_dir: &Path) -> std::path::PathBuf {
 pub struct HnswIndex {
     index: usearch::Index,
     dims: usize,
+    next_label: u64,
 }
 
 const INITIAL_HNSW_CAPACITY: usize = 1_024;
@@ -39,16 +40,27 @@ impl HnswIndex {
         index
             .reserve(INITIAL_HNSW_CAPACITY)
             .map_err(|e| GlossError::Embedding(format!("Failed to reserve HNSW index: {e}")))?;
-        Ok(Self { index, dims })
+        Ok(Self {
+            index,
+            dims,
+            next_label: 0,
+        })
     }
 
     pub fn load_with_hwm(path: &Path, hwm: i64, dims: usize) -> Result<Self, GlossError> {
-        let index = Self::new(dims)?;
+        let mut index = Self::new(dims)?;
         if path.exists() {
             index
                 .index
                 .load(path.to_str().unwrap_or(""))
                 .map_err(|e| GlossError::Embedding(format!("Failed to load HNSW index: {e}")))?;
+            if index.index.dimensions() != dims {
+                return Err(GlossError::Embedding(format!(
+                    "Stored HNSW dimension mismatch: artifact has {} dims, expected {dims}",
+                    index.index.dimensions()
+                )));
+            }
+            index.next_label = u64::try_from(hwm).unwrap_or(0).saturating_add(1);
             let hwm_capacity = usize::try_from(hwm).unwrap_or(0);
             let capacity = hwm_capacity.max(index.index.size());
             index
@@ -67,7 +79,17 @@ impl HnswIndex {
                 self.dims
             )));
         }
-        let label = self.index.size() as u64;
+        let mut label = self.next_label;
+        while self.index.contains(label) {
+            label = label
+                .checked_add(1)
+                .ok_or_else(|| GlossError::Embedding("HNSW label overflow".into()))?;
+        }
+        if label > i64::MAX as u64 {
+            return Err(GlossError::Embedding(
+                "HNSW label exceeds SQLite integer range".into(),
+            ));
+        }
         if self.index.size() >= self.index.capacity() {
             let capacity = self
                 .index
@@ -82,6 +104,7 @@ impl HnswIndex {
         self.index
             .add(label, vector)
             .map_err(|e| GlossError::Embedding(format!("HNSW add failed: {e}")))?;
+        self.next_label = label + 1;
         Ok(label)
     }
 
@@ -698,6 +721,46 @@ async fn ollama_embed_request(
         out.push(vector);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod audit_dense_tests {
+    use super::*;
+
+    #[test]
+    fn deleting_a_vector_never_reuses_a_live_label() {
+        let mut index = HnswIndex::new(3).unwrap();
+        assert_eq!(index.add(&[1.0, 0.0, 0.0]).unwrap(), 0);
+        assert_eq!(index.add(&[0.0, 1.0, 0.0]).unwrap(), 1);
+        assert_eq!(index.add(&[0.0, 0.0, 1.0]).unwrap(), 2);
+        assert!(index.remove(0).unwrap());
+        assert_eq!(index.add(&[0.5, 0.5, 0.0]).unwrap(), 3);
+        assert_eq!(index.size(), 3);
+    }
+
+    #[test]
+    fn reloading_after_delete_respects_durable_high_water_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = native_dense_artifact_path(dir.path());
+        let mut index = HnswIndex::new(3).unwrap();
+        for _ in 0..4 {
+            index.add(&[1.0, 0.0, 0.0]).unwrap();
+        }
+        index.remove(1).unwrap();
+        index.save(&path).unwrap();
+        let mut reloaded = HnswIndex::load_with_hwm(&path, 3, 3).unwrap();
+        assert_eq!(reloaded.add(&[0.0, 1.0, 0.0]).unwrap(), 4);
+    }
+
+    #[test]
+    fn rejects_artifact_with_different_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = native_dense_artifact_path(dir.path());
+        let mut index = HnswIndex::new(3).unwrap();
+        index.add(&[1.0, 0.0, 0.0]).unwrap();
+        index.save(&path).unwrap();
+        assert!(HnswIndex::load_with_hwm(&path, 0, 4).is_err());
+    }
 }
 
 #[cfg(test)]

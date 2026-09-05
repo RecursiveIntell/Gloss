@@ -148,7 +148,7 @@ impl LlmProvider for OpenAIProvider {
             let byte_stream = resp.bytes_stream();
 
             let stream = stream::unfold(
-                (byte_stream, Vec::<u8>::new(), ctx.clone()),
+                (byte_stream, super::sse::SseDecoder::new(), ctx.clone()),
                 |(mut byte_stream, mut buffer, ctx)| async move {
                     loop {
                         let next = tokio::select! {
@@ -168,62 +168,34 @@ impl LlmProvider for OpenAIProvider {
                                         (byte_stream, buffer, ctx),
                                     ));
                                 }
-                                buffer.extend_from_slice(&bytes);
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
-
-                                // Process complete SSE lines
-                                while let Some(newline_pos) =
-                                    buffer.iter().position(|&b| b == b'\n')
-                                {
-                                    // Copy the line out of the buffer first
-                                    // so we can drain the consumed bytes
-                                    // without holding an immutable borrow.
-                                    let owned: String =
-                                        match std::str::from_utf8(&buffer[..newline_pos]) {
-                                            Ok(s) => s.trim().to_string(),
-                                            Err(_) => {
-                                                buffer.drain(..=newline_pos);
-                                                continue;
-                                            }
-                                        };
-                                    buffer.drain(..=newline_pos);
-                                    let line = owned.as_str();
-
-                                    if line.is_empty() || line.starts_with(':') {
-                                        continue;
+                                let events = match buffer.push(&bytes) {
+                                    Ok(events) => events,
+                                    Err(error) => return Some((
+                                        stream::iter(vec![Err(GlossError::Provider { provider: "openai".into(), source: anyhow::anyhow!(error) })]),
+                                        (byte_stream, buffer, ctx),
+                                    )),
+                                };
+                                for data in events {
+                                    if data == "[DONE]" {
+                                        tokens.push(Ok(ChatToken { token: String::new(), done: true })); break;
                                     }
-                                    if let Some(data) = line.strip_prefix("data: ") {
-                                        let data = data.trim();
-                                        if data == "[DONE]" {
-                                            tokens.push(Ok(ChatToken {
-                                                token: String::new(),
-                                                done: true,
-                                            }));
-                                            break;
+                                    let val: serde_json::Value = match serde_json::from_str(&data) {
+                                        Ok(val) => val,
+                                        Err(error) => {
+                                            tokens.push(Err(GlossError::Provider { provider: "openai".into(), source: anyhow::anyhow!("Invalid JSON in SSE event: {}", error) })); break;
                                         }
-                                        if let Ok(val) =
-                                            serde_json::from_str::<serde_json::Value>(data)
-                                        {
-                                            let content = val
-                                                .get("choices")
-                                                .and_then(|c| c.get(0))
-                                                .and_then(|c| c.get("delta"))
-                                                .and_then(|d| d.get("content"))
-                                                .and_then(|c| c.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let finish = val
-                                                .get("choices")
-                                                .and_then(|c| c.get(0))
-                                                .and_then(|c| c.get("finish_reason"))
-                                                .and_then(|f| f.as_str())
-                                                .is_some();
-                                            tokens.push(Ok(ChatToken {
-                                                token: content,
-                                                done: finish,
-                                            }));
-                                        }
+                                    };
+                                    if let Some(error) = val.get("error") {
+                                        let message = error.as_str().or_else(|| error.get("message").and_then(|v| v.as_str())).unwrap_or("Provider reported a streaming error");
+                                        let bounded: String = message.chars().take(512).collect();
+                                        tokens.push(Err(GlossError::Provider { provider: "openai".into(), source: anyhow::anyhow!("Provider stream error: {}", bounded) })); break;
                                     }
+                                    let choice = val.get("choices").and_then(|v| v.get(0));
+                                    let content = choice.and_then(|v| v.get("delta")).and_then(|v| v.get("content")).and_then(|v| v.as_str()).unwrap_or("");
+                                    let done = choice.and_then(|v| v.get("finish_reason")).and_then(|v| v.as_str()).is_some();
+                                    tokens.push(Ok(ChatToken { token: content.to_string(), done }));
+                                    if done { break; }
                                 }
 
                                 if !tokens.is_empty() {

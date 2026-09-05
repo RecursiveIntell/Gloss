@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod llamacpp;
 pub mod ollama;
 pub mod openai;
+mod sse;
 
 use crate::db::app_db::{AppDb, ModelRecord, Provider};
 use crate::error::GlossError;

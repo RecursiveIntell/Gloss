@@ -17,10 +17,10 @@ libm = { version = "0.2", default-features = false }
 # fib-quant scoring (Gram table + compressed attention)
 # NOTE: fib-quant 0.1.0-beta.1 on crates.io does not yet export FibScorer/FibPreparedQuery.
 # To use the fib feature, build from source: path = "../fib-quant"
-fib-quant = "{ path = "../fib-quant", optional = true, default-features = false }
+fib-quant = { path = "../fib-quant", optional = true, default-features = false }
 
 # turbo-quant scoring (PolarQuant + QJL inner product estimates)
-turbo-quant = "{ path = "../turbo-quant", optional = true, default-features = false }
+turbo-quant = { path = "../turbo-quant", optional = true, default-features = false }
 
 [features]
 default = ["turbo", "c-kernels"]

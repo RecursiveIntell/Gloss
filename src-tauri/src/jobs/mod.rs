@@ -363,6 +363,12 @@ async fn execute_index_chunks(
     };
 
     let mut embedded_count = 0;
+    db.mark_embedding_index_status(
+        crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+        crate::db::notebook_db::EmbeddingIndexMetadataStatus::Building,
+        Some("Native dense indexing is in progress; verified publication is pending"),
+    )
+    .map_err(|e| QueueError::Execution(e.to_string()))?;
 
     // Process in batches
     for chunk_batch in unindexed_chunks.chunks(MAX_CHUNKS_PER_BATCH) {
@@ -381,6 +387,13 @@ async fn execute_index_chunks(
         let embeddings = embedder
             .embed_batch(&texts)
             .map_err(|e| QueueError::Execution(format!("Embedding failed: {e}")))?;
+        if embeddings.len() != chunk_batch.len() {
+            return Err(QueueError::Execution(format!(
+                "Embedding batch returned {} vectors for {} chunks",
+                embeddings.len(),
+                chunk_batch.len()
+            )));
+        }
 
         // Add to HNSW and update DB
         for (i, chunk) in chunk_batch.iter().enumerate() {
@@ -395,12 +408,14 @@ async fn execute_index_chunks(
         }
 
         // Save index after each batch
-        if let Err(e) = index.save_atomic_verified(
-            &index_path,
-            db.max_embedding_id().unwrap_or(None).unwrap_or(0),
-        ) {
-            tracing::warn!(error = %e, "failed to save HNSW index during batch");
-        }
+        index
+            .save_atomic_verified(
+                &index_path,
+                db.max_embedding_id().unwrap_or(None).unwrap_or(0),
+            )
+            .map_err(|e| {
+                QueueError::Execution(format!("Failed to publish native dense artifact: {e}"))
+            })?;
     }
 
     // Update embedding index metadata

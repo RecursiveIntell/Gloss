@@ -138,7 +138,7 @@ impl LlmProvider for LlamaCppProvider {
             let byte_stream = resp.bytes_stream();
 
             let stream = stream::unfold(
-                (byte_stream, String::new(), ctx.clone()),
+                (byte_stream, super::sse::SseDecoder::new(), ctx.clone()),
                 |(mut byte_stream, mut buffer, ctx)| async move {
                     loop {
                         let next = tokio::select! {
@@ -158,48 +158,34 @@ impl LlmProvider for LlamaCppProvider {
                                         (byte_stream, buffer, ctx),
                                     ));
                                 }
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
                                 let mut tokens: Vec<Result<ChatToken, GlossError>> = Vec::new();
-
-                                while let Some(newline_pos) = buffer.find('\n') {
-                                    let line = buffer[..newline_pos].trim().to_string();
-                                    buffer = buffer[newline_pos + 1..].to_string();
-
-                                    if line.is_empty() || line.starts_with(':') {
-                                        continue;
+                                let events = match buffer.push(&bytes) {
+                                    Ok(events) => events,
+                                    Err(error) => return Some((
+                                        stream::iter(vec![Err(GlossError::Provider { provider: "llamacpp".into(), source: anyhow::anyhow!(error) })]),
+                                        (byte_stream, buffer, ctx),
+                                    )),
+                                };
+                                for data in events {
+                                    if data == "[DONE]" {
+                                        tokens.push(Ok(ChatToken { token: String::new(), done: true })); break;
                                     }
-                                    if let Some(data) = line.strip_prefix("data: ") {
-                                        let data = data.trim();
-                                        if data == "[DONE]" {
-                                            tokens.push(Ok(ChatToken {
-                                                token: String::new(),
-                                                done: true,
-                                            }));
-                                            break;
+                                    let val: serde_json::Value = match serde_json::from_str(&data) {
+                                        Ok(val) => val,
+                                        Err(error) => {
+                                            tokens.push(Err(GlossError::Provider { provider: "llamacpp".into(), source: anyhow::anyhow!("Invalid JSON in SSE event: {}", error) })); break;
                                         }
-                                        if let Ok(val) =
-                                            serde_json::from_str::<serde_json::Value>(data)
-                                        {
-                                            let content = val
-                                                .get("choices")
-                                                .and_then(|c| c.get(0))
-                                                .and_then(|c| c.get("delta"))
-                                                .and_then(|d| d.get("content"))
-                                                .and_then(|c| c.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let finish = val
-                                                .get("choices")
-                                                .and_then(|c| c.get(0))
-                                                .and_then(|c| c.get("finish_reason"))
-                                                .and_then(|f| f.as_str())
-                                                .is_some();
-                                            tokens.push(Ok(ChatToken {
-                                                token: content,
-                                                done: finish,
-                                            }));
-                                        }
+                                    };
+                                    if let Some(error) = val.get("error") {
+                                        let message = error.as_str().or_else(|| error.get("message").and_then(|v| v.as_str())).unwrap_or("Provider reported a streaming error");
+                                        let bounded: String = message.chars().take(512).collect();
+                                        tokens.push(Err(GlossError::Provider { provider: "llamacpp".into(), source: anyhow::anyhow!("Provider stream error: {}", bounded) })); break;
                                     }
+                                    let choice = val.get("choices").and_then(|v| v.get(0));
+                                    let content = choice.and_then(|v| v.get("delta")).and_then(|v| v.get("content")).and_then(|v| v.as_str()).unwrap_or("");
+                                    let done = choice.and_then(|v| v.get("finish_reason")).and_then(|v| v.as_str()).is_some();
+                                    tokens.push(Ok(ChatToken { token: content.to_string(), done }));
+                                    if done { break; }
                                 }
 
                                 if !tokens.is_empty() {

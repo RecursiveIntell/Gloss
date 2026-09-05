@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { parseAssistantPayload } from "./chatEvidence";
 import type {
   Notebook,
   Source,
@@ -269,7 +270,14 @@ export async function loadMessages(
   notebookId: string,
   conversationId: string
 ): Promise<Message[]> {
-  return invoke("load_messages", { notebookId, conversationId });
+  // Rust persists and returns citations as optional JSON text. Normalize it
+  // before publishing typed Message objects to chat and inspector consumers.
+  type StoredMessage = Omit<Message, "citations"> & { citations?: string | null };
+  const messages: StoredMessage[] = await invoke("load_messages", { notebookId, conversationId });
+  return messages.map((message) => ({
+    ...message,
+    citations: message.citations ? parseAssistantPayload(message.citations) : undefined,
+  }));
 }
 
 export async function getChatEventsSince(

@@ -1040,7 +1040,10 @@ mod tests {
 
         assert_eq!(result.full_response, "hello world");
         assert_eq!(result.generation_receipt.status, "completed");
-        assert_eq!(result.prompt_receipt.capture_state, "captured_system_prompt");
+        assert_eq!(
+            result.prompt_receipt.capture_state,
+            "captured_system_prompt"
+        );
         assert_eq!(
             result.prompt_receipt.redaction_state,
             "system_prompt_stored_other_content_digest_only"

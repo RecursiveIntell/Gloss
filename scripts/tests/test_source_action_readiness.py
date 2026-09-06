@@ -50,6 +50,35 @@ class SourceActionReadinessTests(unittest.TestCase):
             workflow.click_source_button('Recovery fixture', 'button[title="Retry ingestion"]')
         workflow.ui.click_ref.assert_called_once_with('button')
 
+    def test_retry_command_error_is_retained_before_alert_expires(self):
+        for title in ['Retry Failed', 'Reindex Failed', 'Reindex Complete']:
+            with self.subTest(title=title):
+                workflow = self.workflow()
+                workflow.ui.execute.return_value = [{'title': title, 'message': 'original immediate diagnostic'}]
+                workflow.ui.wait.side_effect = lambda condition, **kwargs: condition()
+                with self.assertRaisesRegex(RuntimeError, 'original immediate diagnostic'):
+                    workflow.wait_source_retry('Recovery fixture', 'old embedding error')
+                workflow.ui.click_ref.assert_not_called()
+
+    def test_retry_wait_requires_the_requested_sources_new_terminal_state(self):
+        workflow = self.workflow()
+        workflow.ui.execute.return_value = []
+        workflow.source_rows = Mock()
+        workflow.ui.wait.side_effect = lambda condition, **kwargs: condition()
+        for title, status, error, expected in [
+            ('Recovery fixture', 'error', 'old embedding error', False),
+            ('Recovery fixture', 'pending', None, False),
+            ('different source', 'ready', None, False),
+            ('Recovery fixture', 'ready', None, True),
+            ('Recovery fixture', 'error', 'new embedding error', True),
+        ]:
+            workflow.source_rows.return_value = [{'title': title, 'status': status, 'error': error}]
+            results = []
+            workflow.ui.wait.side_effect = lambda condition, **kwargs: results.append(condition())
+            workflow.wait_source_retry('Recovery fixture', 'old embedding error')
+            self.assertEqual(results, [expected])
+        workflow.ui.click_ref.assert_not_called()
+
     def test_readonly_query_rejects_absent_hidden_ambiguous_and_disabled_actions(self):
         workflow = self.workflow()
         workflow.ui.wait.side_effect = lambda condition, **kwargs: condition()

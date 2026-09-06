@@ -725,6 +725,21 @@ return {at_end, id:button?.getAttribute('aria-controls') || null,
             label=f"visible source action {title}: {selector}")
         self.ui.click_ref(button)
 
+    def wait_source_retry(self, title: str, original_error: str | None):
+        def completed():
+            # Preserve immediate command failures before transient alerts expire.
+            # This observes rendered UI only; it never dispatches another action.
+            alerts = self.ui.execute("""return Array.from(document.querySelectorAll('[role="alert"]'))
+                .filter(e=>e.getClientRects().length).map(e=>({
+                    title:e.querySelector('p')?.textContent,
+                    message:e.getAttribute('aria-label') || e.innerText}));""")
+            unexpected = [a for a in alerts if a.get("title") in ("Retry Failed", "Reindex Failed", "Reindex Complete")]
+            if unexpected:
+                raise RuntimeError(f"source retry action failed or activated a different action: {json.dumps(unexpected)}")
+            return any(row["title"] == title and (row["status"] == "ready" or (
+                row["status"] == "error" and row["error"] != original_error)) for row in self.source_rows())
+        self.ui.wait(completed, timeout=180, label="explicit retry produced a new terminal source state")
+
     def paste(self, title: str, content: str):
         self.sources()
         self.ui.click_text("Paste")
@@ -916,7 +931,7 @@ return {at_end, id:button?.getAttribute('aria-controls') || null,
         self.close_settings()
         self.sources()
         self.click_source_button("Recovery fixture", 'button[title="Retry ingestion"]')
-        self.ui.wait(lambda: any(row["title"] == "Recovery fixture" and (row["status"] == "ready" or (row["status"] == "error" and row["error"] != original_error)) for row in self.source_rows()), timeout=180, label="explicit retry produced a new terminal source state")
+        self.wait_source_retry("Recovery fixture", original_error)
         self.inspector("Health")
         self.ui.click_text("Rebuild dense index")
         self.ui.wait(lambda: "Dense index ready:" in self.ui.text("#inspector-panel-diagnostics"), timeout=180, label="explicit native index rebuild")

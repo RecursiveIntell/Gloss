@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { useChatStore } from '../chatStore';
 import { useNotebookStore } from '../notebookStore';
 import * as api from '../../lib/tauri';
+import type { Message } from '../../lib/types';
 
 // Mock the Tauri API layer so we never need a running backend
 vi.mock('../../lib/tauri', () => ({
@@ -28,6 +29,12 @@ const localStorageMock = (() => {
   };
 })();
 vi.stubGlobal('localStorage', localStorageMock);
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
 
 describe('chatStore', () => {
   beforeEach(() => {
@@ -179,6 +186,297 @@ describe('chatStore', () => {
     const after = useChatStore.getState();
     expect(after.messages).toEqual(persisted);
     expect(after.messages.filter((message) => message.id === 'assistant-rehydrate')).toHaveLength(1);
+  });
+
+  it('older same-conversation hydration cannot erase a newer completed assistant', async () => {
+    const roles = ['user', 'assistant', 'user', 'user', 'assistant', 'user', 'assistant', 'user'] as const;
+    const beforeCompletion: Message[] = roles.map((role, index) => ({
+      id: `saved-row-${index + 1}`,
+      conversation_id: 'conv-1',
+      role,
+      content: `Saved content ${index + 1}`,
+      created_at: `2026-09-06T00:00:0${index + 1}Z`,
+    }));
+    const completed: Message = {
+      id: 'newly-completed-assistant', conversation_id: 'conv-1', role: 'assistant',
+      content: 'The Atlas launch code is GLACIER-ORBIT-417.', created_at: '2026-09-06T00:00:09Z',
+    };
+    const afterCompletion = [...beforeCompletion, completed];
+    const older = deferred<Message[]>();
+    const newer = deferred<Message[]>();
+    vi.mocked(api.loadMessages)
+      .mockImplementationOnce(() => older.promise)
+      .mockImplementationOnce(() => newer.promise);
+    useChatStore.setState({
+      activeConversationId: 'conv-1', messages: beforeCompletion,
+      isStreaming: true, streamingNotebookId: 'nb-1',
+      streamingMessageId: completed.id, pendingMessageIds: { [completed.id]: true },
+      streamingContent: completed.content,
+    });
+
+    const olderLoad = useChatStore.getState().rehydrateConversation('nb-1', 'conv-1');
+    const completion = useChatStore.getState().finalizeMessage('nb-1', 'conv-1', completed.id);
+    newer.resolve(afterCompletion);
+    await completion;
+    expect(useChatStore.getState().messages).toEqual(afterCompletion);
+    expect(useChatStore.getState().isStreaming).toBe(false);
+
+    // The earlier database snapshot reaches the same active conversation last.
+    older.resolve(beforeCompletion);
+    await olderLoad;
+    const afterOlderLoad = useChatStore.getState();
+    expect(afterOlderLoad.messages).toEqual(afterCompletion);
+    expect(afterOlderLoad.messages[afterOlderLoad.messages.length - 1]?.id).toBe(completed.id);
+  });
+
+  it('hydration started before a new send cannot erase its optimistic user or stream', async () => {
+    const saved: Message[] = [{
+      id: 'prior-user', conversation_id: 'conv-1', role: 'user',
+      content: 'Previous question', created_at: '2026-09-06T00:00:01Z',
+    }, {
+      id: 'prior-assistant', conversation_id: 'conv-1', role: 'assistant',
+      content: 'Previous answer', created_at: '2026-09-06T00:00:02Z',
+    }];
+    const oldSnapshot = deferred<Message[]>();
+    const acknowledgement = deferred<string>();
+    vi.mocked(api.loadMessages).mockImplementationOnce(() => oldSnapshot.promise);
+    vi.mocked(api.sendMessage).mockImplementationOnce(() => acknowledgement.promise);
+    useChatStore.setState({
+      activeConversationId: 'conv-1', messages: saved,
+      isStreaming: false, streamingNotebookId: null, streamingMessageId: null,
+      preparingMessageId: null, pendingMessageIds: {}, streamingContent: '',
+    });
+
+    const hydration = useChatStore.getState().rehydrateConversation('nb-1', 'conv-1');
+    const send = useChatStore.getState().sendMessage('nb-1', 'Current question', { kind: 'none' }, 'model-1');
+    const current = useChatStore.getState();
+    const assistantId = current.streamingMessageId!;
+    const optimisticUser = current.messages[current.messages.length - 1]!;
+    expect(assistantId).toBeTruthy();
+    expect(optimisticUser.content).toBe('Current question');
+    useChatStore.getState().appendToken('nb-1', 'conv-1', assistantId, 'Current response token');
+    acknowledgement.resolve(assistantId);
+    await send;
+
+    oldSnapshot.resolve(saved);
+    await hydration;
+    const after = useChatStore.getState();
+    expect(after.isStreaming).toBe(true);
+    expect(after.streamingMessageId).toBe(assistantId);
+    expect(after.pendingMessageIds[assistantId]).toBe(true);
+    expect(after.streamingContent).toBe('Current response token');
+    expect(after.messages).toEqual([...saved, optimisticUser]);
+  });
+
+  it('conversation A to B to A rejects the old A load and accepts a fresh A hydration', async () => {
+    const currentA: Message[] = [{
+      id: 'current-a-user', conversation_id: 'conv-a', role: 'user',
+      content: 'Current A question', created_at: '2026-09-06T00:00:01Z',
+    }, {
+      id: 'current-a-assistant', conversation_id: 'conv-a', role: 'assistant',
+      content: 'Current A answer', created_at: '2026-09-06T00:00:02Z',
+    }];
+    const staleA = currentA.slice(0, 1);
+    const freshA: Message[] = [...currentA, {
+      id: 'new-a-user', conversation_id: 'conv-a', role: 'user',
+      content: 'New canonical A question', created_at: '2026-09-06T00:00:03Z',
+    }];
+    const older = deferred<Message[]>();
+    const fresh = deferred<Message[]>();
+    vi.mocked(api.loadMessages)
+      .mockImplementationOnce(() => older.promise)
+      .mockImplementationOnce(() => fresh.promise);
+    useChatStore.setState({
+      activeConversationId: 'conv-a', messages: currentA,
+      isStreaming: false, streamingNotebookId: null, streamingMessageId: null,
+      preparingMessageId: null, pendingMessageIds: {}, streamingContent: '',
+    });
+
+    const oldLoad = useChatStore.getState().rehydrateConversation('nb-1', 'conv-a');
+    useChatStore.getState().setActiveConversation('conv-b');
+    useChatStore.getState().setActiveConversation('conv-a');
+    older.resolve(staleA);
+    await oldLoad;
+    expect(useChatStore.getState().activeConversationId).toBe('conv-a');
+    expect(useChatStore.getState().messages).toEqual(currentA);
+
+    const freshLoad = useChatStore.getState().rehydrateConversation('nb-1', 'conv-a');
+    fresh.resolve(freshA);
+    await freshLoad;
+    expect(useChatStore.getState().messages).toEqual(freshA);
+  });
+
+  it('hydration started after send reservation preserves the optimistic user before acknowledgement', async () => {
+    const saved: Message[] = [{
+      id: 'prior-user', conversation_id: 'conv-1', role: 'user',
+      content: 'Previous question', created_at: '2026-09-06T00:00:01Z',
+    }];
+    const snapshot = deferred<Message[]>();
+    const acknowledgement = deferred<string>();
+    vi.mocked(api.loadMessages).mockImplementationOnce(() => snapshot.promise);
+    vi.mocked(api.sendMessage).mockImplementationOnce(() => acknowledgement.promise);
+    useChatStore.setState({
+      activeConversationId: 'conv-1', messages: saved,
+      isStreaming: false, streamingNotebookId: null, streamingMessageId: null,
+      preparingMessageId: null, pendingMessageIds: {}, streamingContent: '',
+    });
+
+    const send = useChatStore.getState().sendMessage('nb-1', 'Current question', { kind: 'none' }, 'model-1');
+    const current = useChatStore.getState();
+    const assistantId = current.streamingMessageId!;
+    const optimisticUser = current.messages[current.messages.length - 1]!;
+    useChatStore.getState().appendToken('nb-1', 'conv-1', assistantId, 'Current response token');
+    const hydration = useChatStore.getState().rehydrateConversation('nb-1', 'conv-1');
+    snapshot.resolve(saved);
+    await hydration;
+    const beforeAcknowledgement = useChatStore.getState();
+    acknowledgement.resolve(assistantId);
+    await send;
+
+    expect(beforeAcknowledgement.messages).toEqual([...saved, optimisticUser]);
+    expect(beforeAcknowledgement.isStreaming).toBe(true);
+    expect(beforeAcknowledgement.streamingMessageId).toBe(assistantId);
+    expect(beforeAcknowledgement.pendingMessageIds[assistantId]).toBe(true);
+    expect(beforeAcknowledgement.streamingContent).toBe('Current response token');
+  });
+
+  it('final focus hydration recovers with a fresh canonical read after an owned send rejection', async () => {
+    const saved: Message[] = [{
+      id: 'known-user', conversation_id: 'conv-1', role: 'user',
+      content: 'Known question', created_at: '2026-09-06T00:00:01Z',
+    }];
+    const recovered: Message[] = [...saved, {
+      id: 'canonical-answer', conversation_id: 'conv-1', role: 'assistant',
+      content: 'Saved answer discovered on focus', created_at: '2026-09-06T00:00:02Z',
+    }];
+    const focusSnapshot = deferred<Message[]>();
+    const recoverySnapshot = deferred<Message[]>();
+    let reads = 0;
+    vi.mocked(api.loadMessages).mockClear().mockImplementation(() => (
+      ++reads === 1 ? focusSnapshot.promise : recoverySnapshot.promise
+    ));
+    vi.mocked(api.sendMessage).mockRejectedValueOnce(new Error('IPC rejected before attempt'));
+    useChatStore.setState({
+      activeConversationId: 'conv-1', messages: saved,
+      isStreaming: false, streamingNotebookId: null, streamingMessageId: null,
+      preparingMessageId: null, pendingMessageIds: {}, streamingContent: '',
+    });
+
+    try {
+      // App's final focus hydration has no later hydration continuation.
+      await useChatStore.getState().replayChatEvents('nb-1', 'conv-1');
+      const focusHydration = useChatStore.getState().rehydrateConversation('nb-1', 'conv-1');
+      await useChatStore.getState().sendMessage('nb-1', 'Next question', { kind: 'none' }, 'model-1');
+      expect(api.loadMessages).toHaveBeenCalledTimes(2);
+      expect(useChatStore.getState().isStreaming).toBe(false);
+      expect(useChatStore.getState().streamingError).toBe('IPC rejected before attempt');
+      expect(useChatStore.getState().messages).toEqual(saved);
+
+      focusSnapshot.resolve(recovered);
+      await focusHydration;
+      // The invalidated focus result cannot stand in for the fresh recovery read.
+      expect(useChatStore.getState().messages).toEqual(saved);
+      recoverySnapshot.resolve(recovered);
+      await recoverySnapshot.promise;
+      await Promise.resolve();
+      expect(useChatStore.getState().messages).toEqual(recovered);
+      expect(useChatStore.getState().streamingError).toBe('IPC rejected before attempt');
+      expect(api.loadMessages).toHaveBeenCalledTimes(2);
+    } finally {
+      focusSnapshot.resolve(saved);
+      recoverySnapshot.resolve(recovered);
+      await Promise.resolve();
+      vi.mocked(api.loadMessages).mockReset().mockResolvedValue([]);
+    }
+  });
+
+  it.each(['newer send', 'conversation round trip'] as const)(
+    'send rejection recovery cannot commit after a %s', async (invalidation) => {
+      const saved: Message[] = [{
+        id: 'known-user', conversation_id: 'conv-1', role: 'user',
+        content: 'Known question', created_at: '2026-09-06T00:00:01Z',
+      }];
+      const recovered: Message[] = [...saved, {
+        id: 'older-canonical-answer', conversation_id: 'conv-1', role: 'assistant',
+        content: 'Answer from the invalidated recovery', created_at: '2026-09-06T00:00:02Z',
+      }];
+      const focusSnapshot = deferred<Message[]>();
+      const recoverySnapshot = deferred<Message[]>();
+      const acknowledgement = deferred<string>();
+      let reads = 0;
+      vi.mocked(api.loadMessages).mockClear().mockImplementation(() => (
+        ++reads === 1 ? focusSnapshot.promise : recoverySnapshot.promise
+      ));
+      vi.mocked(api.sendMessage).mockRejectedValueOnce(new Error('IPC rejected before attempt'));
+      useChatStore.setState({
+        activeConversationId: 'conv-1', messages: saved,
+        isStreaming: false, streamingNotebookId: null, streamingMessageId: null,
+        preparingMessageId: null, pendingMessageIds: {}, streamingContent: '',
+      });
+      let newerSend: Promise<void> | undefined;
+      let assistantId: string | null = null;
+
+      try {
+        const focusHydration = useChatStore.getState().rehydrateConversation('nb-1', 'conv-1');
+        await useChatStore.getState().sendMessage('nb-1', 'Rejected question', { kind: 'none' }, 'model-1');
+        expect(api.loadMessages).toHaveBeenCalledTimes(2);
+        if (invalidation === 'newer send') {
+          vi.mocked(api.sendMessage).mockImplementationOnce(() => acknowledgement.promise);
+          newerSend = useChatStore.getState().sendMessage('nb-1', 'Current question', { kind: 'none' }, 'model-1');
+          assistantId = useChatStore.getState().streamingMessageId;
+          useChatStore.getState().appendToken('nb-1', 'conv-1', assistantId!, 'Current response token');
+        } else {
+          useChatStore.getState().setActiveConversation('conv-2');
+          useChatStore.getState().setActiveConversation('conv-1');
+        }
+        const current = useChatStore.getState();
+
+        focusSnapshot.resolve(recovered);
+        await focusHydration;
+        recoverySnapshot.resolve(recovered);
+        await recoverySnapshot.promise;
+        await Promise.resolve();
+        const after = useChatStore.getState();
+        expect(after.messages).toEqual(current.messages);
+        expect(after.activeConversationId).toBe('conv-1');
+        expect(after.isStreaming).toBe(current.isStreaming);
+        expect(after.streamingMessageId).toBe(current.streamingMessageId);
+        expect(after.streamingContent).toBe(current.streamingContent);
+        expect(after.streamingError).toBe(current.streamingError);
+        expect(api.loadMessages).toHaveBeenCalledTimes(2);
+      } finally {
+        focusSnapshot.resolve(saved);
+        recoverySnapshot.resolve(recovered);
+        acknowledgement.resolve(assistantId ?? 'unused-acknowledgement');
+        await newerSend;
+        await Promise.resolve();
+        vi.mocked(api.loadMessages).mockReset().mockResolvedValue([]);
+      }
+    }
+  );
+
+  it('loading conversation B is not blocked by an active stream and displayed users from conversation A', async () => {
+    const conversationA: Message[] = [{
+      id: 'a-user', conversation_id: 'conv-a', role: 'user',
+      content: 'Question in A', created_at: '2026-09-06T00:00:01Z',
+    }];
+    const conversationB: Message[] = [{
+      id: 'b-user', conversation_id: 'conv-b', role: 'user',
+      content: 'Question in B', created_at: '2026-09-06T00:00:02Z',
+    }];
+    const snapshot = deferred<Message[]>();
+    vi.mocked(api.loadMessages).mockImplementationOnce(() => snapshot.promise);
+    useChatStore.setState({
+      activeConversationId: 'conv-a', messages: conversationA,
+      isStreaming: true, streamingNotebookId: 'nb-1', streamingMessageId: 'a-assistant',
+      preparingMessageId: null, pendingMessageIds: { 'a-assistant': true }, streamingContent: 'A response',
+    });
+
+    const loadB = useChatStore.getState().loadMessages('nb-1', 'conv-b');
+    snapshot.resolve(conversationB);
+    await loadB;
+    expect(useChatStore.getState().activeConversationId).toBe('conv-b');
+    expect(useChatStore.getState().messages).toEqual(conversationB);
   });
 
   it('replayed done after listener loss finalizes from DB once', async () => {

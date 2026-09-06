@@ -21,6 +21,7 @@ vi.mock('react', async (importOriginal) => ({
     }];
   },
   useEffect: () => {},
+  useRef: () => ({ current: null }),
   useMemo: (compute: () => unknown) => compute(),
 }));
 vi.mock('../../stores/chatStore', () => ({

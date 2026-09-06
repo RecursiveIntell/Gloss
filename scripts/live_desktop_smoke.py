@@ -627,21 +627,51 @@ class IntegratedWorkflow:
         self.ui.snapshot("applied-settings", self.root)
         self.close_settings()
 
+    def answer_snapshot(self) -> dict:
+        # A mounted virtual row is meaningful as latest only at the acknowledged
+        # list end. Bind identity and text to that same persisted bubble.
+        return self.ui.execute("""const region=document.querySelector('[aria-label="Chat messages"]');
+const at_end=region?.dataset.chatAtBottom==='true';
+const button=at_end ? Array.from(region.querySelectorAll(arguments[0])).at(-1) : null;
+const bubble=button?.closest('.gloss-assistant-bubble');
+return {at_end, id:button?.getAttribute('aria-controls') || null,
+  text:bubble?.querySelector('.prose')?.innerText || '',
+  latest:!!bubble && bubble.dataset.chatMessageRole==='assistant' &&
+    bubble.dataset.chatMessageId===region.dataset.chatLatestMessageId,
+  streaming:!!document.querySelector('button[aria-label="Stop generation"]')};""", [MESSAGE_EVIDENCE_SELECTOR])
+
+    def jump_to_latest(self) -> dict:
+        if not self.answer_snapshot()["at_end"]:
+            def navigation_ready():
+                if self.answer_snapshot()["at_end"]:
+                    return {"at_end": True}
+                button = self.ui.find_visible('button[aria-label="Jump to latest"]')
+                return {"button": button} if button else None
+            navigation = self.ui.wait(navigation_ready, label="latest-message navigation control")
+            if "button" in navigation:
+                self.ui.click_ref(navigation["button"])
+        return self.ui.wait(lambda: (state if (state := self.answer_snapshot())["at_end"] else None),
+                            label="latest-message navigation acknowledged")
+
+    def wait_for_answer(self, previous: str | None, label: str) -> dict:
+        def completed():
+            state = self.answer_snapshot()
+            return state if state["at_end"] and state["latest"] and state["id"] and state["id"] != previous and not state["streaming"] else None
+        return self.ui.wait(completed, timeout=180, label=label)
+
     def answer_id(self) -> str | None:
-        # The list is virtualized: rendered row counts are not monotonic.
-        # Observe the last actual message's existing disclosure target instead.
-        return self.ui.execute("return Array.from(document.querySelectorAll(arguments[0])).at(-1)?.getAttribute('aria-controls') || null", [MESSAGE_EVIDENCE_SELECTOR])
+        return self.answer_snapshot()["id"]
 
     def last_answer(self) -> str:
-        return self.ui.execute("return Array.from(document.querySelectorAll('.gloss-assistant-bubble .prose')).at(-1)?.innerText || ''")
+        return self.answer_snapshot()["text"]
 
     def send(self, question: str, expected: str | None = None) -> str:
         self.focus_chat()
-        previous = self.answer_id()
+        previous = self.jump_to_latest()["id"]
         self.ui.fill('textarea[aria-label="Chat message"]', question + " /no_think")
         self.ui.click('button[aria-label="Send message"]')
-        self.ui.wait(lambda: self.answer_id() and self.answer_id() != previous and not self.ui.find_visible('button[aria-label="Stop generation"]'), timeout=180, label="persisted assistant answer")
-        answer = self.last_answer()
+        self.jump_to_latest()
+        answer = self.wait_for_answer(previous, "persisted assistant answer")["text"]
         self.check(bool(answer.strip()), "assistant response is nonempty")
         if expected:
             self.check(expected in answer, f"assistant contains fixture fact {expected}")
@@ -802,8 +832,8 @@ class IntegratedWorkflow:
 
         self.case_id = "chat_cancel_and_retry"
         self.focus_chat()
-        before = self.answer_id()
-        saved_answer = self.last_answer()
+        prior_answer = self.jump_to_latest()
+        before, saved_answer = prior_answer["id"], prior_answer["text"]
         self.ui.fill('textarea[aria-label="Chat message"]', "Write a long numbered list of 100 detailed facts about oceanography. /no_think")
         self.ui.click('button[aria-label="Send message"]')
         self.ui.wait(lambda: self.ui.find_visible('button[aria-label="Stop generation"]') and self.ui.execute("return Array.from(document.querySelectorAll('.gloss-assistant-bubble pre')).some(e=>e.innerText.trim().length>0)"), timeout=180, label="actual streamed model tokens before cancellation")
@@ -819,10 +849,11 @@ class IntegratedWorkflow:
         # replacement prompt so completion rather than a second cancel is proven.
         self.ui.click_ref(self.ui.find_visible('button[title="Edit and rerun"]', last=True))
         self.ui.fill('textarea[aria-label="Chat message"]', "Reply with exactly RETRY_GLOSS. /no_think")
-        previous = self.answer_id()
+        previous = self.jump_to_latest()["id"]
         self.ui.click('button[aria-label="Rerun edited message"]')
-        self.ui.wait(lambda: self.answer_id() and self.answer_id() != previous and not self.ui.find_visible('button[aria-label="Stop generation"]'), timeout=180, label="explicit edit-and-rerun complete")
-        self.check("RETRY_GLOSS" in self.last_answer(), "explicit retry produced a completed model response")
+        self.jump_to_latest()
+        retry_answer = self.wait_for_answer(previous, "explicit edit-and-rerun complete")
+        self.check("RETRY_GLOSS" in retry_answer["text"], "explicit retry produced a completed model response")
         self.evidence(0, 0, False)
         self.record(self.case_id, "Observed real streamed tokens, stopped through the UI, saw the explicit cancellation alert without a new completed answer, restarted and verified the prior saved answer, then used Edit and rerun for a successful explicit retry.")
 

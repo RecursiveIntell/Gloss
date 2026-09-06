@@ -59,6 +59,9 @@ interface ChatStore {
   setResponseLength: (length: string) => void;
 }
 
+// A newer read, send, or context change supersedes an outstanding history read.
+let hydrationEpoch = 0;
+
 export const useChatStore = create<ChatStore>((set, get) => ({
   conversations: [],
   activeConversationId: null,
@@ -124,21 +127,38 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     await get().loadConversations(notebookId);
   },
 
-  setActiveConversation: (id) => set({ activeConversationId: id }),
+  setActiveConversation: (id) => {
+    hydrationEpoch += 1;
+    set({ activeConversationId: id });
+  },
 
   loadMessages: async (notebookId, conversationId) => {
-    set({ activeConversationId: conversationId });
+    get().setActiveConversation(conversationId);
     await get().rehydrateConversation(notebookId, conversationId);
   },
 
   rehydrateConversation: async (notebookId, conversationId) => {
+    if (useNotebookStore.getState().activeNotebookId !== notebookId ||
+        get().activeConversationId !== conversationId) return;
+    const requestEpoch = ++hydrationEpoch;
     try {
       const messages = await api.loadMessages(notebookId, conversationId);
+      if (requestEpoch !== hydrationEpoch) return;
       if (useNotebookStore.getState().activeNotebookId !== notebookId) {
         return;
       }
       if (get().activeConversationId !== conversationId) {
         return;
+      }
+      // A focus/replay read can precede backend acceptance of the visible
+      // optimistic user. Keep that active turn until a complete snapshot or
+      // terminal refresh is available; never merge guessed database rows.
+      const current = get();
+      if (current.isStreaming && current.streamingNotebookId === notebookId) {
+        const savedIds = new Set(messages.map((message) => message.id));
+        if (current.messages.some((message) => message.role === 'user' &&
+            message.conversation_id === conversationId &&
+            !savedIds.has(message.id))) return;
       }
       set({ messages });
     } catch (e) {
@@ -192,6 +212,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   sendMessage: async (notebookId, query, sourceScope, model, historyBeforeUserMessageId) => {
     if (get().isStreaming || useNotebookStore.getState().activeNotebookId !== notebookId) return;
+    hydrationEpoch += 1;
     const assistantMessageId = crypto.randomUUID();
     const ownsRequest = () => get().streamingMessageId === assistantMessageId;
     // Reserve the single frontend stream before any asynchronous conversation creation.
@@ -254,6 +275,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         streamingMessageId: null, streamingStatus: null,
         pendingMessageIds: {}, pendingEvidence: {},
       }));
+      // Starting this send superseded earlier reads. A rejected IPC has no
+      // terminal event to replace them, so recover canonical history without
+      // delaying the caller's error/draft handling or touching a newer owner.
+      const current = get();
+      if (userMsg && !current.isStreaming && !current.streamingMessageId &&
+          useNotebookStore.getState().activeNotebookId === notebookId &&
+          current.activeConversationId === userMsg.conversation_id) {
+        void current.rehydrateConversation(notebookId, userMsg.conversation_id);
+      }
     }
   },
 
@@ -458,6 +488,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   resetForNotebookSwitch: () => {
+    hydrationEpoch += 1;
     const current = get();
     set({
       conversations: [],

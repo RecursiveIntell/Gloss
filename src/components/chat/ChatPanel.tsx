@@ -1,10 +1,10 @@
-import { memo, useContext, useState, useEffect, useMemo, createContext } from "react";
+import { memo, useContext, useState, useEffect, useMemo, useRef, createContext } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useNoteStore } from "../../stores/noteStore";
 import { useNotebookStore } from "../../stores/notebookStore";
-import { Virtuoso } from "react-virtuoso";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { SourceViewerModal } from "../sources/SourceViewerModal";
 import {
   Send,
@@ -97,6 +97,54 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
+  const listRef = useRef<VirtuosoHandle>(null);
+  const navigationIntent = useRef<{
+    notebookId: string; conversationId: string | null; activation: number;
+    assistantId: string; previousIds: Set<string>;
+  } | null>(null);
+  const [bottomState, setBottomState] = useState({ notebookId, conversationId: activeConversationId, atBottom: false });
+  const atBottom = messages.length === 0 ||
+    (bottomState.notebookId === notebookId && bottomState.conversationId === activeConversationId && bottomState.atBottom);
+  const jumpToLatest = () => listRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
+
+  useEffect(() => {
+    const intent = navigationIntent.current;
+    if (!intent) return;
+    const notebook = useNotebookStore.getState();
+    const chat = useChatStore.getState();
+    if (intent.notebookId !== notebookId || notebook.activeNotebookId !== notebookId ||
+        notebook.activationRequestId !== intent.activation || streamingError ||
+        (intent.conversationId !== null && intent.conversationId !== activeConversationId) ||
+        (chat.streamingMessageId && chat.streamingMessageId !== intent.assistantId)) {
+      navigationIntent.current = null;
+      return;
+    }
+    if (!activeConversationId || !listRef.current) return;
+    // A first send may create its own conversation before appending the user.
+    if (intent.conversationId === null && chat.streamingMessageId !== intent.assistantId) return;
+    if (!messages.some((message) => message.role === "user" &&
+        message.conversation_id === activeConversationId && !intent.previousIds.has(message.id))) return;
+    navigationIntent.current = null;
+    jumpToLatest();
+  }, [messages, notebookId, activeConversationId, streamingError]);
+
+  const sendWithNavigation = async (query: string, beforeUserId?: string) => {
+    const previousIds = new Set(useChatStore.getState().messages.map((message) => message.id));
+    const activation = useNotebookStore.getState().activationRequestId;
+    const sending = sendMessage(notebookId, query, getSourceScope(), activeModel, beforeUserId);
+    const chat = useChatStore.getState();
+    const intent = chat.streamingNotebookId === notebookId && chat.streamingMessageId
+      ? { notebookId, conversationId: activeConversationId, activation,
+          assistantId: chat.streamingMessageId, previousIds } : null;
+    navigationIntent.current = intent;
+    try {
+      await sending;
+    } finally {
+      if (useChatStore.getState().streamingError && navigationIntent.current === intent) {
+        navigationIntent.current = null;
+      }
+    }
+  };
 
   useEffect(() => {
     if (isStreaming) {
@@ -124,7 +172,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
     const restoreToken = {};
     const notebookActivation = useNotebookStore.getState().activationRequestId;
     setDraft({ ...emptyDraft, restoreToken });
-    await sendMessage(notebookId, query, getSourceScope(), activeModel, historyBeforeUserMessageId);
+    await sendWithNavigation(query, historyBeforeUserMessageId);
     if (useChatStore.getState().streamingError) {
       setDraft((current) => {
         const notebook = useNotebookStore.getState();
@@ -143,6 +191,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
 
   const handleDeleteConversation = async () => {
     if (!activeConversationId) return;
+    navigationIntent.current = null;
     setDraft(emptyDraft);
     await deleteConversation(notebookId, activeConversationId);
   };
@@ -158,6 +207,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   };
 
   const handleStop = async () => {
+    navigationIntent.current = null;
     await stopStreaming(notebookId);
   };
 
@@ -178,14 +228,14 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       .find((message) => message.role === "user");
     if (priorUser) {
       setDraft((current) => ({ ...current, restoreToken: null }));
-      await sendMessage(notebookId, priorUser.content, getSourceScope(), activeModel, priorUser.id);
+      await sendWithNavigation(priorUser.content, priorUser.id);
     }
   };
 
   const handleContinue = async () => {
     if (isStreaming || selectionPending) return;
     setDraft((current) => ({ ...current, restoreToken: null }));
-    await sendMessage(notebookId, "Continue from the previous partial answer.", getSourceScope(), activeModel);
+    await sendWithNavigation("Continue from the previous partial answer.");
   };
 
   const handleEditUserMessage = (message: Message) => {
@@ -251,6 +301,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <button
             onClick={() => {
+              navigationIntent.current = null;
               setDraft(emptyDraft);
               return createConversation(notebookId);
             }}
@@ -267,6 +318,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
               onChange={(e) => {
                 const id = e.target.value;
                 if (id) {
+                  navigationIntent.current = null;
                   setDraft(emptyDraft);
                   setActiveConversation(id);
                   loadMessages(notebookId, id);
@@ -425,7 +477,25 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       </div>
 
       {/* Messages */}
-      <div className="gloss-chat-scroll min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+      <div className="flex h-7 shrink-0 justify-end px-5">
+        {!atBottom && messages.length > 0 && (
+          <button type="button" aria-label="Jump to latest" onClick={jumpToLatest}
+            className="rounded px-2 text-xs text-accent hover:bg-bg-secondary">
+            Jump to latest
+          </button>
+        )}
+      </div>
+      <div role="region" aria-label="Chat messages" data-chat-at-bottom={atBottom}
+        data-chat-latest-message-id={messages[messages.length - 1]?.id}
+        onPointerDownCapture={() => { navigationIntent.current = null; }}
+        onWheelCapture={() => { navigationIntent.current = null; }}
+        onTouchMoveCapture={() => { navigationIntent.current = null; }}
+        onKeyDownCapture={(event) => {
+          if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) {
+            navigationIntent.current = null;
+          }
+        }}
+        className="gloss-chat-scroll min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
         {messages.length === 0 && !isStreaming && (
           <div className="mt-12 w-full text-center">
             <MessageSquare className="mx-auto mb-3 h-10 w-10 text-text-muted" />
@@ -480,7 +550,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           )}
         >
           <Virtuoso
+            key={`${notebookId}:${activeConversationId ?? "new"}`}
+            ref={listRef}
             data={messages}
+            computeItemKey={(_index, message) => message.id}
+            atBottomStateChange={(value) => setBottomState({ notebookId, conversationId: activeConversationId, atBottom: value })}
             followOutput="auto"
             initialTopMostItemIndex={Math.max(messages.length - 1, 0)}
             itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} />}
@@ -644,6 +718,8 @@ const MessageRow = memo(function MessageRow({
   return (
     <div className={`flex w-full ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
       <div
+        data-chat-message-id={msg.id}
+        data-chat-message-role={msg.role}
         className={`max-w-[82%] px-3 py-2 text-sm ${
           msg.role === "user"
             ? "gloss-user-bubble text-white"

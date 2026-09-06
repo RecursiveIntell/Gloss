@@ -37,6 +37,14 @@ interface ChatPanelProps {
 type ChatStoreState = ReturnType<typeof useChatStore.getState>;
 type SettingsStoreState = ReturnType<typeof useSettingsStore.getState>;
 
+interface ChatListContext { streamingContent: string }
+
+function ChatStreamingFooter({ context }: { context?: ChatListContext }) {
+  return context?.streamingContent ? <StreamingMessage content={context.streamingContent} /> : null;
+}
+
+const CHAT_LIST_COMPONENTS = { Footer: ChatStreamingFooter };
+
 export function ChatPanel({ notebookId }: ChatPanelProps) {
   const conversations = useChatStore((s: ChatStoreState) => s.conversations);
   const activeConversationId = useChatStore((s: ChatStoreState) => s.activeConversationId);
@@ -96,16 +104,40 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
-  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
   const listRef = useRef<VirtuosoHandle>(null);
   const navigationIntent = useRef<{
     notebookId: string; conversationId: string | null; activation: number;
     assistantId: string; previousIds: Set<string>;
   } | null>(null);
+  const followingLatest = useRef<{
+    notebookId: string; conversationId: string | null; activation: number;
+  } | null>(null);
   const [bottomState, setBottomState] = useState({ notebookId, conversationId: activeConversationId, atBottom: false });
   const atBottom = messages.length === 0 ||
     (bottomState.notebookId === notebookId && bottomState.conversationId === activeConversationId && bottomState.atBottom);
-  const jumpToLatest = () => listRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
+  const scrollToLatest = () => listRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
+  const cancelNavigation = () => {
+    navigationIntent.current = null;
+    followingLatest.current = null;
+  };
+  const jumpToLatest = () => {
+    const notebook = useNotebookStore.getState();
+    if (notebook.activeNotebookId !== notebookId ||
+        useChatStore.getState().activeConversationId !== activeConversationId) return;
+    followingLatest.current = { notebookId, conversationId: activeConversationId, activation: notebook.activationRequestId };
+    scrollToLatest();
+  };
+  const followMeasuredHeight = () => {
+    const intent = followingLatest.current;
+    const notebook = useNotebookStore.getState();
+    if (!intent || intent.notebookId !== notebookId || intent.conversationId !== activeConversationId ||
+        notebook.activeNotebookId !== notebookId || notebook.activationRequestId !== intent.activation ||
+        useChatStore.getState().activeConversationId !== activeConversationId ||
+        useChatStore.getState().streamingError) return;
+    // Tokens change footer height without changing item count. Preserve the
+    // explicit follow intent through measured growth and terminal hydration.
+    scrollToLatest();
+  };
 
   useEffect(() => {
     const intent = navigationIntent.current;
@@ -129,6 +161,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   }, [messages, notebookId, activeConversationId, streamingError]);
 
   const sendWithNavigation = async (query: string, beforeUserId?: string) => {
+    followingLatest.current = null;
     const previousIds = new Set(useChatStore.getState().messages.map((message) => message.id));
     const activation = useNotebookStore.getState().activationRequestId;
     const sending = sendMessage(notebookId, query, getSourceScope(), activeModel, beforeUserId);
@@ -141,18 +174,14 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       await sending;
     } finally {
       if (useChatStore.getState().streamingError && navigationIntent.current === intent) {
-        navigationIntent.current = null;
+        cancelNavigation();
       }
     }
   };
 
   useEffect(() => {
-    if (isStreaming) {
-      setStreamingMessageId("streaming");
-    } else {
-      setStreamingMessageId(null);
-    }
-  }, [isStreaming]);
+    if (streamingError) cancelNavigation();
+  }, [streamingError]);
 
   useEffect(() => {
     if (!activeConversationId) return;
@@ -191,7 +220,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
 
   const handleDeleteConversation = async () => {
     if (!activeConversationId) return;
-    navigationIntent.current = null;
+    cancelNavigation();
     setDraft(emptyDraft);
     await deleteConversation(notebookId, activeConversationId);
   };
@@ -207,7 +236,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   };
 
   const handleStop = async () => {
-    navigationIntent.current = null;
+    cancelNavigation();
     await stopStreaming(notebookId);
   };
 
@@ -301,7 +330,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <button
             onClick={() => {
-              navigationIntent.current = null;
+              cancelNavigation();
               setDraft(emptyDraft);
               return createConversation(notebookId);
             }}
@@ -318,7 +347,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
               onChange={(e) => {
                 const id = e.target.value;
                 if (id) {
-                  navigationIntent.current = null;
+                  cancelNavigation();
                   setDraft(emptyDraft);
                   setActiveConversation(id);
                   loadMessages(notebookId, id);
@@ -487,12 +516,12 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       </div>
       <div role="region" aria-label="Chat messages" data-chat-at-bottom={atBottom}
         data-chat-latest-message-id={messages[messages.length - 1]?.id}
-        onPointerDownCapture={() => { navigationIntent.current = null; }}
-        onWheelCapture={() => { navigationIntent.current = null; }}
-        onTouchMoveCapture={() => { navigationIntent.current = null; }}
+        onPointerDownCapture={cancelNavigation}
+        onWheelCapture={cancelNavigation}
+        onTouchMoveCapture={cancelNavigation}
         onKeyDownCapture={(event) => {
           if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) {
-            navigationIntent.current = null;
+            cancelNavigation();
           }
         }}
         className="gloss-chat-scroll min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
@@ -553,17 +582,14 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             key={`${notebookId}:${activeConversationId ?? "new"}`}
             ref={listRef}
             data={messages}
+            context={{ streamingContent: isStreaming ? streamingContent : "" }}
             computeItemKey={(_index, message) => message.id}
             atBottomStateChange={(value) => setBottomState({ notebookId, conversationId: activeConversationId, atBottom: value })}
+            totalListHeightChanged={followMeasuredHeight}
             followOutput="auto"
             initialTopMostItemIndex={Math.max(messages.length - 1, 0)}
             itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} />}
-            components={{
-              Footer: () => {
-                if (!streamingMessageId || !streamingContent) return null;
-                return <StreamingMessage content={streamingContent} />;
-              },
-            }}
+            components={CHAT_LIST_COMPONENTS}
           />
         </MessageRowContext.Provider>
 

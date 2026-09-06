@@ -101,12 +101,63 @@ describe('chat latest-message navigation', () => {
     await send();
     render(); flush();
     expect(scroll).toHaveBeenCalledTimes(1);
+    find(render(), (props) => props['aria-label'] === 'Chat messages').props.onWheelCapture();
     list(render()).props.atBottomStateChange(false);
     fixture.chat.messages = [...fixture.chat.messages, { id: 'owned-answer', role: 'assistant', content: 'New answer' }];
     const tree = render(); flush();
     expect(scroll).toHaveBeenCalledTimes(1);
     expect(list(tree).props.followOutput).toBe('auto');
     expect(button(tree, 'Jump to latest')).toBeDefined();
+  });
+
+  it('keeps explicit latest intent across measured streaming-footer growth and completion', async () => {
+    await send();
+    render(); flush();
+    expect(scroll).toHaveBeenCalledTimes(1);
+    fixture.chat.streamingContent = 'New streamed answer';
+    let tree = render();
+    list(tree).props.atBottomStateChange(false);
+    list(tree).props.totalListHeightChanged(1200);
+    expect(scroll).toHaveBeenCalledTimes(2);
+    expect(find(render(), (props) => props['aria-label'] === 'Chat messages').props['data-chat-at-bottom']).toBe(false);
+    fixture.chat.isStreaming = false;
+    fixture.chat.messages = [...fixture.chat.messages, { id: 'owned-answer', role: 'assistant', content: 'New streamed answer', conversation_id: 'conv' }];
+    tree = render();
+    list(tree).props.totalListHeightChanged(1300);
+    expect(scroll).toHaveBeenCalledTimes(3);
+    find(tree, (props) => props['aria-label'] === 'Chat messages').props.onWheelCapture();
+    list(tree).props.totalListHeightChanged(1400);
+    expect(scroll).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not carry measured-height following into a different notebook activation', async () => {
+    await send();
+    render(); flush();
+    const oldList = list(render());
+    fixture.notebook.activationRequestId += 2;
+    oldList.props.totalListHeightChanged(1200);
+    expect(scroll).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['failure', 'conversation round trip'])('cancels measured-height following after %s', async (change) => {
+    await send();
+    render(); flush();
+    if (change === 'failure') fixture.chat.streamingError = 'Rejected';
+    else {
+      button(render(), 'Conversation').props.onChange({ target: { value: 'other' } });
+      button(render(), 'Conversation').props.onChange({ target: { value: 'conv' } });
+    }
+    list(render()).props.totalListHeightChanged(1200);
+    expect(scroll).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the streaming footer component identity stable as tokens change', () => {
+    fixture.chat.isStreaming = true;
+    fixture.chat.streamingContent = 'First';
+    const before = list(render()).props.components.Footer;
+    fixture.chat.streamingContent = 'First second';
+    const after = list(render()).props.components.Footer;
+    expect(after).toBe(before);
   });
 
   it.each(['conversation', 'notebook', 'failure', 'history', 'pointer history'])('drops pending navigation after %s changes', async (change) => {

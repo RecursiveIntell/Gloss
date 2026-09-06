@@ -710,8 +710,20 @@ return {at_end, id:button?.getAttribute('aria-controls') || null,
     def choose_source(self, title: str):
         self.sources()
         self.ui.click_text("None")
-        row = self.ui.execute("return Array.from(document.querySelectorAll('p[title]')).find(e=>e.title===arguments[0]).parentElement.parentElement", [title])
-        self.ui.click_ref(self.ui.execute("return arguments[0].querySelector('button')", [row]))
+        self.click_source_button(title, "button")
+
+    def click_source_button(self, title: str, selector: str):
+        # Opening the rail can return before Virtuoso mounts the source rows.
+        # Observe the exact visible action, then click once through WebDriver.
+        button = self.ui.wait(lambda: self.ui.execute("""const labels=Array.from(document.querySelectorAll('p[title]'))
+            .filter(e=>e.title===arguments[0] && e.getClientRects().length);
+            if(labels.length!==1) return null;
+            const row=labels[0].parentElement?.parentElement;
+            if(!row?.querySelector('button[title="Reindex for semantic-memory preview"]')) return null;
+            const button=row.querySelector(arguments[1]);
+            return button && !button.disabled && button.getClientRects().length ? button : null;""", [title, selector]),
+            label=f"visible source action {title}: {selector}")
+        self.ui.click_ref(button)
 
     def paste(self, title: str, content: str):
         self.sources()
@@ -903,8 +915,7 @@ return {at_end, id:button?.getAttribute('aria-controls') || null,
         self.embedding_settings(self.config["embedding_model"])
         self.close_settings()
         self.sources()
-        recovery = self.ui.execute("return Array.from(document.querySelectorAll('p[title]')).find(e=>e.title==='Recovery fixture').parentElement.parentElement")
-        self.ui.click_ref(self.ui.execute("return arguments[0].querySelector('button[title=\"Retry ingestion\"]')", [recovery]))
+        self.click_source_button("Recovery fixture", 'button[title="Retry ingestion"]')
         self.ui.wait(lambda: any(row["title"] == "Recovery fixture" and (row["status"] == "ready" or (row["status"] == "error" and row["error"] != original_error)) for row in self.source_rows()), timeout=180, label="explicit retry produced a new terminal source state")
         self.inspector("Health")
         self.ui.click_text("Rebuild dense index")

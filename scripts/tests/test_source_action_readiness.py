@@ -1,0 +1,83 @@
+"""Driver synchronization contracts; real native acceptance remains separate."""
+import json
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+from unittest.mock import Mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from live_desktop_smoke import IntegratedWorkflow
+
+
+class SourceActionReadinessTests(unittest.TestCase):
+    def workflow(self):
+        workflow = object.__new__(IntegratedWorkflow)
+        workflow.ui = Mock()
+        return workflow
+
+    def test_delayed_virtual_row_mount_precedes_the_single_native_click(self):
+        workflow = self.workflow()
+        workflow.ui.execute.side_effect = [None, None, 'ready-button']
+        def wait(condition, **kwargs):
+            for _ in range(3):
+                workflow.ui.click_ref.assert_not_called()
+                result = condition()
+                if result:
+                    return result
+            raise RuntimeError('source not ready')
+        workflow.ui.wait.side_effect = wait
+        workflow.click_source_button('Recovery fixture', 'button[title="Retry ingestion"]')
+        self.assertEqual(workflow.ui.execute.call_count, 3)
+        workflow.ui.click_ref.assert_called_once_with('ready-button')
+
+    def test_missing_source_times_out_without_clicking_any_other_row(self):
+        workflow = self.workflow()
+        workflow.ui.execute.return_value = None
+        def wait(condition, **kwargs):
+            self.assertIsNone(condition())
+            raise RuntimeError('visible source action timed out')
+        workflow.ui.wait.side_effect = wait
+        with self.assertRaisesRegex(RuntimeError, 'timed out'):
+            workflow.click_source_button('Recovery fixture', 'button[title="Retry ingestion"]')
+        workflow.ui.click_ref.assert_not_called()
+
+    def test_native_click_failure_is_not_retried(self):
+        workflow = self.workflow()
+        workflow.ui.wait.return_value = 'button'
+        workflow.ui.click_ref.side_effect = RuntimeError('intercepted click')
+        with self.assertRaisesRegex(RuntimeError, 'intercepted'):
+            workflow.click_source_button('Recovery fixture', 'button[title="Retry ingestion"]')
+        workflow.ui.click_ref.assert_called_once_with('button')
+
+    def test_readonly_query_rejects_absent_hidden_ambiguous_and_disabled_actions(self):
+        workflow = self.workflow()
+        workflow.ui.wait.side_effect = lambda condition, **kwargs: condition()
+        workflow.click_source_button('Recovery fixture', 'button[title="Retry ingestion"]')
+        script, args = workflow.ui.execute.call_args.args
+        program = r'''
+const fs=require('fs'); const input=JSON.parse(fs.readFileSync(0,'utf8'));
+let visible=true, disabled=false, actionVisible=true, marker=true;
+const button={id:'retry',get disabled(){return disabled},getClientRects:()=>actionVisible?[{}]:[]};
+const row={querySelector:s=>s.includes('Reindex')?(marker?{}:null):button};
+const label={title:'Recovery fixture',getClientRects:()=>visible?[{}]:[],parentElement:{parentElement:row}};
+let labels=[]; global.document={querySelectorAll:()=>labels};
+const run=()=>new Function(input.script)(...input.args);
+const missing=run(); labels=[label]; const ready=run()?.id;
+visible=false;const hidden=run();visible=true;
+labels=[label,label];const ambiguous=run();labels=[label];
+disabled=true;const blocked=run();disabled=false;
+actionVisible=false;const hiddenAction=run();actionVisible=true;
+marker=false;const wrongRow=run();
+process.stdout.write(JSON.stringify({missing,ready,hidden,ambiguous,blocked,hiddenAction,wrongRow}));
+'''
+        result = subprocess.run(['node', '-e', program], input=json.dumps({'script': script, 'args': args}),
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), {'missing': None, 'ready': 'retry', 'hidden': None,
+                         'ambiguous': None, 'blocked': None, 'hiddenAction': None, 'wrongRow': None})
+        for mutation in ['.click(', 'scrollTo', 'dispatchEvent', '__TAURI', '.value =']:
+            self.assertNotIn(mutation, script)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -118,3 +118,48 @@ describe('captured decoding evidence in the answer drawer', () => {
     expect(html).not.toContain('Provider default');
   });
 });
+
+describe('captured dense availability and stored inventory', () => {
+  function renderCoverage(available?: boolean): string {
+    const evidence = evidenceWith();
+    evidence.retrieval_outcome = {
+      mode: 'bm25_only', results: [], degraded: true,
+      engines: available === undefined ? [] : [{
+        engine: 'native_dense_hnsw', attempted: available, available,
+        contributed: false, candidate_count: 0, elapsed_ms: 0,
+        reason_code: available ? undefined : 'embedding_index_metadata_stale',
+      }],
+      coverage: {
+        selected_sources: 1, total_chunks: 1, fts_indexed_chunks: 1,
+        embedded_chunks: 1, missing_embeddings: 0, dense_coverage_ratio: 1,
+        semantic_links_total: 0, semantic_links_healthy: 0, semantic_links_degraded: 0,
+      },
+      fallback_chain: ['embedding_index_metadata_stale'],
+      user_visible_summary: 'BM25 with stale dense metadata', trace_ref: 'captured-trace',
+    };
+    return renderToStaticMarkup(createElement(EvidenceDrawer, { id: 'dense-evidence', evidence }));
+  }
+
+  function value(html: string, label: string): string | undefined {
+    return html.match(new RegExp(`${label}: </span><span[^>]*>([^<]*)</span>`))?.[1];
+  }
+
+  it('does not present stored stale embeddings as usable dense coverage', () => {
+    const html = renderCoverage(false);
+    expect(value(html, 'Dense coverage')).toBe('Unavailable');
+    expect(value(html, 'Stored embeddings')).toBe('1/1 chunks');
+    expect(html).toContain('embedding_index_metadata_stale');
+  });
+
+  it('shows captured coverage when the dense engine is available', () => {
+    const html = renderCoverage(true);
+    expect(value(html, 'Dense coverage')).toBe('100% (1/1)');
+    expect(value(html, 'Stored embeddings')).toBe('1/1 chunks');
+  });
+
+  it('does not invent readiness for historical receipts without the engine', () => {
+    const html = renderCoverage();
+    expect(value(html, 'Dense coverage')).toBe('Not recorded');
+    expect(value(html, 'Stored embeddings')).toBe('1/1 chunks');
+  });
+});

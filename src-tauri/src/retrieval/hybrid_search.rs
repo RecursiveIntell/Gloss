@@ -1196,6 +1196,10 @@ mod tests {
             .find(|engine| engine.engine == "native_dense_hnsw")
             .unwrap();
         assert!(!dense.attempted);
+        assert!(!dense.available);
+        // Coverage is stored inventory, not proof that those vectors are usable.
+        assert_eq!(outcome.coverage.embedded_chunks, 1);
+        assert_eq!(outcome.coverage.dense_coverage_ratio, 1.0);
         assert_eq!(
             dense.reason_code,
             Some(RetrievalReasonCode::EmbeddingIndexMetadataStale)

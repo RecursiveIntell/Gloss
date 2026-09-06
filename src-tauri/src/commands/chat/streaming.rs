@@ -1188,6 +1188,12 @@ mod tests {
             ]
         );
         assert_eq!(result.prompt_receipt.user_turn_digest, digest_text(query));
+        assert!(result
+            .prompt_receipt
+            .system_prompt_text
+            .as_deref()
+            .unwrap()
+            .contains("Answer the latest user message."));
         assert_eq!(saved.len(), 4);
         assert_eq!(saved[2].content, "Write 100 ocean facts");
     }

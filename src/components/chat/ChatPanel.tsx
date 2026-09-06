@@ -862,6 +862,7 @@ function StreamingMessage({ content }: { content: string }) {
 
 
 export function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDisclosure }) {
+  const denseEngine = evidence.retrieval_outcome?.engines.find((engine) => engine.engine === "native_dense_hnsw");
   const degraded = evidence.fallback_used || evidence.degradation_markers.length > 0 || evidence.citation_invalid_count > 0;
   return (
     <div id={id} role="region" aria-label="Answer evidence" className="mt-2 rounded border border-border/70 bg-bg-secondary p-2 text-[10px] text-text-secondary">
@@ -929,7 +930,13 @@ export function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvi
             <EvidenceRow label="Retrieval mode" value={evidence.retrieval_outcome.mode} />
             <EvidenceRow
               label="Dense coverage"
-              value={`${Math.round(evidence.retrieval_outcome.coverage.dense_coverage_ratio * 100)}% (${evidence.retrieval_outcome.coverage.embedded_chunks}/${evidence.retrieval_outcome.coverage.total_chunks})`}
+              value={denseEngine?.available
+                ? `${Math.round(evidence.retrieval_outcome.coverage.dense_coverage_ratio * 100)}% (${evidence.retrieval_outcome.coverage.embedded_chunks}/${evidence.retrieval_outcome.coverage.total_chunks})`
+                : denseEngine ? "Unavailable" : "Not recorded"}
+            />
+            <EvidenceRow
+              label="Stored embeddings"
+              value={`${evidence.retrieval_outcome.coverage.embedded_chunks}/${evidence.retrieval_outcome.coverage.total_chunks} chunks`}
             />
             <EvidenceRow
               label="Engines"

@@ -120,4 +120,21 @@ describe('health polling owns exact provider identity', () => {
     expect(useHealthStore.getState().chatConnected).toBe(true);
     expect(useHealthStore.getState().backgroundConnected).toBe(true);
   });
+
+  it('rejects an old endpoint result after settings restart health for the same provider', async () => {
+    const oldEndpoint = deferred<boolean>();
+    vi.mocked(api.getQueueStatus).mockResolvedValue(queue('chat'));
+    vi.mocked(api.testProvider).mockReturnValueOnce(oldEndpoint.promise).mockResolvedValue(true);
+    useHealthStore.getState().startPolling('nb', 'chat');
+    const prior = useHealthStore.getState().poll();
+    useHealthStore.getState().stopPolling();
+    useHealthStore.getState().startPolling('nb', 'chat');
+    expect(useHealthStore.getState().chatConnected).toBeNull();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useHealthStore.getState().chatConnected).toBe(true);
+    oldEndpoint.resolve(false);
+    await prior;
+    expect(useHealthStore.getState().chatConnected).toBe(true);
+    expect(vi.getTimerCount()).toBe(1);
+  });
 });

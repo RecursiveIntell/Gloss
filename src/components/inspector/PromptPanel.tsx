@@ -122,7 +122,7 @@ export function PromptPanel() {
         <Section title="Generation Receipt">
           <KVRow label="Provider" value={generationReceipt.provider} />
           <KVRow label="Model" value={generationReceipt.model} />
-          <KVRow label="Status" value={generationReceipt.status} warn={generationReceipt.status !== "complete"} />
+          <KVRow label="Status" value={generationReceipt.status} warn={generationReceipt.status !== "completed" || !!generationReceipt.error} />
           {generationReceipt.error && (
             <div className="flex items-start gap-1 rounded bg-error/10 px-2 py-1 text-error">
               <XCircle className="w-3 h-3 shrink-0 mt-0.5" />

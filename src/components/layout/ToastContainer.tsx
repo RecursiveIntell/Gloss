@@ -28,11 +28,12 @@ function ToastItem({ toast }: { toast: Toast }) {
       {iconMap[toast.type]}
       <div className="flex-1 min-w-0">
         <p className="text-xs font-medium text-text">{toast.title}</p>
-        <p className="text-xs text-text-secondary truncate">{toast.message}</p>
+        <p className="text-xs text-text-secondary break-words">{toast.message}</p>
       </div>
       <button
         onClick={() => removeToast(toast.id)}
-        className="text-text-muted hover:text-text shrink-0"
+        aria-label={`Dismiss ${toast.title}`}
+        className="pointer-events-auto flex h-6 w-6 items-center justify-center rounded text-text-muted hover:text-text shrink-0 focus-visible:outline focus-visible:outline-accent"
       >
         <X className="w-3.5 h-3.5" />
       </button>
@@ -46,7 +47,7 @@ export function ToastContainer() {
   if (toasts.length === 0) return null;
 
   return (
-    <div className="fixed bottom-10 right-4 z-50 flex flex-col gap-2">
+    <div className="pointer-events-none fixed top-14 right-4 z-50 flex max-w-[calc(100vw-2rem)] flex-col gap-2">
       {toasts.map((t) => (
         <ToastItem key={t.id} toast={t} />
       ))}

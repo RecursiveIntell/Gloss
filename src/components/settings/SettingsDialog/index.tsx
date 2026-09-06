@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type React from "react";
+import { ChatTemperatureControl } from "./ChatTemperatureControl";
 import { useSettingsStore } from "../../../stores/settingsStore";
 import { useToastStore } from "../../../stores/toastStore";
 import { useNotebookStore } from "../../../stores/notebookStore";
@@ -903,6 +904,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
           </SettingsSection>
 
           <SettingsSection title="Chat" icon={<Settings2 className="h-4 w-4" />}>
+            <ChatTemperatureControl providerId={activeProviderId} />
             <div className="grid gap-2 sm:grid-cols-2">
               <HealthCard
                 title="Provider"

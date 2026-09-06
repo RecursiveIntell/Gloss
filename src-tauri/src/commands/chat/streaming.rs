@@ -162,8 +162,8 @@ pub(crate) async fn stream_chat_response<R: tauri::Runtime>(
         message_id: message_id.to_string(),
         prompt_digest: request_digest.clone(),
         context_payload_digest,
-        capture_state: "captured_digest_only".to_string(),
-        redaction_state: "content_not_stored_in_receipt".to_string(),
+        capture_state: "captured_system_prompt".to_string(),
+        redaction_state: "system_prompt_stored_other_content_digest_only".to_string(),
         system_prompt_digest: digest_text(&system_prompt),
         system_prompt_text: Some(system_prompt.clone()),
         user_turn_digest,
@@ -893,6 +893,27 @@ mod tests {
         Vec<ChatStreamEventV1>,
         ChatAttemptTraceV1,
     ) {
+        // Only the phase under test gets a short deadline. A one-millisecond
+        // provider-start budget can expire during synchronous trace writes
+        // before an immediate provider is polled, masking later-phase cases.
+        let mut timeouts = crate::providers::LlmPhaseTimeouts {
+            provider_start: Duration::from_secs(5),
+            first_token: Duration::from_secs(5),
+            stream_idle: Duration::from_secs(5),
+        };
+        match &mode {
+            ScriptedFailureMode::ProviderStartNeverReturns => {
+                timeouts.provider_start = Duration::from_millis(1);
+            }
+            ScriptedFailureMode::FirstTokenNeverArrives => {
+                timeouts.first_token = Duration::from_millis(1);
+            }
+            ScriptedFailureMode::IdleAfterFirstToken => {
+                timeouts.stream_idle = Duration::from_millis(1);
+            }
+            ScriptedFailureMode::ProviderReturnsError | ScriptedFailureMode::CancelDuringStream => {
+            }
+        }
         let data_dir = tempdir().expect("temporary state directory");
         let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
         state.set_active_notebook(Some("notebook-1".to_string()), Some(7));
@@ -926,14 +947,7 @@ mod tests {
             None,
             &trace,
             data_dir.path(),
-            LlmExecutionContext::new(
-                cancellation,
-                crate::providers::LlmPhaseTimeouts {
-                    provider_start: Duration::from_millis(1),
-                    first_token: Duration::from_millis(1),
-                    stream_idle: Duration::from_millis(1),
-                },
-            ),
+            LlmExecutionContext::new(cancellation, timeouts),
         )
         .await;
         let events =
@@ -1039,6 +1053,21 @@ mod tests {
         .expect("done frame must complete without waiting for EOF");
 
         assert_eq!(result.full_response, "hello world");
+        assert_eq!(result.generation_receipt.status, "completed");
+        assert_eq!(
+            result.prompt_receipt.capture_state,
+            "captured_system_prompt"
+        );
+        assert_eq!(
+            result.prompt_receipt.redaction_state,
+            "system_prompt_stored_other_content_digest_only"
+        );
+        let captured_prompt = result.prompt_receipt.system_prompt_text.as_ref().unwrap();
+        assert!(!captured_prompt.is_empty());
+        assert_eq!(
+            result.prompt_receipt.system_prompt_digest,
+            digest_text(captured_prompt)
+        );
         assert!(result.generation_receipt.done_frame_seen);
         assert!(!result.generation_receipt.eof_seen);
         assert_eq!(
@@ -1049,6 +1078,124 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    struct HistoryCapturingProvider {
+        captured: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for HistoryCapturingProvider {
+        async fn list_models(&self) -> Result<Vec<crate::providers::ModelInfo>, GlossError> {
+            Ok(Vec::new())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            context: LlmExecutionContext,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatToken, GlossError>> + Send>>,
+            GlossError,
+        > {
+            *self.captured.lock().unwrap() = request
+                .messages
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect();
+            ScriptedDoneProvider.chat(request, context).await
+        }
+
+        async fn health_check(&self) -> Result<bool, GlossError> {
+            Ok(true)
+        }
+
+        fn provider_type(&self) -> crate::providers::ProviderType {
+            crate::providers::ProviderType::Ollama
+        }
+    }
+
+    #[tokio::test]
+    async fn edited_turn_sends_retained_history_then_replacement_query_exactly_once() {
+        let data_dir = tempdir().unwrap();
+        let state = AppState::initialize_for_test(data_dir.path()).unwrap();
+        state.set_active_notebook(Some("notebook-1".to_string()), Some(7));
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
+            "notebook-1",
+            "conversation-1",
+            "message-1",
+            "scripted-model",
+            None,
+            None,
+            Some("none".to_string()),
+        )));
+        let make_message = |id: &str, role: &str, content: &str| Message {
+            id: id.to_string(),
+            conversation_id: "conversation-1".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            citations: None,
+            model_used: None,
+            tokens_prompt: None,
+            tokens_response: None,
+            created_at: String::new(),
+        };
+        let saved = vec![
+            make_message("greeting", "user", "HELLO_GLOSS"),
+            make_message("answer", "assistant", "HELLO_GLOSS"),
+            make_message("cancelled", "user", "Write 100 ocean facts"),
+            make_message("later", "user", "Later question"),
+        ];
+        let history =
+            super::super::history_before_rerun(saved.clone(), "conversation-1", Some("cancelled"))
+                .unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = HistoryCapturingProvider {
+            captured: Arc::clone(&captured),
+        };
+        let query = "Reply with exactly RETRY_GLOSS. /no_think";
+        let scope = SourceScope::Explicit(Vec::new()).resolve(&[]);
+        let result = stream_chat_response(
+            app.handle(),
+            &provider,
+            "notebook-1",
+            7,
+            "conversation-1",
+            "message-1",
+            query,
+            "scripted-model",
+            &history,
+            None,
+            "balanced",
+            "normal",
+            &scope,
+            &[],
+            None,
+            &trace,
+            data_dir.path(),
+            LlmExecutionContext::uncancellable(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![
+                ("user".to_string(), "HELLO_GLOSS".to_string()),
+                ("assistant".to_string(), "HELLO_GLOSS".to_string()),
+                ("user".to_string(), query.to_string()),
+            ]
+        );
+        assert_eq!(result.prompt_receipt.user_turn_digest, digest_text(query));
+        assert!(result
+            .prompt_receipt
+            .system_prompt_text
+            .as_deref()
+            .unwrap()
+            .contains("Answer the latest user message."));
+        assert_eq!(saved.len(), 4);
+        assert_eq!(saved[2].content, "Write 100 ocean facts");
     }
 
     #[tokio::test]

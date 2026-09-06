@@ -55,7 +55,7 @@ main/master pushes and manual workflow dispatch. It uses an isolated D-Bus sessi
 and Xvfb, installs the native WebKit driver, then runs:
 
 ```bash
-dbus-run-session -- xvfb-run -a python3 scripts/live_desktop_smoke.py \
+xvfb-run -a dbus-run-session -- python3 scripts/live_desktop_smoke.py \
   --repo . --require-baseline --output .codex-run-receipts/desktop-baseline
 ```
 
@@ -78,7 +78,7 @@ installed chat/embedding model names and complete model digests, and keeps that
 runtime alive while the UI runs:
 
 ```bash
-dbus-run-session -- xvfb-run -a python3 scripts/live_ollama_canary.py \
+xvfb-run -a dbus-run-session -- python3 scripts/live_ollama_canary.py \
   --repo . --desktop --output .codex-run-receipts/ollama-desktop
 ```
 
@@ -99,7 +99,7 @@ the parent runtime/model snapshot.
 | `chat_no_retrieval` | Save Ollama settings with Apply; real response with zero context. |
 | `chat_persistence_restart` | Restart and reopen the observed Conversation dropdown option; identical saved answer. |
 | `model_dropdown_and_prompt` | Installed model selection persists; captured full prompt identifies provider/model. |
-| `chat_cancel_and_retry` | Observe streamed tokens, Stop, inspect cancelled receipt, Edit and rerun successfully. |
+| `chat_cancel_and_retry` | Observe streamed tokens, Stop, explicit cancellation alert with no new completed answer; restart preserves prior saved answer; Edit and rerun succeeds. |
 | `folder_import_scope` | Native chooser imports only two nested fixture files; outside-directory symlink remains absent. |
 | `citation_evidence` | Select Atlas alone; exact fixture fact, preserved scope, valid citation and actual source viewer. |
 | `retrieval_backend_and_degradation` | Missing embedding model causes visible failure and disclosed BM25 degradation; restore model, Retry ingestion, Rebuild dense index, observe 100% coverage. |

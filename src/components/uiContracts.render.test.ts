@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { ChatPanel } from './chat/ChatPanel';
 import { NotesPanel } from './notes/NotesPanel';
 import { PromptPanel } from './inspector/PromptPanel';
+import { ReceiptPanel } from './inspector/ReceiptPanel';
 
 // Real components and React server rendering, with explicit store fixtures.
 // Virtual layout requires a browser, so only the virtualizer is replaced by a
@@ -71,5 +72,48 @@ describe('rendered UI trust contracts', () => {
     } } }];
     const markup = renderToStaticMarkup(createElement(PromptPanel));
     expect(markup).toContain('System prompt text was not captured for this response.');
+  });
+
+  it.each([
+    ['completed', undefined, 'text-success', 'text-text-secondary'],
+    ['completed', 'Persistence error', 'text-error', 'text-warning'],
+    ['cancelled', undefined, 'text-error', 'text-warning'],
+  ])('renders canonical generation status %s with error %s honestly', (status, error, receiptTone, promptTone) => {
+    fixture.chat.messages = [{ id: 'answer', role: 'assistant', citations: { evidence: {
+      receipt_id: 'evidence-id', context_passage_count: 0, context_digest: '', source_context_digest: '',
+      generation_receipt: {
+        schema: 'GenerationReceiptV1', receipt_id: 'generation-id', status, error,
+        provider: 'ollama', model: 'fixture-model', prompt_receipt_id: 'prompt-id',
+        decoding_settings_receipt_id: 'decoding-id', provider_request_digest: 'request-digest',
+        partial_persisted: true, done_frame_seen: true, eof_seen: false, chunks_seen: 1,
+      },
+    } } }];
+    const receipt = renderToStaticMarkup(createElement(ReceiptPanel));
+    const prompt = renderToStaticMarkup(createElement(PromptPanel));
+    expect(receipt).toContain(`<span class="${receiptTone}">${status}</span>`);
+    expect(prompt).toContain(`<span class="break-words  ${promptTone}">${status}</span>`);
+    expect(receipt).toContain('Showing the latest saved assistant response.');
+  });
+
+  it('shows missing generation evidence as unknown instead of a failed generation', () => {
+    fixture.chat.messages = [{ id: 'answer', role: 'assistant', citations: { evidence: {
+      receipt_id: 'evidence-id', context_passage_count: 0, context_digest: '', source_context_digest: '',
+    } } }];
+    const receipt = renderToStaticMarkup(createElement(ReceiptPanel));
+    expect(receipt).toContain('<span class="text-warning">unknown</span>');
+    expect(receipt).not.toContain('<span class="text-error">unknown</span>');
+  });
+
+  it('does not show an older receipt as the latest assistant response', () => {
+    fixture.chat.messages = [
+      { id: 'older', role: 'assistant', citations: { evidence: {
+        receipt_id: 'old-evidence', context_digest: '', source_context_digest: '',
+      } } },
+      { id: 'latest', role: 'assistant', content: 'No receipt was captured' },
+    ];
+    const receipt = renderToStaticMarkup(createElement(ReceiptPanel));
+    expect(receipt).toContain('No receipts available yet.');
+    expect(receipt).not.toContain('old-evidence');
+    expect(receipt).not.toContain('Generation Status');
   });
 });

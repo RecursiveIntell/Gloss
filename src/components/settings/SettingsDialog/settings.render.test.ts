@@ -36,4 +36,32 @@ describe('settings rendered controls', () => {
     expect(html).toContain('Gloss uses exactly the selected embedding backend');
     expect(html).not.toContain('Gloss automatically falls back');
   });
+
+  it('renders the default Chat temperature and explicit Apply control in the dialog', () => {
+    const html = renderToStaticMarkup(createElement(SettingsDialog, { open: true, onClose: vi.fn() }));
+    const input = html.match(/<input[^>]*aria-label="Chat temperature"[^>]*>/)?.[0];
+    expect(input).toContain('type="number"');
+    expect(input).toContain('min="0"');
+    expect(input).toContain('max="2"');
+    expect(input).toContain('value="0.7"');
+    expect(input).not.toContain('disabled=');
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Apply chat temperature<\/button>/);
+    expect(html).toContain('Default temperature');
+  });
+
+  it('shows a persisted zero after reopening Settings', () => {
+    fixture.settings.settings = { default_provider: 'ollama', generation_temperature: '0' };
+    const html = renderToStaticMarkup(createElement(SettingsDialog, { open: true, onClose: vi.fn() }));
+    expect(html.match(/<input[^>]*aria-label="Chat temperature"[^>]*>/)?.[0]).toContain('value="0"');
+    expect(html).toContain('Saved temperature');
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Apply chat temperature<\/button>/);
+  });
+
+  it('disables Anthropic temperature without claiming the saved preference is applied', () => {
+    fixture.settings.settings = { default_provider: 'anthropic', generation_temperature: '0' };
+    const html = renderToStaticMarkup(createElement(SettingsDialog, { open: true, onClose: vi.fn() }));
+    expect(html.match(/<input[^>]*aria-label="Chat temperature"[^>]*>/)?.[0]).toContain('disabled=""');
+    expect(html).toContain('Anthropic uses provider-managed temperature. This setting is not applied to Anthropic replies.');
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Apply chat temperature<\/button>/);
+  });
 });

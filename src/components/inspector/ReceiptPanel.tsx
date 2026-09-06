@@ -13,11 +13,11 @@ export function ReceiptPanel() {
   const isStreaming = useChatStore((s) => s.isStreaming);
   const streamingContent = useChatStore((s) => s.streamingContent);
 
-  const lastAssistantWithEvidence = [...messages]
+  const lastAssistant = [...messages]
     .reverse()
-    .find((m) => m.role === "assistant" && m.citations?.evidence);
+    .find((m) => m.role === "assistant");
 
-  const evidence = lastAssistantWithEvidence?.citations?.evidence;
+  const evidence = lastAssistant?.citations?.evidence;
   const promptReceipt: PromptReceiptV1 | undefined = evidence?.prompt_receipt ?? undefined;
   const decodingReceipt: DecodingSettingsReceiptV1 | undefined = evidence?.decoding_settings_receipt ?? undefined;
   const generationReceipt: GenerationReceiptV1 | undefined = evidence?.generation_receipt ?? undefined;
@@ -40,11 +40,14 @@ export function ReceiptPanel() {
     );
   }
 
-  const generationOk = generationReceipt?.status === "complete" && !generationReceipt?.error;
-  const generationFailed = generationReceipt?.status !== "complete" || !!generationReceipt?.error;
+  const generationOk = generationReceipt?.status === "completed" && !generationReceipt?.error;
+  const generationFailed = !!generationReceipt && !generationOk;
 
   return (
     <div className="p-3 space-y-3 text-xs overflow-y-auto h-full">
+      <div role="status" className="text-text-muted">
+        {isStreaming ? "Showing the previous saved response; the current receipt is not yet available." : "Showing the latest saved assistant response."}
+      </div>
       {/* Status Overview */}
       <div className="rounded border border-border p-2 space-y-1">
         <div className="font-medium text-text">Generation Status</div>

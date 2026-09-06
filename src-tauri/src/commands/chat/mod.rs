@@ -32,6 +32,7 @@ use tauri_queue::QueueManager;
 
 mod emit;
 mod gates;
+mod history;
 pub(crate) mod receipts;
 mod streaming;
 mod types;
@@ -40,6 +41,7 @@ mod types;
 // functions that remain in this file.
 use emit::{emit_chat_error, emit_chat_evidence, emit_chat_status, ChatTerminalEmitter};
 use gates::acquire_gate_with_epoch;
+use history::{history_before_rerun, resolve_user_message_id};
 use receipts::{chat_attempt_trace_snapshot, new_chat_attempt_trace, record_chat_attempt_trace};
 
 // Pull in types from the types submodule.
@@ -64,6 +66,61 @@ const MAX_CONTEXT_WINDOW_TOKENS: u32 = 32_768;
 /// Total character budget for retrieved passages injected into the user turn.
 /// Keeps the prompt inside MAX_CONTEXT_WINDOW_TOKENS even at the largest top_k.
 const MAX_CONTEXT_CHARS_TOTAL: usize = 32_000;
+
+/// A degraded optional engine does not invalidate context from an available
+/// local index. Keep this separate from the caller's ID, scope and link checks.
+fn local_indexed_fallback_preserves_scope(
+    requested_backend: &str,
+    outcome: Option<&RetrievalOutcome>,
+    context: &[ContextPassage],
+) -> bool {
+    if requested_backend != MEMORY_BACKEND_GLOSS_LOCAL || context.is_empty() {
+        return false;
+    }
+    let Some(outcome) = outcome else {
+        return false;
+    };
+    let contributed = |name: &str| {
+        outcome.engines.iter().any(|engine| {
+            engine.engine == name && engine.available && engine.attempted && engine.contributed
+        })
+    };
+    let indexed = match outcome.mode {
+        RetrievalMode::Bm25Only => contributed("bm25_fts5"),
+        RetrievalMode::DenseOnly => contributed("native_dense_hnsw"),
+        RetrievalMode::HybridRrf => contributed("bm25_fts5") && contributed("native_dense_hnsw"),
+        _ => false,
+    };
+    indexed
+        && context.iter().all(|passage| {
+            passage.evidence_class == outcome.mode.as_str()
+                && passage.chunk_id.is_some()
+                && outcome.results.iter().any(|result| {
+                    result.source_id == passage.source_id && result.chunk_id == passage.chunk_id
+                })
+        })
+}
+
+fn native_dense_evidence(outcome: Option<&RetrievalOutcome>) -> (bool, String) {
+    match outcome.and_then(|outcome| {
+        outcome
+            .engines
+            .iter()
+            .find(|engine| engine.engine == "native_dense_hnsw")
+    }) {
+        Some(engine) if engine.available => (true, "native-dense-enabled".to_string()),
+        Some(engine) => (
+            false,
+            engine
+                .reason_code
+                .as_ref()
+                .map(|reason| reason.as_str())
+                .unwrap_or("native-dense-unavailable")
+                .to_string(),
+        ),
+        None => (false, "not-observed".to_string()),
+    }
+}
 
 // All struct/type definitions moved to types.rs; imported via `use types::*` above.
 
@@ -767,9 +824,11 @@ pub(crate) fn provider_decoding_capability(
             }
         }
         providers::ProviderType::Anthropic => ProviderDecodingCapabilityV1 {
-            supports_temperature: true,
-            supports_top_p: true,
-            supports_top_k: true,
+            // The current Anthropic adapter omits sampling controls to retain
+            // compatibility with models that reject non-default parameters.
+            supports_temperature: false,
+            supports_top_p: false,
+            supports_top_k: false,
             supports_min_p: false,
             supports_repeat_penalty: false,
         },
@@ -820,9 +879,22 @@ pub(crate) fn effective_decoding_settings(
         "repeat_penalty": requested_repeat_penalty,
     });
     let mut unsupported_fields = Vec::new();
-    let temperature = parse_optional_f32(requested["temperature"].as_str().map(str::to_string))
-        .unwrap_or(DEFAULT_CHAT_TEMPERATURE)
-        .clamp(0.0, 2.0);
+    let temperature = if capability.supports_temperature {
+        parse_optional_f32(requested["temperature"].as_str().map(str::to_string))
+            .unwrap_or(DEFAULT_CHAT_TEMPERATURE)
+            .clamp(0.0, 2.0)
+    } else {
+        if requested["temperature"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            unsupported_fields.push("temperature".to_string());
+        }
+        // Anthropic omits this field: record its documented Messages API
+        // default, not the saved value that never reaches the provider.
+        // https://platform.claude.com/docs/en/api/messages/create
+        1.0
+    };
     let top_p = if capability.supports_top_p {
         parse_optional_f32(requested["top_p"].as_str().map(str::to_string))
     } else {
@@ -1139,6 +1211,8 @@ pub async fn send_message(
     style: Option<String>,
     custom_goal: Option<String>,
     response_length: Option<String>,
+    history_before_user_message_id: Option<String>,
+    user_message_id: Option<String>,
     state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
     app_handle: tauri::AppHandle,
@@ -1146,6 +1220,18 @@ pub async fn send_message(
     let message_id = message_id
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let user_message_id = resolve_user_message_id(user_message_id, &message_id)?;
+    // Reject an invalid edit target before accepting an attempt or preempting
+    // background work. Retain this validated request-only prefix; ordinary
+    // sends still load their full history at the existing context boundary.
+    let rerun_history = match history_before_user_message_id.as_deref() {
+        Some(target) => Some(history_before_rerun(
+            state.with_notebook_db(&notebook_id, |db| db.load_messages(&conversation_id))?,
+            &conversation_id,
+            Some(target),
+        )?),
+        None => None,
+    };
     let (trace_memory_backend, trace_memory_fallback) = {
         let app_db = state
             .app_db
@@ -1187,7 +1273,6 @@ pub async fn send_message(
     // Register before *any* normal user-turn side effect. The lease clears the
     // registration on every pre-stream error path; ownership transfers to the
     // spawned stream task only after context construction succeeds.
-    let user_message_id = uuid::Uuid::new_v4().to_string();
     let active_chat_attempt_lease = match state.lease_active_chat_attempt(
         &notebook_id,
         &conversation_id,
@@ -1377,7 +1462,10 @@ pub async fn send_message(
     let effective_response_length = response_length
         .filter(|r| !r.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
-    let history = state.with_notebook_db(&notebook_id, |db| db.load_messages(&conversation_id))?;
+    let history = match rerun_history {
+        Some(history) => history,
+        None => state.with_notebook_db(&notebook_id, |db| db.load_messages(&conversation_id))?,
+    };
 
     // Store user message
     let user_msg = Message {
@@ -2775,7 +2863,12 @@ pub async fn send_message(
         let no_unanchored_context = source_context
             .iter()
             .all(|passage| passage.chunk_id.is_some());
-        let fallback_class_allowed = retrieval_fallback_reason.is_none();
+        let fallback_class_allowed = retrieval_fallback_reason.is_none()
+            || local_indexed_fallback_preserves_scope(
+                &retrieval_backend_requested,
+                retrieval_outcome_for_evidence.as_ref(),
+                &source_context,
+            );
         let projection_links_preserved = !retrieval_degradation_markers.iter().any(|marker| {
             marker.contains("semantic_memory")
                 || marker.contains("semantic-memory")
@@ -2798,6 +2891,8 @@ pub async fn send_message(
         }
     };
 
+    let (native_dense_ready, native_index_status) =
+        native_dense_evidence(retrieval_outcome_for_evidence.as_ref());
     let retrieval_capability_decision = RetrievalCapabilityDecisionV1 {
         requested_backend: retrieval_backend_requested.clone(),
         effective_backend: retrieval_backend_used.clone(),
@@ -2809,7 +2904,7 @@ pub async fn send_message(
             marker == RetrievalReasonCode::SemanticMemoryLinksMissing.as_str()
                 || marker == RetrievalReasonCode::SemanticMemoryLinksDegraded.as_str()
         }),
-        dense_ready: native_dense_possible,
+        dense_ready: native_dense_ready,
         fallback_allowed: semantic_fallback_allowed,
         degraded: retrieval_fallback_reason.is_some() || !retrieval_degradation_markers.is_empty(),
     };
@@ -2869,10 +2964,8 @@ pub async fn send_message(
         source_scope_preserved: source_scope_integrity.preserved,
         index_status: if resolved_scope.is_none() {
             "scope-none".to_string()
-        } else if native_dense_possible {
-            "native-dense-enabled".to_string()
         } else {
-            "fallback".to_string()
+            native_index_status
         },
         link_status: if memory_backend == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW {
             "semantic-memory-links-checked".to_string()
@@ -3402,9 +3495,353 @@ pub async fn get_last_chat_attempt_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{RetrievalCoverage, RetrievalEngineStatus, RetrievalResult};
     use async_trait::async_trait;
     use futures::stream;
     use tokio::sync::{oneshot, Mutex as AsyncMutex};
+
+    fn indexed_fallback_fixture() -> (RetrievalOutcome, Vec<ContextPassage>) {
+        let outcome = RetrievalOutcome {
+            mode: RetrievalMode::Bm25Only,
+            results: vec![RetrievalResult {
+                chunk_id: Some("chunk-1".to_string()),
+                source_id: "selected".to_string(),
+                title: None,
+                content: "indexed content".to_string(),
+                score: 1.0,
+                engine: "bm25_fts5".to_string(),
+            }],
+            engines: vec![
+                RetrievalEngineStatus {
+                    engine: "bm25_fts5".to_string(),
+                    attempted: true,
+                    available: true,
+                    contributed: true,
+                    candidate_count: 1,
+                    elapsed_ms: 0,
+                    reason_code: None,
+                    detail: None,
+                },
+                RetrievalEngineStatus {
+                    engine: "native_dense_hnsw".to_string(),
+                    attempted: false,
+                    available: false,
+                    contributed: false,
+                    candidate_count: 0,
+                    elapsed_ms: 0,
+                    reason_code: Some(RetrievalReasonCode::EmbeddingIndexMetadataStale),
+                    detail: None,
+                },
+            ],
+            coverage: RetrievalCoverage {
+                total_chunks: 1,
+                embedded_chunks: 1,
+                dense_coverage_ratio: 1.0,
+                ..Default::default()
+            },
+            degraded: true,
+            fallback_chain: vec![RetrievalReasonCode::EmbeddingIndexMetadataStale],
+            user_visible_summary: "BM25 with stale dense metadata".to_string(),
+            trace_ref: "indexed-fallback-test".to_string(),
+        };
+        let context = vec![ContextPassage {
+            source_id: "selected".to_string(),
+            chunk_id: Some("chunk-1".to_string()),
+            title: "Selected source".to_string(),
+            content: "indexed content".to_string(),
+            evidence_class: "bm25_only".to_string(),
+        }];
+        (outcome, context)
+    }
+
+    #[test]
+    fn scoped_indexed_bm25_context_survives_optional_dense_degradation() {
+        let (outcome, context) = indexed_fallback_fixture();
+        assert!(local_indexed_fallback_preserves_scope(
+            MEMORY_BACKEND_GLOSS_LOCAL,
+            Some(&outcome),
+            &context,
+        ));
+        assert!(!local_indexed_fallback_preserves_scope(
+            MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
+            Some(&outcome),
+            &context,
+        ));
+        assert!(!local_indexed_fallback_preserves_scope(
+            MEMORY_BACKEND_GLOSS_LOCAL,
+            None,
+            &context,
+        ));
+        assert!(!local_indexed_fallback_preserves_scope(
+            MEMORY_BACKEND_GLOSS_LOCAL,
+            Some(&outcome),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fallback_integrity_requires_indexed_anchors_and_engine_evidence() {
+        let (outcome, context) = indexed_fallback_fixture();
+        for field in ["source", "chunk", "unanchored", "class"] {
+            let mut changed = context.clone();
+            match field {
+                "source" => changed[0].source_id = "excluded".to_string(),
+                "chunk" => changed[0].chunk_id = Some("other-chunk".to_string()),
+                "unanchored" => changed[0].chunk_id = None,
+                _ => changed[0].evidence_class = "source-order-fallback".to_string(),
+            }
+            assert!(
+                !local_indexed_fallback_preserves_scope(
+                    MEMORY_BACKEND_GLOSS_LOCAL,
+                    Some(&outcome),
+                    &changed,
+                ),
+                "{field}"
+            );
+        }
+        for field in [
+            "results",
+            "engines",
+            "available",
+            "attempted",
+            "contributed",
+        ] {
+            let mut changed = outcome.clone();
+            match field {
+                "results" => changed.results.clear(),
+                "engines" => changed.engines.clear(),
+                "available" => changed.engines[0].available = false,
+                "attempted" => changed.engines[0].attempted = false,
+                _ => changed.engines[0].contributed = false,
+            }
+            assert!(
+                !local_indexed_fallback_preserves_scope(
+                    MEMORY_BACKEND_GLOSS_LOCAL,
+                    Some(&changed),
+                    &context,
+                ),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_contributing_native_index_modes_allow_degraded_context() {
+        let (mut outcome, mut context) = indexed_fallback_fixture();
+        for mode in [
+            RetrievalMode::SemanticMemory,
+            RetrievalMode::SourceOrderFallback,
+            RetrievalMode::RawContentFallback,
+            RetrievalMode::Unavailable,
+        ] {
+            context[0].evidence_class = mode.as_str().to_string();
+            outcome.mode = mode;
+            assert!(!local_indexed_fallback_preserves_scope(
+                MEMORY_BACKEND_GLOSS_LOCAL,
+                Some(&outcome),
+                &context,
+            ));
+        }
+        for mode in [RetrievalMode::DenseOnly, RetrievalMode::HybridRrf] {
+            context[0].evidence_class = mode.as_str().to_string();
+            outcome.mode = mode;
+            assert!(!local_indexed_fallback_preserves_scope(
+                MEMORY_BACKEND_GLOSS_LOCAL,
+                Some(&outcome),
+                &context,
+            ));
+            outcome.engines[1].available = true;
+            outcome.engines[1].attempted = true;
+            outcome.engines[1].contributed = true;
+            assert!(local_indexed_fallback_preserves_scope(
+                MEMORY_BACKEND_GLOSS_LOCAL,
+                Some(&outcome),
+                &context,
+            ));
+            outcome.engines[1].available = false;
+        }
+    }
+
+    #[test]
+    fn dense_readiness_requires_observed_availability_not_stored_inventory() {
+        let (mut outcome, _) = indexed_fallback_fixture();
+        assert_eq!(
+            native_dense_evidence(Some(&outcome)),
+            (false, "embedding_index_metadata_stale".to_string())
+        );
+        outcome.engines[1].reason_code = None;
+        assert_eq!(
+            native_dense_evidence(Some(&outcome)),
+            (false, "native-dense-unavailable".to_string())
+        );
+        outcome.engines[1].available = true;
+        assert_eq!(
+            native_dense_evidence(Some(&outcome)),
+            (true, "native-dense-enabled".to_string())
+        );
+        outcome.engines.pop();
+        assert_eq!(
+            native_dense_evidence(Some(&outcome)),
+            (false, "not-observed".to_string())
+        );
+        assert_eq!(
+            native_dense_evidence(None),
+            (false, "not-observed".to_string())
+        );
+    }
+
+    #[test]
+    fn decoding_receipt_anthropic_preserves_requested_settings_without_claiming_application() {
+        let data_dir = tempfile::tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        {
+            let app_db = state.app_db.lock().expect("app database lock");
+            for (key, value) in [
+                ("generation_temperature", "0.7"),
+                ("generation_top_p", "0.8"),
+                ("generation_top_k", "40"),
+                ("generation_min_p", "0.05"),
+                ("generation_repeat_penalty", "1.1"),
+            ] {
+                app_db
+                    .set_setting(key, value)
+                    .expect("saved decoding setting");
+            }
+        }
+        let receipt = effective_decoding_settings(
+            &state,
+            providers::ProviderType::Anthropic,
+            "claude-test-model",
+            512,
+        )
+        .expect("decoding receipt");
+
+        assert_eq!(receipt.provider, "anthropic");
+        assert_eq!(receipt.model, "claude-test-model");
+        assert_eq!(receipt.effective.max_tokens, 512);
+        assert_eq!(receipt.effective.temperature, 1.0);
+        assert_eq!(receipt.effective.top_p, None);
+        assert_eq!(receipt.effective.top_k, None);
+        assert_eq!(receipt.effective.min_p, None);
+        assert_eq!(receipt.effective.repeat_penalty, None);
+        assert_eq!(
+            receipt.requested,
+            serde_json::json!({
+                "temperature": "0.7", "top_p": "0.8", "top_k": "40",
+                "min_p": "0.05", "repeat_penalty": "1.1",
+            })
+        );
+        assert_eq!(
+            receipt.unsupported_fields,
+            ["temperature", "top_p", "top_k", "min_p", "repeat_penalty"]
+        );
+        assert!(!receipt.provider_capability.supports_temperature);
+        assert!(!receipt.provider_capability.supports_top_p);
+        assert!(!receipt.provider_capability.supports_top_k);
+        assert!(!receipt.provider_capability.supports_min_p);
+        assert!(!receipt.provider_capability.supports_repeat_penalty);
+        assert_eq!(
+            state
+                .app_db
+                .lock()
+                .expect("app database lock")
+                .get_setting("generation_temperature")
+                .expect("saved setting"),
+            Some("0.7".to_string())
+        );
+    }
+
+    #[test]
+    fn decoding_receipt_anthropic_absent_or_blank_knobs_use_default_without_unsupported_requests() {
+        let data_dir = tempfile::tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        // AppDb migrations seed generation_temperature=0.7. Remove the seeded
+        // values explicitly so this fixture actually exercises absent keys.
+        state
+            .app_db
+            .lock()
+            .expect("app database lock")
+            .conn()
+            .execute(
+                "DELETE FROM settings WHERE key IN ('generation_temperature', 'generation_top_p', \
+                 'generation_top_k', 'generation_min_p', 'generation_repeat_penalty')",
+                [],
+            )
+            .expect("remove seeded decoding settings in fixture");
+        for saved in [None, Some(" \t")] {
+            if let Some(value) = saved {
+                let app_db = state.app_db.lock().expect("app database lock");
+                for key in [
+                    "generation_temperature",
+                    "generation_top_p",
+                    "generation_top_k",
+                    "generation_min_p",
+                    "generation_repeat_penalty",
+                ] {
+                    app_db
+                        .set_setting(key, value)
+                        .expect("blank decoding setting");
+                }
+            }
+            let receipt = effective_decoding_settings(
+                &state,
+                providers::ProviderType::Anthropic,
+                "claude-test-model",
+                512,
+            )
+            .expect("decoding receipt");
+            assert_eq!(receipt.requested["temperature"], serde_json::json!(saved));
+            assert_eq!(receipt.effective.temperature, 1.0);
+            assert!(receipt.unsupported_fields.is_empty());
+            assert!(!receipt.provider_capability.supports_temperature);
+        }
+    }
+
+    #[test]
+    fn decoding_receipt_other_providers_keep_saved_temperature_and_supported_sampling() {
+        let data_dir = tempfile::tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        {
+            let app_db = state.app_db.lock().expect("app database lock");
+            for (key, value) in [
+                ("generation_temperature", "0.35"),
+                ("generation_top_p", "0.8"),
+                ("generation_top_k", "40"),
+                ("generation_min_p", "0.05"),
+                ("generation_repeat_penalty", "1.1"),
+            ] {
+                app_db
+                    .set_setting(key, value)
+                    .expect("saved decoding setting");
+            }
+        }
+        for provider in [
+            providers::ProviderType::Ollama,
+            providers::ProviderType::OpenAI,
+            providers::ProviderType::LlamaCpp,
+        ] {
+            let receipt = effective_decoding_settings(&state, provider, "test-model", 512)
+                .expect("decoding receipt");
+            assert_eq!(receipt.effective.temperature, 0.35);
+            assert_eq!(receipt.effective.top_p, Some(0.8));
+            assert!(receipt.provider_capability.supports_temperature);
+            assert!(receipt.provider_capability.supports_top_p);
+            if matches!(provider, providers::ProviderType::Ollama) {
+                assert_eq!(receipt.effective.top_k, Some(40));
+                assert_eq!(receipt.effective.min_p, Some(0.05));
+                assert_eq!(receipt.effective.repeat_penalty, Some(1.1));
+                assert!(receipt.unsupported_fields.is_empty());
+            } else {
+                assert_eq!(receipt.effective.top_k, None);
+                assert_eq!(receipt.effective.min_p, None);
+                assert_eq!(receipt.effective.repeat_penalty, None);
+                assert_eq!(
+                    receipt.unsupported_fields,
+                    ["top_k", "min_p", "repeat_penalty"]
+                );
+            }
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum ScriptedLifecycleMode {

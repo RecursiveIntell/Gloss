@@ -148,6 +148,41 @@ class RuntimeConfigPolicyTests(unittest.TestCase):
 
 
 class WebDriverTransportEvidenceTests(unittest.TestCase):
+    def test_loopback_request_headers_and_http_errors_are_not_replayed(self):
+        received = []
+
+        class ResponseHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                received.append((dict(self.headers), self.rfile.read(int(self.headers["Content-Length"]))))
+                status = 200 if len(received) == 1 else 503
+                body = b'{"value":{"acknowledged":true}}' if status == 200 else b'fixture unavailable'
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        with http.server.HTTPServer(("127.0.0.1", 0), ResponseHandler) as server:
+            server.timeout = 2
+            worker = threading.Thread(target=lambda: [server.handle_request() for _ in range(2)])
+            worker.start()
+            client = driver.WebDriver(server.server_port)
+            self.assertEqual(client.request("POST", "/session/fixture/action", {}), {"acknowledged": True})
+            with self.assertRaisesRegex(RuntimeError, "HTTP 503: fixture unavailable"):
+                client.request("POST", "/session/fixture/action", {})
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(len(received), 2)
+        self.assertTrue(all(headers.get("Connection", "").lower() != "close" for headers, _ in received))
+        self.assertEqual([body for _, body in received], [b"{}", b"{}"])
+        self.assertEqual(len(client.trace), 2)
+        self.assertIn("HTTP 503", client.trace[1]["error"])
+        self.assertNotIn("response", client.trace[1])
+
     def test_disconnected_mutation_is_recorded_and_never_replayed(self):
         received = []
 

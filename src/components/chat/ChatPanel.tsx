@@ -1,9 +1,10 @@
-import { memo, useContext, useState, useEffect, useMemo, createContext } from "react";
+import { memo, useContext, useState, useEffect, useMemo, useRef, createContext } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useNoteStore } from "../../stores/noteStore";
-import { Virtuoso } from "react-virtuoso";
+import { useNotebookStore } from "../../stores/notebookStore";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { SourceViewerModal } from "../sources/SourceViewerModal";
 import {
   Send,
@@ -25,7 +26,9 @@ import {
   RefreshCw,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
-import type { ChatEvidenceDisclosure, ChatEvidencePayload, Citation, Message } from "../../lib/types";
+import type { ChatEvidenceDisclosure, Citation, Message } from "../../lib/types";
+
+import { parseAssistantPayload } from "../../lib/chatEvidence";
 
 interface ChatPanelProps {
   notebookId: string;
@@ -33,6 +36,14 @@ interface ChatPanelProps {
 
 type ChatStoreState = ReturnType<typeof useChatStore.getState>;
 type SettingsStoreState = ReturnType<typeof useSettingsStore.getState>;
+
+interface ChatListContext { streamingContent: string }
+
+function ChatStreamingFooter({ context }: { context?: ChatListContext }) {
+  return context?.streamingContent ? <StreamingMessage content={context.streamingContent} /> : null;
+}
+
+const CHAT_LIST_COMPONENTS = { Footer: ChatStreamingFooter };
 
 export function ChatPanel({ notebookId }: ChatPanelProps) {
   const conversations = useChatStore((s: ChatStoreState) => s.conversations);
@@ -73,20 +84,104 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const selectionPending = useSettingsStore((s) => s.selectionPending);
   const selectionError = useSettingsStore((s) => s.selectionError);
 
-  const [input, setInput] = useState("");
+  const emptyDraft = {
+    notebookId, conversationId: activeConversationId, input: "",
+    editingUserMessageId: null as string | null, restoreToken: null as object | null,
+  };
+  const [storedDraft, setDraft] = useState(emptyDraft);
+  let draft = storedDraft;
+  if (draft.notebookId !== notebookId || draft.conversationId !== activeConversationId) {
+    // A first send may create its own conversation. Explicit selection actions
+    // clear the token before switching; every other context change drops it.
+    draft = {
+      ...emptyDraft,
+      restoreToken: draft.notebookId === notebookId && draft.conversationId === null
+        ? draft.restoreToken : null,
+    };
+    setDraft(draft);
+  }
+  const { input, editingUserMessageId } = draft;
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const [expandedEvidence, setExpandedEvidence] = useState<Set<string>>(new Set());
-  const [editingUserMessageId, setEditingUserMessageId] = useState<string | null>(null);
-  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
+  const listRef = useRef<VirtuosoHandle>(null);
+  const navigationIntent = useRef<{
+    notebookId: string; conversationId: string | null; activation: number;
+    assistantId: string; previousIds: Set<string>;
+  } | null>(null);
+  const followingLatest = useRef<{
+    notebookId: string; conversationId: string | null; activation: number;
+  } | null>(null);
+  const [bottomState, setBottomState] = useState({ notebookId, conversationId: activeConversationId, atBottom: false });
+  const atBottom = messages.length === 0 ||
+    (bottomState.notebookId === notebookId && bottomState.conversationId === activeConversationId && bottomState.atBottom);
+  const scrollToLatest = () => listRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
+  const cancelNavigation = () => {
+    navigationIntent.current = null;
+    followingLatest.current = null;
+  };
+  const jumpToLatest = () => {
+    const notebook = useNotebookStore.getState();
+    if (notebook.activeNotebookId !== notebookId ||
+        useChatStore.getState().activeConversationId !== activeConversationId) return;
+    followingLatest.current = { notebookId, conversationId: activeConversationId, activation: notebook.activationRequestId };
+    scrollToLatest();
+  };
+  const followMeasuredHeight = () => {
+    const intent = followingLatest.current;
+    const notebook = useNotebookStore.getState();
+    if (!intent || intent.notebookId !== notebookId || intent.conversationId !== activeConversationId ||
+        notebook.activeNotebookId !== notebookId || notebook.activationRequestId !== intent.activation ||
+        useChatStore.getState().activeConversationId !== activeConversationId ||
+        useChatStore.getState().streamingError) return;
+    // Tokens change footer height without changing item count. Preserve the
+    // explicit follow intent through measured growth and terminal hydration.
+    scrollToLatest();
+  };
 
   useEffect(() => {
-    if (isStreaming) {
-      setStreamingMessageId("streaming");
-    } else {
-      setStreamingMessageId(null);
+    const intent = navigationIntent.current;
+    if (!intent) return;
+    const notebook = useNotebookStore.getState();
+    const chat = useChatStore.getState();
+    if (intent.notebookId !== notebookId || notebook.activeNotebookId !== notebookId ||
+        notebook.activationRequestId !== intent.activation || streamingError ||
+        (intent.conversationId !== null && intent.conversationId !== activeConversationId) ||
+        (chat.streamingMessageId && chat.streamingMessageId !== intent.assistantId)) {
+      navigationIntent.current = null;
+      return;
     }
-  }, [isStreaming]);
+    if (!activeConversationId || !listRef.current) return;
+    // A first send may create its own conversation before appending the user.
+    if (intent.conversationId === null && chat.streamingMessageId !== intent.assistantId) return;
+    if (!messages.some((message) => message.role === "user" &&
+        message.conversation_id === activeConversationId && !intent.previousIds.has(message.id))) return;
+    navigationIntent.current = null;
+    jumpToLatest();
+  }, [messages, notebookId, activeConversationId, streamingError]);
+
+  const sendWithNavigation = async (query: string, beforeUserId?: string) => {
+    followingLatest.current = null;
+    const previousIds = new Set(useChatStore.getState().messages.map((message) => message.id));
+    const activation = useNotebookStore.getState().activationRequestId;
+    const sending = sendMessage(notebookId, query, getSourceScope(), activeModel, beforeUserId);
+    const chat = useChatStore.getState();
+    const intent = chat.streamingNotebookId === notebookId && chat.streamingMessageId
+      ? { notebookId, conversationId: activeConversationId, activation,
+          assistantId: chat.streamingMessageId, previousIds } : null;
+    navigationIntent.current = intent;
+    try {
+      await sending;
+    } finally {
+      if (useChatStore.getState().streamingError && navigationIntent.current === intent) {
+        cancelNavigation();
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (streamingError) cancelNavigation();
+  }, [streamingError]);
 
   useEffect(() => {
     if (!activeConversationId) return;
@@ -102,20 +197,31 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const handleSend = async () => {
     if (!input.trim() || isStreaming || selectionPending) return;
     const query = input.trim();
-    setInput("");
-    setEditingUserMessageId(null);
-    await sendMessage(notebookId, query, getSourceScope(), activeModel);
+    const historyBeforeUserMessageId = editingUserMessageId ?? undefined;
+    const restoreToken = {};
+    const notebookActivation = useNotebookStore.getState().activationRequestId;
+    setDraft({ ...emptyDraft, restoreToken });
+    await sendWithNavigation(query, historyBeforeUserMessageId);
     if (useChatStore.getState().streamingError) {
-      setInput((current) => current || query);
+      setDraft((current) => {
+        const notebook = useNotebookStore.getState();
+        const conversationId = useChatStore.getState().activeConversationId;
+        if (current.restoreToken !== restoreToken || current.notebookId !== notebookId ||
+            notebook.activeNotebookId !== notebookId || notebook.activationRequestId !== notebookActivation ||
+            (current.conversationId !== null && current.conversationId !== conversationId)) return current;
+        return { ...current, conversationId, input: query, editingUserMessageId: historyBeforeUserMessageId ?? null, restoreToken: null };
+      });
     }
   };
 
   const handleSuggestionClick = (question: string) => {
-    setInput(question);
+    setDraft({ ...emptyDraft, input: question });
   };
 
   const handleDeleteConversation = async () => {
     if (!activeConversationId) return;
+    cancelNavigation();
+    setDraft(emptyDraft);
     await deleteConversation(notebookId, activeConversationId);
   };
 
@@ -130,6 +236,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   };
 
   const handleStop = async () => {
+    cancelNavigation();
     await stopStreaming(notebookId);
   };
 
@@ -149,18 +256,19 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       .reverse()
       .find((message) => message.role === "user");
     if (priorUser) {
-      await sendMessage(notebookId, priorUser.content, getSourceScope(), activeModel);
+      setDraft((current) => ({ ...current, restoreToken: null }));
+      await sendWithNavigation(priorUser.content, priorUser.id);
     }
   };
 
   const handleContinue = async () => {
     if (isStreaming || selectionPending) return;
-    await sendMessage(notebookId, "Continue from the previous partial answer.", getSourceScope(), activeModel);
+    setDraft((current) => ({ ...current, restoreToken: null }));
+    await sendWithNavigation("Continue from the previous partial answer.");
   };
 
   const handleEditUserMessage = (message: Message) => {
-    setInput(message.content);
-    setEditingUserMessageId(message.id);
+    setDraft({ ...emptyDraft, input: message.content, editingUserMessageId: message.id });
   };
 
   const toggleEvidence = (messageId: string) => {
@@ -221,7 +329,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       <div className="gloss-panel-header flex shrink-0 flex-wrap items-center gap-2 px-4 py-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <button
-            onClick={() => createConversation(notebookId)}
+            onClick={() => {
+              cancelNavigation();
+              setDraft(emptyDraft);
+              return createConversation(notebookId);
+            }}
             disabled={isStreaming}
             className="flex items-center gap-1 rounded border border-accent/35 bg-accent/15 px-2 py-1 text-xs text-accent hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -235,6 +347,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
               onChange={(e) => {
                 const id = e.target.value;
                 if (id) {
+                  cancelNavigation();
+                  setDraft(emptyDraft);
                   setActiveConversation(id);
                   loadMessages(notebookId, id);
                 }
@@ -392,7 +506,25 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
       </div>
 
       {/* Messages */}
-      <div className="gloss-chat-scroll min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+      <div className="flex h-7 shrink-0 justify-end px-5">
+        {!atBottom && messages.length > 0 && (
+          <button type="button" aria-label="Jump to latest" onClick={jumpToLatest}
+            className="rounded px-2 text-xs text-accent hover:bg-bg-secondary">
+            Jump to latest
+          </button>
+        )}
+      </div>
+      <div role="region" aria-label="Chat messages" data-chat-at-bottom={atBottom}
+        data-chat-latest-message-id={messages[messages.length - 1]?.id}
+        onPointerDownCapture={cancelNavigation}
+        onWheelCapture={cancelNavigation}
+        onTouchMoveCapture={cancelNavigation}
+        onKeyDownCapture={(event) => {
+          if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) {
+            cancelNavigation();
+          }
+        }}
+        className="gloss-chat-scroll min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
         {messages.length === 0 && !isStreaming && (
           <div className="mt-12 w-full text-center">
             <MessageSquare className="mx-auto mb-3 h-10 w-10 text-text-muted" />
@@ -447,16 +579,17 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
           )}
         >
           <Virtuoso
+            key={`${notebookId}:${activeConversationId ?? "new"}`}
+            ref={listRef}
             data={messages}
+            context={{ streamingContent: isStreaming ? streamingContent : "" }}
+            computeItemKey={(_index, message) => message.id}
+            atBottomStateChange={(value) => setBottomState({ notebookId, conversationId: activeConversationId, atBottom: value })}
+            totalListHeightChanged={followMeasuredHeight}
             followOutput="auto"
             initialTopMostItemIndex={Math.max(messages.length - 1, 0)}
             itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} />}
-            components={{
-              Footer: () => {
-                if (!streamingMessageId || !streamingContent) return null;
-                return <StreamingMessage content={streamingContent} />;
-              },
-            }}
+            components={CHAT_LIST_COMPONENTS}
           />
         </MessageRowContext.Provider>
 
@@ -506,7 +639,10 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             aria-label="Chat message"
             aria-describedby="gloss-chat-shortcuts"
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              const value = e.target.value;
+              setDraft((current) => ({ ...current, input: value, restoreToken: null }));
+            }}
             onKeyDown={(e) => {
               if (shouldSubmitChat(e.key, e.shiftKey, e.nativeEvent.isComposing, e.keyCode)) {
                 e.preventDefault();
@@ -530,7 +666,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
         <p id="gloss-chat-shortcuts" className="mt-1 text-[10px] text-text-muted">Enter to send · Shift+Enter for a new line</p>
         {editingUserMessageId && (
           <div className="mx-auto mt-1 max-w-[900px] text-[10px] text-text-muted">
-            Editing a previous question; sending will rerun it as a new turn.
+            Rerun uses the conversation before this question. All saved turns are retained.
           </div>
         )}
       </div>
@@ -556,24 +692,6 @@ export function capturedModelLabel(message: Message): string {
   return receipt?.model === model && receipt.provider ? `${model} · ${receipt.provider}` : model;
 }
 
-function parseAssistantPayload(raw: unknown): ChatEvidencePayload {
-  if (!raw) return { citations: [], evidence: nullEvidence() };
-  try {
-    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (Array.isArray(parsed)) {
-      return { citations: parsed, evidence: nullEvidence(parsed.length) };
-    }
-    if (parsed && typeof parsed === "object" && Array.isArray(parsed.citations)) {
-      return {
-        citations: parsed.citations,
-        evidence: parsed.evidence ?? nullEvidence(parsed.citations.length),
-      };
-    }
-  } catch {
-    return { citations: [], evidence: nullEvidence() };
-  }
-  return { citations: [], evidence: nullEvidence() };
-}
 
 type MessageRowContextValue = {
   isStreaming: boolean;
@@ -626,6 +744,8 @@ const MessageRow = memo(function MessageRow({
   return (
     <div className={`flex w-full ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
       <div
+        data-chat-message-id={msg.id}
+        data-chat-message-role={msg.role}
         className={`max-w-[82%] px-3 py-2 text-sm ${
           msg.role === "user"
             ? "gloss-user-bubble text-white"
@@ -740,86 +860,9 @@ function StreamingMessage({ content }: { content: string }) {
   );
 }
 
-function nullEvidence(citationCount = 0): ChatEvidenceDisclosure {
-  return {
-    backend_requested: "unknown",
-    backend_used: "unknown",
-    retrieval_mode: "unknown",
-    fallback_used: false,
-    fallback_reason: null,
-    fallback_reason_code: null,
-    degradation_markers: [],
-    source_scope_mode: "unknown",
-    requested_source_ids: [],
-    selected_source_ids: [],
-    effective_source_ids: [],
-    invalid_source_ids: [],
-    excluded_source_ids: [],
-    invalid_source_count: 0,
-    effective_source_count: 0,
-    excluded_source_count: 0,
-    context_passage_count: 0,
-    citation_valid_count: citationCount,
-    citation_invalid_count: 0,
-    citation_anchors: [],
-    citation_filter_reasons: [],
-    omitted_candidate_count: 0,
-    source_scope_preserved: false,
-    index_status: "unknown",
-    link_status: "unknown",
-    receipt_id: "not recorded",
-    context_digest: "",
-    source_context_digest: "",
-    prompt_digest: null,
-    semantic_memory_receipt_id: null,
-    candidate_backend: null,
-    turbo_quant_generation_id: null,
-    vector_artifact_manifest_digest: null,
-    exact_rerank: null,
-    exact_rerank_count: null,
-    approximate_candidate_count: null,
-    semantic_memory_fallback_reason: null,
-    retrieval_outcome: null,
-    retrieval_capability_decision: {
-      requested_backend: "unknown",
-      effective_backend: "unknown",
-      decision_reason: null,
-      decision_reason_code: null,
-      build_feature_available: false,
-      runtime_enabled: false,
-      projection_ready: false,
-      dense_ready: false,
-      fallback_allowed: false,
-      degraded: false,
-    },
-    semantic_memory_runtime_truth: {
-      schema: "SemanticMemoryRuntimeTruthV1",
-      receipt_id: "not recorded",
-      build: {},
-      settings: {},
-      projection: {},
-      turbo_quant: {},
-      decision: {
-        requested_backend: "unknown",
-        effective_backend: "unknown",
-        decision_reason: null,
-        decision_reason_code: null,
-        build_feature_available: false,
-        runtime_enabled: false,
-        projection_ready: false,
-        dense_ready: false,
-        fallback_allowed: false,
-        degraded: false,
-      },
-    },
-    decoding_settings_receipt: null,
-    prompt_receipt: null,
-    generation_receipt: null,
-    prompt_budget_receipt: null,
-  };
-}
 
-function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDisclosure }) {
+export function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDisclosure }) {
+  const denseEngine = evidence.retrieval_outcome?.engines.find((engine) => engine.engine === "native_dense_hnsw");
   const degraded = evidence.fallback_used || evidence.degradation_markers.length > 0 || evidence.citation_invalid_count > 0;
   return (
     <div id={id} role="region" aria-label="Answer evidence" className="mt-2 rounded border border-border/70 bg-bg-secondary p-2 text-[10px] text-text-secondary">
@@ -851,7 +894,12 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
         <EvidenceRow label="Index" value={evidence.index_status} />
         <EvidenceRow label="Links" value={evidence.link_status} />
         {evidence.decoding_settings_receipt && (
-          <EvidenceRow label="Temperature" value={`${evidence.decoding_settings_receipt.effective.temperature}`} />
+          <EvidenceRow
+            label="Temperature"
+            value={evidence.decoding_settings_receipt.provider_capability.supports_temperature === false
+              ? "Provider default"
+              : `${evidence.decoding_settings_receipt.effective.temperature}`}
+          />
         )}
         {evidence.prompt_receipt && (
           <EvidenceRow label="Prompt" value={evidence.prompt_receipt.capture_state} />
@@ -882,7 +930,13 @@ function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvidenceDi
             <EvidenceRow label="Retrieval mode" value={evidence.retrieval_outcome.mode} />
             <EvidenceRow
               label="Dense coverage"
-              value={`${Math.round(evidence.retrieval_outcome.coverage.dense_coverage_ratio * 100)}% (${evidence.retrieval_outcome.coverage.embedded_chunks}/${evidence.retrieval_outcome.coverage.total_chunks})`}
+              value={denseEngine?.available
+                ? `${Math.round(evidence.retrieval_outcome.coverage.dense_coverage_ratio * 100)}% (${evidence.retrieval_outcome.coverage.embedded_chunks}/${evidence.retrieval_outcome.coverage.total_chunks})`
+                : denseEngine ? "Unavailable" : "Not recorded"}
+            />
+            <EvidenceRow
+              label="Stored embeddings"
+              value={`${evidence.retrieval_outcome.coverage.embedded_chunks}/${evidence.retrieval_outcome.coverage.total_chunks} chunks`}
             />
             <EvidenceRow
               label="Engines"

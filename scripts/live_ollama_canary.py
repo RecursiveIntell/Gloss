@@ -6,6 +6,7 @@ or HTTP fixture is used. A missing service/model is a failed required gate.
 The downloaded release, model identities, command output and native artifacts
 are bound to the source snapshot in the resulting evidence directory.
 With --desktop, the same owned service remains alive for the native UI driver.
+An optional --prebuilt-config keeps that driver on the installer's extracted AppRun.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from pathlib import Path
 import platform
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,6 +45,7 @@ MODELS = {
 }
 ENDPOINT = "http://127.0.0.1:11435"
 TEST = "live_ollama_embed_publish_reload_chat_and_precancel"
+CANARY_SCHEMA = "GlossHostedOllamaCanaryV1"
 
 
 def now() -> str:
@@ -52,6 +55,36 @@ def now() -> str:
 def sha256(path: Path) -> str:
     with path.open("rb") as file:
         return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def read_owned_json(path: Path, evidence: Path) -> tuple[dict, str]:
+    """Share one bounded reader between diagnostic input and parent summaries."""
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            raise ValueError(message)
+
+    bound = 2 * 1024 * 1024
+    root = evidence.absolute()
+    require(root.resolve() == root and not root.is_symlink(), "Linked evidence root")
+    relative = path.absolute().relative_to(root)
+    require(".." not in relative.parts, "Outside evidence root")
+    for count in range(len(relative.parts) + 1):
+        component = root.joinpath(*relative.parts[:count])
+        info = component.lstat()
+        require(not stat.S_ISLNK(info.st_mode), "Linked evidence ancestor or file")
+        if count < len(relative.parts):
+            require(stat.S_ISDIR(info.st_mode), "Non-directory evidence ancestor")
+    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "Evidence must be a single-link regular file")
+    require(info.st_size <= bound, "Evidence exceeds diagnostic bound")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        require((opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino)
+                and stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1
+                and opened.st_size <= bound, "Evidence identity changed before read")
+        raw = stream.read(bound + 1)
+    require(len(raw) <= bound, "Evidence exceeds diagnostic bound")
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
 
 
 def validate_release(archive: Path, checksums: Path) -> dict:
@@ -104,6 +137,7 @@ def terminate_group(process: subprocess.Popen) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
+        process.wait(timeout=5)
         return
     try:
         process.wait(timeout=5)
@@ -117,6 +151,68 @@ def terminate_group(process: subprocess.Popen) -> None:
     process.wait(timeout=5)
 
 
+class CanaryCancelled(RuntimeError):
+    """The parent requested cancellation of this canary's owned work."""
+
+
+class OwnedProcesses:
+    """Cooperatively unwind only sessions created by this canary."""
+
+    def __init__(self) -> None:
+        self.processes: list[subprocess.Popen] = []
+        self.handlers: dict = {}
+        self.cancel_signal: int | None = None
+
+    def install(self) -> None:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            self.handlers[sig] = signal.signal(sig, self.request_cancel)
+
+    def request_cancel(self, sig: int, _frame) -> None:
+        # Do not raise asynchronously between Popen and ownership registration,
+        # or interrupt cleanup when the parent repeats its termination request.
+        self.cancel_signal = sig
+
+    def check_cancelled(self) -> None:
+        if self.cancel_signal is not None:
+            raise CanaryCancelled(f"Canary cancelled by signal {self.cancel_signal}")
+
+    def start(self, command: list[str], **kwargs) -> subprocess.Popen:
+        self.check_cancelled()
+        process = subprocess.Popen(command, start_new_session=True, **kwargs)
+        self.processes.append(process)
+        return process
+
+    def wait(self, process: subprocess.Popen, timeout: int) -> int:
+        deadline = time.monotonic() + timeout
+        while True:
+            self.check_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            try:
+                return process.wait(timeout=min(0.2, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+
+    def stop(self, process: subprocess.Popen) -> None:
+        terminate_group(process)
+        self.processes.remove(process)
+
+    def close(self) -> None:
+        errors = []
+        try:
+            for process in list(reversed(self.processes)):
+                try:
+                    self.stop(process)
+                except (OSError, subprocess.SubprocessError) as error:
+                    errors.append(str(error))
+        finally:
+            for sig, handler in self.handlers.items():
+                signal.signal(sig, handler)
+        if errors:
+            raise RuntimeError("Owned canary process cleanup failed: " + "; ".join(errors))
+
+
 def desktop_configuration(models: dict) -> dict:
     """Carry the owned service identity to the existing native desktop driver."""
     return {"schema": "gloss-desktop-ollama-config/v1", "provider": "ollama",
@@ -126,7 +222,8 @@ def desktop_configuration(models: dict) -> dict:
         "embedding_model_digest": models["all-minilm:22m"]["digest"]}
 
 
-def validate_desktop_receipt(child: dict, source: dict, configuration: dict) -> None:
+def validate_desktop_receipt(child: dict, source: dict, configuration: dict,
+                             prebuilt: dict | None = None) -> None:
     # The desktop driver owns its case list and acceptance logic. Do not create
     # a second interpretation of partial/blocked desktop release evidence here.
     from live_desktop_smoke import LIVE_SCHEMA, result_exit_code
@@ -136,11 +233,95 @@ def validate_desktop_receipt(child: dict, source: dict, configuration: dict) -> 
         raise ValueError("Desktop receipt does not match the owned Ollama configuration")
     if result_exit_code(child, require_integrated=True) != 0:
         raise ValueError("Required integrated native desktop workflow did not pass")
+    if prebuilt is not None:
+        # A packaged completion claim must retain the exact launcher/build
+        # selected by the installer, as well as the complete native acceptance.
+        if child.get("status") != "pass" or child.get("prebuilt_config") != prebuilt:
+            raise ValueError("Packaged desktop receipt is incomplete or changed its prebuilt identity")
+        build = child["build"]
+        if (build.get("artifact_sha256") != prebuilt["artifact_sha256"]
+                or build.get("command") != prebuilt["build_command"]
+                or build["binary"]["sha256"] != prebuilt["binary_sha256"]
+                or not isinstance(build.get("launcher"), dict)
+                or build["launcher"].get("sha256") != prebuilt["application_sha256"]
+                or build["log"]["sha256"] != sha256(Path(prebuilt["build_log"]))):
+            raise ValueError("Packaged desktop receipt changed its archive, launcher, binary or build proof")
 
 
-def execute(root: Path, output: Path, desktop: bool = False) -> int:
+def failed_turn_summary(result: dict) -> dict:
+    """Keep decisive synthetic observations available when artifact GET fails."""
+    verified = result.get("verified_request", {})
+    material = verified.get("request_material", {})
+    messages = material.get("messages", [])
+    query = messages[-1].get("content", "") if messages else ""
+    return {"status": result.get("status"), "error": str(result.get("error", ""))[:1000],
+        "source_sha256": result.get("source", {}).get("source_sha256"),
+        "request_material_sha256": verified.get("request_material_sha256"),
+        "user_turn_sha256": hashlib.sha256(query.encode()).hexdigest() if messages else None,
+        "current_query": query[:2000], "current_query_truncated": len(query) > 2000,
+        "model": material.get("model"),
+        "observations": [{"label": call.get("label"), "status": call.get("status"),
+            "request_sha256": call.get("request_sha256"),
+            "answer": str(call.get("answer", ""))[:3000],
+            "answer_truncated": len(str(call.get("answer", ""))) > 3000,
+            "answer_sha256": call.get("answer_sha256"),
+            "raw_response_sha256": call.get("raw_response_sha256"),
+            "error": str(call.get("error", ""))[:1000]} for call in result.get("calls", [])[:2]]}
+
+
+def run_desktop_with_diagnostic(run, command: list[str], root: Path, output: Path,
+                                owned: OwnedProcesses, receipt: dict, save) -> None:
+    """Observe a failed turn on the owned service; never change desktop acceptance."""
+    try:
+        run("native-desktop-workflow", command, 1200)
+    except CanaryCancelled:
+        raise
+    except Exception as original:
+        diagnostic = {"status": "pending", "original_error": str(original)}
+        receipt["failure_diagnostic"] = diagnostic
+        result_path = output / "failed-turn-diagnostic" / "receipt.json"
+        try:
+            if owned.cancel_signal is not None:
+                diagnostic["status"] = "skipped_cancelled"
+            else:
+                save()
+                run("failed-turn-diagnostic", [sys.executable,
+                    str(root / "scripts" / "diagnose_failed_ollama_turn.py"),
+                    "--repo", str(root), "--evidence", str(output)], 190)
+                diagnostic["status"] = "completed"
+        except CanaryCancelled as error:
+            diagnostic.update({"status": "cancelled", "error": str(error)})
+        except Exception as error:
+            diagnostic.update({"status": "error", "error": str(error)})
+        finally:
+            result = diagnostic
+            try:
+                result, result_digest = read_owned_json(result_path, output)
+                diagnostic.update(path=str(result_path.relative_to(output)), sha256=result_digest)
+                if diagnostic["status"] == "completed":
+                    diagnostic["status"] = result["status"]
+            except Exception as error:
+                diagnostic["summary_error"] = str(error)
+                if diagnostic["status"] == "completed":
+                    diagnostic.update(status="error", error="Could not read owned diagnostic receipt")
+            try:
+                summary = failed_turn_summary(result)
+                summary["command_status"] = diagnostic["status"]
+                print("FAILED_TURN_DIAGNOSTIC " + json.dumps(summary, ensure_ascii=False), flush=True)
+            except Exception as error:
+                diagnostic["summary_error"] = str(error)
+            try:
+                save()
+            except Exception as error:
+                # Evidence I/O must not replace the failure that caused it.
+                diagnostic["save_error"] = str(error)
+        raise
+
+
+def execute(root: Path, output: Path, desktop: bool = False,
+            prebuilt_config: Path | None = None) -> int:
     output.mkdir(parents=True, exist_ok=False)
-    receipt = {"schema": "GlossHostedOllamaCanaryV1", "status": "running",
+    receipt = {"schema": CANARY_SCHEMA, "status": "running",
         "started_utc": now(), "live_service_exercised": False,
         "source": capture_source_identity(root), "commands": [],
         "desktop_requested": desktop, "desktop_status": "pending" if desktop else "not_requested",
@@ -151,6 +332,7 @@ def execute(root: Path, output: Path, desktop: bool = False) -> int:
                             ["Hosted synthetic tiny-model canary only",
                              "No user-installed model, desktop GUI, or Tauri orchestration proof"])}
     receipt_path = output / "receipt.json"
+    owned = OwnedProcesses()
 
     def save() -> None:
         receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
@@ -160,16 +342,21 @@ def execute(root: Path, output: Path, desktop: bool = False) -> int:
         receipt["commands"].append(entry)
         save()
         with (output / f"{label}.log").open("wb") as log:
-            process = subprocess.Popen(command, cwd=root, env=env, stdout=log,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
+            process = owned.start(command, cwd=root, env=env, stdout=log,
+                                  stderr=subprocess.STDOUT)
             try:
-                entry["exit_code"] = process.wait(timeout=seconds)
+                entry["exit_code"] = owned.wait(process, seconds)
             except subprocess.TimeoutExpired:
-                terminate_group(process)
                 entry["exit_code"] = 124
                 entry["error"] = "command deadline exceeded"
-        entry["finished_utc"] = now()
-        save()
+            except CanaryCancelled as error:
+                entry["exit_code"] = 128 + owned.cancel_signal
+                entry["error"] = str(error)
+                raise
+            finally:
+                owned.stop(process)
+                entry["finished_utc"] = now()
+                save()
         if entry["exit_code"] != 0:
             # Preserve actionable diagnostics in the job log even when an
             # artifact cannot be downloaded. Complete output remains on disk.
@@ -182,12 +369,20 @@ def execute(root: Path, output: Path, desktop: bool = False) -> int:
 
     save()
     try:
+        owned.install()
+        if prebuilt_config is not None and not desktop:
+            raise ValueError("--prebuilt-config requires --desktop")
         if (os.environ.get("GITHUB_ACTIONS") != "true"
                 or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
                 or platform.system() != "Linux" or platform.machine() != "x86_64"):
             raise RuntimeError("This gate requires an isolated GitHub-hosted Linux x86_64 runner")
         if desktop and (not os.environ.get("DISPLAY") or not os.environ.get("DBUS_SESSION_BUS_ADDRESS")):
             raise RuntimeError("Desktop mode requires the dbus-run-session and Xvfb outer wrapper")
+        prebuilt = None
+        if prebuilt_config is not None:
+            from live_desktop_smoke import load_prebuilt_config
+            prebuilt = load_prebuilt_config(prebuilt_config, receipt["source"])
+            receipt["prebuilt_config"] = prebuilt
         # A pre-existing identity belongs to another installation; never reuse it.
         if (Path.home() / ".ollama").exists():
             raise RuntimeError("Refusing to use an existing Ollama installation identity")
@@ -220,12 +415,12 @@ def execute(root: Path, output: Path, desktop: bool = False) -> int:
                 "OLLAMA_KEEP_ALIVE": "60s", "OLLAMA_CONTEXT_LENGTH": "1024",
                 "CUDA_VISIBLE_DEVICES": "-1", "ROCR_VISIBLE_DEVICES": "-1"})
             with (output / "ollama-service.log").open("wb") as log:
-                service = subprocess.Popen([str(binary), "serve"], cwd=work,
-                    env=service_env, stdout=log, stderr=subprocess.STDOUT,
-                    start_new_session=True)
+                service = owned.start([str(binary), "serve"], cwd=work,
+                    env=service_env, stdout=log, stderr=subprocess.STDOUT)
                 try:
                     deadline = time.monotonic() + 30
                     while True:
+                        owned.check_cancelled()
                         if service.poll() is not None:
                             raise RuntimeError("Isolated Ollama service exited during startup")
                         try:
@@ -267,13 +462,19 @@ def execute(root: Path, output: Path, desktop: bool = False) -> int:
                         configuration_path.write_text(json.dumps(configuration, indent=2) + "\n")
                         desktop_output = output / "desktop"
                         receipt["desktop_status"] = "running"
-                        run("native-desktop-workflow", [sys.executable,
+                        desktop_command = [sys.executable,
                             str(root / "scripts" / "live_desktop_smoke.py"), "--repo", str(root),
                             "--output", str(desktop_output), "--ollama-config", str(configuration_path),
-                            "--require-integrated"], 1200)
+                            "--require-integrated"]
+                        if prebuilt_config is not None:
+                            desktop_command.extend(["--prebuilt-config", str(prebuilt_config)])
+                        run_desktop_with_diagnostic(run, desktop_command, root, output,
+                                                    owned, receipt, save)
                         desktop_receipt = desktop_output / "LIVE_DESKTOP_SMOKE_RECEIPT.json"
                         child = json.loads(desktop_receipt.read_text())
-                        validate_desktop_receipt(child, receipt["source"], configuration)
+                        validate_desktop_receipt(child, receipt["source"], configuration, prebuilt)
+                        if prebuilt_config is not None and load_prebuilt_config(prebuilt_config, receipt["source"]) != prebuilt:
+                            raise ValueError("Prebuilt manifest changed during the packaged workflow")
                         receipt["desktop_status"] = "pass"
                         receipt["desktop_receipt"] = {
                             "path": str(desktop_receipt.relative_to(output)),
@@ -282,10 +483,11 @@ def execute(root: Path, output: Path, desktop: bool = False) -> int:
                             "full_acceptance_status": child["status"]}
                     (output / "loaded-models.json").write_text(json.dumps(api("/api/ps"), indent=2) + "\n")
                 finally:
-                    terminate_group(service)
+                    owned.stop(service)
         receipt["source_after"] = capture_source_identity(root)
         if receipt["source_after"] != receipt["source"]:
             raise RuntimeError("Source changed during the live canary")
+        owned.check_cancelled()
         receipt["status"] = "pass"
     except Exception as error:
         receipt["status"] = "fail"
@@ -293,6 +495,16 @@ def execute(root: Path, output: Path, desktop: bool = False) -> int:
             receipt["desktop_status"] = "fail"
         receipt["error"] = f"{type(error).__name__}: {error}"
     finally:
+        try:
+            owned.close()
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            receipt["status"] = "fail"
+            receipt["cleanup_error"] = str(error)
+        if owned.cancel_signal is not None:
+            receipt["status"] = "fail"
+            receipt["cancel_signal"] = owned.cancel_signal
+            if desktop:
+                receipt["desktop_status"] = "fail"
         receipt["finished_utc"] = now()
         receipt["evidence"] = [{"path": str(path.relative_to(output)), "sha256": sha256(path)}
             for path in sorted(output.rglob("*")) if path.is_file() and path != receipt_path]
@@ -308,8 +520,13 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--desktop", action="store_true",
                         help="Require the native desktop workflow against this same isolated Ollama service.")
+    parser.add_argument("--prebuilt-config", type=Path,
+                        help="With --desktop, replay the installer's source-bound extracted AppRun without rebuilding.")
     args = parser.parse_args()
-    return execute(args.repo.resolve(), args.output.resolve(), desktop=args.desktop)
+    if args.prebuilt_config and not args.desktop:
+        parser.error("--prebuilt-config requires --desktop")
+    return execute(args.repo.resolve(), args.output.resolve(), desktop=args.desktop,
+                   prebuilt_config=args.prebuilt_config.resolve() if args.prebuilt_config else None)
 
 
 if __name__ == "__main__":

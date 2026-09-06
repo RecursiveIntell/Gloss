@@ -9,6 +9,7 @@ function check(name, condition, detail) {
 
 const types = readFileSync("src/lib/types.ts", "utf8");
 const chatPanel = readFileSync("src/components/chat/ChatPanel.tsx", "utf8");
+const chatEvidence = readFileSync("src/lib/chatEvidence.ts", "utf8");
 const notebookSidebar = readFileSync("src/components/notebooks/NotebookSidebar.tsx", "utf8");
 const sourcesPanel = readFileSync("src/components/sources/SourcesPanel.tsx", "utf8");
 const settingsDialog = readFileSync("src/components/settings/SettingsDialog/index.tsx", "utf8");
@@ -34,7 +35,7 @@ check(
 );
 check(
   "unknown evidence defaults are not marked preserved",
-  /source_scope_preserved: false,/.test(chatPanel),
+  /source_scope_preserved: false,/.test(chatEvidence),
   "Null evidence must not claim source scope was preserved."
 );
 check(

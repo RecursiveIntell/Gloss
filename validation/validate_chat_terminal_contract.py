@@ -48,6 +48,25 @@ terminal_markers = [
 
 violations = []
 
+# An invalid rerun target must be rejected before a durable queued attempt is
+# created. This is an ordering guard; Rust history tests prove membership/role
+# rejection, and native workflow tests prove actual accepted rerun behavior.
+send_at = text.find('pub async fn send_message(')
+send_open = text.find('{', send_at)
+send_end = balanced_block_end(text, send_open) if send_open >= 0 else -1
+send = text[send_open:send_end] if send_at >= 0 and send_end >= 0 else ''
+validation_at = send.find('let rerun_history =')
+acceptance_sites = [send.find(marker) for marker in (
+    'let attempt_trace =', 'let active_chat_attempt_lease =',
+    'persist_chat_attempt_status(', 'state.bump_chat_grace()',
+)]
+if (validation_at < 0 or any(site < 0 for site in acceptance_sites)
+        or validation_at >= min(acceptance_sites)
+        or 'history_before_rerun(' not in send[validation_at:min(acceptance_sites)]
+        or send.count('history_before_rerun(') != 1
+        or 'let history = match rerun_history' not in send):
+    violations.append('rerun target rejection must precede attempt acceptance and preemption')
+
 # Check explicit `return;`
 for m in re.finditer(r'(?m)^\s*return\s*;\s*$', block):
     before = block[max(0, m.start()-500):m.start()]

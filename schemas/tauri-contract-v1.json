@@ -1009,7 +1009,9 @@
           "messageId",
           "style",
           "customGoal",
-          "responseLength"
+          "responseLength",
+          "historyBeforeUserMessageId",
+          "userMessageId"
         ]
       },
       "response_family": "string"
@@ -1196,7 +1198,7 @@
       "definition": "src-tauri/src/commands/settings.rs",
       "error_family": "GlossError",
       "wrapper": "updateSetting",
-      "caller_count": 2,
+      "caller_count": 3,
       "operator_only": false,
       "request": {
         "casing": "camelCase",

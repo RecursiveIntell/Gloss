@@ -12,6 +12,7 @@ import { MemoryPanel } from "../inspector/MemoryPanel";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useChatStore } from "../../stores/chatStore";
 import { useNoteStore } from "../../stores/noteStore";
+import { useNotebookStore } from "../../stores/notebookStore";
 import {
   Activity,
   Database,
@@ -52,6 +53,8 @@ interface PanelLayoutProps {
 }
 
 export function PanelLayout({ notebookId }: PanelLayoutProps) {
+  const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
+  const activationStatus = useNotebookStore((s) => s.activationStatus);
   const loadSources = useSourceStore((s) => s.loadSources);
   const loadStats = useSourceStore((s) => s.loadStats);
   const stats = useSourceStore((s) => s.stats);
@@ -82,12 +85,16 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
   }, [compact, leftCollapsed, rightCollapsed]);
 
   useEffect(() => {
+    // A remembered notebook ID is only a preference until backend activation
+    // completes. Activation clears these stores, so load after its acknowledgment.
+    if (activationStatus !== "confirmed" || activeNotebookId !== notebookId) return;
     loadSources(notebookId);
     loadStats(notebookId);
     loadConversations(notebookId);
     loadSuggestedQuestions(notebookId);
     loadNotes(notebookId);
-  }, [notebookId]);
+  }, [notebookId, activeNotebookId, activationStatus, loadSources, loadStats,
+    loadConversations, loadSuggestedQuestions, loadNotes]);
 
   useEffect(() => {
     localStorage.setItem("gloss:layout:leftWidth", String(leftWidth));

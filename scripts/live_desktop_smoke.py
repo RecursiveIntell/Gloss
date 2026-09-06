@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import base64
 from datetime import datetime, timezone
+import hashlib
+import http.client
 import json
 import ipaddress
 import os
@@ -19,12 +21,13 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import sqlite3
+import stat
 import subprocess
 import sys
 import time
 import traceback
 import urllib.error
-import urllib.request
 import urllib.parse
 import uuid
 
@@ -37,6 +40,191 @@ from source_snapshot import capture_source_identity
 BASELINE_CASES = ("startup_idle", "notebook_crud_restart")
 OLLAMA_CONFIG_SCHEMA = "gloss-desktop-ollama-config/v1"
 ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
+MESSAGE_EVIDENCE_SELECTOR = '.gloss-assistant-bubble button[title="Evidence"][aria-controls^="evidence-"]'
+
+
+def collect_desktop_failure_evidence(root: Path) -> dict:
+    """Read bounded canonical records from this run's disposable profile only.
+
+    Saved receipts and rows are observations, not an inferred provider request.
+    Incomplete evidence must not be used to guess a retry history or pass a gate.
+    """
+    result = {"schema": "GlossDesktopFailureProfileV1", "status": "absent",
+              "truncated": False, "notebooks": []}
+    root = root.absolute()
+
+    def owned(path: Path, directory: bool = False):
+        if root.is_symlink() or root.resolve() != root or not path.is_relative_to(root):
+            raise ValueError("unsafe_profile_path")
+        for part in (root, *[root.joinpath(*path.relative_to(root).parts[:i])
+                             for i in range(1, len(path.relative_to(root).parts) + 1)]):
+            if part.is_symlink():
+                raise ValueError("unsafe_profile_path")
+        info = path.stat()
+        if not path.resolve().is_relative_to(root):
+            raise ValueError("unsafe_profile_path")
+        if directory:
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError("unsafe_profile_path")
+        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("unsafe_profile_path")
+        return info
+
+    def decode(raw):
+        if not raw:
+            return None
+        if len(raw) > 32768:
+            result["truncated"] = True
+            raise ValueError("receipt_limit")
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("invalid_receipt_object")
+        return value
+
+    try:
+        if not root.exists() and not root.is_symlink():
+            return result
+        owned(root, directory=True)
+        base = root / "profile" / "data" / "gloss" / "notebooks"
+        # Check components even when the final path is absent (including broken links).
+        for component in (root / "profile", root / "profile/data", root / "profile/data/gloss", base):
+            if component.is_symlink():
+                raise ValueError("unsafe_profile_path")
+            if not component.exists():
+                return result
+            owned(component, directory=True)
+        with os.scandir(base) as entries:
+            candidates = []
+            for index, entry in enumerate(entries):
+                if index == 16:
+                    result["truncated"] = True
+                    break
+                if entry.is_symlink():
+                    raise ValueError("unsafe_profile_path")
+                try:
+                    if str(uuid.UUID(entry.name)) != entry.name:
+                        continue
+                except ValueError:
+                    continue
+                candidates.append(Path(entry.path))
+        if len(candidates) > 4:
+            result["truncated"] = True
+        for directory in sorted(candidates)[:4]:
+            owned(directory, directory=True)
+            database = directory / "notebook.db"
+            if not database.exists() and not database.is_symlink():
+                continue
+            database_bytes = owned(database).st_size
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar = database.with_name(database.name + suffix)
+                if sidecar.exists() or sidecar.is_symlink():
+                    database_bytes += owned(sidecar).st_size
+            if database_bytes > 64 * 1024 * 1024:
+                result["truncated"] = True
+                continue
+            notebook = {"notebook_id": directory.name, "messages": []}
+            result["notebooks"].append(notebook)
+            connection = None
+            try:
+                with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0.2) as connection:
+                    connection.execute("PRAGMA query_only=ON")
+                    connection.execute("PRAGMA trusted_schema=OFF")
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 131072)
+                    deadline = time.monotonic() + 1
+                    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                    # A stored view cannot redirect the collector into settings or other tables.
+                    connection.set_authorizer(lambda action, first, second, _db, _trigger:
+                        sqlite3.SQLITE_OK if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_TRANSACTION)
+                        or action == sqlite3.SQLITE_READ and first in ("messages", "prompt_receipts")
+                        or action == sqlite3.SQLITE_FUNCTION and second in ("substr", "length", "count")
+                        else sqlite3.SQLITE_DENY)
+                    connection.execute("BEGIN")
+                    latest = connection.execute("SELECT conversation_id FROM messages ORDER BY rowid DESC LIMIT 1").fetchone()
+                    if latest is None:
+                        continue
+                    conversation = latest[0]
+                    notebook["conversation_id"] = conversation
+                    notebook["message_count"] = connection.execute("SELECT count(*) FROM messages WHERE conversation_id=?", (conversation,)).fetchone()[0]
+                    notebook["messages_truncated"] = notebook["message_count"] > 16
+                    result["truncated"] |= notebook["messages_truncated"]
+                    rows = connection.execute(
+                        "SELECT rowid,id,conversation_id,role,created_at,substr(content,1,512),length(content),"
+                        "substr(citations,1,32769),model_used FROM messages WHERE conversation_id=? ORDER BY created_at ASC LIMIT 16",
+                        (conversation,)).fetchall()
+                    for row in rows:
+                        content = row[5]
+                        truncated = len(content) != row[6]
+                        result["truncated"] |= truncated
+                        notebook["messages"].append(dict(zip(
+                            ("rowid", "id", "conversation_id", "role", "created_at"), row[:5]),
+                            content=content, content_truncated=truncated,
+                            content_sha256=None if truncated else hashlib.sha256(content.encode()).hexdigest()))
+                    assistants = [row for row in rows if row[3] == "assistant"]
+                    if not assistants:
+                        continue
+                    assistant = max(assistants, key=lambda row: row[0])
+                    saved = {"message_id": assistant[1], "conversation_id": conversation,
+                             "notebook_id": directory.name, "model": assistant[8]}
+                    notebook["latest_assistant"] = saved
+                    evidence = (decode(assistant[7]) or {}).get("evidence", {})
+                    if not isinstance(evidence, dict):
+                        raise ValueError("invalid_evidence_object")
+                    try:
+                        canonical = connection.execute(
+                            "SELECT substr(raw_receipt_json,1,32769) FROM prompt_receipts WHERE message_id=? AND conversation_id=? LIMIT 2",
+                            (assistant[1], conversation)).fetchall()
+                    except sqlite3.OperationalError as error:
+                        if "no such table: prompt_receipts" not in str(error):
+                            raise
+                        canonical = []
+                    if len(canonical) > 1:
+                        raise ValueError("ambiguous_prompt_receipt")
+                    prompt = decode(canonical[0][0]) if canonical else evidence.get("prompt_receipt")
+                    saved["prompt_receipt_source"] = "prompt_receipts" if canonical else "messages.citations.evidence"
+                    if not isinstance(prompt, dict) or any(prompt.get(key) != value for key, value in
+                            (("message_id", assistant[1]), ("conversation_id", conversation), ("notebook_id", directory.name))):
+                        raise ValueError("missing_or_mismatched_prompt_receipt")
+                    keys = ("schema", "receipt_id", "notebook_id", "conversation_id", "message_id", "prompt_digest",
+                            "context_payload_digest", "system_prompt_digest", "user_turn_digest", "system_prompt_text", "source_passage_count")
+                    saved["prompt_receipt"] = {key: prompt[key] for key in keys if key in prompt}
+                    for key, fields in (
+                        ("decoding_settings_receipt", ("schema", "provider", "model", "effective")),
+                        ("prompt_budget_receipt", ("model_context_window", "message_count", "source_passage_count", "prompt_digest",
+                                                   "system_prompt_chars", "estimated_prompt_tokens", "context_budgeted"))):
+                        value = evidence.get(key)
+                        if isinstance(value, dict):
+                            saved[key] = {field: value[field] for field in fields if field in value}
+                    decoding = saved.get("decoding_settings_receipt", {}).get("effective")
+                    if isinstance(decoding, dict):
+                        saved["decoding_settings_receipt"]["effective"] = {key: decoding[key] for key in
+                            ("temperature", "top_p", "top_k", "min_p", "repeat_penalty", "max_tokens") if key in decoding}
+            except (OSError, sqlite3.Error, ValueError, TypeError) as error:
+                notebook["capture_error"] = type(error).__name__
+                result["status"] = "partial"
+            finally:
+                if connection is not None:
+                    connection.close()
+        if result["notebooks"] and result["status"] == "absent":
+            result["status"] = "ok"
+    except (OSError, ValueError) as error:
+        result["status"] = "rejected" if isinstance(error, ValueError) else "error"
+        result["capture_error"] = type(error).__name__
+    if len(json.dumps(result).encode()) > 8192:
+        # Retain ordering and counts when text alone exhausts the output budget.
+        result.update(status="partial", truncated=True, capture_error="serialized_evidence_limit")
+        for notebook in result["notebooks"]:
+            for message in notebook["messages"]:
+                if message["content"]:
+                    message.update(content="", content_truncated=True, content_sha256=None)
+            prompt = notebook.get("latest_assistant", {}).get("prompt_receipt", {})
+            if prompt.get("system_prompt_text"):
+                prompt.update(system_prompt_text="", system_prompt_truncated=True)
+    if len(json.dumps(result).encode()) > 8192:
+        return {"schema": result["schema"], "status": "partial", "truncated": True,
+                "notebooks": [], "capture_error": "serialized_evidence_limit"}
+    if result["truncated"] and result["status"] in ("ok", "absent"):
+        result["status"] = "partial"
+    return result
 
 
 def load_ollama_config(path: Path) -> dict:
@@ -152,31 +340,33 @@ def free_port() -> int:
 
 class WebDriver:
     def __init__(self, port: int):
-        self.endpoint = f"http://127.0.0.1:{port}"
+        self.port = port
         self.session: str | None = None
         self.trace: list[dict] = []
 
     def request(self, method: str, path: str, payload: dict | None = None):
-        request = urllib.request.Request(
-            self.endpoint + path,
-            data=json.dumps(payload).encode() if payload is not None else None,
-            headers={"Content-Type": "application/json"},
-            method=method,
-        )
+        # urllib forces Connection: close, which the Tauri proxy forwards to
+        # its pooled native WebDriver connection. Use an explicit loopback
+        # connection without that hop-by-hop header or ambient proxy settings.
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         observation = {"at": now(), "method": method, "path": path, "request": payload}
         self.trace.append(observation)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                result = json.load(response)
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode(errors="replace")
-            observation["error"] = f"HTTP {error.code}: {detail}"
-            raise RuntimeError(f"WebDriver {method} {path}: {detail}") from error
+            connection.request(method, path,
+                               body=json.dumps(payload).encode() if payload is not None else None,
+                               headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            body = response.read()
+            if response.status >= 400:
+                raise RuntimeError(f"WebDriver {method} {path}: HTTP {response.status}: {body.decode(errors='replace')}")
+            result = json.loads(body)
         except Exception as error:
             # A failed POST may already have acted. Preserve the attempted
             # command and propagate the failure without replaying the mutation.
             observation["error"] = f"{type(error).__name__}: {error}"
             raise
+        finally:
+            connection.close()
         value = result.get("value")
         observation["response"] = "PNG captured" if path.endswith("/screenshot") else value
         if isinstance(value, dict) and value.get("error"):
@@ -216,6 +406,30 @@ class WebDriver:
     def click_ref(self, element: dict):
         self.call("POST", f"/element/{element[ELEMENT_KEY]}/click", {})
 
+    def click_when_unobstructed(self, selector: str):
+        previous_target = None
+        def ready():
+            nonlocal previous_target
+            observation = self.execute("""const nodes=Array.from(document.querySelectorAll(arguments[0]))
+                .filter(e=>e.getClientRects().length);
+                if(nodes.length!==1) return {ready:false, matches:nodes.length};
+                const button=nodes[0], r=button.getBoundingClientRect();
+                const left=Math.max(0,r.left), right=Math.min(innerWidth,r.right);
+                const top=Math.max(0,r.top), bottom=Math.min(innerHeight,r.bottom);
+                const inView=right>left && bottom>top;
+                const hit=inView ? document.elementFromPoint((left+right)/2,(top+bottom)/2) : null;
+                const owned=!!hit && (hit===button || button.contains(hit));
+                return {ready:inView && owned && !button.disabled, button,
+                    rect:{x:r.x,y:r.y,width:r.width,height:r.height},
+                    hit:hit ? {tag:hit.tagName,label:hit.getAttribute('aria-label'),title:hit.title} : null};""", [selector])
+            target = (observation.get("button"), observation.get("rect")) if observation.get("ready") else None
+            observation["stable"] = target is not None and target == previous_target
+            previous_target = target
+            self.trace.append({"at": now(), "click_readiness": selector, "observation": observation})
+            return observation.get("button") if observation["stable"] else None
+        button = self.wait(ready, label=f"unobstructed native action {selector}")
+        self.click_ref(button)
+
     def find_visible(self, selector: str, text: str | None = None, last: bool = False):
         return self.execute("""const nodes=Array.from(document.querySelectorAll(arguments[0])).filter(e=>e.getClientRects().length && (!arguments[1] || e.textContent.trim()===arguments[1])); return nodes[arguments[2] ? nodes.length-1 : 0] || null""", [selector, text, last])
 
@@ -233,8 +447,47 @@ class WebDriver:
             self.call("POST", f"/element/{identifier}/value", {"text": value})
 
     def select(self, selector: str, value: str):
-        element = self.wait(lambda: self.execute("""const s=document.querySelector(arguments[0]); return s && s.getClientRects().length ? Array.from(s.options).find(o=>o.value===arguments[1] && !o.disabled) || null : null""", [selector, value]), label=f"selectable {value}")
-        self.click_ref(element)
+        target = self.wait(lambda: self.execute("""const s=document.querySelector(arguments[0]);
+            const o=s && Array.from(s.options).find(o=>o.value===arguments[1] && !o.matches(':disabled'));
+            return s && !s.matches(':disabled') && s.getClientRects().length && o
+                ? {select:s, option:o, original_value:s.value} : null""", [selector, value]), label=f"selectable {value}")
+        select_element, option = target["select"], target["option"]
+        # WebKit's standard Send Keys focuses the select and schedules native
+        # scrolling. Balanced Shift changes no option and leaves no modifier
+        # held. Empty Send Keys is rejected by WebKit's keyboard backend.
+        self.call("POST", f"/element/{select_element[ELEMENT_KEY]}/value", {"text": "\ue008\ue008"})
+        observation = {}
+
+        def ready():
+            nonlocal observation
+            observation = self.execute("""const s=arguments[1], o=arguments[2];
+                const r=s.getClientRects()[0], v=window.visualViewport;
+                const viewport={left:v?.offsetLeft || 0, top:v?.offsetTop || 0,
+                    width:v?.width ?? window.innerWidth, height:v?.height ?? window.innerHeight};
+                const left=r ? Math.max(r.left,viewport.left) : 0;
+                const top=r ? Math.max(r.top,viewport.top) : 0;
+                const right=r ? Math.min(r.right,viewport.left+viewport.width) : 0;
+                const bottom=r ? Math.min(r.bottom,viewport.top+viewport.height) : 0;
+                const in_view=right>left && bottom>top;
+                const hits=in_view ? document.elementsFromPoint((left+right)/2,(top+bottom)/2) : [];
+                return {same_select:s.isConnected && document.querySelector(arguments[0])===s,
+                    same_option:o.isConnected && Array.from(s.options).includes(o) && o.value===arguments[3],
+                    focused:document.activeElement===s, enabled:!s.matches(':disabled') && !o.matches(':disabled'),
+                    value_unchanged:s.value===arguments[4], in_view,
+                    select_hit:hits.includes(s), top_hit_owned:!!hits[0] && (hits[0]===s || s.contains(hits[0])),
+                    rect:r ? {x:r.x,y:r.y,width:r.width,height:r.height} : null, viewport};
+                """, [selector, select_element, option, value, target["original_value"]])
+            if not observation["same_select"] or not observation["same_option"]:
+                raise RuntimeError("select target changed during native focus preparation")
+            if not observation["value_unchanged"]:
+                raise RuntimeError("select value changed during native focus preparation")
+            return all(observation[key] for key in ("focused", "enabled", "in_view", "select_hit", "top_hit_owned"))
+
+        try:
+            self.wait(ready, timeout=5, label=f"select interactable {value}")
+        finally:
+            self.trace.append({"at": now(), "select_readiness": selector, "target_geometry": observation})
+        self.click_ref(option)
         self.wait(lambda: self.execute("return document.querySelector(arguments[0])?.value===arguments[1]", [selector, value]), label=f"selected {value}")
 
     def text(self, selector: str = "body") -> str:
@@ -315,8 +568,8 @@ class IntegratedWorkflow:
 
     def inspector(self, tab: str):
         if self.ui.find_visible('button[aria-label="Open inspector"]'):
-            self.ui.click('button[aria-label="Open inspector"]')
-        self.ui.click(f'button[aria-label="Inspector tab: {tab}"]')
+            self.ui.click_when_unobstructed('button[aria-label="Open inspector"]')
+        self.ui.click_when_unobstructed(f'button[aria-label="Inspector tab: {tab}"]')
 
     def create_notebook(self, name: str):
         self.remember_conversation()
@@ -340,6 +593,8 @@ class IntegratedWorkflow:
             # Conversation selection itself is intentionally not persisted by
             # the product. Reopen the previously observed conversation through
             # its actual dropdown before checking durable message content.
+            # A restored compact Sources drawer can cover the dropdown.
+            self.focus_chat()
             self.ui.select('select[aria-label="Conversation"]', self.conversations[notebook])
 
     def restart(self, notebook: str):
@@ -372,37 +627,77 @@ class IntegratedWorkflow:
         self.ui.fill('input[aria-label="Ollama server URL"]', self.config["base_url"])
         self.ui.click_ref(self.ui.execute("return document.querySelector('input[aria-label=\"Ollama server URL\"]').parentElement.querySelector('button')"))
         self.ui.wait(lambda: self.ui.execute("return document.querySelector('input[aria-label=\"Ollama server URL\"]').parentElement.querySelector('button').disabled"), label="Ollama URL saved")
+        self.ui.fill('input[aria-label="Chat temperature"]', "0")
+        self.ui.click_text("Apply chat temperature")
+        self.ui.wait(lambda: self.ui.execute("return Array.from(document.querySelectorAll('button')).some(e=>e.textContent==='Apply chat temperature' && e.disabled)"), label="chat temperature Apply acknowledged")
         self.ui.select('select:has(option[value="gloss-local"])', "gloss-local")
+        def profile_applied():
+            text = self.ui.text()
+            self.check("Memory profile not applied" not in text and "Memory profile blocked" not in text,
+                       "memory profile Apply succeeded")
+            return "Memory profile applied" in text
+        self.ui.wait(profile_applied, label="acknowledged memory profile Apply")
         self.embedding_settings(self.config["embedding_model"])
         self.close_settings()
         self.ui.click('button[title="Refresh model list from providers"]')
         self.ui.select('select[aria-label="Chat model and provider"]', "ollama::" + self.config["chat_model"])
         self.ui.select('select[aria-label="Response length"]', "short")
         self.ui.select('select[aria-label="Conversational style"]', "custom")
-        self.ui.fill('input[aria-label="Custom conversation goal"]', "Be concise. Quote exact source facts and cite them using [1]. /no_think")
+        self.ui.fill('input[aria-label="Custom conversation goal"]', "Be concise. When sources are provided, quote exact source facts and cite them using [1]. /no_think")
         self.ui.wait(lambda: "Saving model selection" not in self.ui.text(), label="chat model saved")
         self.settings()
         for label, expected in (("Ollama server URL", self.config["base_url"]), ("Embedding URL", self.config["base_url"]),
-                                ("Embedding model", self.config["embedding_model"]), ("Embedding timeout seconds", "60")):
+                                ("Embedding model", self.config["embedding_model"]), ("Embedding timeout seconds", "60"),
+                                ("Chat temperature", "0")):
             self.check(self.ui.execute("return document.querySelector(arguments[0]).value", [f'input[aria-label="{label}"]']) == expected, f"reopened {label} matches applied value")
         self.ui.snapshot("applied-settings", self.root)
         self.close_settings()
 
+    def answer_snapshot(self) -> dict:
+        # A mounted virtual row is meaningful as latest only at the acknowledged
+        # list end. Bind identity and text to that same persisted bubble.
+        return self.ui.execute("""const region=document.querySelector('[aria-label="Chat messages"]');
+const at_end=region?.dataset.chatAtBottom==='true';
+const button=at_end ? Array.from(region.querySelectorAll(arguments[0])).at(-1) : null;
+const bubble=button?.closest('.gloss-assistant-bubble');
+return {at_end, id:button?.getAttribute('aria-controls') || null,
+  text:bubble?.querySelector('.prose')?.innerText || '',
+  latest:!!bubble && bubble.dataset.chatMessageRole==='assistant' &&
+    bubble.dataset.chatMessageId===region.dataset.chatLatestMessageId,
+  streaming:!!document.querySelector('button[aria-label="Stop generation"]')};""", [MESSAGE_EVIDENCE_SELECTOR])
+
+    def jump_to_latest(self) -> dict:
+        if not self.answer_snapshot()["at_end"]:
+            def navigation_ready():
+                if self.answer_snapshot()["at_end"]:
+                    return {"at_end": True}
+                button = self.ui.find_visible('button[aria-label="Jump to latest"]')
+                return {"button": button} if button else None
+            navigation = self.ui.wait(navigation_ready, label="latest-message navigation control")
+            if "button" in navigation:
+                self.ui.click_ref(navigation["button"])
+        return self.ui.wait(lambda: (state if (state := self.answer_snapshot())["at_end"] else None),
+                            label="latest-message navigation acknowledged")
+
+    def wait_for_answer(self, previous: str | None, label: str) -> dict:
+        def completed():
+            state = self.answer_snapshot()
+            return state if state["at_end"] and state["latest"] and state["id"] and state["id"] != previous and not state["streaming"] else None
+        return self.ui.wait(completed, timeout=180, label=label)
+
     def answer_id(self) -> str | None:
-        # The list is virtualized: rendered row counts are not monotonic.
-        # Observe the last actual message's existing disclosure target instead.
-        return self.ui.execute("return Array.from(document.querySelectorAll('button[title=\"Evidence\"]')).at(-1)?.getAttribute('aria-controls') || null")
+        return self.answer_snapshot()["id"]
 
     def last_answer(self) -> str:
-        return self.ui.execute("return Array.from(document.querySelectorAll('.gloss-assistant-bubble .prose')).at(-1)?.innerText || ''")
+        return self.answer_snapshot()["text"]
 
     def send(self, question: str, expected: str | None = None) -> str:
         self.focus_chat()
-        previous = self.answer_id()
+        previous = self.jump_to_latest()["id"]
         self.ui.fill('textarea[aria-label="Chat message"]', question + " /no_think")
         self.ui.click('button[aria-label="Send message"]')
-        self.ui.wait(lambda: self.answer_id() and self.answer_id() != previous and not self.ui.find_visible('button[aria-label="Stop generation"]'), timeout=180, label="persisted assistant answer")
-        answer = self.last_answer()
+        self.jump_to_latest()
+        answer = self.wait_for_answer(previous, "persisted assistant answer")["text"]
         self.check(bool(answer.strip()), "assistant response is nonempty")
         if expected:
             self.check(expected in answer, f"assistant contains fixture fact {expected}")
@@ -410,12 +705,15 @@ class IntegratedWorkflow:
         return answer
 
     def evidence(self, selected: int, excluded: int, retrieval: bool, *, degraded: bool = False) -> dict:
-        button = self.ui.find_visible('button[title="Evidence"]', last=True)
+        button = self.ui.find_visible(MESSAGE_EVIDENCE_SELECTOR, last=True)
+        drawer_id = self.ui.execute("return arguments[0].getAttribute('aria-controls')", [button])
         if not self.ui.execute("return arguments[0].getAttribute('aria-expanded')==='true'", [button]):
-            self.ui.click_ref(button)
-        values = self.ui.execute("""const r=Array.from(document.querySelectorAll('[aria-label="Answer evidence"]')).at(-1); const g=r.querySelector('.grid'); return Object.fromEntries(Array.from(g.children).map(e=>[e.children[0].textContent.replace(/:\\s*$/, '').trim(), e.children[1].textContent.trim()]));""")
+            self.ui.click_when_unobstructed(f'button[aria-controls={json.dumps(drawer_id)}]')
+        self.ui.wait(lambda: self.ui.execute("return document.getElementById(arguments[0])?.getClientRects().length>0", [drawer_id]), label="message evidence disclosure")
+        values = self.ui.execute("""const r=document.getElementById(arguments[0]); const g=r.querySelector('.grid'); return Object.fromEntries(Array.from(g.children).map(e=>[e.children[0].textContent.replace(/:\\s*$/, '').trim(), e.children[1].textContent.trim()]));""", [drawer_id])
         require_scope_evidence(values, selected, excluded, retrieval, degraded=degraded)
-        self.check(values.get("Generation") == "complete", "rendered generation receipt is complete")
+        self.check(values.get("Generation") == "completed", "rendered generation receipt is complete")
+        self.check(values.get("Temperature") == "0", "rendered effective chat temperature matches the applied setting")
         self.scope_checks.append(values)
         self.ui.snapshot(f"evidence-{len(self.scope_checks)}", self.root)
         return values
@@ -438,8 +736,35 @@ class IntegratedWorkflow:
     def choose_source(self, title: str):
         self.sources()
         self.ui.click_text("None")
-        row = self.ui.execute("return Array.from(document.querySelectorAll('p[title]')).find(e=>e.title===arguments[0]).parentElement.parentElement", [title])
-        self.ui.click_ref(self.ui.execute("return arguments[0].querySelector('button')", [row]))
+        self.click_source_button(title, "button")
+
+    def click_source_button(self, title: str, selector: str):
+        # Opening the rail can return before Virtuoso mounts the source rows.
+        # Observe the exact visible action, then click once through WebDriver.
+        button = self.ui.wait(lambda: self.ui.execute("""const labels=Array.from(document.querySelectorAll('p[title]'))
+            .filter(e=>e.title===arguments[0] && e.getClientRects().length);
+            if(labels.length!==1) return null;
+            const row=labels[0].parentElement?.parentElement;
+            if(!row?.querySelector('button[title="Reindex for semantic-memory preview"]')) return null;
+            const button=row.querySelector(arguments[1]);
+            return button && !button.disabled && button.getClientRects().length ? button : null;""", [title, selector]),
+            label=f"visible source action {title}: {selector}")
+        self.ui.click_ref(button)
+
+    def wait_source_retry(self, title: str, original_error: str | None):
+        def completed():
+            # Preserve immediate command failures before transient alerts expire.
+            # This observes rendered UI only; it never dispatches another action.
+            alerts = self.ui.execute("""return Array.from(document.querySelectorAll('[role="alert"]'))
+                .filter(e=>e.getClientRects().length).map(e=>({
+                    title:e.querySelector('p')?.textContent,
+                    message:e.getAttribute('aria-label') || e.innerText}));""")
+            unexpected = [a for a in alerts if a.get("title") in ("Retry Failed", "Reindex Failed", "Reindex Complete")]
+            if unexpected:
+                raise RuntimeError(f"source retry action failed or activated a different action: {json.dumps(unexpected)}")
+            return any(row["title"] == title and (row["status"] == "ready" or (
+                row["status"] == "error" and row["error"] != original_error)) for row in self.source_rows())
+        self.ui.wait(completed, timeout=180, label="explicit retry produced a new terminal source state")
 
     def paste(self, title: str, content: str):
         self.sources()
@@ -450,27 +775,89 @@ class IntegratedWorkflow:
         self.ui.wait(lambda: not self.ui.find_visible('textarea[placeholder="Paste text here..."]'), label="paste accepted")
 
     def folder(self, folder: Path):
+        self.check(folder.is_absolute(), "native folder selection requires an absolute path")
         if not shutil.which("xdotool"):
             raise BaselineBlocked("xdotool is required to observe the real native folder chooser")
         self.sources()
-        self.ui.click_text("Folder")
-        def native(*args: str) -> str:
-            result = subprocess.run(["xdotool", *args], capture_output=True, text=True, timeout=10, check=True)
-            self.ui.trace.append({"at": now(), "native_ui_command": ["xdotool", *args], "stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode})
+        def native(*args: str, timeout: float = 10, allow_absent: bool = False) -> str:
+            command = ["xdotool", *args]
+            entry = {"at": now(), "native_ui_command": command, "timeout_seconds": timeout}
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                entry.update(exit_code=None, error=str(error), timed_out=isinstance(error, subprocess.TimeoutExpired))
+                for field in ("stdout", "stderr"):
+                    value = getattr(error, field, "") or ""
+                    entry[field] = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+                self.ui.trace.append(entry)
+                raise
+            entry.update(stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode)
+            self.ui.trace.append(entry)
+            # xdotool search returns 1 with empty output when no window matches.
+            # Other failures, including mutations, are recorded and never replayed.
+            if result.returncode and not (allow_absent and result.returncode == 1
+                                          and not result.stdout.strip() and not result.stderr.strip()):
+                raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
             return result.stdout.strip()
+
+        def visible_dialogs(timeout: float = 2) -> set[str]:
+            found = native("search", "--onlyvisible", "--name", "Select|Open|Choose",
+                           timeout=timeout, allow_absent=True).splitlines()
+            self.check(all(re.fullmatch(r"[1-9]\d*", item) and int(item) > 1 for item in found),
+                       "native chooser search returned window identifiers")
+            return set(found)
+
         # Keyboard selection operates on the actual GTK chooser opened by the
         # Folder button. No dialog result, file path, store or IPC is injected.
-        native("search", "--sync", "--onlyvisible", "--name", "Select|Open|Choose")
-        name = native("getwindowfocus", "getwindowname")
-        self.check(bool(re.search(r"select|open|choose", name, re.I)), f"native folder chooser focused: {name}")
-        native("key", "--clearmodifiers", "ctrl+l")
-        native("type", "--clearmodifiers", "--delay", "1", str(folder))
-        native("key", "--clearmodifiers", "Return")
+        previous = visible_dialogs()
+        self.ui.click_text("Folder")
+        deadline = time.monotonic() + 10
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("native folder chooser did not appear within 10 seconds")
+            candidates = visible_dialogs(min(2, remaining)) - previous
+            self.check(len(candidates) <= 1, "native folder chooser identity is unambiguous")
+            if candidates:
+                dialog = candidates.pop()
+                break
+            time.sleep(min(0.1, remaining))
+        name = native("getwindowname", dialog)
+        self.check(bool(re.search(r"select|open|choose", name, re.I)), f"native folder chooser identified: {dialog} {name}")
+        # Xvfb has no EWMH window manager. Set focus on the discovered dialog
+        # directly, then inspect raw X focus without WM_CLASS parent traversal.
+        native("windowfocus", "--sync", dialog)
+        time.sleep(0.25)
+
+        def key_action(*args: str):
+            self.check(native("getwindowfocus", "-f") == dialog,
+                       f"native folder chooser {dialog} retains keyboard focus")
+            native(*args)
+
+        # GTK's slash shortcut initializes folder browsing from the initial
+        # Recent view. Ctrl+L can expose an entry with no current folder and a
+        # disabled Open button. Let the native entry realize before typing;
+        # the slash key supplies the absolute path's first character.
+        key_action("key", "--clearmodifiers", "slash")
+        time.sleep(0.25)
+        self.ui.trace.append({"at": now(), "native_folder_path_entry": "slash",
+                              "window_settle_seconds": 0.25, "entry_settle_seconds": 0.25})
+        key_action("type", "--clearmodifiers", "--delay", "1", str(folder)[1:])
+        key_action("key", "--clearmodifiers", "Return")
         time.sleep(0.3)
         # GTK may navigate to the directory first. Activating the dialog's
-        # default action after navigation selects that directory.
-        if re.search(r"select|open|choose", native("getwindowfocus", "getwindowname"), re.I):
-            native("key", "--clearmodifiers", "Return")
+        # default action is a separate step only while that same chooser remains
+        # visible and focused. A failed command is never retried.
+        if dialog in visible_dialogs():
+            key_action("key", "--clearmodifiers", "Return")
+        deadline = time.monotonic() + 5
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("native folder chooser did not close after confirmation")
+            if dialog not in visible_dialogs(min(2, remaining)):
+                break
+            time.sleep(min(0.1, remaining))
 
     def run(self, name: str):
         self.create_notebook(name)
@@ -484,6 +871,9 @@ class IntegratedWorkflow:
         self.restart(name)
         self.ui.wait(lambda: greeting == self.last_answer(), label="exact chat content after restart")
         self.check(self.ui.execute("return document.querySelector('select[aria-label=\"Chat model and provider\"]').value") == "ollama::" + self.config["chat_model"], "exact provider/model restored after restart")
+        self.settings()
+        self.check(self.ui.execute("return document.querySelector('input[aria-label=\"Chat temperature\"]').value") == "0", "applied chat temperature survives native restart")
+        self.close_settings()
         self.record(self.case_id, "Restarted the actual native process and observed identical persisted assistant content and the selected Ollama model.")
 
         self.case_id = "model_dropdown_and_prompt"
@@ -495,27 +885,30 @@ class IntegratedWorkflow:
 
         self.case_id = "chat_cancel_and_retry"
         self.focus_chat()
-        before = self.answer_id()
+        prior_answer = self.jump_to_latest()
+        before, saved_answer = prior_answer["id"], prior_answer["text"]
         self.ui.fill('textarea[aria-label="Chat message"]', "Write a long numbered list of 100 detailed facts about oceanography. /no_think")
         self.ui.click('button[aria-label="Send message"]')
         self.ui.wait(lambda: self.ui.find_visible('button[aria-label="Stop generation"]') and self.ui.execute("return Array.from(document.querySelectorAll('.gloss-assistant-bubble pre')).some(e=>e.innerText.trim().length>0)"), timeout=180, label="actual streamed model tokens before cancellation")
         self.ui.snapshot("stream-before-cancel", self.root)
         self.ui.click('button[aria-label="Stop generation"]')
-        self.ui.wait(lambda: not self.ui.find_visible('button[aria-label="Stop generation"]') and self.answer_id() and self.answer_id() != before, label="cancelled partial response persisted")
-        self.inspector("Receipt")
-        self.ui.wait(lambda: re.search(r"cancel", self.ui.text("#inspector-panel-receipt"), re.I), label="cancelled terminal receipt")
-        self.ui.snapshot("cancelled-receipt", self.root)
+        self.ui.wait(lambda: not self.ui.find_visible('button[aria-label="Stop generation"]') and self.ui.find_visible('[role="alert"]', "Chat cancelled by user"), label="explicit cancelled terminal event")
+        self.check(self.answer_id() == before, "cancelled generation is not presented as a completed assistant answer")
+        self.ui.snapshot("cancelled-terminal", self.root)
+        self.restart(name)
+        self.ui.wait(lambda: self.last_answer() == saved_answer and self.answer_id() == before, label="prior saved answer preserved after cancellation and restart")
         self.focus_chat()
         # Edit-and-rerun is the explicit UI retry action, bounded to a short
         # replacement prompt so completion rather than a second cancel is proven.
         self.ui.click_ref(self.ui.find_visible('button[title="Edit and rerun"]', last=True))
         self.ui.fill('textarea[aria-label="Chat message"]', "Reply with exactly RETRY_GLOSS. /no_think")
-        previous = self.answer_id()
+        previous = self.jump_to_latest()["id"]
         self.ui.click('button[aria-label="Rerun edited message"]')
-        self.ui.wait(lambda: self.answer_id() and self.answer_id() != previous and not self.ui.find_visible('button[aria-label="Stop generation"]'), timeout=180, label="explicit edit-and-rerun complete")
-        self.check("RETRY_GLOSS" in self.last_answer(), "explicit retry produced a completed model response")
+        self.jump_to_latest()
+        retry_answer = self.wait_for_answer(previous, "explicit edit-and-rerun complete")
+        self.check("RETRY_GLOSS" in retry_answer["text"], "explicit retry produced a completed model response")
         self.evidence(0, 0, False)
-        self.record(self.case_id, "Observed real streamed tokens, stopped through the UI, inspected the cancelled terminal receipt, then used Edit and rerun for a successful explicit retry.")
+        self.record(self.case_id, "Observed real streamed tokens, stopped through the UI, saw the explicit cancellation alert without a new completed answer, restarted and verified the prior saved answer, then used Edit and rerun for a successful explicit retry.")
 
         self.case_id = "folder_import_scope"
         folder = self.root / "folder-fixture"
@@ -563,9 +956,8 @@ class IntegratedWorkflow:
         self.embedding_settings(self.config["embedding_model"])
         self.close_settings()
         self.sources()
-        recovery = self.ui.execute("return Array.from(document.querySelectorAll('p[title]')).find(e=>e.title==='Recovery fixture').parentElement.parentElement")
-        self.ui.click_ref(self.ui.execute("return arguments[0].querySelector('button[title=\"Retry ingestion\"]')", [recovery]))
-        self.ui.wait(lambda: any(row["title"] == "Recovery fixture" and (row["status"] == "ready" or (row["status"] == "error" and row["error"] != original_error)) for row in self.source_rows()), timeout=180, label="explicit retry produced a new terminal source state")
+        self.click_source_button("Recovery fixture", 'button[title="Retry ingestion"]')
+        self.wait_source_retry("Recovery fixture", original_error)
         self.inspector("Health")
         self.ui.click_text("Rebuild dense index")
         self.ui.wait(lambda: "Dense index ready:" in self.ui.text("#inspector-panel-diagnostics"), timeout=180, label="explicit native index rebuild")
@@ -737,7 +1129,7 @@ def main() -> int:
             try:
                 driver.request("GET", "/status")
                 break
-            except urllib.error.URLError:
+            except (urllib.error.URLError, OSError):
                 if time.monotonic() >= deadline:
                     raise RuntimeError("tauri-driver startup timed out")
                 time.sleep(0.2)
@@ -781,7 +1173,10 @@ def main() -> int:
         receipt["blockers"].append(str(error))
         details = {"case": workflow.case_id if workflow else "baseline-or-build", "error": str(error)[-2000:], "traceback": traceback.format_exc()[-3000:]}
         if driver:
-            details["last_webdriver_request"] = json.dumps(driver.trace[-1])[-2000:] if driver.trace else None
+            last_request = next((item for item in reversed(driver.trace) if "method" in item and "path" in item), None)
+            details["last_webdriver_request"] = json.dumps(last_request)[-2000:] if last_request else None
+            details["last_select_readiness"] = next((item for item in reversed(driver.trace) if "select_readiness" in item), None)
+            details["last_click_readiness"] = next((item for item in reversed(driver.trace) if "click_readiness" in item), None)
             try:
                 details["visible_ui_text"] = driver.text()[-8000:]
                 driver.snapshot("failure", root)
@@ -794,6 +1189,10 @@ def main() -> int:
         if driver_log:
             driver_log.flush()
             details["driver_log_tail"] = (root / "driver.log").read_text(errors="replace")[-6000:]
+        try:
+            details["owned_profile_evidence"] = collect_desktop_failure_evidence(root)
+        except Exception as capture_error:
+            details["owned_profile_evidence"] = {"status": "error", "capture_error": type(capture_error).__name__}
         (root / "failure.json").write_text(json.dumps(details, indent=2) + "\n")
         print("NATIVE_DESKTOP_FAILURE " + json.dumps(details), flush=True)
     finally:

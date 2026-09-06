@@ -147,7 +147,11 @@ const SourceListItem = memo(function SourceListItem({
 }) {
   return (
     <div className="group flex items-center gap-2 px-2 py-1.5 rounded hover:bg-bg-tertiary">
-      <button onClick={() => onToggle(source.id)} className="shrink-0">
+      <button
+        onClick={() => onToggle(source.id)}
+        className="shrink-0"
+        aria-label={`${isSelected ? "Deselect" : "Select"} ${source.title}`}
+      >
         {isSelected ? (
           <CheckSquare className="w-4 h-4 text-accent" />
         ) : (
@@ -181,29 +185,35 @@ const SourceListItem = memo(function SourceListItem({
           )}
         </p>
       </div>
-      {source.status === "error" && (
+      <div className="flex shrink-0 items-center gap-0.5">
+        {source.status === "error" && (
+          <button
+            onClick={() => onRetry(source.id)}
+            className="px-1 py-1.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent flex shrink-0 items-center gap-1"
+            title="Retry ingestion"
+            aria-label={`Retry ingestion of ${source.title}`}
+          >
+            <RotateCcw className="w-3 h-3" />
+            <span className="text-[10px]">Retry</span>
+          </button>
+        )}
         <button
-          onClick={() => onRetry(source.id)}
-          className="p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent flex items-center gap-1"
-          title="Retry ingestion"
+          onClick={() => onReindex(source.id)}
+          className="p-1.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent"
+          title="Reindex for semantic-memory preview"
+          aria-label={`Reindex ${source.title} for semantic-memory preview`}
         >
-          <RotateCcw className="w-3 h-3" />
-          <span className="text-[10px] hidden group-hover:inline">Retry</span>
+          <Layers className="w-3 h-3" />
         </button>
-      )}
-      <button
-        onClick={() => onReindex(source.id)}
-        className="hidden group-hover:block p-0.5 rounded hover:bg-accent/20 text-text-muted hover:text-accent"
-        title="Reindex for semantic-memory preview"
-      >
-        <Layers className="w-3 h-3" />
-      </button>
-      <button
-        onClick={() => onDelete(source.id)}
-        className="hidden group-hover:block p-0.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
-      >
-        <Trash2 className="w-3 h-3" />
-      </button>
+        <button
+          onClick={() => onDelete(source.id)}
+          className="p-1.5 rounded hover:bg-error/20 text-text-muted hover:text-error"
+          title="Delete source"
+          aria-label={`Delete ${source.title}`}
+        >
+          <Trash2 className="w-3 h-3" />
+        </button>
+      </div>
     </div>
   );
 });

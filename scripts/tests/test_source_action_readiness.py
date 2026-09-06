@@ -118,8 +118,10 @@ class InspectorHitReadinessTests(unittest.TestCase):
     def test_transient_blocker_clears_before_one_native_click(self):
         driver = self.driver()
         driver.execute.side_effect = [{'ready': False, 'hit': {'label': 'Dismiss notification'}},
-                                      {'ready': True, 'button': 'inspector'}]
+                                      {'ready': True, 'button': 'inspector', 'rect': {'x': 100}},
+                                      {'ready': True, 'button': 'inspector', 'rect': {'x': 100}}]
         def wait(condition, **kwargs):
+            self.assertIsNone(condition())
             self.assertIsNone(condition())
             driver.click_ref.assert_not_called()
             return condition()
@@ -127,6 +129,25 @@ class InspectorHitReadinessTests(unittest.TestCase):
         driver.click_when_unobstructed('button[aria-label="Open inspector"]')
         driver.click_ref.assert_called_once_with('inspector')
         self.assertEqual(driver.trace[0]['observation']['hit']['label'], 'Dismiss notification')
+
+    def test_moving_or_replaced_target_requires_new_stable_observations(self):
+        driver = self.driver()
+        driver.execute.side_effect = [
+            {'ready': True, 'button': 'old', 'rect': {'x': 100}},
+            {'ready': True, 'button': 'old', 'rect': {'x': 105}},
+            {'ready': True, 'button': 'new', 'rect': {'x': 105}},
+            {'ready': False},
+            {'ready': True, 'button': 'new', 'rect': {'x': 105}},
+            {'ready': True, 'button': 'new', 'rect': {'x': 105}},
+        ]
+        def wait(condition, **kwargs):
+            for _ in range(5):
+                self.assertIsNone(condition())
+                driver.click_ref.assert_not_called()
+            return condition()
+        driver.wait = wait
+        driver.click_when_unobstructed('button')
+        driver.click_ref.assert_called_once_with('new')
 
     def test_readiness_timeout_never_clicks_and_native_failure_is_not_replayed(self):
         driver = self.driver()
@@ -147,7 +168,7 @@ class InspectorHitReadinessTests(unittest.TestCase):
     def test_actual_readonly_query_rejects_occlusion_and_clipping(self):
         driver = self.driver()
         driver.execute.return_value = {'ready': True, 'button': 'inspector'}
-        driver.wait = lambda condition, **kwargs: condition()
+        driver.wait = lambda condition, **kwargs: (condition(), condition())[1]
         driver.click_when_unobstructed('button')
         script, args = driver.execute.call_args.args
         program = r'''

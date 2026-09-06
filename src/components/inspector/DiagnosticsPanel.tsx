@@ -52,7 +52,11 @@ export function DiagnosticsPanel({ notebookId }: { notebookId: string }) {
     } finally {
       if (useNotebookStore.getState().activeNotebookId === notebookId) {
         setRebuilding(false);
-        await Promise.all([useSourceStore.getState().loadSources(notebookId), poll()]);
+        await Promise.all([
+          useSourceStore.getState().loadSources(notebookId),
+          useSourceStore.getState().loadStats(notebookId),
+          poll(),
+        ]);
       }
     }
   };

@@ -407,7 +407,9 @@ class WebDriver:
         self.call("POST", f"/element/{element[ELEMENT_KEY]}/click", {})
 
     def click_when_unobstructed(self, selector: str):
+        previous_target = None
         def ready():
+            nonlocal previous_target
             observation = self.execute("""const nodes=Array.from(document.querySelectorAll(arguments[0]))
                 .filter(e=>e.getClientRects().length);
                 if(nodes.length!==1) return {ready:false, matches:nodes.length};
@@ -420,8 +422,11 @@ class WebDriver:
                 return {ready:inView && owned && !button.disabled, button,
                     rect:{x:r.x,y:r.y,width:r.width,height:r.height},
                     hit:hit ? {tag:hit.tagName,label:hit.getAttribute('aria-label'),title:hit.title} : null};""", [selector])
+            target = (observation.get("button"), observation.get("rect")) if observation.get("ready") else None
+            observation["stable"] = target is not None and target == previous_target
+            previous_target = target
             self.trace.append({"at": now(), "click_readiness": selector, "observation": observation})
-            return observation.get("button") if observation.get("ready") else None
+            return observation.get("button") if observation["stable"] else None
         button = self.wait(ready, label=f"unobstructed native action {selector}")
         self.click_ref(button)
 
@@ -588,6 +593,8 @@ class IntegratedWorkflow:
             # Conversation selection itself is intentionally not persisted by
             # the product. Reopen the previously observed conversation through
             # its actual dropdown before checking durable message content.
+            # A restored compact Sources drawer can cover the dropdown.
+            self.focus_chat()
             self.ui.select('select[aria-label="Conversation"]', self.conversations[notebook])
 
     def restart(self, notebook: str):
@@ -701,7 +708,7 @@ return {at_end, id:button?.getAttribute('aria-controls') || null,
         button = self.ui.find_visible(MESSAGE_EVIDENCE_SELECTOR, last=True)
         drawer_id = self.ui.execute("return arguments[0].getAttribute('aria-controls')", [button])
         if not self.ui.execute("return arguments[0].getAttribute('aria-expanded')==='true'", [button]):
-            self.ui.click_ref(button)
+            self.ui.click_when_unobstructed(f'button[aria-controls={json.dumps(drawer_id)}]')
         self.ui.wait(lambda: self.ui.execute("return document.getElementById(arguments[0])?.getClientRects().length>0", [drawer_id]), label="message evidence disclosure")
         values = self.ui.execute("""const r=document.getElementById(arguments[0]); const g=r.querySelector('.grid'); return Object.fromEntries(Array.from(g.children).map(e=>[e.children[0].textContent.replace(/:\\s*$/, '').trim(), e.children[1].textContent.trim()]));""", [drawer_id])
         require_scope_evidence(values, selected, excluded, retrieval, degraded=degraded)

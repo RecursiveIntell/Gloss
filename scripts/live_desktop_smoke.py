@@ -406,6 +406,25 @@ class WebDriver:
     def click_ref(self, element: dict):
         self.call("POST", f"/element/{element[ELEMENT_KEY]}/click", {})
 
+    def click_when_unobstructed(self, selector: str):
+        def ready():
+            observation = self.execute("""const nodes=Array.from(document.querySelectorAll(arguments[0]))
+                .filter(e=>e.getClientRects().length);
+                if(nodes.length!==1) return {ready:false, matches:nodes.length};
+                const button=nodes[0], r=button.getBoundingClientRect();
+                const left=Math.max(0,r.left), right=Math.min(innerWidth,r.right);
+                const top=Math.max(0,r.top), bottom=Math.min(innerHeight,r.bottom);
+                const inView=right>left && bottom>top;
+                const hit=inView ? document.elementFromPoint((left+right)/2,(top+bottom)/2) : null;
+                const owned=!!hit && (hit===button || button.contains(hit));
+                return {ready:inView && owned && !button.disabled, button,
+                    rect:{x:r.x,y:r.y,width:r.width,height:r.height},
+                    hit:hit ? {tag:hit.tagName,label:hit.getAttribute('aria-label'),title:hit.title} : null};""", [selector])
+            self.trace.append({"at": now(), "click_readiness": selector, "observation": observation})
+            return observation.get("button") if observation.get("ready") else None
+        button = self.wait(ready, label=f"unobstructed native action {selector}")
+        self.click_ref(button)
+
     def find_visible(self, selector: str, text: str | None = None, last: bool = False):
         return self.execute("""const nodes=Array.from(document.querySelectorAll(arguments[0])).filter(e=>e.getClientRects().length && (!arguments[1] || e.textContent.trim()===arguments[1])); return nodes[arguments[2] ? nodes.length-1 : 0] || null""", [selector, text, last])
 
@@ -544,8 +563,8 @@ class IntegratedWorkflow:
 
     def inspector(self, tab: str):
         if self.ui.find_visible('button[aria-label="Open inspector"]'):
-            self.ui.click('button[aria-label="Open inspector"]')
-        self.ui.click(f'button[aria-label="Inspector tab: {tab}"]')
+            self.ui.click_when_unobstructed('button[aria-label="Open inspector"]')
+        self.ui.click_when_unobstructed(f'button[aria-label="Inspector tab: {tab}"]')
 
     def create_notebook(self, name: str):
         self.remember_conversation()
@@ -1150,6 +1169,7 @@ def main() -> int:
             last_request = next((item for item in reversed(driver.trace) if "method" in item and "path" in item), None)
             details["last_webdriver_request"] = json.dumps(last_request)[-2000:] if last_request else None
             details["last_select_readiness"] = next((item for item in reversed(driver.trace) if "select_readiness" in item), None)
+            details["last_click_readiness"] = next((item for item in reversed(driver.trace) if "click_readiness" in item), None)
             try:
                 details["visible_ui_text"] = driver.text()[-8000:]
                 driver.snapshot("failure", root)

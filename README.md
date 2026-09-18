@@ -1,4 +1,4 @@
-<!-- last-verified: 2026-08-24 -->
+<!-- last-verified: 2026-09-18 -->
 
 # Gloss
 
@@ -8,14 +8,14 @@
 
 > A local-first desktop notebook for source-grounded research and chat.
 
-Gloss is a source-implemented local-first desktop notebook for source-grounded research and chat. The input, retrieval, provider, and receipt paths described below are source-level capabilities; live provider/model and release-grade desktop behavior are not verified in this snapshot.
+Gloss is a source-implemented local-first desktop notebook for source-grounded research and chat. Source/build verification, native desktop execution, provider/model execution, package replay, and a tagged release are separate evidence boundaries.
 
 > [!WARNING]
 > Gloss is under active development and currently distributed as source. Linux x86_64 is the maintained development/build target. The repository does not publish a tagged, end-user binary release.
 >
-> The current source/build verification passes for the checked paths, including frontend tests/build, Cargo feature checks/tests, strict Clippy, dependency policy checks, and a Tauri debug compile. Those results do **not** establish live desktop behavior, an installed workflow, or real provider/model execution.
+> The current source/build verifier covers frontend tests/build, Cargo feature checks/tests, strict Clippy, dependency policy checks, and a Tauri debug compile. Those results do **not** by themselves establish a complete installed workflow, every provider/model configuration, or release-grade behavior.
 >
-> The scripted desktop contract passes, but no live GUI driver or live desktop receipt exists for this snapshot. AppImage installer smoke is also blocked because no release AppImage artifact is available. Treat Gloss as source/build/test verified, not release-proven.
+> The repository ships a Linux native WebDriver baseline and an AppImage build/replay gate. Their receipts are run-specific evidence, not implications of source presence. Gloss remains source-distributed: no tagged binary release, signed installer, upgrade workflow, or non-Linux certification is claimed.
 
 ![Gloss desktop interface showing notebooks, selected sources, chat, citations, and runtime status](src/assets/gloss-gui/pasted-1779172952776-0.png)
 
@@ -45,7 +45,7 @@ It is a good fit when you want:
 - notebook-scoped source files, conversations, notes, and receipts;
 - explicit `all`, `selected`, or `none` retrieval scope;
 - local FTS/BM25 and dense retrieval with disclosed degradation;
-- local or explicitly configured remote provider paths, subject to provider availability and network consent; no real provider/model smoke was run for this snapshot;
+- local or explicitly configured remote provider paths, subject to provider availability and network consent; live-model coverage is narrow and run-specific;
 - structured Studio outputs tied to the current source scope;
 - a desktop interface backed by Rust/Tauri rather than a hosted Gloss service.
 
@@ -57,20 +57,21 @@ The evidence states below are deliberately separate:
 
 | Surface | State in this snapshot | Boundary |
 | --- | --- | --- |
-| Frontend unit and contract tests | **Verified-executed** | 28 frontend tests plus static contract checks passed locally |
+| Frontend unit and contract tests | **Verified-executed** | The current canonical verifier runs the complete Vitest and static-contract suites |
 | Frontend production build | **Verified-executed** | `npm run build` passed; Vite emitted a non-blocking chunk-size advisory |
 | Rust default, semantic-memory, and TurboQuant profiles | **Verified-executed** | Cargo checks passed for all three profiles |
-| Rust feature test suite | **Verified-executed** | 212 passed, 2 intentionally ignored |
+| Rust test matrices | **Verified-executed** | Application, native-owner, and TurboQuant harness tests pass; explicitly environment-dependent live-model tests remain separate |
 | Strict Clippy | **Verified-executed** | `-D warnings` passed for the TurboQuant profile |
+| Dependency policy | **Verified-executed** | Rust advisories/licenses/sources and both production and development npm audits pass for the locked candidate |
 | Tauri debug desktop compile | **Verified-executed** | `npm run verify` built `target/debug/gloss` without bundling |
-| Scripted desktop contract | **Verified-executed** | Contract harness passed, but `live_desktop_exercised=false` |
-| AppImage packaging | **Blocked** | No AppImage artifact is available and the release packaging toolchain is incomplete in the current environment |
-| Installed package workflow | **Not verified** | No installed GUI workflow receipt exists beyond the available scripted/package checks |
-| Real provider/model chat | **Blocked** | No live provider/model smoke receipt exists for this snapshot |
-| Offline cached Nomic embedding smoke | **Blocked** | The local Hugging Face cache does not contain the model |
+| Native desktop baseline | **Run-specific** | A real Tauri/WebKit driver is shipped and required in CI; a workflow result applies only to its exact candidate |
+| AppImage packaging | **Run-specific** | The locked builder and extracted-payload replay gate are shipped; this is not a tagged, signed, or installed release |
+| Installed package workflow | **Not release-certified** | Launch/replay evidence does not establish system installation, upgrade, rollback, or distribution signing |
+| Real provider/model chat | **Narrow scope only** | Transport contracts are automated; any live endpoint/model result applies only to the named runtime and model digests |
+| Offline cached Nomic embedding smoke | **Environment-dependent** | The model is not bundled; this gate requires an independently identified local cache |
 | Other desktop operating systems | **Not verified in this snapshot** | No CI, packaging, or live-runtime evidence is provided here for non-Linux platforms |
 
-The canonical release projection is intentionally `release_ready: false` and `public_claim_ready: false` until a live, release-grade desktop receipt exists.
+The canonical release projection remains `release_ready: false` and `public_claim_ready: false` until tagged-artifact, installed-workflow, and independent-reproduction gates are satisfied.
 
 ## Quick start
 
@@ -79,7 +80,7 @@ The canonical release projection is intentionally `release_ready: false` and `pu
 The verified CI development path uses:
 
 - Node.js 22 and npm;
-- the stable Rust toolchain with `rustfmt`;
+- the repository-pinned Rust 1.98.1 toolchain with `rustfmt` and `clippy`;
 - Tauri 2 Linux development libraries;
 - a configured provider for interactive model-backed chat.
 
@@ -119,7 +120,7 @@ A full run with no skipped gates ends with a JSON receipt whose status is `"pass
 npm run tauri:dev:release
 ```
 
-This command launches a Tauri development app using the `semantic-memory-turbo-quant` feature profile. It was not exercised in a live GUI session here; the debug compile and scripted contract were verified instead.
+This command launches a Tauri development app using the `semantic-memory-turbo-quant` feature profile. Native UI and provider behavior remain environment-dependent; use the repository-owned live driver when you need a receipt-bound baseline.
 
 Open Settings to select a provider and model. Chat can use no retrieval context, but interactive model-backed chat still requires a configured provider and model.
 
@@ -136,7 +137,7 @@ The following are source-declared paths. They are covered by the repository's bu
 
 ### Source-grounded chat
 
-- Source-level provider adapters exist for Ollama, llama.cpp, OpenAI, and Anthropic. No live provider/model execution was verified for this snapshot.
+- Source-level provider adapters exist for Ollama, llama.cpp, OpenAI, and Anthropic. Automated transport contracts do not turn one live endpoint/model run into proof for every provider.
 - `all`, explicit selected-source, and `none` retrieval scope.
 - SQLite FTS5/BM25 and local HNSW dense retrieval with reciprocal-rank fusion.
 - Bounded query rewriting with fallback to the original query when refinement is unavailable.
@@ -208,7 +209,7 @@ When a cloud provider is selected, the assembled prompt and source context leave
 flowchart LR
     A[Notebook + selected scope] --> B[Extraction and chunking]
     B --> C[SQLite FTS5/BM25]
-    B --> D[Configured embedding backend:\nOllama when selected/reachable;\notherwise Candle/Nomic fallback]
+    B --> D[Explicit embedding backend:\nOllama or local Candle/Nomic;\nno silent substitution]
     D --> E[HNSW/usearch]
     C --> F[Candidate fusion]
     E --> F
@@ -241,8 +242,8 @@ The frontend renders backend-owned attempt, source-scope, retrieval, and termina
 | `npm run build` | TypeScript check plus production Vite build | Frontend build only |
 | `npm test` | Frontend unit and static contract tests | Does not prove live Tauri interaction |
 | `npm run verify` | Canonical source/build verification | Checks static gates, Cargo profiles/tests, frontend tests/build, cargo-deny, npm audit, and a debug Tauri compile; it does not prove AppImage packaging, live GUI behavior, or provider/model execution |
-| `npm run desktop-smoke` | Scripted runtime/evidence contract harness | Passes without proving a headed live GUI workflow |
-| `npm run installer-smoke` | Release bundle and installer smoke | Requires release packaging tools and an artifact; currently blocked here |
+| `npm run desktop-smoke` | Scripted runtime/evidence contract harness | Validates supplied receipts; headed proof requires `scripts/live_desktop_smoke.py` |
+| `npm run installer-smoke` | Locked AppImage build and extracted-payload replay | Linux package evidence only; does not install, sign, publish, or validate upgrades |
 
 ### Feature profiles
 
@@ -271,7 +272,7 @@ bash validation/run_all_gloss_repair_gates.sh .
 
 ## Verification
 
-The CI workflow runs `npm run verify` on pull requests and pushes to `main`. The local verifier currently performs:
+The CI workflow runs `npm run verify` on pull requests and pushes to the canonical `master` branch. The local verifier currently performs:
 
 1. Rust formatting and source-derived Tauri command/event checks;
 2. static repair and security/receipt gates;
@@ -282,7 +283,7 @@ The CI workflow runs `npm run verify` on pull requests and pushes to `main`. The
 7. production npm audit;
 8. a debug Tauri desktop compile without bundling.
 
-The current local evidence is source/build/test verified. The release projection remains blocked until live desktop, installed workflow, and real provider/model evidence exists.
+The current local evidence is source/build/test verified. Native desktop, provider/model, package replay, installation, and release remain separately scoped gates.
 
 ## Repository map
 
@@ -303,8 +304,8 @@ Canonical ownership and development rules are in [`AGENTS.md`](AGENTS.md). The a
 
 - No tagged binary release or in-app updater is published.
 - Linux x86_64 is the maintained build/packaging target; other desktop platforms are not CI-certified in this repository.
-- No automated live GUI driver is currently shipped, so scripted desktop smoke is not release-grade GUI proof.
-- AppImage installer smoke requires a release artifact and packaging tooling that are not present in the current environment.
+- The native GUI driver is Linux/WebKit-specific and its evidence is candidate- and environment-bound; it does not certify other desktop platforms.
+- AppImage build/replay does not establish system installation, upgrade behavior, signing, or publication.
 - A real cached Nomic model is required for offline embedding-model smoke; the model is not bundled in the repository.
 - Document extraction preserves text/value content, not visual layout, forms, or OCR fidelity.
 - Image, audio, and video paths depend on model/tool availability and are not equally proven across formats.

@@ -51,7 +51,7 @@ mark unobserved safety flags false. A build/driver failure exits 1. Missing host
 capabilities are listed before attempting a build or launching the app.
 
 The `desktop-baseline` GitHub Actions job runs on Ubuntu 24.04 for pull requests,
-main/master pushes and manual workflow dispatch. It uses an isolated D-Bus session
+canonical `master` pushes, and manual workflow dispatch. It uses an isolated D-Bus session
 and Xvfb, installs the native WebKit driver, then runs:
 
 ```bash

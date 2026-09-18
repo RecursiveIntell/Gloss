@@ -8,7 +8,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { CommandPalette } from "./components/CommandPalette";
 import { EmptyStateOnboarding } from "./components/EmptyStateOnboarding";
 import { SettingsDialog } from "./components/settings/SettingsDialog";
-import { useNotebookStore } from "./stores/notebookStore";
+import { useNotebookStore, readActiveNotebookId } from "./stores/notebookStore";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useToastStore } from "./stores/toastStore";
@@ -84,15 +84,30 @@ export function App() {
 
   useEffect(() => {
     loadNotebooks().then(() => {
-      // Sync persisted activeNotebookId to backend on startup
-      const nbId = useNotebookStore.getState().activeNotebookId;
+      // A persisted selection is only a hint. Confirm it with the backend before
+      // mounting notebook-owned stores so PanelLayout observes a real ID change.
+      const nbId = readActiveNotebookId();
       if (nbId) {
         const exists = useNotebookStore.getState().notebooks.some((n) => n.id === nbId);
         if (exists) {
-          void useNotebookStore.getState().setActive(nbId);
+          void useNotebookStore.getState().setActive(nbId).catch((error) => {
+            useToastStore.getState().addToast({
+              type: "error",
+              title: "Notebook recovery failed",
+              message: String(error),
+              duration: 8000,
+            });
+          });
         } else {
           // Stale ID — notebook was deleted
-          useNotebookStore.getState().setActive(null);
+          void useNotebookStore.getState().setActive(null).catch((error) => {
+            useToastStore.getState().addToast({
+              type: "error",
+              title: "Notebook recovery failed",
+              message: String(error),
+              duration: 8000,
+            });
+          });
         }
       }
     });
@@ -255,7 +270,14 @@ export function App() {
         statsDebounceRef.current = setTimeout(() => {
           statsDebounceRef.current = null;
           const nbId = useNotebookStore.getState().activeNotebookId;
-          if (nbId) useSourceStore.getState().loadStats(nbId);
+          if (nbId) {
+            useSourceStore.getState().loadStats(nbId);
+            // Final source status is emitted after dense indexing and optional
+            // semantic projection. Re-read the canonical source projection so
+            // the card does not remain stuck on "dense missing"/"projection
+            // disabled" after the backend has completed successfully.
+            useSourceStore.getState().loadSources(nbId);
+          }
         }, 1000);
       }
 

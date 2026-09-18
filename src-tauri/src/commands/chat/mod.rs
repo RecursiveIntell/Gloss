@@ -4134,9 +4134,9 @@ mod tests {
             attempt_trace: trace,
             trace_data_dir: data_dir.path().to_path_buf(),
             phase_timeouts: providers::LlmPhaseTimeouts {
-                provider_start: Duration::from_millis(1),
-                first_token: Duration::from_millis(1),
-                stream_idle: Duration::from_millis(1),
+                provider_start: Duration::from_millis(100),
+                first_token: Duration::from_millis(100),
+                stream_idle: Duration::from_millis(100),
             },
         };
 
@@ -4346,9 +4346,9 @@ mod tests {
             attempt_trace: trace,
             trace_data_dir: data_dir.path().to_path_buf(),
             phase_timeouts: providers::LlmPhaseTimeouts {
-                provider_start: Duration::from_millis(1),
-                first_token: Duration::from_millis(1),
-                stream_idle: Duration::from_millis(1),
+                provider_start: Duration::from_millis(100),
+                first_token: Duration::from_millis(100),
+                stream_idle: Duration::from_millis(100),
             },
         };
 

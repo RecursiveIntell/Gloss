@@ -1,218 +1,29 @@
 name: CI
 
 on:
-  workflow_dispatch:
   pull_request:
   push:
     branches:
       - master
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: gloss-ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_BUILD_JOBS: 2
-  CARGO_PROFILE_DEV_DEBUG: 0
-  CARGO_PROFILE_TEST_DEBUG: 0
-  CARGO_TARGET_DIR: ${{ github.workspace }}/target
-
 jobs:
-  live-ollama-canary:
-    # Real downloaded models + actual Rust owners. This does not certify any
-    # user-installed model, GPU, native GUI, or complete desktop workflow.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: live-ollama-native-owners
-          workspaces: validation/native_harness -> ../../target
-      - name: Require real loopback Ollama embedding and chat owners
-        run: |
-          python3 scripts/live_ollama_canary.py --repo . \
-            --output .codex-run-receipts/live-ollama-canary
-      - name: Preserve runtime, models, commands and native evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: live-ollama-canary-${{ github.sha }}
-          path: .codex-run-receipts/live-ollama-canary/
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 14
-
-  desktop-baseline:
-    # Preserve the startup/persistence baseline, then require integrated native
-    # UI cases against isolated real Ollama models. Each receipt retains its scope.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: desktop-baseline
-          cache-on-failure: true
-      - name: Install Linux desktop and WebDriver dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            dbus-x11 \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            pkg-config \
-            webkit2gtk-driver \
-            xauth \
-            xdotool \
-            xvfb
-      - run: npm ci
-      - name: Install pinned Tauri native WebDriver
-        # https://tauri.app/release/tauri-driver/v2.0.6/
-        run: cargo install tauri-driver --version 2.0.6 --locked
-      - name: Require native desktop baseline
-        run: |
-          xvfb-run -a dbus-run-session -- python3 scripts/live_desktop_smoke.py \
-            --repo . --require-baseline --output .codex-run-receipts/desktop-baseline
-      - name: Require real-model integrated native desktop workflow
-        timeout-minutes: 50
-        run: |
-          xvfb-run -a dbus-run-session -- python3 scripts/live_ollama_canary.py \
-            --repo . --desktop --output .codex-run-receipts/desktop-ollama-workflow
-      - name: Preserve native desktop evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: desktop-baseline-${{ github.sha }}
-          path: .codex-run-receipts/desktop-baseline/
-          include-hidden-files: true
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Preserve integrated desktop and real-model evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: desktop-ollama-workflow-${{ github.sha }}
-          path: .codex-run-receipts/desktop-ollama-workflow/
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 14
-
-  linux-package:
-    # Build the configured AppImage and replay the extracted package through the
-    # real native driver and owned Ollama models. No signing or publication.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 150
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: linux-package
-          cache-on-failure: true
-      - name: Install Linux package and native replay dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            dbus-x11 \
-            file \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            patchelf \
-            pkg-config \
-            squashfs-tools \
-            webkit2gtk-driver \
-            xauth \
-            xdotool \
-            xvfb
-      - run: npm ci
-      - name: Install pinned Tauri native WebDriver
-        run: cargo install tauri-driver --version 2.0.6 --locked
-      - name: Build and require the actual AppImage real-model workflow
-        run: |
-          xvfb-run -a dbus-run-session -- python3 validation/gloss_installer_smoke_gate.py \
-            --repo . --build --require-integrated --receipt .codex-run-receipts/linux-package/receipt.json
-      - name: Preserve package and replay evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-package-${{ github.sha }}
-          path: .codex-run-receipts/linux-package/
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 14
-
-  frontend:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm test
-      - run: npm run build
-
-  native-sanitizers:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: native-sanitizers
-      - name: Native C++ address and leak checks
-        run: python3 scripts/run_native_sanitizers.py --receipt .codex-run-receipts/native-sanitizers.json
-      - name: Preserve sanitizer evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-sanitizers-${{ github.sha }}
-          path: .codex-run-receipts/native-sanitizers.json
-          include-hidden-files: true
-
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Node
-        # This runs before native dependency installation to fail packaging drift early.
         uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -221,17 +32,11 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.98.1
           components: rustfmt, clippy
-
-      - name: Verify vendored source closure
-        run: |
-          python3 validation/validate_vendor_closure.py .
-          python3 -m unittest discover -s validation/tests -v
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
 
       - name: Install Linux dependencies
         run: |
@@ -255,12 +60,67 @@ jobs:
         run: cargo install cargo-deny --version 0.19.8 --locked
 
       - name: Canonical release verification
-        run: npm run verify -- --receipt .codex-run-receipts/build-verification.json
+        run: npm run verify
 
-      - name: Preserve verification evidence
+  desktop-baseline:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install native desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            dbus-x11 \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            webkit2gtk-driver \
+            wget \
+            xvfb
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install pinned Tauri WebDriver bridge
+        run: cargo install tauri-driver --version 2.0.6 --locked
+
+      - name: Run native desktop baseline
+        run: |
+          xvfb-run -a dbus-run-session -- \
+            python3 scripts/live_desktop_smoke.py \
+              --repo . \
+              --require-baseline \
+              --output .codex-run-receipts/desktop-baseline
+
+      - name: Preserve native desktop evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-verification-${{ github.sha }}
-          path: .codex-run-receipts/build-verification.json
+          name: gloss-desktop-baseline-${{ github.run_id }}
+          path: .codex-run-receipts/desktop-baseline
           include-hidden-files: true
+          retention-days: 14

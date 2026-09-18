@@ -472,8 +472,9 @@ class WebDriver:
 
     def click_when_unobstructed(self, selector: str):
         previous_target = None
+        scroll_prepared = None
         def ready():
-            nonlocal previous_target
+            nonlocal previous_target, scroll_prepared
             observation = self.execute("""const nodes=Array.from(document.querySelectorAll(arguments[0]))
                 .filter(e=>e.getClientRects().length);
                 if(nodes.length!==1) return {ready:false, matches:nodes.length};
@@ -483,14 +484,31 @@ class WebDriver:
                 const inView=right>left && bottom>top;
                 const hit=inView ? document.elementFromPoint((left+right)/2,(top+bottom)/2) : null;
                 const owned=!!hit && (hit===button || button.contains(hit));
-                return {ready:inView && owned && !button.disabled, button,
+                const enabled=!button.disabled;
+                return {ready:inView && owned && enabled, button, inView, owned, enabled,
                     rect:{x:r.x,y:r.y,width:r.width,height:r.height},
                     hit:hit ? {tag:hit.tagName,label:hit.getAttribute('aria-label'),title:hit.title} : null};""", [selector])
-            target = (observation.get("button"), observation.get("rect")) if observation.get("ready") else None
+            button = observation.get("button")
+            if (button and observation.get("inView") and observation.get("enabled")
+                    and not observation.get("owned") and button != scroll_prepared):
+                self.trace.append({
+                    "at": now(),
+                    "click_preparation": "scroll_into_view",
+                    "selector": selector,
+                    "element": button,
+                })
+                self.execute(
+                    "arguments[0].scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});",
+                    [button],
+                )
+                scroll_prepared = button
+                previous_target = None
+                return None
+            target = (button, observation.get("rect")) if observation.get("ready") else None
             observation["stable"] = target is not None and target == previous_target
             previous_target = target
             self.trace.append({"at": now(), "click_readiness": selector, "observation": observation})
-            return observation.get("button") if observation["stable"] else None
+            return button if observation["stable"] else None
         button = self.wait(ready, label=f"unobstructed native action {selector}")
         self.click_ref(button)
 

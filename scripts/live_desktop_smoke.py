@@ -338,6 +338,22 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+class WebDriverHttpError(RuntimeError):
+    def __init__(self, method: str, path: str, status: int, body: bytes):
+        self.method = method
+        self.path = path
+        self.status = status
+        self.body = body
+        try:
+            parsed = json.loads(body)
+            self.webdriver_error = parsed.get("value", {}).get("error")
+        except (TypeError, ValueError):
+            self.webdriver_error = None
+        super().__init__(
+            f"WebDriver {method} {path}: HTTP {status}: {body.decode(errors='replace')}"
+        )
+
+
 class WebDriver:
     def __init__(self, port: int):
         self.port = port
@@ -358,7 +374,7 @@ class WebDriver:
             response = connection.getresponse()
             body = response.read()
             if response.status >= 400:
-                raise RuntimeError(f"WebDriver {method} {path}: HTTP {response.status}: {body.decode(errors='replace')}")
+                raise WebDriverHttpError(method, path, response.status, body)
             result = json.loads(body)
         except Exception as error:
             # A failed POST may already have acted. Preserve the attempted
@@ -401,10 +417,36 @@ class WebDriver:
         return value["element-6066-11e4-a52e-4f735466cecf"]
 
     def click(self, selector: str):
-        self.call("POST", f"/element/{self.element(selector)}/click", {})
+        self.click_ref({ELEMENT_KEY: self.element(selector)})
 
     def click_ref(self, element: dict):
-        self.call("POST", f"/element/{element[ELEMENT_KEY]}/click", {})
+        identifier = element[ELEMENT_KEY]
+        try:
+            self.call("POST", f"/element/{identifier}/click", {})
+            return
+        except WebDriverHttpError as error:
+            # WebKit on some supported Linux hosts explicitly reports that the
+            # W3C element-click command is unsupported. That typed response is
+            # a negative witness that no click occurred, so one pointer-action
+            # fallback is safe. Never replay an ambiguous transport or element
+            # failure because the first mutation may already have acted.
+            if error.webdriver_error != "unsupported operation":
+                raise
+        self.trace.append({
+            "at": now(),
+            "click_fallback": "w3c_pointer_actions",
+            "element": identifier,
+        })
+        self.call("POST", "/actions", {"actions": [{
+            "type": "pointer",
+            "id": "gloss-mouse",
+            "parameters": {"pointerType": "mouse"},
+            "actions": [
+                {"type": "pointerMove", "duration": 0, "origin": element, "x": 0, "y": 0},
+                {"type": "pointerDown", "button": 0},
+                {"type": "pointerUp", "button": 0},
+            ],
+        }]})
 
     def click_when_unobstructed(self, selector: str):
         previous_target = None
@@ -440,7 +482,7 @@ class WebDriver:
     def fill(self, selector: str, value: str):
         element = self.wait(lambda: self.find_visible(selector), label=f"visible {selector}")
         identifier = element[ELEMENT_KEY]
-        self.call("POST", f"/element/{identifier}/click", {})
+        self.click_ref(element)
         # Actual keyboard input updates React through the native WebDriver.
         self.call("POST", f"/element/{identifier}/value", {"text": "\ue009a\ue000\ue003"})
         if value:

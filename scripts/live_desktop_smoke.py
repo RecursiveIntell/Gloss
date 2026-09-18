@@ -437,16 +437,38 @@ class WebDriver:
             "click_fallback": "w3c_pointer_actions",
             "element": identifier,
         })
-        self.call("POST", "/actions", {"actions": [{
-            "type": "pointer",
-            "id": "gloss-mouse",
-            "parameters": {"pointerType": "mouse"},
-            "actions": [
-                {"type": "pointerMove", "duration": 0, "origin": element, "x": 0, "y": 0},
-                {"type": "pointerDown", "button": 0},
-                {"type": "pointerUp", "button": 0},
-            ],
-        }]})
+        try:
+            self.call("POST", "/actions", {"actions": [{
+                "type": "pointer",
+                "id": "gloss-mouse",
+                "parameters": {"pointerType": "mouse"},
+                "actions": [
+                    {"type": "pointerMove", "duration": 0, "origin": element, "x": 0, "y": 0},
+                    {"type": "pointerDown", "button": 0},
+                    {"type": "pointerUp", "button": 0},
+                ],
+            }]})
+            return
+        except WebDriverHttpError as error:
+            if error.webdriver_error != "unsupported operation":
+                raise
+
+        # Older WebKit drivers can reject both click command families while
+        # still supporting the Element Send Keys endpoint. Focus is a
+        # non-effectful preparation; Enter is delivered once as real keyboard
+        # input only after both prior responses prove no pointer action ran.
+        focused = self.execute(
+            "arguments[0].focus(); return document.activeElement===arguments[0]",
+            [element],
+        )
+        if not focused:
+            raise RuntimeError("WebDriver could not focus element for keyboard activation")
+        self.trace.append({
+            "at": now(),
+            "click_fallback": "webdriver_enter_key",
+            "element": identifier,
+        })
+        self.call("POST", f"/element/{identifier}/value", {"text": "\ue007"})
 
     def click_when_unobstructed(self, selector: str):
         previous_target = None

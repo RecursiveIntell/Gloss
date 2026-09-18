@@ -149,6 +149,36 @@ class InspectorHitReadinessTests(unittest.TestCase):
         driver.click_when_unobstructed('button')
         driver.click_ref.assert_called_once_with('new')
 
+    def test_occluded_target_scrolls_once_before_stable_native_click(self):
+        driver = self.driver()
+        driver.execute.side_effect = [
+            {'ready': False, 'button': 'evidence', 'rect': {'x': 507, 'y': 783},
+             'inView': True, 'owned': False, 'enabled': True,
+             'hit': {'tag': 'DIV'}},
+            None,
+            {'ready': True, 'button': 'evidence', 'rect': {'x': 507, 'y': 420},
+             'inView': True, 'owned': True, 'enabled': True},
+            {'ready': True, 'button': 'evidence', 'rect': {'x': 507, 'y': 420},
+             'inView': True, 'owned': True, 'enabled': True},
+        ]
+
+        def wait(condition, **kwargs):
+            self.assertIsNone(condition())
+            self.assertIsNone(condition())
+            return condition()
+
+        driver.wait = wait
+        driver.click_when_unobstructed('button[aria-controls="evidence-fixture"]')
+        driver.click_ref.assert_called_once_with('evidence')
+        self.assertEqual(driver.execute.call_count, 4)
+        scroll_script, scroll_args = driver.execute.call_args_list[1].args
+        self.assertIn('scrollIntoView', scroll_script)
+        self.assertEqual(scroll_args, ['evidence'])
+        self.assertEqual(
+            [entry.get('click_preparation') for entry in driver.trace if entry.get('click_preparation')],
+            ['scroll_into_view'],
+        )
+
     def test_readiness_timeout_never_clicks_and_native_failure_is_not_replayed(self):
         driver = self.driver()
         driver.execute.return_value = {'ready': False}

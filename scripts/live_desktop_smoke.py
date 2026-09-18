@@ -338,6 +338,22 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+class WebDriverHttpError(RuntimeError):
+    def __init__(self, method: str, path: str, status: int, body: bytes):
+        self.method = method
+        self.path = path
+        self.status = status
+        self.body = body
+        try:
+            parsed = json.loads(body)
+            self.webdriver_error = parsed.get("value", {}).get("error")
+        except (TypeError, ValueError):
+            self.webdriver_error = None
+        super().__init__(
+            f"WebDriver {method} {path}: HTTP {status}: {body.decode(errors='replace')}"
+        )
+
+
 class WebDriver:
     def __init__(self, port: int):
         self.port = port
@@ -358,7 +374,7 @@ class WebDriver:
             response = connection.getresponse()
             body = response.read()
             if response.status >= 400:
-                raise RuntimeError(f"WebDriver {method} {path}: HTTP {response.status}: {body.decode(errors='replace')}")
+                raise WebDriverHttpError(method, path, response.status, body)
             result = json.loads(body)
         except Exception as error:
             # A failed POST may already have acted. Preserve the attempted
@@ -401,15 +417,64 @@ class WebDriver:
         return value["element-6066-11e4-a52e-4f735466cecf"]
 
     def click(self, selector: str):
-        self.call("POST", f"/element/{self.element(selector)}/click", {})
+        self.click_ref({ELEMENT_KEY: self.element(selector)})
 
     def click_ref(self, element: dict):
-        self.call("POST", f"/element/{element[ELEMENT_KEY]}/click", {})
+        identifier = element[ELEMENT_KEY]
+        try:
+            self.call("POST", f"/element/{identifier}/click", {})
+            return
+        except WebDriverHttpError as error:
+            # WebKit on some supported Linux hosts explicitly reports that the
+            # W3C element-click command is unsupported. That typed response is
+            # a negative witness that no click occurred, so one pointer-action
+            # fallback is safe. Never replay an ambiguous transport or element
+            # failure because the first mutation may already have acted.
+            if error.webdriver_error != "unsupported operation":
+                raise
+        self.trace.append({
+            "at": now(),
+            "click_fallback": "w3c_pointer_actions",
+            "element": identifier,
+        })
+        try:
+            self.call("POST", "/actions", {"actions": [{
+                "type": "pointer",
+                "id": "gloss-mouse",
+                "parameters": {"pointerType": "mouse"},
+                "actions": [
+                    {"type": "pointerMove", "duration": 0, "origin": element, "x": 0, "y": 0},
+                    {"type": "pointerDown", "button": 0},
+                    {"type": "pointerUp", "button": 0},
+                ],
+            }]})
+            return
+        except WebDriverHttpError as error:
+            if error.webdriver_error != "unsupported operation":
+                raise
+
+        # Older WebKit drivers can reject both click command families while
+        # still supporting the Element Send Keys endpoint. Focus is a
+        # non-effectful preparation; Enter is delivered once as real keyboard
+        # input only after both prior responses prove no pointer action ran.
+        focused = self.execute(
+            "arguments[0].focus(); return document.activeElement===arguments[0]",
+            [element],
+        )
+        if not focused:
+            raise RuntimeError("WebDriver could not focus element for keyboard activation")
+        self.trace.append({
+            "at": now(),
+            "click_fallback": "webdriver_enter_key",
+            "element": identifier,
+        })
+        self.call("POST", f"/element/{identifier}/value", {"text": "\ue007"})
 
     def click_when_unobstructed(self, selector: str):
         previous_target = None
+        scroll_prepared = None
         def ready():
-            nonlocal previous_target
+            nonlocal previous_target, scroll_prepared
             observation = self.execute("""const nodes=Array.from(document.querySelectorAll(arguments[0]))
                 .filter(e=>e.getClientRects().length);
                 if(nodes.length!==1) return {ready:false, matches:nodes.length};
@@ -419,14 +484,31 @@ class WebDriver:
                 const inView=right>left && bottom>top;
                 const hit=inView ? document.elementFromPoint((left+right)/2,(top+bottom)/2) : null;
                 const owned=!!hit && (hit===button || button.contains(hit));
-                return {ready:inView && owned && !button.disabled, button,
+                const enabled=!button.disabled;
+                return {ready:inView && owned && enabled, button, inView, owned, enabled,
                     rect:{x:r.x,y:r.y,width:r.width,height:r.height},
                     hit:hit ? {tag:hit.tagName,label:hit.getAttribute('aria-label'),title:hit.title} : null};""", [selector])
-            target = (observation.get("button"), observation.get("rect")) if observation.get("ready") else None
+            button = observation.get("button")
+            if (button and observation.get("inView") and observation.get("enabled")
+                    and not observation.get("owned") and button != scroll_prepared):
+                self.trace.append({
+                    "at": now(),
+                    "click_preparation": "scroll_into_view",
+                    "selector": selector,
+                    "element": button,
+                })
+                self.execute(
+                    "arguments[0].scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});",
+                    [button],
+                )
+                scroll_prepared = button
+                previous_target = None
+                return None
+            target = (button, observation.get("rect")) if observation.get("ready") else None
             observation["stable"] = target is not None and target == previous_target
             previous_target = target
             self.trace.append({"at": now(), "click_readiness": selector, "observation": observation})
-            return observation.get("button") if observation["stable"] else None
+            return button if observation["stable"] else None
         button = self.wait(ready, label=f"unobstructed native action {selector}")
         self.click_ref(button)
 
@@ -440,7 +522,7 @@ class WebDriver:
     def fill(self, selector: str, value: str):
         element = self.wait(lambda: self.find_visible(selector), label=f"visible {selector}")
         identifier = element[ELEMENT_KEY]
-        self.call("POST", f"/element/{identifier}/click", {})
+        self.click_ref(element)
         # Actual keyboard input updates React through the native WebDriver.
         self.call("POST", f"/element/{identifier}/value", {"text": "\ue009a\ue000\ue003"})
         if value:

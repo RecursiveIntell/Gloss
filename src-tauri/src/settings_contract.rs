@@ -47,18 +47,38 @@ pub fn save_embedding_settings(db: &AppDb, config: &EmbeddingSettings) -> Result
         "chunk_target_tokens",
         &config.chunk_target_tokens.to_string(),
     )?;
-    let identity_changed = [
-        (
-            "semantic_memory_embedding_provider",
-            config.provider.as_str(),
-        ),
-        ("semantic_memory_embedding_url", config.url.as_str()),
-        ("semantic_memory_embedding_model", config.model.as_str()),
-    ]
-    .into_iter()
-    .try_fold(false, |changed, (key, value)| -> Result<bool, GlossError> {
-        Ok(changed || db.get_setting(key)?.as_deref() != Some(value))
-    })?;
+
+    fn derivation_identity(
+        provider: &str,
+        url: Option<&str>,
+        model: Option<&str>,
+    ) -> (String, String, String) {
+        match provider {
+            "fastembed" | "native" => ("fastembed".to_string(), String::new(), String::new()),
+            _ => (
+                provider.to_string(),
+                url.unwrap_or_default()
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_string(),
+                model.unwrap_or_default().trim().to_string(),
+            ),
+        }
+    }
+
+    let prior_provider = db.get_setting("semantic_memory_embedding_provider")?;
+    let prior_identity = match prior_provider.as_deref() {
+        Some(provider) => Some(derivation_identity(
+            provider,
+            db.get_setting("semantic_memory_embedding_url")?.as_deref(),
+            db.get_setting("semantic_memory_embedding_model")?
+                .as_deref(),
+        )),
+        None => None,
+    };
+    let next_identity =
+        derivation_identity(&config.provider, Some(&config.url), Some(&config.model));
+    let identity_changed = prior_identity.as_ref() != Some(&next_identity);
     let timeout = config.timeout_secs.to_string();
     let search_timeout = config.search_timeout_ms.to_string();
     let chunk_tokens = config.chunk_target_tokens.to_string();
@@ -273,6 +293,14 @@ mod tests {
         );
         config.provider = "fastembed".into();
         // A disabled, irrelevant LAN URL must not block local-only recovery.
-        assert!(save_embedding_settings(&db, &config).is_ok());
+        assert!(save_embedding_settings(&db, &config).unwrap());
+
+        config.url = "http://irrelevant.invalid:11434".into();
+        config.model = "irrelevant-remote-model".into();
+        config.timeout_secs = 120;
+        assert!(
+            !save_embedding_settings(&db, &config).unwrap(),
+            "remote-only fields must not invalidate the fixed local Candle identity"
+        );
     }
 }

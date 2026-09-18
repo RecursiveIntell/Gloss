@@ -148,6 +148,143 @@ class RuntimeConfigPolicyTests(unittest.TestCase):
 
 
 class WebDriverTransportEvidenceTests(unittest.TestCase):
+    def test_explicit_unsupported_element_click_uses_one_pointer_action_fallback(self):
+        received = []
+
+        class ClickHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                received.append((self.path, json.loads(body or b"{}")))
+                if self.path.endswith("/element/button-id/click"):
+                    status = 500
+                    payload = {"value": {"error": "unsupported operation", "message": "", "stacktrace": ""}}
+                elif self.path.endswith("/actions"):
+                    status = 200
+                    payload = {"value": None}
+                else:
+                    status = 404
+                    payload = {"value": {"error": "unknown command"}}
+                encoded = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, format, *args):
+                del format, args
+
+        with http.server.HTTPServer(("127.0.0.1", 0), ClickHandler) as server:
+            worker = threading.Thread(target=lambda: [server.handle_request() for _ in range(2)])
+            worker.start()
+            client = driver.WebDriver(server.server_port)
+            client.session = "fixture"
+            client.click_ref({driver.ELEMENT_KEY: "button-id"})
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive())
+
+        self.assertEqual(
+            [path for path, _ in received],
+            [
+                "/session/fixture/element/button-id/click",
+                "/session/fixture/actions",
+            ],
+        )
+        actions = received[1][1]["actions"][0]["actions"]
+        self.assertEqual(actions[0]["origin"], {driver.ELEMENT_KEY: "button-id"})
+        self.assertEqual([action["type"] for action in actions], ["pointerMove", "pointerDown", "pointerUp"])
+        self.assertEqual(
+            [entry.get("click_fallback") for entry in client.trace if entry.get("click_fallback")],
+            ["w3c_pointer_actions"],
+        )
+
+    def test_ambiguous_click_failure_is_never_replayed_as_pointer_actions(self):
+        received = []
+
+        class FailedClickHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                received.append((self.path, body))
+                payload = json.dumps({"value": {"error": "element click intercepted"}}).encode()
+                self.send_response(500)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format, *args):
+                del format, args
+
+        with http.server.HTTPServer(("127.0.0.1", 0), FailedClickHandler) as server:
+            worker = threading.Thread(target=server.handle_request)
+            worker.start()
+            client = driver.WebDriver(server.server_port)
+            client.session = "fixture"
+            with self.assertRaisesRegex(driver.WebDriverHttpError, "element click intercepted"):
+                client.click_ref({driver.ELEMENT_KEY: "button-id"})
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive())
+
+        self.assertEqual(len(received), 1)
+        self.assertTrue(received[0][0].endswith("/element/button-id/click"))
+
+    def test_two_explicit_unsupported_click_families_use_one_enter_key(self):
+        received = []
+
+        class KeyboardFallbackHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                payload = json.loads(body or b"{}")
+                received.append((self.path, payload))
+                if self.path.endswith("/element/button-id/click") or self.path.endswith("/actions"):
+                    status = 500
+                    response = {"value": {"error": "unsupported operation", "message": "", "stacktrace": ""}}
+                elif self.path.endswith("/execute/sync"):
+                    status = 200
+                    response = {"value": True}
+                elif self.path.endswith("/element/button-id/value"):
+                    status = 200
+                    response = {"value": None}
+                else:
+                    status = 404
+                    response = {"value": {"error": "unknown command"}}
+                encoded = json.dumps(response).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, format, *args):
+                del format, args
+
+        with http.server.HTTPServer(("127.0.0.1", 0), KeyboardFallbackHandler) as server:
+            worker = threading.Thread(target=lambda: [server.handle_request() for _ in range(4)])
+            worker.start()
+            client = driver.WebDriver(server.server_port)
+            client.session = "fixture"
+            client.click_ref({driver.ELEMENT_KEY: "button-id"})
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive())
+
+        self.assertEqual(
+            [path for path, _ in received],
+            [
+                "/session/fixture/element/button-id/click",
+                "/session/fixture/actions",
+                "/session/fixture/execute/sync",
+                "/session/fixture/element/button-id/value",
+            ],
+        )
+        self.assertEqual(received[-1][1], {"text": "\ue007"})
+        self.assertEqual(
+            [entry.get("click_fallback") for entry in client.trace if entry.get("click_fallback")],
+            ["w3c_pointer_actions", "webdriver_enter_key"],
+        )
+
     def test_loopback_request_headers_and_http_errors_are_not_replayed(self):
         received = []
 

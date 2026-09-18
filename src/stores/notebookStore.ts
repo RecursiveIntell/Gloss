@@ -26,7 +26,7 @@ const ACTIVE_NB_KEY = 'gloss:activeNotebookId';
 // receives its own operation result, including create/import activation.
 let activationQueue: Promise<void> = Promise.resolve();
 
-function readActiveNotebookId(): string | null {
+export function readActiveNotebookId(): string | null {
   return typeof globalThis.localStorage === 'undefined'
     ? null
     : globalThis.localStorage.getItem(ACTIVE_NB_KEY);
@@ -34,10 +34,12 @@ function readActiveNotebookId(): string | null {
 
 export const useNotebookStore = create<NotebookStore>((set, get) => ({
   notebooks: [],
-  activeNotebookId: readActiveNotebookId(),
-  activationStatus: readActiveNotebookId() ? 'pending' : 'idle',
+  // The persisted selection is a recovery hint. Backend activation is the
+  // authority that permits notebook-owned panels and stores to mount.
+  activeNotebookId: null,
+  activationStatus: 'idle',
   activationRequestId: 0,
-  activationTargetId: readActiveNotebookId(),
+  activationTargetId: null,
   activationError: null,
   loading: false,
 

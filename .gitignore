@@ -54,6 +54,8 @@ src/stores/memory/
 .files/
 sr/
 Archive.tar.gz
+target-cfg-probe/
+evidence/llm-path/
 *.tmp
 *.bak
 
@@ -72,6 +74,13 @@ docs/design/
 # Generated source packages and bundle sidecars
 docs/source-packages/
 docs/noncanonical-source-archive/20260524-p01-quarantine/
+docs/*next-codex-context*.zip
+docs/*next-codex-context*.codex-archive.json
+docs/*next-codex-context*.excluded.json
+docs/*next-codex-context*.findings.json
+docs/*next-codex-context*.manifest.json
+docs/*next-codex-context*.report.md
+docs/*.7z
 /*.zip
 /*.codex-archive.json
 /*.excluded.json

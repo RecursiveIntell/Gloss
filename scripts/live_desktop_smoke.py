@@ -704,6 +704,24 @@ class IntegratedWorkflow:
         self.ui.wait(lambda: self.ui.execute("return Array.from(document.querySelectorAll('button')).some(e=>e.textContent==='Apply embedding and ingestion settings' && e.disabled)"), label="embedding Apply acknowledged")
         self.check("Unsaved changes. Apply" not in self.ui.text(), "embedding settings have no unacknowledged draft")
 
+    def select_memory_profile(self, profile: str):
+        selector = 'select:has(option[value="gloss-local"])'
+        current = self.ui.execute(
+            "return document.querySelector(arguments[0])?.value || null", [selector]
+        )
+        if current == profile:
+            self.check(True, f"memory profile {profile} already selected")
+            return
+        self.ui.select(selector, profile)
+
+        def profile_applied():
+            text = self.ui.text()
+            self.check("Memory profile not applied" not in text and "Memory profile blocked" not in text,
+                       "memory profile Apply succeeded")
+            return "Memory profile applied" in text
+
+        self.ui.wait(profile_applied, timeout=180, label="acknowledged memory profile Apply")
+
     def configure(self):
         self.settings()
         self.ui.fill('input[aria-label="Ollama server URL"]', self.config["base_url"])
@@ -712,13 +730,7 @@ class IntegratedWorkflow:
         self.ui.fill('input[aria-label="Chat temperature"]', "0")
         self.ui.click_text("Apply chat temperature")
         self.ui.wait(lambda: self.ui.execute("return Array.from(document.querySelectorAll('button')).some(e=>e.textContent==='Apply chat temperature' && e.disabled)"), label="chat temperature Apply acknowledged")
-        self.ui.select('select:has(option[value="gloss-local"])', "gloss-local")
-        def profile_applied():
-            text = self.ui.text()
-            self.check("Memory profile not applied" not in text and "Memory profile blocked" not in text,
-                       "memory profile Apply succeeded")
-            return "Memory profile applied" in text
-        self.ui.wait(profile_applied, label="acknowledged memory profile Apply")
+        self.select_memory_profile("gloss-local")
         self.embedding_settings(self.config["embedding_model"])
         self.close_settings()
         self.ui.click('button[title="Refresh model list from providers"]')

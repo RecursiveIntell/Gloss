@@ -3950,6 +3950,25 @@ pub async fn get_source_content(
 
 /// Retry one source with an observed terminal or queued disposition. The caller
 /// owns batching; this function never detaches unobserved text ingestion work.
+fn source_retry_needs_native_dense_rebuild(
+    state: &AppState,
+    notebook_id: &str,
+    source_id: &str,
+) -> Result<bool, GlossError> {
+    state.with_notebook_db(notebook_id, |db| {
+        let embedding_failure = db
+            .native_embedding_failures()?
+            .iter()
+            .any(|(failed_source_id, _)| failed_source_id == source_id);
+        if !embedding_failure {
+            return Ok(false);
+        }
+        Ok(db
+            .embedding_index_metadata(crate::db::notebook_db::NATIVE_HNSW_INDEX_ID)?
+            .is_some_and(|metadata| metadata.status != "ready"))
+    })
+}
+
 async fn retry_source_ingestion_inner(
     notebook_id: &str,
     source_id: &str,
@@ -3974,6 +3993,32 @@ async fn retry_source_ingestion_inner(
                 return Ok(RetrySourceDisposition::AlreadyRunning);
             }
         }
+    }
+
+    // Restoring an embedding configuration deliberately marks the notebook's
+    // derived dense index stale. A per-source Retry must repair that owner
+    // boundary before it can republish any chunk labels; otherwise every retry
+    // repeats the same typed "explicit rebuild required" failure.
+    if source_retry_needs_native_dense_rebuild(state, notebook_id, source_id)? {
+        let receipt = native_dense_rebuild(notebook_id.to_string(), app_handle.clone())
+            .await
+            .map_err(|error| {
+                retry_source_error(
+                    state,
+                    app_handle,
+                    notebook_id,
+                    source_id,
+                    format!("Native dense repair before source retry failed: {error}"),
+                )
+            })?;
+        tracing::info!(
+            notebook_id,
+            source_id,
+            rebuild_id = %receipt.rebuild_id,
+            chunks_indexed = receipt.chunks_indexed,
+            sources_recovered = receipt.sources_recovered,
+            "Repaired stale native dense projection before source retry"
+        );
     }
 
     // Capture labels and claim the retry under the notebook writer. A second
@@ -5527,6 +5572,61 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.status, "pending");
         assert!(persisted.error_message.is_none());
+    }
+
+    #[test]
+    fn source_retry_repairs_stale_native_projection_for_embedding_failure() {
+        let (_dir, state, notebook_id) = build_state();
+        let mut source = ready_source("retry-stale-dense");
+        source.status = "error".into();
+        source.error_message = Some("Embedding error: model changed".into());
+        state
+            .with_notebook_db_write(&notebook_id, |db| {
+                db.insert_source(&source)?;
+                db.insert_chunks(&[Chunk {
+                    id: "retry-stale-dense-c0".into(),
+                    source_id: source.id.clone(),
+                    chunk_index: 0,
+                    content: "recover this chunk".into(),
+                    token_count: Some(3),
+                    start_offset: Some(0),
+                    end_offset: Some(18),
+                    metadata: None,
+                    embedding_id: None,
+                    embedding_model: None,
+                }])?;
+                db.update_source_index_status(
+                    &source.id,
+                    Some("indexed"),
+                    Some("blocked"),
+                    source.error_message.as_deref(),
+                )?;
+                let mut metadata = crate::db::notebook_db::EmbeddingIndexMetadata::ready(
+                    crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+                    "ollama",
+                    "nomic-embed-text:latest",
+                    Some("fixture-digest".into()),
+                    768,
+                );
+                metadata.status = "stale".into();
+                db.upsert_embedding_index_metadata(&metadata)
+            })
+            .unwrap();
+
+        assert!(source_retry_needs_native_dense_rebuild(&state, &notebook_id, &source.id).unwrap());
+
+        state
+            .with_notebook_db_write(&notebook_id, |db| {
+                db.mark_embedding_index_status(
+                    crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+                    crate::db::notebook_db::EmbeddingIndexMetadataStatus::Ready,
+                    Some("fixture ready"),
+                )
+            })
+            .unwrap();
+        assert!(
+            !source_retry_needs_native_dense_rebuild(&state, &notebook_id, &source.id).unwrap()
+        );
     }
 
     #[test]

@@ -128,7 +128,7 @@ mod tests {
             model: "before".into(),
             timeout_secs: 60,
             download_consent: false,
-            search_timeout_ms: 8000,
+            search_timeout_ms: 65_000,
             chunk_target_tokens: 1100,
         };
         save_embedding_settings(&app, &config).unwrap();
@@ -163,6 +163,7 @@ mod tests {
         };
         assert!(proof().probe_matches);
         config.timeout_secs = 90;
+        config.search_timeout_ms = 95_000;
         assert!(!save_embedding_settings(&app, &config).unwrap());
         assert!(proof().probe_matches);
         config.model = "after".into();

@@ -200,6 +200,25 @@ pub struct VectorArtifactStatus {
     pub last_error: Option<String>,
 }
 
+impl VectorArtifactStatus {
+    /// True only when TurboQuant is compiled, selected by the runtime profile,
+    /// and backed by fresh notebook-scoped artifact plus exact-rerank proof.
+    pub fn turbo_quant_effective(&self) -> bool {
+        self.compiled_turbo_quant
+            && self.runtime_turbo_quant_enabled
+            && self
+                .candidate_backend
+                .as_deref()
+                .is_some_and(|backend| backend.contains("turbo_quant"))
+            && self.artifact_generation_id.is_some()
+            && self.vector_artifact_manifest_digest.is_some()
+            && self.vector_artifact_missing_count == 0
+            && self.vector_artifact_stale_count == 0
+            && self.exact_rerank
+            && self.exact_rerank_count > 0
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct RetrievalDiagnostics {
     pub query: String,
@@ -876,7 +895,7 @@ fn semantic_memory_runtime_config_from_app_db(
         crate::commands::chat::setting_is_enabled(
             app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
         ),
-        features::turbo_quant_active(app_db)?,
+        features::turbo_quant_requested(app_db)?,
         crate::commands::chat::setting_is_enabled(
             app_db.get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
         ),
@@ -1047,6 +1066,93 @@ pub struct FailedImportQuarantineReceipt {
     pub deleted_sources: usize,
     pub cancelled_queue_jobs: u32,
     pub recorded_utc: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RetryFailedSourceError {
+    pub source_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RetryFailedImportsReceipt {
+    pub schema: &'static str,
+    pub receipt_id: String,
+    pub notebook_id: String,
+    pub failed_sources_before: usize,
+    pub recovered_by_dense_rebuild: usize,
+    pub retried_sources: usize,
+    pub already_running_sources: usize,
+    pub queued_sources: usize,
+    pub completed_sources: usize,
+    pub failed_sources: usize,
+    pub errors: Vec<RetryFailedSourceError>,
+    pub recorded_utc: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrySourceDisposition {
+    AlreadyRunning,
+    Queued,
+    Completed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RetrySourceClaim {
+    AlreadyRunning,
+    Completed,
+    Claimed {
+        source_type: String,
+        old_embedding_ids: Vec<u64>,
+    },
+}
+
+static RETRY_FAILED_IMPORTS_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+fn claim_source_retry(
+    state: &AppState,
+    notebook_id: &str,
+    source_id: &str,
+) -> Result<RetrySourceClaim, GlossError> {
+    state.with_notebook_db_write(notebook_id, |db| {
+        let source = db.get_source(source_id)?;
+        if source.status == "ready" {
+            return Ok(RetrySourceClaim::Completed);
+        }
+        if source.status != "error" {
+            return Ok(RetrySourceClaim::AlreadyRunning);
+        }
+        let old_embedding_ids = db.get_embedding_ids_for_source(source_id)?;
+        let source_type = db.reset_source_for_reingestion(notebook_id, source_id)?;
+        Ok(RetrySourceClaim::Claimed {
+            source_type,
+            old_embedding_ids,
+        })
+    })
+}
+
+fn retry_source_error(
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+    notebook_id: &str,
+    source_id: &str,
+    message: String,
+) -> GlossError {
+    if let Err(status_error) = state.with_notebook_db_write(notebook_id, |db| {
+        db.update_source_status(source_id, "error", Some(&message))
+    }) {
+        tracing::error!(
+            notebook_id,
+            source_id,
+            error = %status_error,
+            "Retry failed and its terminal source error could not be persisted"
+        );
+    }
+    emit_status(app_handle, notebook_id, source_id, "error", Some(&message));
+    GlossError::Ingestion {
+        source_id: source_id.to_string(),
+        message,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3842,40 +3948,104 @@ pub async fn get_source_content(
     })
 }
 
-/// Retry ingestion for a failed source (Fix 9).
-#[tauri::command]
-pub async fn retry_source_ingestion(
-    notebook_id: String,
-    source_id: String,
-    state: State<'_, AppState>,
-    queue: State<'_, Arc<QueueManager>>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), GlossError> {
-    invalidate_suggested_questions(&state, &notebook_id);
-    // Capture labels, commit canonical reset, then clean up detached vectors
-    let old_embedding_ids: Vec<u64> = state.with_notebook_db(&notebook_id, |db| {
-        db.get_embedding_ids_for_source(&source_id)
-    })?;
+/// Retry one source with an observed terminal or queued disposition. The caller
+/// owns batching; this function never detaches unobserved text ingestion work.
+fn source_retry_needs_native_dense_rebuild(
+    state: &AppState,
+    notebook_id: &str,
+    source_id: &str,
+) -> Result<bool, GlossError> {
+    state.with_notebook_db(notebook_id, |db| {
+        let embedding_failure = db
+            .native_embedding_failures()?
+            .iter()
+            .any(|(failed_source_id, _)| failed_source_id == source_id);
+        if !embedding_failure {
+            return Ok(false);
+        }
+        Ok(db
+            .embedding_index_metadata(crate::db::notebook_db::NATIVE_HNSW_INDEX_ID)?
+            .is_some_and(|metadata| metadata.status != "ready"))
+    })
+}
 
-    let source_type = state.with_notebook_db_write(&notebook_id, |db| {
-        db.reset_source_for_reingestion(&notebook_id, &source_id)
-    })?;
+async fn retry_source_ingestion_inner(
+    notebook_id: &str,
+    source_id: &str,
+    state: &AppState,
+    queue: &Arc<QueueManager>,
+    app_handle: &tauri::AppHandle,
+) -> Result<RetrySourceDisposition, GlossError> {
+    invalidate_suggested_questions(state, notebook_id);
+
+    // Persisted queue work is the idempotency owner for media/index retries.
+    // Repeated clicks observe the existing job instead of resetting the source
+    // underneath it or appending a duplicate.
+    for (_job_id, status, data_json) in queue
+        .list_jobs_with_data()
+        .map_err(|error| GlossError::Other(error.to_string()))?
+    {
+        if !matches!(status.as_str(), "pending" | "processing") {
+            continue;
+        }
+        if let Ok(job) = serde_json::from_str::<GlossJob>(&data_json) {
+            if job.notebook_id() == notebook_id && job.source_id() == source_id {
+                return Ok(RetrySourceDisposition::AlreadyRunning);
+            }
+        }
+    }
+
+    // Restoring an embedding configuration deliberately marks the notebook's
+    // derived dense index stale. A per-source Retry must repair that owner
+    // boundary before it can republish any chunk labels; otherwise every retry
+    // repeats the same typed "explicit rebuild required" failure.
+    if source_retry_needs_native_dense_rebuild(state, notebook_id, source_id)? {
+        let receipt = native_dense_rebuild(notebook_id.to_string(), app_handle.clone())
+            .await
+            .map_err(|error| {
+                retry_source_error(
+                    state,
+                    app_handle,
+                    notebook_id,
+                    source_id,
+                    format!("Native dense repair before source retry failed: {error}"),
+                )
+            })?;
+        tracing::info!(
+            notebook_id,
+            source_id,
+            rebuild_id = %receipt.rebuild_id,
+            chunks_indexed = receipt.chunks_indexed,
+            sources_recovered = receipt.sources_recovered,
+            "Repaired stale native dense projection before source retry"
+        );
+    }
+
+    // Capture labels and claim the retry under the notebook writer. A second
+    // request sees pending/ready rather than replaying the destructive reset.
+    let (source_type, old_embedding_ids) = match claim_source_retry(state, notebook_id, source_id)?
+    {
+        RetrySourceClaim::AlreadyRunning => return Ok(RetrySourceDisposition::AlreadyRunning),
+        RetrySourceClaim::Completed => return Ok(RetrySourceDisposition::Completed),
+        RetrySourceClaim::Claimed {
+            source_type,
+            old_embedding_ids,
+        } => (source_type, old_embedding_ids),
+    };
 
     if !old_embedding_ids.is_empty() {
         let removed_count = {
-            // Recover from a poisoned lock instead of failing every retry with
-            // "poisoned lock: another task failed inside".
             let mut indices = state.hnsw_indices.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(index) = indices.get_mut(&notebook_id) {
+            if let Some(index) = indices.get_mut(notebook_id) {
                 let mut removed = 0usize;
                 for eid in &old_embedding_ids {
                     match index.remove(*eid) {
                         Ok(_) => removed += 1,
-                        Err(e) => tracing::warn!(
+                        Err(error) => tracing::warn!(
                             notebook_id,
                             source_id,
                             embedding_id = eid,
-                            error = %e,
+                            error = %error,
                             "Failed to remove old HNSW vector during retry"
                         ),
                     }
@@ -3885,53 +4055,195 @@ pub async fn retry_source_ingestion(
                 0
             }
         };
-
         tracing::debug!(count = removed_count, source_id, "Removed old HNSW vectors");
         if removed_count > 0 {
-            if let Err(e) = state.save_hnsw_index(&notebook_id) {
+            if let Err(error) = state.save_hnsw_index(notebook_id) {
                 tracing::warn!(
                     notebook_id,
                     source_id,
-                    error = %e,
+                    error = %error,
                     "Failed to persist HNSW index after retry cleanup"
                 );
             }
         }
     }
 
-    // Route based on source type
     match source_type.as_str() {
         "image" => {
-            match queue_describe_image_job(&queue, &state, &notebook_id, &source_id, Path::new(""))
-            {
-                Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
-                Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
+            queue_describe_image_job(queue, state, notebook_id, source_id, Path::new("")).map_err(
+                |message| retry_source_error(state, app_handle, notebook_id, source_id, message),
+            )?;
+            emit_status(app_handle, notebook_id, source_id, "pending", None);
+            Ok(RetrySourceDisposition::Queued)
+        }
+        "video" => {
+            queue_describe_video_job(queue, state, notebook_id, source_id).map_err(|message| {
+                retry_source_error(state, app_handle, notebook_id, source_id, message)
+            })?;
+            emit_status(app_handle, notebook_id, source_id, "pending", None);
+            Ok(RetrySourceDisposition::Queued)
+        }
+        "audio" => {
+            queue_audio_metadata_job(queue, state, notebook_id, source_id).map_err(|message| {
+                retry_source_error(state, app_handle, notebook_id, source_id, message)
+            })?;
+            emit_status(app_handle, notebook_id, source_id, "pending", None);
+            Ok(RetrySourceDisposition::Queued)
+        }
+        _ => {
+            let notebook = notebook_id.to_string();
+            let source = source_id.to_string();
+            let queue = Arc::clone(queue);
+            let handle = app_handle.clone();
+            let terminal = tokio::task::spawn_blocking(move || {
+                let state = handle.state::<AppState>();
+                run_ingestion_inner(
+                    &notebook,
+                    &source,
+                    &state,
+                    &handle,
+                    &queue,
+                    IngestionOpts::default(),
+                )
+            })
+            .await;
+            let terminal = match terminal {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    return Err(retry_source_error(
+                        state,
+                        app_handle,
+                        notebook_id,
+                        source_id,
+                        format!("Retry ingestion task failed: {error}"),
+                    ));
+                }
+            };
+            match terminal {
+                IngestionTerminalState::Ready | IngestionTerminalState::SkippedUnsupported => {
+                    Ok(RetrySourceDisposition::Completed)
+                }
+                IngestionTerminalState::DeletedDuringIngestion => Err(GlossError::NotFound(
+                    format!("Source {source_id} was deleted during retry"),
+                )),
+                IngestionTerminalState::Error => {
+                    let message = state
+                        .with_notebook_db(notebook_id, |db| db.get_source(source_id))?
+                        .error_message
+                        .unwrap_or_else(|| "Retry ingestion failed".to_string());
+                    Err(retry_source_error(
+                        state,
+                        app_handle,
+                        notebook_id,
+                        source_id,
+                        message,
+                    ))
+                }
             }
         }
-        "video" => match queue_describe_video_job(&queue, &state, &notebook_id, &source_id) {
-            Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
-            Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
-        },
-        "audio" => match queue_audio_metadata_job(&queue, &state, &notebook_id, &source_id) {
-            Ok(()) => emit_status(&app_handle, &notebook_id, &source_id, "pending", None),
-            Err(msg) => emit_status(&app_handle, &notebook_id, &source_id, "error", Some(&msg)),
-        },
-        _ => {
-            // Spawn in background so the IPC thread isn't blocked
-            let nb = notebook_id.clone();
-            let src = source_id.clone();
-            let q = Arc::clone(&queue);
-            let handle = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = tokio::task::spawn_blocking(move || {
-                    let state = handle.state::<AppState>();
-                    run_ingestion(&nb, &src, &state, &handle, &q);
-                })
-                .await;
-            });
+    }
+}
+
+#[tauri::command]
+pub async fn retry_source_ingestion(
+    notebook_id: String,
+    source_id: String,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), GlossError> {
+    retry_source_ingestion_inner(&notebook_id, &source_id, &state, &queue, &app_handle)
+        .await
+        .map(|_| ())
+}
+
+/// Retry every failed source through one bounded backend operation. Native
+/// embedding-only failures are repaired once for the notebook; remaining
+/// sources are handled sequentially with per-source observed outcomes.
+#[tauri::command]
+pub async fn retry_failed_imports(
+    notebook_id: String,
+    state: State<'_, AppState>,
+    queue: State<'_, Arc<QueueManager>>,
+    app_handle: tauri::AppHandle,
+) -> Result<RetryFailedImportsReceipt, GlossError> {
+    let _batch_guard = RETRY_FAILED_IMPORTS_GATE
+        .acquire()
+        .await
+        .map_err(|error| GlossError::Other(format!("Retry batch gate closed: {error}")))?;
+    let failed_before = failed_import_source_ids(&state, &notebook_id)?;
+    let embedding_failures_before = state.with_notebook_db(&notebook_id, |db| {
+        db.native_embedding_failures().map(|rows| rows.len())
+    })?;
+    let mut recovered_by_dense_rebuild = 0usize;
+    let mut errors = Vec::new();
+
+    if embedding_failures_before > 0 {
+        match native_dense_rebuild(notebook_id.clone(), app_handle.clone()).await {
+            Ok(receipt) => recovered_by_dense_rebuild = receipt.sources_recovered,
+            Err(error) => errors.push(RetryFailedSourceError {
+                source_id: "<native-dense-rebuild>".to_string(),
+                error: error.to_string(),
+            }),
         }
     }
-    Ok(())
+
+    let remaining = failed_import_source_ids(&state, &notebook_id)?;
+    let remaining_sources = state.with_notebook_db(&notebook_id, |db| {
+        remaining
+            .iter()
+            .map(|source_id| db.get_source(source_id))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let vision_preflight = remaining_sources
+        .iter()
+        .any(|source| matches!(source.source_type.as_str(), "image" | "video"))
+        .then(|| resolve_background_job_config(&state, BackgroundJobKind::Vision))
+        .transpose();
+
+    let mut retried_sources = 0usize;
+    let mut already_running_sources = 0usize;
+    let mut queued_sources = 0usize;
+    let mut completed_sources = 0usize;
+    for source in remaining_sources {
+        if matches!(source.source_type.as_str(), "image" | "video") {
+            if let Err(error) = &vision_preflight {
+                errors.push(RetryFailedSourceError {
+                    source_id: source.id,
+                    error: error.clone(),
+                });
+                continue;
+            }
+        }
+        retried_sources += 1;
+        match retry_source_ingestion_inner(&notebook_id, &source.id, &state, &queue, &app_handle)
+            .await
+        {
+            Ok(RetrySourceDisposition::AlreadyRunning) => already_running_sources += 1,
+            Ok(RetrySourceDisposition::Queued) => queued_sources += 1,
+            Ok(RetrySourceDisposition::Completed) => completed_sources += 1,
+            Err(error) => errors.push(RetryFailedSourceError {
+                source_id: source.id,
+                error: error.to_string(),
+            }),
+        }
+    }
+
+    let failed_sources = failed_import_source_ids(&state, &notebook_id)?.len();
+    Ok(RetryFailedImportsReceipt {
+        schema: "RetryFailedImportsReceiptV1",
+        receipt_id: uuid::Uuid::new_v4().to_string(),
+        notebook_id,
+        failed_sources_before: failed_before.len(),
+        recovered_by_dense_rebuild,
+        retried_sources,
+        already_running_sources,
+        queued_sources,
+        completed_sources,
+        failed_sources,
+        errors,
+        recorded_utc: chrono::Utc::now().to_rfc3339(),
+    })
 }
 
 /// Get notebook-level statistics (Fix 10).
@@ -4347,13 +4659,156 @@ fn link_status_for_notebook(
     })
 }
 
+fn semantic_projection_required_for_status(
+    state: &AppState,
+    notebook_id: &str,
+) -> Result<bool, GlossError> {
+    state.with_notebook_db(notebook_id, |db| {
+        let sources = db.list_sources()?;
+        let resolved = SourceScope::All.resolve(&sources);
+        let coverage = db.retrieval_coverage(&resolved)?;
+        if coverage.total_chunks == 0 {
+            return Ok(false);
+        }
+        let summary = db.semantic_memory_projection_summary(notebook_id, &resolved)?;
+        Ok(summary.projection_required || summary.healthy_links < coverage.total_chunks)
+    })
+}
+
+#[derive(Debug)]
+struct SelectedBackendHealth {
+    index_sync_status: String,
+    last_sync_error: Option<String>,
+    fallback_reason: Option<String>,
+    fallback_reason_code: Option<RetrievalReasonCode>,
+    degradation_markers: Vec<String>,
+    degraded: bool,
+    diagnostic: Option<String>,
+}
+
+fn selected_backend_health(
+    requested_backend: &str,
+    link_status: Option<&SemanticMemoryLinkStatus>,
+    embedding_index_metadata: &[EmbeddingIndexStatusView],
+    semantic_memory_available: bool,
+    semantic_projection_required: bool,
+) -> SelectedBackendHealth {
+    let semantic_selected =
+        requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW;
+    let relevant_index = if semantic_selected {
+        crate::db::notebook_db::SEMANTIC_MEMORY_INDEX_ID
+    } else {
+        crate::db::notebook_db::NATIVE_HNSW_INDEX_ID
+    };
+    let relevant_metadata = embedding_index_metadata
+        .iter()
+        .find(|metadata| metadata.index_id == relevant_index);
+    let mut degradation_markers = Vec::new();
+    let mut fallback_reason = None;
+    let mut fallback_reason_code = None;
+    let mut diagnostic = None;
+    let mut last_sync_error = None;
+
+    let mut index_sync_status = if semantic_selected {
+        link_status
+            .map(|status| {
+                last_sync_error = status.last_sync_error.clone();
+                if status.failed_links > 0 {
+                    "failed"
+                } else if status.stale_links > 0 || status.missing_document_links > 0 {
+                    "degraded"
+                } else if status.synced_links > 0 {
+                    "synced"
+                } else {
+                    "empty"
+                }
+            })
+            .unwrap_or("unknown")
+            .to_string()
+    } else {
+        match relevant_metadata.map(|metadata| metadata.status.as_str()) {
+            Some("ready") => "synced",
+            Some("stale") => "degraded",
+            Some("blocked") => "failed",
+            Some(_) => "unknown",
+            None => "empty",
+        }
+        .to_string()
+    };
+
+    if semantic_selected && !semantic_memory_available {
+        fallback_reason = Some("semantic-memory-flag-off".to_string());
+        fallback_reason_code = Some(RetrievalReasonCode::SemanticMemoryFeatureDisabled);
+        degradation_markers.push("semantic_memory_feature_disabled".to_string());
+        index_sync_status = "failed".to_string();
+    }
+    if semantic_selected && index_sync_status == "empty" && semantic_projection_required {
+        degradation_markers.push("semantic-memory-sync-empty".to_string());
+        fallback_reason = Some("semantic-memory projection is required but empty".to_string());
+        fallback_reason_code = Some(RetrievalReasonCode::SemanticMemoryLinksMissing);
+    } else if semantic_selected
+        && semantic_memory_available
+        && matches!(index_sync_status.as_str(), "failed" | "degraded")
+    {
+        degradation_markers.push(format!("semantic-memory-sync-{index_sync_status}"));
+        fallback_reason = Some(
+            last_sync_error
+                .clone()
+                .unwrap_or_else(|| format!("semantic-memory projection is {index_sync_status}")),
+        );
+        fallback_reason_code = Some(RetrievalReasonCode::SemanticMemoryLinksDegraded);
+    }
+
+    if let Some(metadata) = relevant_metadata {
+        if matches!(metadata.status.as_str(), "stale" | "blocked" | "unknown") {
+            degradation_markers.push(format!(
+                "embedding-index-{}-{}",
+                metadata.index_id, metadata.status
+            ));
+            let reason = metadata.status_reason.clone().unwrap_or_else(|| {
+                format!(
+                    "embedding index {} is {}",
+                    metadata.index_id, metadata.status
+                )
+            });
+            diagnostic.get_or_insert_with(|| reason.clone());
+            if semantic_selected {
+                fallback_reason.get_or_insert(reason);
+                fallback_reason_code.get_or_insert(match metadata.status.as_str() {
+                    "stale" => RetrievalReasonCode::EmbeddingIndexMetadataStale,
+                    _ => RetrievalReasonCode::EmbeddingIndexMetadataUnknown,
+                });
+            }
+        }
+    }
+
+    let degraded = !degradation_markers.is_empty();
+    if diagnostic.is_none() {
+        diagnostic = fallback_reason.clone();
+    }
+    SelectedBackendHealth {
+        index_sync_status,
+        last_sync_error,
+        fallback_reason,
+        fallback_reason_code,
+        degradation_markers,
+        degraded,
+        diagnostic,
+    }
+}
+
 #[tauri::command]
 pub async fn memory_backend_status(
     notebook_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<MemoryBackendStatus, GlossError> {
     let active_backend = active_memory_backend(&state)?;
-    let (requested_backend, semantic_memory_feature_enabled, semantic_memory_available) = {
+    let (
+        requested_backend,
+        semantic_memory_feature_enabled,
+        semantic_memory_available,
+        fallback_allowed,
+    ) = {
         let app_db = state
             .app_db
             .lock()
@@ -4364,12 +4819,20 @@ pub async fn memory_backend_status(
                 .unwrap_or_else(|| MEMORY_BACKEND_GLOSS_LOCAL.to_string()),
             cfg!(feature = "semantic-memory-backend"),
             features::semantic_memory_preview_active(&app_db)?,
+            crate::commands::chat::setting_is_enabled(
+                app_db.get_setting("memory_backend_fallback")?,
+            ),
         )
     };
-    let link_status = notebook_id
-        .as_deref()
-        .map(|id| link_status_for_notebook(&state, id))
-        .transpose()?;
+    let link_status = if requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
+    {
+        notebook_id
+            .as_deref()
+            .map(|id| link_status_for_notebook(&state, id))
+            .transpose()?
+    } else {
+        None
+    };
     let embedding_index_metadata = notebook_id
         .as_deref()
         .map(|id| {
@@ -4393,63 +4856,33 @@ pub async fn memory_backend_status(
         })
         .transpose()?
         .unwrap_or_default();
+    let semantic_projection_required =
+        if requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW {
+            notebook_id
+                .as_deref()
+                .map(|id| semantic_projection_required_for_status(&state, id))
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
-    let index_sync_status = link_status
-        .as_ref()
-        .map(|status| {
-            if status.failed_links > 0 {
-                "failed"
-            } else if status.stale_links > 0 || status.missing_document_links > 0 {
-                "degraded"
-            } else if status.synced_links > 0 {
-                "synced"
-            } else {
-                "empty"
-            }
-        })
-        .unwrap_or("unknown")
-        .to_string();
-    let mut degradation_markers = Vec::new();
-    let mut fallback_reason = None;
-    let mut fallback_reason_code = None;
-    if requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
-        && !semantic_memory_available
-    {
-        fallback_reason = Some("semantic-memory-flag-off".to_string());
-        fallback_reason_code = Some(RetrievalReasonCode::SemanticMemoryFeatureDisabled);
-        degradation_markers.push("semantic_memory_feature_disabled".to_string());
-    }
-    if index_sync_status == "failed" || index_sync_status == "degraded" {
-        degradation_markers.push(format!("semantic-memory-sync-{index_sync_status}"));
-    }
-    for metadata in &embedding_index_metadata {
-        if matches!(metadata.status.as_str(), "stale" | "blocked" | "unknown") {
-            degradation_markers.push(format!(
-                "embedding-index-{}-{}",
-                metadata.index_id, metadata.status
-            ));
-            fallback_reason.get_or_insert_with(|| {
-                metadata.status_reason.clone().unwrap_or_else(|| {
-                    format!(
-                        "embedding index {} is {}",
-                        metadata.index_id, metadata.status
-                    )
-                })
-            });
-            fallback_reason_code.get_or_insert(match metadata.status.as_str() {
-                "stale" => RetrievalReasonCode::EmbeddingIndexMetadataStale,
-                _ => RetrievalReasonCode::EmbeddingIndexMetadataUnknown,
-            });
-        }
-    }
-
-    let degraded = fallback_reason.is_some() || !degradation_markers.is_empty();
+    let health = selected_backend_health(
+        &requested_backend,
+        link_status.as_ref(),
+        &embedding_index_metadata,
+        semantic_memory_available,
+        semantic_projection_required,
+    );
 
     Ok(MemoryBackendStatus {
         backend_id: requested_backend.clone(),
         default_backend: MEMORY_BACKEND_GLOSS_LOCAL.to_string(),
         active_backend: requested_backend.clone(),
-        backend_used: if fallback_reason.is_some() {
+        backend_used: if fallback_allowed
+            && requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
+            && health.fallback_reason.is_some()
+        {
             MEMORY_BACKEND_GLOSS_LOCAL.to_string()
         } else {
             active_backend
@@ -4458,19 +4891,19 @@ pub async fn memory_backend_status(
         semantic_memory_feature_enabled,
         semantic_memory_available,
         semantic_memory_path: None,
-        index_sync_status: index_sync_status.clone(),
-        sync_status: index_sync_status,
+        index_sync_status: health.index_sync_status.clone(),
+        sync_status: health.index_sync_status,
         last_sync_at: None,
-        last_sync_error: link_status.and_then(|status| status.last_sync_error),
+        last_sync_error: health.last_sync_error,
         last_retrieval_receipt_id: None,
         last_receipt_ref: None,
-        fallback_reason: fallback_reason.clone(),
-        fallback_reason_code,
-        degradation_markers,
+        fallback_reason: health.fallback_reason.clone(),
+        fallback_reason_code: health.fallback_reason_code,
+        degradation_markers: health.degradation_markers,
         backend_version_or_digest: None,
         embedding_index_metadata,
-        degraded,
-        diagnostic: fallback_reason,
+        degraded: health.degraded,
+        diagnostic: health.diagnostic,
     })
 }
 
@@ -4675,7 +5108,7 @@ pub async fn semantic_memory_vector_artifact_status(
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        features::turbo_quant_active(&app_db)?
+        features::turbo_quant_requested(&app_db)?
     };
     let (statuses, source_chunk_counts, latest_probe, embedding_metadata) = state.with_notebook_db(&notebook_id, |db| {
         // One read snapshot binds source counts, projection identity and proof.
@@ -4777,7 +5210,7 @@ async fn compare_memory_backends(
             crate::commands::chat::setting_is_enabled(
                 app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
             ),
-            features::turbo_quant_active(&app_db)?,
+            features::turbo_quant_requested(&app_db)?,
             crate::commands::chat::setting_is_enabled(
                 app_db
                     .get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
@@ -4787,7 +5220,13 @@ async fn compare_memory_backends(
             ),
         )
     };
-    let (all_sources, local_backend_result, local_latency_ms, semantic_links) = {
+    let (
+        all_sources,
+        local_backend_result,
+        local_latency_ms,
+        semantic_links,
+        stored_embedding_metadata,
+    ) = {
         let db = crate::db::notebook_db::NotebookDb::connect(&db_path)?;
         let all_sources = db.list_sources()?;
         let local = GlossLocalMemoryBackend::new(notebook_id.clone(), &db, &all_sources);
@@ -4798,11 +5237,14 @@ async fn compare_memory_backends(
         let semantic_links = semantic_memory_adapter::load_links(&db)?;
         #[cfg(not(feature = "semantic-memory-backend"))]
         let semantic_links = Vec::new();
+        let stored_embedding_metadata =
+            db.embedding_index_metadata(crate::db::notebook_db::SEMANTIC_MEMORY_INDEX_ID)?;
         (
             all_sources,
             local_backend_result,
             local_latency_ms,
             semantic_links,
+            stored_embedding_metadata,
         )
     };
 
@@ -4814,6 +5256,7 @@ async fn compare_memory_backends(
         local_backend_result,
         local_latency_ms,
         semantic_links,
+        stored_embedding_metadata,
         #[cfg(feature = "semantic-memory-backend")]
         Some(semantic_runtime_config),
     )
@@ -4928,6 +5371,147 @@ mod tests {
         assert_eq!(status.last_sync_error.as_deref(), Some("retained error"));
     }
 
+    #[test]
+    fn selected_local_backend_ignores_inactive_semantic_failures() {
+        let link_status = SemanticMemoryLinkStatus {
+            notebook_id: "nb1".into(),
+            total_links: 4,
+            synced_links: 1,
+            stale_links: 1,
+            failed_links: 1,
+            missing_document_links: 1,
+            degraded_links: 3,
+            reason_codes: vec!["semantic_memory_links_degraded".into()],
+            last_sync_error: Some("inactive semantic failure".into()),
+        };
+        let metadata = vec![
+            EmbeddingIndexStatusView {
+                index_id: crate::db::notebook_db::NATIVE_HNSW_INDEX_ID.into(),
+                provider: "ollama".into(),
+                model: "nomic-embed-text:latest".into(),
+                model_digest: Some("native-ready".into()),
+                dimensions: Some(768),
+                schema_version: 1,
+                status: "ready".into(),
+                status_reason: None,
+                validated_at: None,
+            },
+            EmbeddingIndexStatusView {
+                index_id: crate::db::notebook_db::SEMANTIC_MEMORY_INDEX_ID.into(),
+                provider: "ollama".into(),
+                model: "nomic-embed-text:latest".into(),
+                model_digest: Some("semantic-stale".into()),
+                dimensions: Some(768),
+                schema_version: 1,
+                status: "stale".into(),
+                status_reason: Some("inactive semantic projection is stale".into()),
+                validated_at: None,
+            },
+        ];
+
+        let health = selected_backend_health(
+            MEMORY_BACKEND_GLOSS_LOCAL,
+            Some(&link_status),
+            &metadata,
+            true,
+            false,
+        );
+        assert_eq!(health.index_sync_status, "synced");
+        assert!(!health.degraded);
+        assert!(health.fallback_reason.is_none());
+        assert!(health.degradation_markers.is_empty());
+    }
+
+    #[test]
+    fn selected_semantic_backend_reports_required_empty_projection_as_degraded() {
+        let link_status = SemanticMemoryLinkStatus {
+            notebook_id: "nb1".into(),
+            total_links: 0,
+            synced_links: 0,
+            stale_links: 0,
+            failed_links: 0,
+            missing_document_links: 0,
+            degraded_links: 0,
+            reason_codes: vec!["semantic_memory_links_missing".into()],
+            last_sync_error: None,
+        };
+
+        let health = selected_backend_health(
+            crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
+            Some(&link_status),
+            &[],
+            true,
+            true,
+        );
+
+        assert_eq!(health.index_sync_status, "empty");
+        assert!(health.degraded);
+        assert_eq!(
+            health.fallback_reason_code,
+            Some(RetrievalReasonCode::SemanticMemoryLinksMissing)
+        );
+        assert_eq!(
+            health.degradation_markers,
+            vec!["semantic-memory-sync-empty"]
+        );
+    }
+
+    #[test]
+    fn source_bearing_notebook_requires_projection_when_links_are_missing() {
+        let (_dir, state, notebook_id) = build_state();
+        let source = ready_source("semantic-missing");
+        state
+            .with_notebook_db_write(&notebook_id, |db| {
+                db.insert_source(&source)?;
+                db.insert_chunks(&[Chunk {
+                    id: "semantic-missing-c0".into(),
+                    source_id: source.id.clone(),
+                    chunk_index: 0,
+                    content: "projection required".into(),
+                    token_count: Some(2),
+                    start_offset: Some(0),
+                    end_offset: Some(19),
+                    metadata: None,
+                    embedding_id: None,
+                    embedding_model: None,
+                }])
+            })
+            .unwrap();
+
+        assert!(semantic_projection_required_for_status(&state, &notebook_id).unwrap());
+    }
+
+    #[cfg(feature = "semantic-memory-turbo-quant")]
+    #[test]
+    fn turbo_quant_effective_requires_selection_artifacts_and_exact_rerank_proof() {
+        let proven = VectorArtifactStatus {
+            compiled_turbo_quant: true,
+            runtime_turbo_quant_enabled: true,
+            candidate_backend: Some("turbo_quant_sidecar".into()),
+            artifact_generation_id: Some("generation".into()),
+            vector_artifact_manifest_digest: Some("manifest".into()),
+            vector_artifact_missing_count: 0,
+            vector_artifact_stale_count: 0,
+            exact_rerank: true,
+            exact_rerank_count: 3,
+            last_receipt_id: Some("receipt".into()),
+            last_error: None,
+        };
+        assert!(proven.turbo_quant_effective());
+
+        let mut only_compiled = proven.clone();
+        only_compiled.runtime_turbo_quant_enabled = false;
+        assert!(!only_compiled.turbo_quant_effective());
+
+        let mut stale = proven.clone();
+        stale.vector_artifact_stale_count = 1;
+        assert!(!stale.turbo_quant_effective());
+
+        let mut no_rerank = proven;
+        no_rerank.exact_rerank_count = 0;
+        assert!(!no_rerank.turbo_quant_effective());
+    }
+
     fn build_queue(dir: &TempDir) -> Arc<QueueManager> {
         Arc::new(
             QueueManager::new(
@@ -4961,6 +5545,88 @@ mod tests {
             updated_at: String::new(),
             processing_state: None,
         }
+    }
+
+    #[test]
+    fn retry_claim_is_atomic_and_duplicate_requests_observe_in_flight_state() {
+        let (_dir, state, notebook_id) = build_state();
+        let mut source = ready_source("retry-source");
+        source.status = "error".into();
+        source.error_message = Some("failed import".into());
+        state
+            .with_notebook_db_write(&notebook_id, |db| db.insert_source(&source))
+            .unwrap();
+
+        let first = claim_source_retry(&state, &notebook_id, &source.id).unwrap();
+        assert!(matches!(
+            first,
+            RetrySourceClaim::Claimed {
+                ref source_type,
+                ..
+            } if source_type == "text"
+        ));
+        let second = claim_source_retry(&state, &notebook_id, &source.id).unwrap();
+        assert_eq!(second, RetrySourceClaim::AlreadyRunning);
+        let persisted = state
+            .with_notebook_db(&notebook_id, |db| db.get_source(&source.id))
+            .unwrap();
+        assert_eq!(persisted.status, "pending");
+        assert!(persisted.error_message.is_none());
+    }
+
+    #[test]
+    fn source_retry_repairs_stale_native_projection_for_embedding_failure() {
+        let (_dir, state, notebook_id) = build_state();
+        let mut source = ready_source("retry-stale-dense");
+        source.status = "error".into();
+        source.error_message = Some("Embedding error: model changed".into());
+        state
+            .with_notebook_db_write(&notebook_id, |db| {
+                db.insert_source(&source)?;
+                db.insert_chunks(&[Chunk {
+                    id: "retry-stale-dense-c0".into(),
+                    source_id: source.id.clone(),
+                    chunk_index: 0,
+                    content: "recover this chunk".into(),
+                    token_count: Some(3),
+                    start_offset: Some(0),
+                    end_offset: Some(18),
+                    metadata: None,
+                    embedding_id: None,
+                    embedding_model: None,
+                }])?;
+                db.update_source_index_status(
+                    &source.id,
+                    Some("indexed"),
+                    Some("blocked"),
+                    source.error_message.as_deref(),
+                )?;
+                let mut metadata = crate::db::notebook_db::EmbeddingIndexMetadata::ready(
+                    crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+                    "ollama",
+                    "nomic-embed-text:latest",
+                    Some("fixture-digest".into()),
+                    768,
+                );
+                metadata.status = "stale".into();
+                db.upsert_embedding_index_metadata(&metadata)
+            })
+            .unwrap();
+
+        assert!(source_retry_needs_native_dense_rebuild(&state, &notebook_id, &source.id).unwrap());
+
+        state
+            .with_notebook_db_write(&notebook_id, |db| {
+                db.mark_embedding_index_status(
+                    crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+                    crate::db::notebook_db::EmbeddingIndexMetadataStatus::Ready,
+                    Some("fixture ready"),
+                )
+            })
+            .unwrap();
+        assert!(
+            !source_retry_needs_native_dense_rebuild(&state, &notebook_id, &source.id).unwrap()
+        );
     }
 
     #[test]

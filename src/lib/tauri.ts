@@ -18,6 +18,7 @@ import type {
   QueueSummariesResult,
   MemoryBackendStatus,
   MemoryBackendProfileReceipt,
+  MemoryRepairWorkflowReceipt,
   SemanticMemoryLinkStatus,
   IndexSourceReceipt,
   SemanticMemoryBackfillReceipt,
@@ -28,6 +29,7 @@ import type {
   EmbeddingDiagnosticsReceipt,
   ExternalToolAvailabilityReceipt,
   FailedImportQuarantineReceipt,
+  RetryFailedImportsReceipt,
   DbDoctorReceipt,
   NotebookExportReceipt,
   NotebookImportReceipt,
@@ -185,6 +187,12 @@ export async function retrySourceIngestion(
   sourceId: string
 ): Promise<void> {
   return invoke("retry_source_ingestion", { notebookId, sourceId });
+}
+
+export async function retryFailedImports(
+  notebookId: string
+): Promise<RetryFailedImportsReceipt> {
+  return invoke("retry_failed_imports", { notebookId });
 }
 
 export async function getNotebookStats(
@@ -469,6 +477,13 @@ export async function setMemoryBackendProfile(
   notebookId?: string | null
 ): Promise<MemoryBackendProfileReceipt> {
   return invoke("set_memory_backend_profile", { profile, notebookId });
+}
+
+export async function repairAndSetMemoryProfile(
+  profile: string,
+  notebookId: string
+): Promise<MemoryRepairWorkflowReceipt> {
+  return invoke("repair_and_set_memory_profile", { profile, notebookId });
 }
 
 export async function checkExternalTools(): Promise<Record<string, ExternalToolAvailabilityReceipt>> {

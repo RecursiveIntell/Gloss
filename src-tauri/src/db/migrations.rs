@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-const APP_SCHEMA_VERSION: i32 = 3;
+const APP_SCHEMA_VERSION: i32 = 4;
 const NOTEBOOK_SCHEMA_VERSION: i32 = 7;
 
 /// Apply pragmas for performance and correctness.
@@ -89,16 +89,16 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
              INSERT OR IGNORE INTO settings (key, value) VALUES ('default_model', 'qwen3.5:4b');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('default_embedding_model', 'NomicEmbedTextV15');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('summary_mode', 'manual');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend', 'semantic-memory-preview');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend', 'gloss-local');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('memory_backend_fallback', 'true');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_auto_project', 'true');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_auto_project', 'false');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_strict_testing', 'false');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_turbo_quant_require_fresh_artifacts', 'true');
              -- v1/v2 default; v3 migration above flips this on upgrade.
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_url', 'http://localhost:11434');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_model', 'bge-m3');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_embedding_timeout_secs', '10');
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_search_timeout_ms', '8000');
+             INSERT OR IGNORE INTO settings (key, value) VALUES ('semantic_memory_search_timeout_ms', '60000');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_temperature', '0.7');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_p', '');
              INSERT OR IGNORE INTO settings (key, value) VALUES ('generation_top_k', '');
@@ -114,7 +114,7 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
              VALUES ('ollama', 1, 'http://localhost:11434');",
         )?;
 
-        set_schema_version(conn, APP_SCHEMA_VERSION)?;
+        set_schema_version(conn, 1)?;
     }
 
     if version < 2 {
@@ -162,6 +162,21 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) \
              VALUES ('semantic_memory_embedding_provider', 'ollama')",
+            [],
+        )?;
+        set_schema_version(conn, 3)?;
+    }
+
+    // v4: the legacy 8-second semantic search default could expire before the
+    // configured 10-second Ollama embedding request, and it was far below the
+    // observed cold-start budget for proof-backed TurboQuant retrieval. Only
+    // migrate the exact legacy default; explicit operator values are retained.
+    if version < 4 {
+        conn.execute(
+            "UPDATE settings
+                SET value = '60000'
+              WHERE key = 'semantic_memory_search_timeout_ms'
+                AND value = '8000'",
             [],
         )?;
         set_schema_version(conn, APP_SCHEMA_VERSION)?;
@@ -941,6 +956,53 @@ fn ensure_studio_outputs_prose_column(conn: &Connection) -> rusqlite::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_v4_migrates_only_the_exact_legacy_search_timeout_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_app_db(&conn).unwrap();
+        conn.execute(
+            "UPDATE _meta SET value = '3' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE settings SET value = '8000' WHERE key = 'semantic_memory_search_timeout_ms'",
+            [],
+        )
+        .unwrap();
+
+        migrate_app_db(&conn).unwrap();
+        let migrated: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'semantic_memory_search_timeout_ms'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated, "60000");
+        assert_eq!(get_schema_version(&conn), APP_SCHEMA_VERSION);
+
+        conn.execute(
+            "UPDATE _meta SET value = '3' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE settings SET value = '45000' WHERE key = 'semantic_memory_search_timeout_ms'",
+            [],
+        )
+        .unwrap();
+        migrate_app_db(&conn).unwrap();
+        let retained: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'semantic_memory_search_timeout_ms'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, "45000");
+    }
 
     #[test]
     fn notebook_migration_repairs_missing_fts_for_existing_schema() {

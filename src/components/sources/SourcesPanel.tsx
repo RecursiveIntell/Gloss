@@ -237,6 +237,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   const quarantineFailedImports = useSourceStore((s: SourceStoreState) => s.quarantineFailedImports);
   const deleteFailedImports = useSourceStore((s: SourceStoreState) => s.deleteFailedImports);
   const retrySource = useSourceStore((s: SourceStoreState) => s.retrySource);
+  const retryFailedSources = useSourceStore((s: SourceStoreState) => s.retryFailedSources);
   const reindexSource = useSourceStore((s: SourceStoreState) => s.reindexSource);
   const reindexNotebook = useSourceStore((s: SourceStoreState) => s.reindexNotebook);
   const bulkDeleteSelected = useSourceStore((s: SourceStoreState) => s.bulkDeleteSelected);
@@ -255,6 +256,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
   const [typeFilter, setTypeFilter] = useState("all");
   const [dragActive, setDragActive] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
+  const [retryingFailed, setRetryingFailed] = useState(false);
 
   // Feature flags
   const featureFlags = useSettingsStore((s) => s.featureFlags);
@@ -676,14 +678,19 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             </div>
             <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
               <button
-                onClick={() => {
-                  for (const source of failedSources) {
-                    retrySource(notebookId, source.id);
+                onClick={async () => {
+                  if (retryingFailed) return;
+                  setRetryingFailed(true);
+                  try {
+                    await retryFailedSources(notebookId);
+                  } finally {
+                    setRetryingFailed(false);
                   }
                 }}
+                disabled={retryingFailed}
                 className="rounded border border-accent/50 px-2 py-0.5 text-accent hover:bg-accent/10"
               >
-                Retry All
+                {retryingFailed ? "Retrying..." : "Retry All"}
               </button>
               <button
                 onClick={() => setStatusFilter("error")}

@@ -1,4 +1,4 @@
-use crate::db::notebook_db::Source;
+use crate::db::notebook_db::{EmbeddingIndexMetadata, Source};
 use crate::error::GlossError;
 use crate::memory::types::{
     IndexSourceReceipt, IndexSourceRequest, MemoryBackendComparison, MemoryBackendStatus,
@@ -244,6 +244,7 @@ pub async fn compare_memory_backends_for_notebook(
     local_backend_result: MemorySearchResponse,
     local_latency_ms: u128,
     semantic_links: Vec<SemanticLinkRow>,
+    stored_embedding_metadata: Option<EmbeddingIndexMetadata>,
     #[cfg(feature = "semantic-memory-backend")] semantic_runtime_config: Option<
         crate::memory::semantic_memory_adapter::SemanticMemoryRuntimeConfig,
     >,
@@ -256,6 +257,7 @@ pub async fn compare_memory_backends_for_notebook(
         semantic_links,
         all_sources,
         request.clone(),
+        stored_embedding_metadata,
         semantic_runtime_config,
     )
     .await?;
@@ -266,6 +268,7 @@ pub async fn compare_memory_backends_for_notebook(
         semantic_links,
         all_sources,
         request.clone(),
+        stored_embedding_metadata,
     )
     .await?;
     let semantic_memory_latency_ms = Some(semantic_started.elapsed().as_millis());
@@ -302,6 +305,7 @@ async fn semantic_memory_comparison_result(
     semantic_links: Vec<SemanticLinkRow>,
     all_sources: &[Source],
     request: MemorySearchRequest,
+    stored_embedding_metadata: Option<EmbeddingIndexMetadata>,
     #[cfg(feature = "semantic-memory-backend")] semantic_runtime_config: Option<
         crate::memory::semantic_memory_adapter::SemanticMemoryRuntimeConfig,
     >,
@@ -315,7 +319,7 @@ async fn semantic_memory_comparison_result(
             all_sources,
             request.clone(),
             semantic_runtime_config,
-            None,
+            stored_embedding_metadata,
         )
         .await
         {
@@ -333,6 +337,7 @@ async fn semantic_memory_comparison_result(
         let _ = data_dir;
         let _ = semantic_links;
         let _ = notebook_id;
+        let _ = stored_embedding_metadata;
         Ok(semantic_memory_unavailable_response(
             all_sources,
             request,
@@ -562,6 +567,7 @@ mod tests {
             local_backend_result,
             local_latency_ms,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -624,6 +630,7 @@ mod tests {
             local_backend_result,
             0,
             Vec::new(),
+            None,
             None,
         )
         .await

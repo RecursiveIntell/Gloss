@@ -107,6 +107,7 @@ interface SourceStore {
   quarantineFailedImports: (notebookId: string) => Promise<void>;
   deleteFailedImports: (notebookId: string) => Promise<void>;
   retrySource: (notebookId: string, sourceId: string) => Promise<void>;
+  retryFailedSources: (notebookId: string) => Promise<void>;
   reindexSource: (notebookId: string, sourceId: string) => Promise<void>;
   reindexNotebook: (notebookId: string) => Promise<void>;
   bulkDeleteSelected: (notebookId: string) => Promise<void>;
@@ -375,6 +376,32 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         message: String(e),
         duration: 5000,
       });
+    }
+  },
+
+  retryFailedSources: async (notebookId) => {
+    try {
+      clearSuggestedQuestions();
+      const receipt = await api.retryFailedImports(notebookId);
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      const partial = receipt.errors.length > 0 || receipt.failed_sources > 0;
+      useToastStore.getState().addToast({
+        type: partial ? 'error' : 'success',
+        title: partial ? 'Retry Batch Needs Attention' : 'Retry Batch Accepted',
+        message: `${receipt.recovered_by_dense_rebuild} recovered by index rebuild, ${receipt.completed_sources} completed, ${receipt.queued_sources} queued, ${receipt.already_running_sources} already running, ${receipt.failed_sources} still failed.`,
+        duration: partial ? 7000 : 5000,
+      });
+    } catch (e) {
+      await get().loadSources(notebookId);
+      await get().loadStats(notebookId);
+      useToastStore.getState().addToast({
+        type: 'error',
+        title: 'Retry Batch Failed',
+        message: String(e),
+        duration: 7000,
+      });
+      throw e;
     }
   },
 

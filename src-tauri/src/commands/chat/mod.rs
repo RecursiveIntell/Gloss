@@ -803,6 +803,38 @@ fn persist_chat_attempt_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn persist_pre_stream_chat_error(
+    state: &AppState,
+    notebook_id: &str,
+    conversation_id: &str,
+    attempt_id: &str,
+    assistant_message_id: &str,
+    user_message_id: &str,
+    provider: &str,
+    model: &str,
+    phase: &str,
+    error_code: &str,
+    error_message: &str,
+) {
+    persist_chat_attempt_status(
+        state,
+        notebook_id,
+        conversation_id,
+        attempt_id,
+        assistant_message_id,
+        Some(user_message_id),
+        Some(provider),
+        Some(model),
+        "error",
+        Some(phase),
+        Some(error_code),
+        Some(error_message),
+        None,
+        true,
+    );
+}
+
 pub(crate) fn provider_decoding_capability(
     provider_type: providers::ProviderType,
 ) -> ProviderDecodingCapabilityV1 {
@@ -1777,7 +1809,7 @@ pub async fn send_message(
                 app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
                 crate::providers::lan_local_providers_allowed(&app_db),
                 setting_is_enabled(app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?),
-                features::turbo_quant_active(&app_db)?,
+                features::turbo_quant_requested(&app_db)?,
                 setting_is_enabled(
                     app_db.get_setting(
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
@@ -1873,6 +1905,19 @@ pub async fn send_message(
                 Some("strict semantic-memory mode failed before local fallback"),
                 Some(&error),
                 |_| {},
+            );
+            persist_pre_stream_chat_error(
+                &state,
+                &notebook_id,
+                &conversation_id,
+                &attempt_id,
+                &message_id,
+                &user_msg.id,
+                provider_config.provider_type.as_str(),
+                &model,
+                "semantic_memory_search_error",
+                "semantic_memory_feature_disabled",
+                &error,
             );
             return Err(GlossError::Config(error));
         }
@@ -2043,6 +2088,19 @@ pub async fn send_message(
                         Some(&error),
                         |_| {},
                     );
+                    persist_pre_stream_chat_error(
+                        &state,
+                        &notebook_id,
+                        &conversation_id,
+                        &attempt_id,
+                        &message_id,
+                        &user_msg.id,
+                        provider_config.provider_type.as_str(),
+                        &model,
+                        "semantic_memory_search_error",
+                        "semantic_memory_projection_required",
+                        &error,
+                    );
                     return Err(GlossError::Search(error));
                 }
             } else {
@@ -2194,6 +2252,19 @@ pub async fn send_message(
                             Some("semantic-memory preview timed out and fallback is disabled"),
                             Some(&error),
                             |_| {},
+                        );
+                        persist_pre_stream_chat_error(
+                            &state,
+                            &notebook_id,
+                            &conversation_id,
+                            &attempt_id,
+                            &message_id,
+                            &user_msg.id,
+                            provider_config.provider_type.as_str(),
+                            &model,
+                            "semantic_memory_search_timeout",
+                            "semantic_memory_timeout",
+                            &error,
                         );
                         return Err(GlossError::Search(error));
                     }
@@ -2381,14 +2452,27 @@ pub async fn send_message(
                                     &error,
                                 );
                                 record_chat_attempt_trace(
-                                &attempt_trace,
-                                &trace_data_dir,
-                                "semantic_memory_search_error",
-                                Some(search_started.elapsed()),
-                                Some("strict semantic-memory mode failed because no candidates were mapped"),
-                                Some(&error),
-                                |_| {},
-                            );
+                                    &attempt_trace,
+                                    &trace_data_dir,
+                                    "semantic_memory_search_error",
+                                    Some(search_started.elapsed()),
+                                    Some("strict semantic-memory mode failed because no candidates were mapped"),
+                                    Some(&error),
+                                    |_| {},
+                                );
+                                persist_pre_stream_chat_error(
+                                    &state,
+                                    &notebook_id,
+                                    &conversation_id,
+                                    &attempt_id,
+                                    &message_id,
+                                    &user_msg.id,
+                                    provider_config.provider_type.as_str(),
+                                    &model,
+                                    "semantic_memory_search_error",
+                                    "semantic_memory_no_candidates",
+                                    &error,
+                                );
                                 return Err(GlossError::Search(error));
                             }
                         } else {
@@ -2485,6 +2569,19 @@ pub async fn send_message(
                             Some(&error),
                             |_| {},
                         );
+                        persist_pre_stream_chat_error(
+                            &state,
+                            &notebook_id,
+                            &conversation_id,
+                            &attempt_id,
+                            &message_id,
+                            &user_msg.id,
+                            provider_config.provider_type.as_str(),
+                            &model,
+                            "semantic_memory_search_error",
+                            "semantic_memory_projection_failed",
+                            &error,
+                        );
                         return Err(err);
                     }
                 }
@@ -2564,6 +2661,19 @@ pub async fn send_message(
                     Some("semantic-memory preview feature is unavailable and fallback is disabled"),
                     Some(&error),
                     |_| {},
+                );
+                persist_pre_stream_chat_error(
+                    &state,
+                    &notebook_id,
+                    &conversation_id,
+                    &attempt_id,
+                    &message_id,
+                    &user_msg.id,
+                    provider_config.provider_type.as_str(),
+                    &model,
+                    "semantic_memory_search_error",
+                    "semantic_memory_build_feature_missing",
+                    &error,
                 );
                 return Err(GlossError::Config(error));
             }
@@ -3499,6 +3609,66 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream;
     use tokio::sync::{oneshot, Mutex as AsyncMutex};
+
+    #[test]
+    fn pre_stream_error_is_terminal_in_durable_attempt_ledger() {
+        let data_dir = tempfile::tempdir().expect("temporary state directory");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        let notebook_id = "terminal-ledger-notebook";
+        let notebook_dir = data_dir.path().join("notebooks").join(notebook_id);
+        std::fs::create_dir_all(&notebook_dir).expect("notebook directory");
+        NotebookDb::open(&notebook_dir.join("notebook.db")).expect("notebook database");
+        state
+            .app_db
+            .lock()
+            .expect("app database lock")
+            .create_notebook(
+                notebook_id,
+                "Terminal ledger fixture",
+                notebook_dir.to_str().expect("UTF-8 notebook directory"),
+            )
+            .expect("register notebook");
+
+        persist_pre_stream_chat_error(
+            &state,
+            notebook_id,
+            "conversation",
+            "attempt",
+            "assistant",
+            "user",
+            "ollama",
+            "fixture-model",
+            "semantic_memory_search_timeout",
+            "semantic_memory_timeout",
+            "search-timeout: fixture",
+        );
+
+        let stored = state
+            .with_notebook_db(notebook_id, |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT status, phase, error_code, error_message, terminal_at IS NOT NULL
+                           FROM chat_attempts WHERE attempt_id = 'attempt'",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, bool>(4)?,
+                            ))
+                        },
+                    )
+                    .map_err(GlossError::from)
+            })
+            .expect("read attempt ledger");
+        assert_eq!(stored.0, "error");
+        assert_eq!(stored.1, "semantic_memory_search_timeout");
+        assert_eq!(stored.2, "semantic_memory_timeout");
+        assert_eq!(stored.3, "search-timeout: fixture");
+        assert!(stored.4);
+    }
 
     fn indexed_fallback_fixture() -> (RetrievalOutcome, Vec<ContextPassage>) {
         let outcome = RetrievalOutcome {

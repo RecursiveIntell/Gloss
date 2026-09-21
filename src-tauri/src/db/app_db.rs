@@ -426,6 +426,36 @@ impl AppDb {
         Ok(())
     }
 
+    /// Restore exact setting state atomically. `None` means the key was absent,
+    /// which is distinct from a present empty string under the settings contract.
+    pub fn restore_settings_atomically(
+        &self,
+        settings: &[(&str, Option<&str>)],
+    ) -> Result<(), GlossError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        for (key, value) in settings {
+            let result = match value {
+                Some(value) => self.conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![key, value],
+                ),
+                None => self.conn.execute(
+                    "DELETE FROM settings WHERE key = ?1",
+                    rusqlite::params![key],
+                ),
+            };
+            if let Err(error) = result {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(GlossError::Database(error));
+            }
+        }
+        if let Err(error) = self.conn.execute_batch("COMMIT") {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(GlossError::Database(error));
+        }
+        Ok(())
+    }
+
     fn table_has_column(&self, table: &str, column: &str) -> Result<bool, GlossError> {
         let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;

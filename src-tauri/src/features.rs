@@ -258,11 +258,18 @@ pub fn feature_flag_statuses(app_db: &AppDb) -> Result<Vec<FeatureFlagStatus>, G
         .map(|definition| {
             if matches!(definition.id, FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED | FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED) {
                 let available = build_feature_available(definition.build_feature);
+                let active = if definition.id == FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED {
+                    available
+                        && app_db.get_setting("memory_backend")?.as_deref()
+                            == Some(MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW)
+                } else {
+                    turbo_quant_requested(app_db)?
+                };
                 return Ok(FeatureFlagStatus {
                     id: definition.id.into(), label: definition.label.replace(" Preview", ""),
                     section: "Memory & Retrieval".into(),
                     description: "Included in this build; select a memory profile to control retrieval behavior.".into(),
-                    enabled: available, active: available, available, stable: true,
+                    enabled: available, active, available, stable: true,
                     default_enabled: true, requires_experimental: false,
                     unavailable_reason: if available { None } else { Some("Not included in this build".into()) },
                 });
@@ -369,8 +376,20 @@ pub fn semantic_memory_preview_active(_app_db: &AppDb) -> Result<bool, GlossErro
     Ok(cfg!(feature = "semantic-memory-backend"))
 }
 
-pub fn turbo_quant_active(_app_db: &AppDb) -> Result<bool, GlossError> {
-    Ok(cfg!(feature = "semantic-memory-turbo-quant"))
+/// Whether the selected runtime profile requests the TurboQuant lane.
+///
+/// This is deliberately distinct from build availability and from effective
+/// artifact/probe proof. Callers that claim effective runtime use must also
+/// inspect the notebook-scoped vector-artifact status.
+pub fn turbo_quant_requested(app_db: &AppDb) -> Result<bool, GlossError> {
+    if !cfg!(feature = "semantic-memory-turbo-quant") {
+        return Ok(false);
+    }
+    let selected_backend = app_db
+        .get_setting("memory_backend")?
+        .unwrap_or_else(|| MEMORY_BACKEND_GLOSS_LOCAL.to_string());
+    Ok(selected_backend == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
+        && setting_bool(app_db, FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED, false)?)
 }
 
 fn find_feature_definition(id: &str) -> Option<&'static FeatureDefinition> {
@@ -406,7 +425,7 @@ fn feature_active(
     available: bool,
 ) -> Result<bool, GlossError> {
     if definition.id == FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED {
-        return turbo_quant_active(app_db);
+        return turbo_quant_requested(app_db);
     }
     Ok(enabled && available)
 }
@@ -517,6 +536,8 @@ mod tests {
     #[test]
     fn unimplemented_and_compiled_capabilities_are_not_mutable_claims() {
         let db = test_db();
+        db.set_setting("memory_backend", MEMORY_BACKEND_GLOSS_LOCAL)
+            .unwrap();
         let flags = feature_flag_statuses(&db).unwrap();
         for id in [
             EXPERIMENTAL_FEATURES_ENABLED,
@@ -532,8 +553,11 @@ mod tests {
             .iter()
             .find(|flag| flag.id == FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED)
             .unwrap();
-        assert_eq!(semantic.active, cfg!(feature = "semantic-memory-backend"));
-        assert_eq!(semantic.available, semantic.active);
+        assert!(!semantic.active);
+        assert_eq!(
+            semantic.available,
+            cfg!(feature = "semantic-memory-backend")
+        );
     }
 
     #[test]
@@ -560,11 +584,15 @@ mod tests {
 
     #[cfg(feature = "semantic-memory-turbo-quant")]
     #[test]
-    fn turbo_quant_active_when_semantic_memory_is_always_on() {
+    fn turbo_quant_is_available_but_inactive_until_profile_selects_it() {
         let db = test_db();
         ensure_default_feature_settings(&db).unwrap();
-        // turbo_quant_active() now only checks the build feature — always true.
-        assert!(turbo_quant_active(&db).unwrap());
+        db.set_setting("memory_backend", MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW)
+            .unwrap();
+        assert!(!turbo_quant_requested(&db).unwrap());
+        db.set_setting(FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED, "true")
+            .unwrap();
+        assert!(turbo_quant_requested(&db).unwrap());
     }
 
     #[cfg(feature = "semantic-memory-turbo-quant")]

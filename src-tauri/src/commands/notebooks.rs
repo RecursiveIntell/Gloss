@@ -246,12 +246,49 @@ pub async fn rename_notebook(
     Ok(())
 }
 
+fn notebook_owned_paths(
+    data_dir: &std::path::Path,
+    notebook_dir: &std::path::Path,
+    notebook_id: &str,
+) -> [std::path::PathBuf; 2] {
+    [
+        notebook_dir.to_path_buf(),
+        crate::memory::semantic_memory_adapter::semantic_memory_base_dir(data_dir, notebook_id),
+    ]
+}
+
+fn remove_rebuildable_notebook_projection(
+    data_dir: &std::path::Path,
+    notebook_id: &str,
+) -> Result<(), GlossError> {
+    let projection =
+        crate::memory::semantic_memory_adapter::semantic_memory_base_dir(data_dir, notebook_id);
+    if projection.exists() {
+        std::fs::remove_dir_all(projection)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn delete_notebook(
     id: String,
     state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
 ) -> Result<(), GlossError> {
+    // Resolve ownership before mutating runtime or registry state. The semantic
+    // projection is rebuildable, so remove it first; failure leaves the
+    // canonical notebook registered and retryable instead of orphaning it.
+    let dir = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        app_db.get_notebook(&id)?.directory
+    };
+    let dir_path = std::path::PathBuf::from(&dir);
+    let owned_paths = notebook_owned_paths(&state.data_dir, &dir_path, &id);
+    remove_rebuildable_notebook_projection(&state.data_dir, &id)?;
+
     // If this is the active notebook, clear it and bump epoch so the summary
     // loop stops picking up jobs for it immediately.
     if state.get_active_notebook_id().as_deref() == Some(id.as_str()) {
@@ -263,23 +300,16 @@ pub async fn delete_notebook(
         tracing::info!(notebook_id = %id, cancelled, "Cancelled queued jobs for deleted notebook");
     }
 
-    // Get directory before deleting from DB
-    let dir = {
+    {
         let app_db = state
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-        let nb = app_db.get_notebook(&id)?;
         app_db.delete_notebook(&id)?;
-        nb.directory
-    };
-
-    // Remove from notebook pools
-    {
-        state.notebook_pools.remove(&id);
     }
 
-    // Remove HNSW index from memory
+    state.notebook_pools.remove(&id);
+
     {
         let mut indices = state
             .hnsw_indices
@@ -288,13 +318,11 @@ pub async fn delete_notebook(
         indices.remove(&id);
     }
 
-    // Delete the notebook directory
-    let dir_path = std::path::PathBuf::from(&dir);
-    if dir_path.exists() {
-        std::fs::remove_dir_all(&dir_path)?;
+    if owned_paths[0].exists() {
+        std::fs::remove_dir_all(&owned_paths[0])?;
     }
 
-    tracing::info!(id = %id, "Deleted notebook");
+    tracing::info!(id = %id, "Deleted notebook and rebuildable semantic projection");
     Ok(())
 }
 
@@ -371,7 +399,9 @@ pub async fn set_active_notebook(
 
 #[cfg(test)]
 mod tests {
-    use super::inspect_queue_for_doctor;
+    use super::{
+        inspect_queue_for_doctor, notebook_owned_paths, remove_rebuildable_notebook_projection,
+    };
     use crate::db::app_db::AppDb;
     use crate::db::notebook_db::{NotebookDb, Source};
     use crate::jobs::GlossJob;
@@ -401,6 +431,32 @@ mod tests {
             updated_at: String::new(),
             processing_state: None,
         }
+    }
+
+    #[test]
+    fn notebook_owned_paths_exclude_the_application_model_cache() {
+        let root = tempdir().unwrap();
+        let notebook_dir = root.path().join("notebooks").join("nb1");
+        let paths = notebook_owned_paths(root.path(), &notebook_dir, "nb1");
+        assert_eq!(paths[0], notebook_dir);
+        assert_eq!(paths[1], root.path().join("semantic-memory").join("nb1"));
+        assert!(!paths.iter().any(|path| path == &root.path().join("models")));
+    }
+
+    #[test]
+    fn notebook_projection_cleanup_removes_only_rebuildable_notebook_state() {
+        let root = tempdir().unwrap();
+        let projection = root.path().join("semantic-memory").join("nb1");
+        let model_cache = root.path().join("models");
+        std::fs::create_dir_all(&projection).unwrap();
+        std::fs::create_dir_all(&model_cache).unwrap();
+        std::fs::write(projection.join("memory.db"), b"projection").unwrap();
+        std::fs::write(model_cache.join("model.bin"), b"model").unwrap();
+
+        remove_rebuildable_notebook_projection(root.path(), "nb1").unwrap();
+
+        assert!(!projection.exists());
+        assert!(model_cache.join("model.bin").exists());
     }
 
     fn queue(dir: &tempfile::TempDir) -> Arc<QueueManager> {

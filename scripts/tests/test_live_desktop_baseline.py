@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import Mock
 
 SPEC = importlib.util.spec_from_file_location("live_desktop_smoke", Path(__file__).resolve().parents[1] / "live_desktop_smoke.py")
 driver = importlib.util.module_from_spec(SPEC)
@@ -98,6 +99,38 @@ class IntegratedReceiptPolicyTests(unittest.TestCase):
             elif fault == "config": candidate["ollama_config"] = {}
             else: candidate["status"] = "fail"
             self.assertNotEqual(driver.result_exit_code(candidate, require_integrated=True), 0, fault)
+
+
+class MemoryProfileSelectionTests(unittest.TestCase):
+    def workflow(self, current: str, rendered_text: str = "Memory profile applied"):
+        workflow = object.__new__(driver.IntegratedWorkflow)
+        workflow.ui = Mock()
+        workflow.ui.execute.return_value = current
+        workflow.ui.text.return_value = rendered_text
+        workflow.ui.wait.side_effect = lambda condition, **_kwargs: condition()
+        workflow.check = Mock()
+        return workflow
+
+    def test_already_selected_fresh_default_needs_no_synthetic_apply_event(self):
+        workflow = self.workflow("gloss-local", rendered_text="")
+        workflow.select_memory_profile("gloss-local")
+        workflow.ui.select.assert_not_called()
+        workflow.ui.wait.assert_not_called()
+        workflow.check.assert_called_once_with(
+            True, "memory profile gloss-local already selected"
+        )
+
+    def test_changed_profile_waits_for_acknowledged_apply_with_repair_budget(self):
+        workflow = self.workflow("semantic-memory-preview")
+        workflow.select_memory_profile("gloss-local")
+        workflow.ui.select.assert_called_once_with(
+            'select:has(option[value="gloss-local"])', "gloss-local"
+        )
+        self.assertEqual(workflow.ui.wait.call_args.kwargs["timeout"], 180)
+        self.assertEqual(
+            workflow.ui.wait.call_args.kwargs["label"],
+            "acknowledged memory profile Apply",
+        )
 
 
 class RuntimeConfigPolicyTests(unittest.TestCase):

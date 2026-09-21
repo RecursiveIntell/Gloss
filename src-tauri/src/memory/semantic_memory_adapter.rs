@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-/// Process-wide cache of the shared candle [`EmbeddingService`].
+/// Process-wide cache of candle [`EmbeddingService`] instances keyed by the
+/// canonical application model-cache root.
 ///
 /// Loading the 550MB nomic v1.5 model takes seconds warm but tens of seconds
 /// cold, and the semantic-memory projection previously constructed a
@@ -36,22 +37,24 @@ use std::time::Duration;
 /// which is why a 279-source folder import took hours with every item stuck
 /// at "pending". Sharing one instance across all projections (and both the
 /// native + semantic-memory lanes) makes the model load happen exactly once
-/// per process.
-static SHARED_FASTEMBED_SERVICE: OnceLock<Mutex<Option<Arc<Mutex<EmbeddingService>>>>> =
+/// per application cache identity. The native lane owns its own AppState
+/// service but reads the same application-scoped model files.
+static SHARED_FASTEMBED_SERVICES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<EmbeddingService>>>>> =
     OnceLock::new();
 
 fn shared_fastembed_service(
     cache_dir: &Path,
     download_consent: bool,
 ) -> Result<Arc<Mutex<EmbeddingService>>, GlossError> {
-    let cell = SHARED_FASTEMBED_SERVICE.get_or_init(|| Mutex::new(None));
+    let cell = SHARED_FASTEMBED_SERVICES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(service) = guard.as_ref() {
+    let cache_identity = cache_dir.to_path_buf();
+    if let Some(service) = guard.get(&cache_identity) {
         return Ok(Arc::clone(service));
     }
     let service = EmbeddingService::new_with_download_policy(cache_dir, false, download_consent)?;
     let arc = Arc::new(Mutex::new(service));
-    *guard = Some(Arc::clone(&arc));
+    guard.insert(cache_identity, Arc::clone(&arc));
     Ok(arc)
 }
 
@@ -293,6 +296,12 @@ pub fn semantic_memory_base_dir(data_dir: &Path, notebook_id: &str) -> PathBuf {
     data_dir.join("semantic-memory").join(notebook_id)
 }
 
+/// The embedding model is application-scoped, not notebook-scoped. Notebook
+/// stores remain isolated, while every store reuses the canonical model cache.
+pub fn semantic_memory_model_cache_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("models")
+}
+
 pub fn content_digest(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -382,6 +391,7 @@ pub fn expected_embedding_index_metadata(
 
 fn open_store(
     base_dir: PathBuf,
+    model_cache_dir: PathBuf,
     runtime_config: Option<&SemanticMemoryRuntimeConfig>,
 ) -> Result<MemoryStore, GlossError> {
     let mut config = MemoryConfig {
@@ -428,7 +438,7 @@ fn open_store(
     match provider {
         EmbeddingProviderKind::FastEmbed => {
             let embedder = FastEmbedSemanticMemoryEmbedder::try_new(
-                config.base_dir.join("fastembed-cache"),
+                model_cache_dir,
                 runtime_config
                     .map(|config| config.fastembed_download_consent)
                     .unwrap_or(false),
@@ -492,6 +502,7 @@ pub async fn rebuild_vector_artifacts(
 ) -> Result<Option<serde_json::Value>, GlossError> {
     let store = open_store(
         semantic_memory_base_dir(data_dir, notebook_id),
+        semantic_memory_model_cache_dir(data_dir),
         runtime_config.as_ref(),
     )?;
     rebuild_vector_artifacts_receipt(&store, runtime_config.as_ref()).await
@@ -1051,6 +1062,7 @@ pub async fn reindex_source_with_options(
 
     let store = open_store(
         semantic_memory_base_dir(data_dir, notebook_id),
+        semantic_memory_model_cache_dir(data_dir),
         runtime_config.as_ref(),
     )?;
     let metadata = serde_json::json!({
@@ -1455,6 +1467,7 @@ pub async fn search_preview(
 
     let store = open_store(
         semantic_memory_base_dir(data_dir, notebook_id),
+        semantic_memory_model_cache_dir(data_dir),
         runtime_config.as_ref(),
     )?;
     let mut context = SearchContext::default_now();
@@ -1787,6 +1800,17 @@ mod tests {
         assert!(!config.allow_lan);
         assert!(!config.turbo_quant_enabled);
         assert!(!config.provekv_pool_enabled);
+    }
+
+    #[test]
+    fn built_in_model_cache_is_global_not_notebook_scoped() {
+        let dir = tempdir().unwrap();
+        let first = semantic_memory_model_cache_dir(dir.path());
+        let second = semantic_memory_model_cache_dir(dir.path());
+        assert_eq!(first, dir.path().join("models"));
+        assert_eq!(second, first);
+        assert!(!first.starts_with(semantic_memory_base_dir(dir.path(), "notebook-a")));
+        assert!(!first.starts_with(semantic_memory_base_dir(dir.path(), "notebook-b")));
     }
 
     #[test]

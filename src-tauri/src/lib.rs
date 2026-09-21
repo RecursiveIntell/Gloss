@@ -169,6 +169,7 @@ pub fn run_inner() -> tauri::Result<()> {
             commands::sources::get_source_content,
             commands::sources::get_import_capability_matrix,
             commands::sources::retry_source_ingestion,
+            commands::sources::retry_failed_imports,
             commands::sources::get_notebook_stats,
             commands::sources::diagnose_retrieval_coverage,
             commands::sources::native_dense_rebuild,
@@ -219,6 +220,7 @@ pub fn run_inner() -> tauri::Result<()> {
             commands::settings::get_feature_flags,
             commands::settings::update_feature_flag,
             commands::settings::set_memory_backend_profile,
+            commands::settings::repair_and_set_memory_profile,
             commands::settings::get_semantic_memory_profile_status,
             commands::settings::check_external_tools,
         ])

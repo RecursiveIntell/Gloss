@@ -1,4 +1,4 @@
-use crate::db::app_db::{ModelRecord, Provider};
+use crate::db::app_db::{AppDb, ModelRecord, Provider};
 use crate::error::GlossError;
 use crate::features::{self, FeatureFlagStatus};
 use crate::memory::MemoryBackendStatus;
@@ -105,6 +105,52 @@ pub struct MemoryRepairWorkflowReceipt {
 }
 
 static MEMORY_REPAIR_WORKFLOW_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+const MEMORY_PROFILE_SETTING_KEYS: [&str; 9] = [
+    features::EXPERIMENTAL_FEATURES_ENABLED,
+    "memory_backend",
+    "memory_backend_fallback",
+    features::SEMANTIC_MEMORY_AUTO_PROJECT,
+    features::SEMANTIC_MEMORY_STRICT_TESTING,
+    features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+    features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
+    features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED,
+    "semantic_memory_search_timeout_ms",
+];
+
+type MemoryProfileSettingsSnapshot = Vec<(String, Option<String>)>;
+
+fn snapshot_memory_profile_settings(
+    app_db: &AppDb,
+) -> Result<MemoryProfileSettingsSnapshot, GlossError> {
+    MEMORY_PROFILE_SETTING_KEYS
+        .iter()
+        .map(|key| {
+            app_db
+                .get_setting(key)
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect()
+}
+
+fn restore_memory_profile_settings(
+    app_db: &AppDb,
+    snapshot: &MemoryProfileSettingsSnapshot,
+) -> Result<(), GlossError> {
+    let refs = snapshot
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_deref()))
+        .collect::<Vec<_>>();
+    app_db.restore_settings_atomically(&refs)?;
+    for (key, expected) in snapshot {
+        if app_db.get_setting(key)? != *expected {
+            return Err(GlossError::Other(format!(
+                "Profile rollback read-back mismatch for {key}"
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeFastEmbedDiagnostics {
@@ -1277,17 +1323,6 @@ pub async fn repair_and_set_memory_profile(
         .await
         .map_err(|error| GlossError::Other(format!("Memory repair gate closed: {error}")))?;
     let workflow_receipt_id = uuid::Uuid::new_v4().to_string();
-    const PROFILE_KEYS: [&str; 9] = [
-        features::EXPERIMENTAL_FEATURES_ENABLED,
-        "memory_backend",
-        "memory_backend_fallback",
-        features::SEMANTIC_MEMORY_AUTO_PROJECT,
-        features::SEMANTIC_MEMORY_STRICT_TESTING,
-        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
-        features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
-        features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED,
-        "semantic_memory_search_timeout_ms",
-    ];
 
     let requested = MemoryProfile::parse(&profile)?;
     let requested_profile = requested.id().to_string();
@@ -1335,14 +1370,7 @@ pub async fn repair_and_set_memory_profile(
             .app_db
             .lock()
             .map_err(|error| GlossError::Other(error.to_string()))?;
-        PROFILE_KEYS
-            .iter()
-            .map(|key| {
-                app_db
-                    .get_setting(key)
-                    .map(|value| ((*key).to_string(), value.unwrap_or_default()))
-            })
-            .collect::<Result<Vec<_>, _>>()?
+        snapshot_memory_profile_settings(&app_db)?
     };
     let staging_profile = if requested.requires_turbo_quant() {
         MemoryProfile::SemanticMemoryTurboQuantSafe
@@ -1555,19 +1583,7 @@ pub async fn repair_and_set_memory_profile(
                     .app_db
                     .lock()
                     .map_err(|lock_error| GlossError::Other(lock_error.to_string()))?;
-                let refs = snapshot
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_str()))
-                    .collect::<Vec<_>>();
-                app_db.set_settings_atomically(&refs)?;
-                for (key, expected) in &snapshot {
-                    if app_db.get_setting(key)?.as_deref() != Some(expected.as_str()) {
-                        return Err(GlossError::Other(format!(
-                            "Profile rollback read-back mismatch for {key}"
-                        )));
-                    }
-                }
-                Ok(())
+                restore_memory_profile_settings(&app_db, &snapshot)
             })();
             if let Err(restore_error) = restore {
                 return Err(GlossError::Other(format!(
@@ -1697,7 +1713,8 @@ pub async fn check_external_tools(
 
 #[cfg(test)]
 mod tests {
-    use super::MemoryProfile;
+    use super::{restore_memory_profile_settings, snapshot_memory_profile_settings, MemoryProfile};
+    use crate::db::app_db::AppDb;
 
     #[test]
     fn memory_profile_parser_normalizes_safe_and_strict_profiles() {
@@ -1712,5 +1729,33 @@ mod tests {
         assert!(MemoryProfile::SemanticMemoryStrict.is_strict());
         assert!(MemoryProfile::SemanticMemoryTurboQuantStrict.requires_turbo_quant());
         assert_eq!(MemoryProfile::GlossLocal.id(), "gloss-local");
+    }
+
+    #[test]
+    fn profile_rollback_preserves_absent_and_explicitly_empty_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AppDb::open(&dir.path().join("app.db")).unwrap();
+        db.restore_settings_atomically(&[
+            ("memory_backend_fallback", None),
+            ("semantic_memory_auto_project", Some("")),
+        ])
+        .unwrap();
+        let before = db.get_settings().unwrap();
+        let snapshot = snapshot_memory_profile_settings(&db).unwrap();
+
+        db.set_settings_atomically(&[
+            ("memory_backend_fallback", "false"),
+            ("semantic_memory_auto_project", "true"),
+            ("memory_backend", "semantic-memory-preview"),
+        ])
+        .unwrap();
+        restore_memory_profile_settings(&db, &snapshot).unwrap();
+
+        assert_eq!(db.get_settings().unwrap(), before);
+        assert_eq!(db.get_setting("memory_backend_fallback").unwrap(), None);
+        assert_eq!(
+            db.get_setting("semantic_memory_auto_project").unwrap(),
+            Some(String::new())
+        );
     }
 }

@@ -4614,6 +4614,22 @@ fn link_status_for_notebook(
     })
 }
 
+fn semantic_projection_required_for_status(
+    state: &AppState,
+    notebook_id: &str,
+) -> Result<bool, GlossError> {
+    state.with_notebook_db(notebook_id, |db| {
+        let sources = db.list_sources()?;
+        let resolved = SourceScope::All.resolve(&sources);
+        let coverage = db.retrieval_coverage(&resolved)?;
+        if coverage.total_chunks == 0 {
+            return Ok(false);
+        }
+        let summary = db.semantic_memory_projection_summary(notebook_id, &resolved)?;
+        Ok(summary.projection_required || summary.healthy_links < coverage.total_chunks)
+    })
+}
+
 #[derive(Debug)]
 struct SelectedBackendHealth {
     index_sync_status: String,
@@ -4630,6 +4646,7 @@ fn selected_backend_health(
     link_status: Option<&SemanticMemoryLinkStatus>,
     embedding_index_metadata: &[EmbeddingIndexStatusView],
     semantic_memory_available: bool,
+    semantic_projection_required: bool,
 ) -> SelectedBackendHealth {
     let semantic_selected =
         requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW;
@@ -4680,7 +4697,14 @@ fn selected_backend_health(
         degradation_markers.push("semantic_memory_feature_disabled".to_string());
         index_sync_status = "failed".to_string();
     }
-    if semantic_selected && matches!(index_sync_status.as_str(), "failed" | "degraded") {
+    if semantic_selected && index_sync_status == "empty" && semantic_projection_required {
+        degradation_markers.push("semantic-memory-sync-empty".to_string());
+        fallback_reason = Some("semantic-memory projection is required but empty".to_string());
+        fallback_reason_code = Some(RetrievalReasonCode::SemanticMemoryLinksMissing);
+    } else if semantic_selected
+        && semantic_memory_available
+        && matches!(index_sync_status.as_str(), "failed" | "degraded")
+    {
         degradation_markers.push(format!("semantic-memory-sync-{index_sync_status}"));
         fallback_reason = Some(
             last_sync_error
@@ -4787,12 +4811,23 @@ pub async fn memory_backend_status(
         })
         .transpose()?
         .unwrap_or_default();
+    let semantic_projection_required =
+        if requested_backend == crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW {
+            notebook_id
+                .as_deref()
+                .map(|id| semantic_projection_required_for_status(&state, id))
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
     let health = selected_backend_health(
         &requested_backend,
         link_status.as_ref(),
         &embedding_index_metadata,
         semantic_memory_available,
+        semantic_projection_required,
     );
 
     Ok(MemoryBackendStatus {
@@ -5334,11 +5369,71 @@ mod tests {
             Some(&link_status),
             &metadata,
             true,
+            false,
         );
         assert_eq!(health.index_sync_status, "synced");
         assert!(!health.degraded);
         assert!(health.fallback_reason.is_none());
         assert!(health.degradation_markers.is_empty());
+    }
+
+    #[test]
+    fn selected_semantic_backend_reports_required_empty_projection_as_degraded() {
+        let link_status = SemanticMemoryLinkStatus {
+            notebook_id: "nb1".into(),
+            total_links: 0,
+            synced_links: 0,
+            stale_links: 0,
+            failed_links: 0,
+            missing_document_links: 0,
+            degraded_links: 0,
+            reason_codes: vec!["semantic_memory_links_missing".into()],
+            last_sync_error: None,
+        };
+
+        let health = selected_backend_health(
+            crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
+            Some(&link_status),
+            &[],
+            true,
+            true,
+        );
+
+        assert_eq!(health.index_sync_status, "empty");
+        assert!(health.degraded);
+        assert_eq!(
+            health.fallback_reason_code,
+            Some(RetrievalReasonCode::SemanticMemoryLinksMissing)
+        );
+        assert_eq!(
+            health.degradation_markers,
+            vec!["semantic-memory-sync-empty"]
+        );
+    }
+
+    #[test]
+    fn source_bearing_notebook_requires_projection_when_links_are_missing() {
+        let (_dir, state, notebook_id) = build_state();
+        let source = ready_source("semantic-missing");
+        state
+            .with_notebook_db_write(&notebook_id, |db| {
+                db.insert_source(&source)?;
+                db.insert_chunks(&[Chunk {
+                    id: "semantic-missing-c0".into(),
+                    source_id: source.id.clone(),
+                    chunk_index: 0,
+                    content: "projection required".into(),
+                    token_count: Some(2),
+                    start_offset: Some(0),
+                    end_offset: Some(19),
+                    metadata: None,
+                    embedding_id: None,
+                    embedding_model: None,
+                }])
+            })
+            .unwrap();
+
+        assert!(semantic_projection_required_for_status(&state, &notebook_id).unwrap());
     }
 
     #[cfg(feature = "semantic-memory-turbo-quant")]

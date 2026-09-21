@@ -24,5 +24,8 @@ export function featureSections(
 }
 
 export function canUseSemanticMemoryPreview(flags: FeatureFlagStatus[]): boolean {
-  return featureById(flags, FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED)?.active === true;
+  // Availability controls whether an unselected profile can be chosen. Active
+  // reports the currently selected runtime lane and must not create a
+  // chicken-and-egg gate that prevents switching away from Gloss local.
+  return featureById(flags, FEATURE_SEMANTIC_MEMORY_PREVIEW_ENABLED)?.available === true;
 }

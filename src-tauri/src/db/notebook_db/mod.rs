@@ -2066,6 +2066,25 @@ impl NotebookDb {
         Ok(())
     }
 
+    /// Close attempts that cannot still be running after a process restart.
+    /// Canonical messages and prior terminal outcomes are preserved; only
+    /// non-terminal transport state is superseded by an explicit terminal row.
+    pub fn recover_interrupted_chat_attempts(&self) -> Result<usize, GlossError> {
+        let changed = self.conn.execute(
+            "UPDATE chat_attempts
+                SET status = 'error',
+                    phase = 'startup_recovery',
+                    error_code = 'interrupted_by_restart',
+                    error_message = 'Chat attempt was interrupted by application restart',
+                    updated_at = datetime('now'),
+                    terminal_at = datetime('now')
+              WHERE terminal_at IS NULL
+                AND status IN ('queued', 'running')",
+            [],
+        )?;
+        Ok(changed)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn insert_prompt_receipt(
         &self,
@@ -2656,6 +2675,74 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_notebook.db");
         NotebookDb::open(&path).unwrap()
+    }
+
+    #[test]
+    fn startup_recovery_closes_only_nonterminal_chat_attempts() {
+        let db = test_db();
+        let attempt = |attempt_id: &str, status: &str, terminal: bool| ChatAttemptStatus {
+            attempt_id: attempt_id.to_string(),
+            notebook_id: "notebook".to_string(),
+            conversation_id: "conversation".to_string(),
+            assistant_message_id: format!("assistant-{attempt_id}"),
+            user_message_id: Some(format!("user-{attempt_id}")),
+            provider: Some("ollama".to_string()),
+            model: Some("fixture".to_string()),
+            status: status.to_string(),
+            phase: Some(status.to_string()),
+            error_code: None,
+            error_message: None,
+            request_digest: None,
+            response_digest: None,
+            partial_policy: Some("full_response_or_terminal_error".to_string()),
+            terminal,
+        };
+        db.upsert_chat_attempt_status(&attempt("running", "running", false))
+            .unwrap();
+        db.upsert_chat_attempt_status(&attempt("done", "succeeded", true))
+            .unwrap();
+
+        assert_eq!(db.recover_interrupted_chat_attempts().unwrap(), 1);
+        assert_eq!(db.recover_interrupted_chat_attempts().unwrap(), 0);
+
+        let recovered: (String, String, String, String, bool) = db
+            .conn()
+            .query_row(
+                "SELECT status, phase, error_code, error_message, terminal_at IS NOT NULL
+                   FROM chat_attempts WHERE attempt_id = 'running'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(recovered.0, "error");
+        assert_eq!(recovered.1, "startup_recovery");
+        assert_eq!(recovered.2, "interrupted_by_restart");
+        assert_eq!(
+            recovered.3,
+            "Chat attempt was interrupted by application restart"
+        );
+        assert!(recovered.4);
+
+        let terminal: (String, String, bool) = db
+            .conn()
+            .query_row(
+                "SELECT status, phase, terminal_at IS NOT NULL
+                   FROM chat_attempts WHERE attempt_id = 'done'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(terminal.0, "succeeded");
+        assert_eq!(terminal.1, "succeeded");
+        assert!(terminal.2);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::state::AppState;
 use crate::tool_invocation::{run_tool_status_receipt, ToolInvocationReceiptV1};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Instant;
 use tauri::State;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,27 @@ pub struct MemoryBackendProfileReceipt {
     pub receipt_id: String,
     pub status: MemoryBackendStatus,
 }
+
+#[derive(Debug, Serialize)]
+pub struct MemoryRepairWorkflowReceipt {
+    pub schema: &'static str,
+    pub receipt_id: String,
+    pub notebook_id: String,
+    pub requested_profile: String,
+    pub staging_profile: String,
+    pub native_dense_rebuild: Option<crate::ingestion::dense::NativeDenseRebuildReceipt>,
+    pub projection_backfill: Option<crate::commands::sources::SemanticMemoryBackfillReceipt>,
+    pub vector_artifact_receipt: Option<serde_json::Value>,
+    pub retrieval_probe: Option<crate::commands::sources::RetrievalProbeReceipt>,
+    pub configured_search_timeout_ms: u64,
+    pub effective_search_timeout_ms: u64,
+    pub search_timeout_adjusted: bool,
+    pub retrieval_probe_elapsed_ms: Option<u64>,
+    pub final_profile: MemoryBackendProfileReceipt,
+    pub recorded_utc: String,
+}
+
+static MEMORY_REPAIR_WORKFLOW_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeFastEmbedDiagnostics {
@@ -1021,24 +1043,14 @@ pub async fn set_memory_backend_profile(
             blocking_reasons = reasons;
         }
     }
-    if profile.is_strict() && cfg!(feature = "semantic-memory-turbo-quant") && !blocked {
+    if profile.is_strict() && profile.requires_turbo_quant() && !blocked {
         if let Some(notebook_id) = notebook_id.clone() {
             let tq_status = crate::commands::sources::semantic_memory_vector_artifact_status(
                 notebook_id,
                 state.clone(),
             )
             .await?;
-            if tq_status
-                .candidate_backend
-                .as_deref()
-                .is_none_or(|backend| !backend.contains("turbo_quant"))
-                || tq_status.artifact_generation_id.is_none()
-                || tq_status.vector_artifact_manifest_digest.is_none()
-                || !tq_status.exact_rerank
-                || tq_status.exact_rerank_count == 0
-                || tq_status.vector_artifact_missing_count > 0
-                || tq_status.vector_artifact_stale_count > 0
-            {
+            if !tq_status.turbo_quant_effective() {
                 blocked = true;
                 next_action =
                     Some("run_retrieval_probe_and_rebuild_turbo_quant_artifacts".to_string());
@@ -1073,7 +1085,7 @@ pub async fn set_memory_backend_profile(
             backend_used: status.backend_used.clone(),
             strict_mode: false,
             semantic_memory_auto_project,
-            turbo_quant_requested: false,
+            turbo_quant_requested: profile.requires_turbo_quant(),
             turbo_quant_active: false,
             blocked,
             next_action,
@@ -1083,13 +1095,7 @@ pub async fn set_memory_backend_profile(
         });
     }
 
-    let (
-        requested_backend,
-        strict_mode,
-        semantic_memory_auto_project,
-        turbo_quant_requested,
-        turbo_quant_active,
-    ) = {
+    let (requested_backend, strict_mode, semantic_memory_auto_project, turbo_quant_requested) = {
         let app_db = state
             .app_db
             .lock()
@@ -1103,6 +1109,10 @@ pub async fn set_memory_backend_profile(
                     ("memory_backend_fallback", "true"),
                     (features::SEMANTIC_MEMORY_AUTO_PROJECT, "false"),
                     (features::SEMANTIC_MEMORY_STRICT_TESTING, "false"),
+                    (
+                        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+                        "false",
+                    ),
                     (
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
                         "true",
@@ -1123,6 +1133,10 @@ pub async fn set_memory_backend_profile(
                     (features::SEMANTIC_MEMORY_AUTO_PROJECT, "true"),
                     (features::SEMANTIC_MEMORY_STRICT_TESTING, "false"),
                     (
+                        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+                        "false",
+                    ),
+                    (
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
                         "true",
                     ),
@@ -1141,6 +1155,10 @@ pub async fn set_memory_backend_profile(
                     ("memory_backend_fallback", "false"),
                     (features::SEMANTIC_MEMORY_AUTO_PROJECT, "true"),
                     (features::SEMANTIC_MEMORY_STRICT_TESTING, "true"),
+                    (
+                        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+                        "false",
+                    ),
                     (
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
                         "true",
@@ -1161,6 +1179,10 @@ pub async fn set_memory_backend_profile(
                     (features::SEMANTIC_MEMORY_AUTO_PROJECT, "true"),
                     (features::SEMANTIC_MEMORY_STRICT_TESTING, "false"),
                     (
+                        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+                        "true",
+                    ),
+                    (
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
                         "true",
                     ),
@@ -1179,6 +1201,10 @@ pub async fn set_memory_backend_profile(
                     ("memory_backend_fallback", "false"),
                     (features::SEMANTIC_MEMORY_AUTO_PROJECT, "true"),
                     (features::SEMANTIC_MEMORY_STRICT_TESTING, "true"),
+                    (
+                        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+                        "true",
+                    ),
                     (
                         features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
                         "true",
@@ -1201,18 +1227,28 @@ pub async fn set_memory_backend_profile(
         );
         let turbo_quant_requested = requested_backend
             == features::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
-            && features::turbo_quant_active(&app_db)?;
-        let turbo_quant_active = features::turbo_quant_active(&app_db)?;
+            && features::turbo_quant_requested(&app_db)?;
         (
             requested_backend,
             strict_mode,
             semantic_memory_auto_project,
             turbo_quant_requested,
-            turbo_quant_active,
         )
     };
 
-    let status = crate::commands::sources::memory_backend_status(notebook_id, state).await?;
+    let status =
+        crate::commands::sources::memory_backend_status(notebook_id.clone(), state.clone()).await?;
+    let turbo_quant_active = if turbo_quant_requested {
+        if let Some(notebook_id) = notebook_id {
+            crate::commands::sources::semantic_memory_vector_artifact_status(notebook_id, state)
+                .await?
+                .turbo_quant_effective()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     Ok(MemoryBackendProfileReceipt {
         profile: normalized,
         requested_backend,
@@ -1227,6 +1263,323 @@ pub async fn set_memory_backend_profile(
         blocking_reasons,
         status,
     })
+}
+
+#[tauri::command]
+pub async fn repair_and_set_memory_profile(
+    profile: String,
+    notebook_id: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<MemoryRepairWorkflowReceipt, GlossError> {
+    let _workflow_guard = MEMORY_REPAIR_WORKFLOW_GATE
+        .acquire()
+        .await
+        .map_err(|error| GlossError::Other(format!("Memory repair gate closed: {error}")))?;
+    let workflow_receipt_id = uuid::Uuid::new_v4().to_string();
+    const PROFILE_KEYS: [&str; 9] = [
+        features::EXPERIMENTAL_FEATURES_ENABLED,
+        "memory_backend",
+        "memory_backend_fallback",
+        features::SEMANTIC_MEMORY_AUTO_PROJECT,
+        features::SEMANTIC_MEMORY_STRICT_TESTING,
+        features::FEATURE_SEMANTIC_MEMORY_TURBO_QUANT_ENABLED,
+        features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
+        features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED,
+        "semantic_memory_search_timeout_ms",
+    ];
+
+    let requested = MemoryProfile::parse(&profile)?;
+    let requested_profile = requested.id().to_string();
+    let (configured_search_timeout_ms, embedding_timeout_secs) = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|error| GlossError::Other(error.to_string()))?;
+        (
+            app_db
+                .get_setting("semantic_memory_search_timeout_ms")?
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(crate::settings_contract::DEFAULT_SEMANTIC_SEARCH_TIMEOUT_MS),
+            app_db
+                .get_setting("semantic_memory_embedding_timeout_secs")?
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(10),
+        )
+    };
+    if requested == MemoryProfile::GlossLocal {
+        let final_profile =
+            set_memory_backend_profile(requested_profile.clone(), Some(notebook_id.clone()), state)
+                .await?;
+        return Ok(MemoryRepairWorkflowReceipt {
+            schema: "MemoryRepairWorkflowReceiptV1",
+            receipt_id: workflow_receipt_id,
+            notebook_id,
+            requested_profile: requested_profile.clone(),
+            staging_profile: requested_profile,
+            native_dense_rebuild: None,
+            projection_backfill: None,
+            vector_artifact_receipt: None,
+            retrieval_probe: None,
+            configured_search_timeout_ms,
+            effective_search_timeout_ms: configured_search_timeout_ms,
+            search_timeout_adjusted: false,
+            retrieval_probe_elapsed_ms: None,
+            final_profile,
+            recorded_utc: chrono::Utc::now().to_rfc3339(),
+        });
+    }
+
+    let snapshot = {
+        let app_db = state
+            .app_db
+            .lock()
+            .map_err(|error| GlossError::Other(error.to_string()))?;
+        PROFILE_KEYS
+            .iter()
+            .map(|key| {
+                app_db
+                    .get_setting(key)
+                    .map(|value| ((*key).to_string(), value.unwrap_or_default()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let staging_profile = if requested.requires_turbo_quant() {
+        MemoryProfile::SemanticMemoryTurboQuantSafe
+    } else {
+        MemoryProfile::SemanticMemorySafe
+    };
+    let staging_profile_id = staging_profile.id().to_string();
+
+    let workflow = async {
+        let staging = set_memory_backend_profile(
+            staging_profile_id.clone(),
+            Some(notebook_id.clone()),
+            state.clone(),
+        )
+        .await?;
+        if staging.blocked {
+            return Err(GlossError::Config(format!(
+                "Memory repair staging profile is blocked: {}",
+                staging.blocking_reasons.join(", ")
+            )));
+        }
+
+        let (needs_native_rebuild, needs_projection_backfill, total_chunks) =
+            state.with_notebook_db(&notebook_id, |db| {
+                let sources = db.list_sources()?;
+                let resolved = SourceScope::All.resolve(&sources);
+                let coverage = db.retrieval_coverage(&resolved)?;
+                let native_metadata = db.embedding_index_metadata(
+                    crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
+                )?;
+                let semantic_metadata = db.embedding_index_metadata(
+                    crate::db::notebook_db::SEMANTIC_MEMORY_INDEX_ID,
+                )?;
+                let projection =
+                    db.semantic_memory_projection_summary(&notebook_id, &resolved)?;
+                Ok((
+                    coverage.total_chunks > 0
+                        && (coverage.missing_embeddings > 0
+                            || native_metadata
+                                .as_ref()
+                                .is_none_or(|metadata| metadata.status != "ready")),
+                    coverage.total_chunks > 0
+                        && (projection.projection_required
+                            || projection.failed_sources > 0
+                            || projection.stale_sources > 0
+                            || semantic_metadata
+                                .as_ref()
+                                .is_none_or(|metadata| metadata.status != "ready")),
+                    coverage.total_chunks,
+                ))
+            })?;
+
+        let native_dense_rebuild = if needs_native_rebuild {
+            Some(
+                crate::commands::sources::native_dense_rebuild(
+                    notebook_id.clone(),
+                    app_handle.clone(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        let projection_backfill = if needs_projection_backfill {
+            let receipt = crate::commands::sources::semantic_memory_backfill_notebook(
+                notebook_id.clone(),
+                state.clone(),
+            )
+            .await?;
+            if receipt.failed_sources > 0
+                || receipt.stale_sources > 0
+                || receipt.projection_summary.projection_required
+            {
+                return Err(GlossError::Config(format!(
+                    "Projection backfill left {} failed and {} stale sources",
+                    receipt.failed_sources, receipt.stale_sources
+                )));
+            }
+            Some(receipt)
+        } else {
+            None
+        };
+        let mut vector_artifact_receipt = projection_backfill
+            .as_ref()
+            .and_then(|receipt| receipt.vector_artifact_receipt.clone());
+
+        if requested.requires_turbo_quant() {
+            let artifact_status =
+                crate::commands::sources::semantic_memory_vector_artifact_status(
+                    notebook_id.clone(),
+                    state.clone(),
+                )
+                .await?;
+            if artifact_status.artifact_generation_id.is_none()
+                || artifact_status.vector_artifact_manifest_digest.is_none()
+                || artifact_status.vector_artifact_missing_count > 0
+                || artifact_status.vector_artifact_stale_count > 0
+            {
+                vector_artifact_receipt =
+                    crate::commands::sources::semantic_memory_rebuild_vector_artifacts(
+                        notebook_id.clone(),
+                        state.clone(),
+                    )
+                    .await?;
+            }
+        }
+
+        let (retrieval_probe, retrieval_probe_elapsed_ms) = if total_chunks > 0 {
+            let probe_started = Instant::now();
+            let receipt = crate::commands::sources::run_retrieval_probe(
+                notebook_id.clone(),
+                "Verify semantic memory readiness for this notebook".to_string(),
+                SourceScope::All,
+                Some(8),
+                state.clone(),
+            )
+            .await?;
+            let elapsed_ms = u64::try_from(probe_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if receipt.backend_used != crate::memory::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
+                || receipt.vector_candidates == 0
+                || receipt.fallback_used
+            {
+                return Err(GlossError::Config(format!(
+                    "Semantic retrieval proof failed: backend={}, vector_candidates={}, fallback_used={}",
+                    receipt.backend_used, receipt.vector_candidates, receipt.fallback_used
+                )));
+            }
+            (Some(receipt), Some(elapsed_ms))
+        } else {
+            (None, None)
+        };
+
+        let effective_search_timeout_ms = crate::settings_contract::proven_semantic_search_timeout_ms(
+            configured_search_timeout_ms,
+            embedding_timeout_secs,
+            retrieval_probe_elapsed_ms.unwrap_or_default(),
+            requested.requires_turbo_quant(),
+        );
+        let search_timeout_adjusted = effective_search_timeout_ms != configured_search_timeout_ms;
+        if search_timeout_adjusted {
+            let value = effective_search_timeout_ms.to_string();
+            let app_db = state
+                .app_db
+                .lock()
+                .map_err(|error| GlossError::Other(error.to_string()))?;
+            app_db.set_setting("semantic_memory_search_timeout_ms", &value)?;
+            if app_db
+                .get_setting("semantic_memory_search_timeout_ms")?
+                .as_deref()
+                != Some(value.as_str())
+            {
+                return Err(GlossError::Other(
+                    "Semantic search timeout read-back mismatch".to_string(),
+                ));
+            }
+        }
+
+        if requested.requires_turbo_quant() {
+            let tq_status = crate::commands::sources::semantic_memory_vector_artifact_status(
+                notebook_id.clone(),
+                state.clone(),
+            )
+            .await?;
+            if !tq_status.turbo_quant_effective() {
+                return Err(GlossError::Config(
+                    "TurboQuant artifacts or exact-rerank probe are not current".to_string(),
+                ));
+            }
+        }
+
+        let final_profile = set_memory_backend_profile(
+            requested_profile.clone(),
+            Some(notebook_id.clone()),
+            state.clone(),
+        )
+        .await?;
+        if final_profile.blocked {
+            return Err(GlossError::Config(format!(
+                "Memory repair did not satisfy the requested profile: {}",
+                final_profile.blocking_reasons.join(", ")
+            )));
+        }
+
+        Ok(MemoryRepairWorkflowReceipt {
+            schema: "MemoryRepairWorkflowReceiptV1",
+            receipt_id: workflow_receipt_id.clone(),
+            notebook_id: notebook_id.clone(),
+            requested_profile: requested_profile.clone(),
+            staging_profile: staging_profile_id.clone(),
+            native_dense_rebuild,
+            projection_backfill,
+            vector_artifact_receipt,
+            retrieval_probe,
+            configured_search_timeout_ms,
+            effective_search_timeout_ms,
+            search_timeout_adjusted,
+            retrieval_probe_elapsed_ms,
+            final_profile,
+            recorded_utc: chrono::Utc::now().to_rfc3339(),
+        })
+    }
+    .await;
+
+    match workflow {
+        Ok(receipt) => Ok(receipt),
+        Err(error) => {
+            let restore = (|| -> Result<(), GlossError> {
+                let app_db = state
+                    .app_db
+                    .lock()
+                    .map_err(|lock_error| GlossError::Other(lock_error.to_string()))?;
+                let refs = snapshot
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str()))
+                    .collect::<Vec<_>>();
+                app_db.set_settings_atomically(&refs)?;
+                for (key, expected) in &snapshot {
+                    if app_db.get_setting(key)?.as_deref() != Some(expected.as_str()) {
+                        return Err(GlossError::Other(format!(
+                            "Profile rollback read-back mismatch for {key}"
+                        )));
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(restore_error) = restore {
+                return Err(GlossError::Other(format!(
+                    "{error}; profile rollback also failed: {restore_error}"
+                )));
+            }
+            Err(GlossError::Config(format!(
+                "MemoryRepairWorkflowReceiptV1 {} failed; previous profile restored: {error}",
+                workflow_receipt_id
+            )))
+        }
+    }
 }
 
 #[tauri::command]
@@ -1247,15 +1600,16 @@ pub async fn get_semantic_memory_profile_status(
             .app_db
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
+        let selected_backend = app_db
+            .get_setting("memory_backend")?
+            .unwrap_or_else(|| features::MEMORY_BACKEND_GLOSS_LOCAL.to_string());
         (
             super::chat::setting_is_enabled(
                 app_db.get_setting(features::EXPERIMENTAL_FEATURES_ENABLED)?,
             ),
-            features::semantic_memory_preview_active(&app_db)?,
-            features::turbo_quant_active(&app_db)?,
-            app_db
-                .get_setting("memory_backend")?
-                .unwrap_or_else(|| features::MEMORY_BACKEND_GLOSS_LOCAL.to_string()),
+            selected_backend == features::MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
+            features::turbo_quant_requested(&app_db)?,
+            selected_backend,
             super::chat::setting_is_enabled(app_db.get_setting("memory_backend_fallback")?),
             super::chat::setting_is_enabled(
                 app_db.get_setting(features::SEMANTIC_MEMORY_STRICT_TESTING)?,

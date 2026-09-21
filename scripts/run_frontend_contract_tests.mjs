@@ -13,6 +13,8 @@ const chatEvidence = readFileSync("src/lib/chatEvidence.ts", "utf8");
 const notebookSidebar = readFileSync("src/components/notebooks/NotebookSidebar.tsx", "utf8");
 const sourcesPanel = readFileSync("src/components/sources/SourcesPanel.tsx", "utf8");
 const settingsDialog = readFileSync("src/components/settings/SettingsDialog/index.tsx", "utf8");
+const sourceStore = readFileSync("src/stores/sourceStore.ts", "utf8");
+const tauriApi = readFileSync("src/lib/tauri.ts", "utf8");
 const studioPanel = readFileSync("src/components/studio/StudioPanel.tsx", "utf8");
 const studioStore = readFileSync("src/stores/studioStore.ts", "utf8");
 const panelLayout = readFileSync("src/components/layout/PanelLayout.tsx", "utf8");
@@ -79,6 +81,22 @@ check(
     /setStatusFilter\("error"\)/.test(sourcesPanel) &&
     /Delete Failed/.test(sourcesPanel),
   "Sources panel must expose a dedicated failed-import review/quarantine/delete workflow."
+);
+check(
+  "failed import retry uses one bounded backend batch",
+  /retryFailedSources/.test(sourcesPanel) &&
+    /await retryFailedSources\(notebookId\)/.test(sourcesPanel) &&
+    /retryFailedImports/.test(sourceStore) &&
+    /retry_failed_imports/.test(tauriApi) &&
+    !/for \(const source of failedSources\)[\s\S]{0,160}retrySource/.test(sourcesPanel),
+  "Retry All must await one receipt-bearing backend batch instead of firing one IPC call per source."
+);
+check(
+  "memory profiles use one ordered repair workflow",
+  /repairAndSetMemoryProfile/.test(settingsDialog) &&
+    /repairingMemoryProfile/.test(settingsDialog) &&
+    /repair_and_set_memory_profile/.test(tauriApi),
+  "Semantic profiles must invoke the ordered backend repair/proof workflow and expose in-progress state."
 );
 check(
   "YouTube transcript UI exposes consented transcript import",

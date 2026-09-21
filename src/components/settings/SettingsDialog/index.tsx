@@ -340,6 +340,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const [reindexingSemanticMemory, setReindexingSemanticMemory] = useState(false);
   const [rebuildingTurboQuant, setRebuildingTurboQuant] = useState(false);
   const [runningRetrievalProbe, setRunningRetrievalProbe] = useState(false);
+  const [repairingMemoryProfile, setRepairingMemoryProfile] = useState<string | null>(null);
   const [runningEmbeddingDiagnostics, setRunningEmbeddingDiagnostics] = useState(false);
   const [embeddingDiagnostics, setEmbeddingDiagnostics] =
     useState<EmbeddingDiagnosticsReceipt | null>(null);
@@ -356,7 +357,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const [embeddingModel, setEmbeddingModel] = useState("");
   const [embeddingTimeout, setEmbeddingTimeout] = useState("10");
   const [downloadConsent, setDownloadConsent] = useState(false);
-  const [searchTimeout, setSearchTimeout] = useState("8000");
+  const [searchTimeout, setSearchTimeout] = useState("60000");
   const [chunkTargetTokens, setChunkTargetTokens] = useState("1100");
   const [embeddingDirty, setEmbeddingDirty] = useState(false);
   const [savingEmbedding, setSavingEmbedding] = useState(false);
@@ -369,11 +370,27 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     setEmbeddingModel(settings.semantic_memory_embedding_model || "bge-m3");
     setEmbeddingTimeout(settings.semantic_memory_embedding_timeout_secs || "10");
     setDownloadConsent(settings.fastembed_download_consent === "true");
-    setSearchTimeout(settings.semantic_memory_search_timeout_ms || "8000");
+    setSearchTimeout(settings.semantic_memory_search_timeout_ms || "60000");
     setChunkTargetTokens(settings.chunk_target_tokens || "1100");
   }, [open, settings, embeddingDirty]);
   const editEmbedding = (setter: (value: string) => void, value: string) => {
     setter(value); setEmbeddingDirty(true); setEmbeddingSaveError(null);
+  };
+  const minimumSearchTimeoutMs = Math.min(
+    300000,
+    Math.max(100, Math.trunc(Number(embeddingTimeout) * 1000) + 5000),
+  );
+  const editEmbeddingTimeout = (value: string) => {
+    setEmbeddingTimeout(value);
+    const timeoutSeconds = Number(value);
+    if (Number.isFinite(timeoutSeconds) && timeoutSeconds >= 2) {
+      const minimum = Math.min(300000, Math.trunc(timeoutSeconds * 1000) + 5000);
+      if (!Number.isFinite(Number(searchTimeout)) || Number(searchTimeout) < minimum) {
+        setSearchTimeout(String(minimum));
+      }
+    }
+    setEmbeddingDirty(true);
+    setEmbeddingSaveError(null);
   };
   const handleApplyEmbedding = async () => {
     setSavingEmbedding(true); setEmbeddingSaveError(null);
@@ -487,8 +504,14 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   };
 
   const handleMemoryProfile = async (profile: string) => {
+    if (repairingMemoryProfile) return;
+    setRepairingMemoryProfile(profile);
     try {
-      const receipt = await api.setMemoryBackendProfile(profile, activeNotebookId);
+      const workflow = profile !== "gloss-local" && activeNotebookId
+        ? await api.repairAndSetMemoryProfile(profile, activeNotebookId)
+        : null;
+      const receipt = workflow?.final_profile
+        ?? await api.setMemoryBackendProfile(profile, activeNotebookId);
       await loadSettings();
       await loadFeatureFlags();
       await refreshMemoryEvidence();
@@ -497,8 +520,10 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
         title: receipt.blocked ? "Memory profile blocked" : "Memory profile applied",
         message: receipt.blocked
           ? `${receipt.blocking_reasons.join(", ")}`
-          : `${receipt.profile}: ${receipt.backend_used}`,
-        duration: 4000,
+          : workflow
+            ? `${receipt.profile}: ${receipt.backend_used}. Repair receipt ${workflow.receipt_id.slice(0, 8)}.${workflow.search_timeout_adjusted ? ` Search timeout tuned from ${workflow.configured_search_timeout_ms} ms to ${workflow.effective_search_timeout_ms} ms using the successful retrieval probe.` : ""}`
+            : `${receipt.profile}: ${receipt.backend_used}`,
+        duration: 5000,
       });
     } catch (error) {
       await loadSettings();
@@ -510,6 +535,8 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
         message: error instanceof Error ? error.message : String(error),
         duration: 7000,
       });
+    } finally {
+      setRepairingMemoryProfile(null);
     }
   };
 
@@ -1181,22 +1208,24 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 <button
                   key={String(profile)}
                   onClick={() => handleMemoryProfile(String(profile))}
-                  disabled={!enabled}
+                  disabled={!enabled || repairingMemoryProfile !== null}
                   className="inline-flex items-center justify-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <Database className="h-3.5 w-3.5" />
-                  {label}
+                  {repairingMemoryProfile === profile ? "Repairing memory..." : label}
                 </button>
               ))}
             </div>
             <div className="grid gap-2 sm:grid-cols-2">
               <button
                 onClick={() => handleMemoryProfile(turboQuant?.available ? "semantic-memory-turbo-quant-strict" : "semantic-memory-strict")}
-                disabled={!activeNotebookId || !semanticPreviewSelectable}
+                disabled={!activeNotebookId || !semanticPreviewSelectable || repairingMemoryProfile !== null}
                 className="inline-flex items-center justify-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <ShieldCheck className="h-3.5 w-3.5" />
-                Strict retrieval {turboQuant?.available ? "with TurboQuant proof" : ""}
+                {repairingMemoryProfile?.includes("strict")
+                  ? "Repairing and proving..."
+                  : `Strict retrieval ${turboQuant?.available ? "with TurboQuant proof" : ""}`}
               </button>
             </div>
             <select
@@ -1381,14 +1410,14 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 type="number"
                 value={embeddingTimeout}
                 disabled={savingEmbedding || embeddingProvider !== "ollama"}
-                onChange={(e) => editEmbedding(setEmbeddingTimeout, e.target.value)}
+                onChange={(e) => editEmbeddingTimeout(e.target.value)}
                 className="rounded border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text focus:border-accent focus:outline-none"
                 min="2" max="300"
                 aria-label="Embedding timeout seconds"
               />
               <input
                 type="number"
-                min="100" max="300000"
+                min={minimumSearchTimeoutMs} max="300000"
                 value={searchTimeout}
                 disabled={savingEmbedding}
                 onChange={(e) => editEmbedding(setSearchTimeout, e.target.value)}

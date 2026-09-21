@@ -2,6 +2,38 @@
 use crate::{db::app_db::AppDb, error::GlossError, providers};
 use serde::Deserialize;
 
+pub const DEFAULT_SEMANTIC_SEARCH_TIMEOUT_MS: u64 = 60_000;
+pub const MAX_SEMANTIC_SEARCH_TIMEOUT_MS: u64 = 300_000;
+const SEMANTIC_SEARCH_TIMEOUT_GRACE_MS: u64 = 5_000;
+
+pub fn minimum_semantic_search_timeout_ms(embedding_timeout_secs: u64) -> u64 {
+    embedding_timeout_secs
+        .saturating_mul(1_000)
+        .saturating_add(SEMANTIC_SEARCH_TIMEOUT_GRACE_MS)
+        .min(MAX_SEMANTIC_SEARCH_TIMEOUT_MS)
+}
+
+pub fn proven_semantic_search_timeout_ms(
+    configured_timeout_ms: u64,
+    embedding_timeout_secs: u64,
+    retrieval_probe_elapsed_ms: u64,
+    turbo_quant_requested: bool,
+) -> u64 {
+    let proof_budget = retrieval_probe_elapsed_ms
+        .saturating_mul(2)
+        .saturating_add(SEMANTIC_SEARCH_TIMEOUT_GRACE_MS);
+    let turbo_quant_floor = if turbo_quant_requested {
+        DEFAULT_SEMANTIC_SEARCH_TIMEOUT_MS
+    } else {
+        0
+    };
+    configured_timeout_ms
+        .max(minimum_semantic_search_timeout_ms(embedding_timeout_secs))
+        .max(proof_budget)
+        .max(turbo_quant_floor)
+        .min(MAX_SEMANTIC_SEARCH_TIMEOUT_MS)
+}
+
 pub fn invalidate_existing_embedding_indexes(
     db: &crate::db::notebook_db::NotebookDb,
 ) -> Result<(), GlossError> {
@@ -43,6 +75,15 @@ pub fn save_embedding_settings(db: &AppDb, config: &EmbeddingSettings) -> Result
         "semantic_memory_search_timeout_ms",
         &config.search_timeout_ms.to_string(),
     )?;
+    if config.provider == "ollama" {
+        let minimum = minimum_semantic_search_timeout_ms(config.timeout_secs);
+        if config.search_timeout_ms < minimum {
+            return Err(GlossError::Config(format!(
+                "semantic_memory_search_timeout_ms must allow embedding timeout plus retrieval overhead (minimum {minimum} ms for {} s embedding timeout)",
+                config.timeout_secs
+            )));
+        }
+    }
     validate_setting_value(
         "chunk_target_tokens",
         &config.chunk_target_tokens.to_string(),
@@ -209,13 +250,14 @@ mod tests {
             model: "old".into(),
             timeout_secs: 60,
             download_consent: false,
-            search_timeout_ms: 8000,
+            search_timeout_ms: 65_000,
             chunk_target_tokens: 1100,
         };
         save_embedding_settings(&db, &config).unwrap();
         db.conn().execute_batch("CREATE TRIGGER fail_config BEFORE INSERT ON settings WHEN NEW.key = 'chunk_target_tokens' BEGIN SELECT RAISE(ABORT, 'injected disk failure'); END;").unwrap();
         config.model = "new".into();
         config.timeout_secs = 90;
+        config.search_timeout_ms = 95_000;
         config.download_consent = true;
         assert!(save_embedding_settings(&db, &config).is_err());
         assert_eq!(
@@ -237,6 +279,43 @@ mod tests {
             Some("false")
         );
     }
+    #[test]
+    fn search_timeout_cannot_expire_before_embedding_timeout_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AppDb::open(&dir.path().join("app.db")).unwrap();
+        let before_provider = db
+            .get_setting("semantic_memory_embedding_provider")
+            .unwrap();
+        let before_model = db.get_setting("semantic_memory_embedding_model").unwrap();
+        let config = EmbeddingSettings {
+            provider: "ollama".into(),
+            url: "http://localhost:11434".into(),
+            model: "fixture".into(),
+            timeout_secs: 10,
+            download_consent: false,
+            search_timeout_ms: 8_000,
+            chunk_target_tokens: 1100,
+        };
+        let error = save_embedding_settings(&db, &config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must allow embedding timeout plus retrieval overhead"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            db.get_setting("semantic_memory_embedding_provider")
+                .unwrap(),
+            before_provider,
+            "invalid settings must not partially change the provider"
+        );
+        assert_eq!(
+            db.get_setting("semantic_memory_embedding_model").unwrap(),
+            before_model,
+            "invalid settings must not partially change the model"
+        );
+    }
+
     #[test]
     fn invalid_numeric_enum_and_boolean_values_are_rejected() {
         for (key, value) in [
@@ -265,7 +344,7 @@ mod tests {
             model: "fixture".into(),
             timeout_secs: 60,
             download_consent: false,
-            search_timeout_ms: 8000,
+            search_timeout_ms: 65_000,
             chunk_target_tokens: 1100,
         };
         save_embedding_settings(&db, &config).unwrap();
@@ -280,6 +359,7 @@ mod tests {
         );
         config.model = "fixture".into();
         config.timeout_secs = 90;
+        config.search_timeout_ms = 95_000;
         assert!(!save_embedding_settings(&db, &config).unwrap());
         config.model = "changed".into();
         assert!(save_embedding_settings(&db, &config).unwrap());
@@ -301,6 +381,27 @@ mod tests {
         assert!(
             !save_embedding_settings(&db, &config).unwrap(),
             "remote-only fields must not invalidate the fixed local Candle identity"
+        );
+    }
+
+    #[test]
+    fn proven_search_budget_covers_embedding_probe_and_turbo_quant_cold_start() {
+        assert_eq!(minimum_semantic_search_timeout_ms(10), 15_000);
+        assert_eq!(
+            proven_semantic_search_timeout_ms(8_000, 10, 2_000, false),
+            15_000
+        );
+        assert_eq!(
+            proven_semantic_search_timeout_ms(8_000, 10, 23_870, true),
+            60_000
+        );
+        assert_eq!(
+            proven_semantic_search_timeout_ms(8_000, 10, 80_000, true),
+            165_000
+        );
+        assert_eq!(
+            proven_semantic_search_timeout_ms(8_000, 300, 300_000, true),
+            MAX_SEMANTIC_SEARCH_TIMEOUT_MS
         );
     }
 }

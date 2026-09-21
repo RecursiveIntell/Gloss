@@ -790,6 +790,22 @@
       },
       "response_family": "void"
     },
+    "repair_and_set_memory_profile": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/settings.rs",
+      "error_family": "GlossError",
+      "wrapper": "repairAndSetMemoryProfile",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "profile",
+          "notebookId"
+        ]
+      },
+      "response_family": "MemoryRepairWorkflowReceipt"
+    },
     "resume_summaries": {
       "registered": true,
       "definition": "src-tauri/src/commands/sources/mod.rs",
@@ -802,6 +818,21 @@
         "fields": []
       },
       "response_family": "void"
+    },
+    "retry_failed_imports": {
+      "registered": true,
+      "definition": "src-tauri/src/commands/sources/mod.rs",
+      "error_family": "GlossError",
+      "wrapper": "retryFailedImports",
+      "caller_count": 1,
+      "operator_only": false,
+      "request": {
+        "casing": "camelCase",
+        "fields": [
+          "notebookId"
+        ]
+      },
+      "response_family": "RetryFailedImportsReceipt"
     },
     "retry_source_ingestion": {
       "registered": true,

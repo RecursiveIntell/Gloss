@@ -19,6 +19,16 @@ vi.mock('../../lib/tauri', () => ({
   quarantineFailedImports: vi.fn().mockResolvedValue({ quarantined_sources: 0, cancelled_queue_jobs: 0 }),
   deleteFailedImports: vi.fn().mockResolvedValue({ deleted_sources: 0, cancelled_queue_jobs: 0 }),
   retrySourceIngestion: vi.fn().mockResolvedValue(undefined),
+  retryFailedImports: vi.fn().mockResolvedValue({
+    failed_sources_before: 3,
+    recovered_by_dense_rebuild: 2,
+    retried_sources: 1,
+    already_running_sources: 0,
+    queued_sources: 1,
+    completed_sources: 0,
+    failed_sources: 0,
+    errors: [],
+  }),
   semanticMemoryReindexSource: vi.fn().mockResolvedValue(undefined),
   semanticMemoryBackfillNotebook: vi.fn().mockResolvedValue({ projected_sources: 0, skipped_no_chunks: 0, failed_sources: 0 }),
   getNotebookStats: vi.fn().mockResolvedValue({ source_count: 0, note_count: 0, conversation_count: 0 }),
@@ -53,6 +63,7 @@ vi.stubGlobal('localStorage', localStorageMock);
 
 describe('sourceStore', () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     useSourceStore.setState({
       sources: [],
       selectedSourceIds: new Set<string>(),
@@ -132,5 +143,15 @@ describe('sourceStore', () => {
   it('preserves invalid explicit ids instead of silently changing scope to none', () => {
     useSourceStore.setState({ sourceScopeMode: 'explicit', selectedSourceIds: new Set(['missing-source']), sourceListStatus: 'ready' });
     expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'explicit', ids: ['missing-source'] });
+  });
+
+  it('retries failed imports through one bounded backend operation', async () => {
+    await useSourceStore.getState().retryFailedSources('nb-1');
+
+    expect(api.retryFailedImports).toHaveBeenCalledTimes(1);
+    expect(api.retryFailedImports).toHaveBeenCalledWith('nb-1');
+    expect(api.retrySourceIngestion).not.toHaveBeenCalled();
+    expect(api.listSources).toHaveBeenCalledTimes(1);
+    expect(api.getNotebookStats).toHaveBeenCalledTimes(1);
   });
 });

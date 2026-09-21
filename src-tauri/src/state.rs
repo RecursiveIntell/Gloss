@@ -384,6 +384,39 @@ impl AppState {
         Ok(())
     }
 
+    fn recover_interrupted_chat_attempts(app_db: &AppDb) -> Result<usize, GlossError> {
+        let mut recovered = 0usize;
+        for notebook in app_db.list_notebooks()? {
+            let notebook_db_path = PathBuf::from(&notebook.directory).join("notebook.db");
+            if !notebook_db_path.exists() {
+                continue;
+            }
+            match NotebookDb::connect(&notebook_db_path)
+                .and_then(|db| db.recover_interrupted_chat_attempts())
+            {
+                Ok(count) => {
+                    recovered = recovered.saturating_add(count);
+                    if count > 0 {
+                        tracing::warn!(
+                            notebook_id = %notebook.id,
+                            recovered_attempts = count,
+                            "Closed chat attempts interrupted by the previous process"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        notebook_id = %notebook.id,
+                        path = %redact_path(&notebook_db_path),
+                        error = %error,
+                        "Failed to recover interrupted chat attempts"
+                    );
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
     /// Initialize application state on startup.
     pub fn initialize(_app_handle: &AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
         let data_dir = directories::ProjectDirs::from("com", "sikmindz", "Gloss")
@@ -402,7 +435,10 @@ impl AppState {
         let db_path = data_dir.join("gloss.db");
         let app_db = AppDb::open(&db_path)?;
         if app_db.get_setting("memory_backend")?.is_none() {
-            app_db.set_setting("memory_backend", "gloss-local")?;
+            // A fresh install starts on the dependency-free local lane. The
+            // semantic profiles remain a deliberate, receipt-bearing choice:
+            // selecting one runs the ordered repair/proof workflow first.
+            app_db.set_setting("memory_backend", features::MEMORY_BACKEND_GLOSS_LOCAL)?;
         }
         if app_db.get_setting("memory_backend_fallback")?.is_none() {
             app_db.set_setting("memory_backend_fallback", "true")?;
@@ -411,7 +447,7 @@ impl AppState {
             .get_setting("semantic_memory_auto_project")?
             .is_none()
         {
-            app_db.set_setting("semantic_memory_auto_project", "true")?;
+            app_db.set_setting("semantic_memory_auto_project", "false")?;
         }
         if app_db
             .get_setting("semantic_memory_turbo_quant_require_fresh_artifacts")?
@@ -462,7 +498,10 @@ impl AppState {
             .get_setting("semantic_memory_search_timeout_ms")?
             .is_none()
         {
-            app_db.set_setting("semantic_memory_search_timeout_ms", "8000")?;
+            app_db.set_setting(
+                "semantic_memory_search_timeout_ms",
+                &crate::settings_contract::DEFAULT_SEMANTIC_SEARCH_TIMEOUT_MS.to_string(),
+            )?;
         }
         // Model downloads require explicit consent. Startup must preserve a
         // user's refusal rather than treating it as an obsolete default.
@@ -476,6 +515,7 @@ impl AppState {
         let secret_store = SecretStore::new(&data_dir)?;
         Self::migrate_legacy_secrets(&app_db, &secret_store)?;
         Self::reconcile_notebook_source_counts(&app_db)?;
+        Self::recover_interrupted_chat_attempts(&app_db)?;
 
         let model_registry = ModelRegistry::new(&app_db, &secret_store)?;
         let summary_starts_paused = Self::summary_mode_starts_paused(&app_db)?;
@@ -1242,6 +1282,25 @@ mod tests {
         assert_eq!(state.data_dir, dir.path());
         assert!(dir.path().join("gloss.db").is_file());
         assert!(dir.path().join("notebooks").is_dir());
+    }
+
+    #[test]
+    fn fresh_install_defaults_to_gloss_local_until_semantic_profile_is_proven() {
+        let dir = tempdir().unwrap();
+        let state = AppState::initialize_for_test(dir.path()).unwrap();
+        let app_db = state.app_db.lock().unwrap();
+        assert_eq!(
+            app_db.get_setting("memory_backend").unwrap().as_deref(),
+            Some(features::MEMORY_BACKEND_GLOSS_LOCAL)
+        );
+        assert!(!features::turbo_quant_requested(&app_db).unwrap());
+        assert_eq!(
+            app_db
+                .get_setting("semantic_memory_search_timeout_ms")
+                .unwrap()
+                .as_deref(),
+            Some("60000")
+        );
     }
 
     #[test]

@@ -139,6 +139,21 @@ export interface FailedImportQuarantineReceipt {
   recorded_utc: string;
 }
 
+export interface RetryFailedImportsReceipt {
+  schema: "RetryFailedImportsReceiptV1";
+  receipt_id: string;
+  notebook_id: string;
+  failed_sources_before: number;
+  recovered_by_dense_rebuild: number;
+  retried_sources: number;
+  already_running_sources: number;
+  queued_sources: number;
+  completed_sources: number;
+  failed_sources: number;
+  errors: Array<{ source_id: string; error: string }>;
+  recorded_utc: string;
+}
+
 export interface YouTubeTranscriptSpan {
   start_ms: number;
   end_ms: number;
@@ -902,6 +917,29 @@ export interface MemoryBackendProfileReceipt {
   blocking_reasons: string[];
   receipt_id: string;
   status: MemoryBackendStatus;
+}
+
+export interface MemoryRepairWorkflowReceipt {
+  schema: "MemoryRepairWorkflowReceiptV1";
+  receipt_id: string;
+  notebook_id: string;
+  requested_profile: string;
+  staging_profile: string;
+  native_dense_rebuild?: {
+    rebuild_id: string;
+    status: string;
+    chunks_indexed: number;
+    sources_recovered: number;
+  } | null;
+  projection_backfill?: SemanticMemoryBackfillReceipt | null;
+  vector_artifact_receipt?: VectorArtifactReceipt | null;
+  retrieval_probe?: RetrievalProbeReceipt | null;
+  configured_search_timeout_ms: number;
+  effective_search_timeout_ms: number;
+  search_timeout_adjusted: boolean;
+  retrieval_probe_elapsed_ms?: number | null;
+  final_profile: MemoryBackendProfileReceipt;
+  recorded_utc: string;
 }
 
 export interface SemanticMemoryProjectionSummary {

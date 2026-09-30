@@ -73,6 +73,8 @@ Baseline source checks: 192 frontend tests plus contracts/build and 232 native u
 
 At this report's local checkpoint: 200 frontend tests plus contracts/build, 247 native unit tests plus six integration tests, and the new extraction/privacy fixtures pass. Counts overlap and must not be summed as unique tests. The explicitly ignored extractor child is executed by its parent isolation test; the existing real-model environment probe remains separate.
 
+The first follow-up candidate passed all three package repetitions and the integrated desktop job, but its canonical verifier stopped at the dependent TurboQuant harness lockfile. Adding extraction owners expanded the native harness dependency graph; the downstream lockfile also needed refresh. The failed [candidate run](https://github.com/RecursiveIntell/Gloss/actions/runs/36732643114) is preserved. Both harness lockfiles now follow the root registry identities; `--locked` remains required and final-source CI must rerun.
+
 An exploratory strict all-targets Clippy run on the native harness reports the same five lints on the untouched baseline and repair: one public-harness `from_str` trait suggestion and four existing test-only read/clone suggestions. This optional harness result is retained as failed; it is not substituted for or used to relax the canonical strict application Clippy gate.
 
 Full Tauri compilation, native GUI/model workflow, sanitizer results and the three AppImage repetitions must be read from the follow-up PR's exact-candidate CI and attached receipts. Local pure-owner tests do not certify those stages. The README retains this distinction and the existing installed-host, real Nomic, large-corpus, media, non-Linux, signing and public-release limits.

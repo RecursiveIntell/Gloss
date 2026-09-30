@@ -42,10 +42,11 @@ an existing user notebook are separate gates.
 | FE-03 | Failed paste/URL imports resolve successfully and erase drafts | Implemented coordinated rejecting mutation contract and catching callers; `hostileInteractions.test.ts` |
 | FE-04 | Retry All leaks rejected event promise | Implemented handler catch; real callback regression |
 | FE-05 | Evidence inspector silently substitutes older response | Implemented latest-assistant ownership and previous-response streaming label; rendered regression |
-| FE-06 | Visual modals lack keyboard/focus/accessible contract | Implemented shared modal focus/inert/Escape/return owner and names; markup gates pass, native keyboard gate added but not yet executed |
+| FE-06 | Visual modals lack keyboard/focus/accessible contract | Implemented shared modal focus/inert/Escape/return owner and names; markup gates pass, native keyboard gate passed at first head; final-head rerun required |
 | FE-07 | Studio stale load/export response replaces newer state | Implemented epochs and success/error ownership; cancellation acknowledgement kept separate from terminal completion; store regressions |
 | FE-08 | Switching progressed quiz/cards to shorter output crashes | Implemented keyed session and guarded identity reset; callback regressions |
 | FE-09 | Slow successful import clears newer draft edits | Implemented synchronous in-flight owner and draft versions; callback regression |
+| FE-10 | Unlayered global reset overrides compiled Tailwind utility padding/margins | Found while inspecting first-head native screenshots. Reset moved to base layer; native computed padding and 24px close-hit-target gates added for Settings and Source viewer; final-head execution pending |
 | M1-01 | Recognized legacy-only/sharded cache cannot load | Implemented one read-only resolver for supported paths; HF/legacy, refs, ambiguity, partial/shard/direct-layout tests |
 | M1-02 | Strict TQ admission requires TQ already active | Implemented prospective proof readiness; exact-rerank/generation/digest gates retained |
 | M2-01 | Export copies main SQLite file and loses committed WAL rows | Implemented and isolated native regressions passed; integrated full gate pending |
@@ -113,3 +114,29 @@ Portability integration review additionally fences native inference/active attem
 ## Integrated local checkpoint
 
 After forced owner-package clean and explicit compilation from this checkout, the integrated native harness passes 227 unit tests and five integration tests. The spawned crash-fixture helper and real Ollama canary are intentionally not standalone local gates. Python suites pass 122 script + 51 validation tests. Frontend build and repair static gates pass. All 21 roots now have implemented repairs; exact-head native/Tauri CI and independent post-audit are still mandatory.
+
+
+## First-head CI and bounded follow-up
+
+At `475ae8c527fca6d01cb2ccee27845e4cbc773af7`, frontend, native C++
+ASan/LSan, real Ollama owner canary and integrated native desktop jobs passed.
+The twelve native desktop cases include scoped question/evidence, failed
+embedding recovery, no-retrieval chat, saved notes, cancellation/retry and
+restart. The native settings keyboard assertions executed successfully.
+Artifact source tree and content digest matched that head. These are hosted
+fresh-profile fixture observations, not validation of an existing user notebook.
+
+Canonical verify failed because the dependent TurboQuant harness lock was not
+updated after native harness integration. The follow-up synchronizes the lock
+with the root workspace owner, adds the direct serde derive dependency consumed
+by the shared proof type, and passes the unchanged locked suite: 8 owner tests
+and 7 transport tests. The original failed CI receipt is retained.
+
+Native screenshot inspection also found FE-10, bringing the remediation map to
+22 roots across the same twelve audit scopes. The global reset was unlayered,
+so it beat Tailwind 4's layered spacing utilities. Moving only that reset into
+the base layer restores the intended utility precedence. The follow-up requires
+computed header/body padding and minimum close-control geometry in the actual
+native WebView, in addition to the existing keyboard gate. Driver policy tests
+reject observations with zero padding or collapsed 16px controls; they do not
+substitute for the required final-head native run.

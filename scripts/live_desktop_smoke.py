@@ -687,10 +687,26 @@ class IntegratedWorkflow:
         self.ui.wait(lambda: self.ui.find_visible("button:not(:disabled)", notebook), label="notebook after native restart")
         self.activate_notebook(notebook)
 
+    def modal_spacing(self, label: str):
+        # Read the actual compiled CSS in the native WebView, not class strings.
+        metrics = self.ui.execute("""const modal=document.querySelector('[role="dialog"][aria-label="'+arguments[0]+'"]');
+if (!modal) return null;
+const header=getComputedStyle(modal.children[0]), body=getComputedStyle(modal.children[1]);
+const close=modal.children[0].querySelector('button').getBoundingClientRect();
+const rem=parseFloat(getComputedStyle(document.documentElement).fontSize);
+return {rem, headerX:parseFloat(header.paddingLeft), headerY:parseFloat(header.paddingTop),
+bodyX:parseFloat(body.paddingLeft), bodyY:parseFloat(body.paddingTop), closeWidth:close.width, closeHeight:close.height};""", [label])
+        self.check(bool(metrics) and all(abs(metrics[key] - metrics["rem"] * factor) < 0.5
+                   for key, factor in (("headerX", 1), ("headerY", 0.75), ("bodyX", 1), ("bodyY", 1))),
+                   f"{label} compiled utility padding survives reset cascade: {metrics}")
+        self.check(metrics["closeWidth"] >= 24 and metrics["closeHeight"] >= 24,
+                   f"{label} close control retains a 24px hit target")
+
     def settings(self):
         self.ui.click_text("Settings")
         self.ui.wait(lambda: self.ui.find_visible('input[aria-label="Ollama server URL"]'), label="settings dialog")
         if not self.modal_keyboard_checked:
+            self.modal_spacing("Settings")
             self.check(self.ui.execute("return document.activeElement?.getAttribute('aria-label')==='Close settings' && !!document.activeElement.closest('[role=dialog][aria-modal=true]')"), "settings enters its named modal focus owner")
             close = self.ui.find_visible('button[aria-label="Close settings"]')
             self.ui.call("POST", f"/element/{close[ELEMENT_KEY]}/value", {"text": "\ue008\ue004\ue000"})
@@ -1043,6 +1059,7 @@ return {at_end, id:button?.getAttribute('aria-controls') || null,
         citation = self.ui.wait(lambda: self.ui.execute("return Array.from(document.querySelectorAll('.gloss-assistant-bubble button')).filter(e=>e.getClientRects().length && e.textContent.includes('facts/atlas.md')).at(-1) || null"), label="Atlas citation button")
         self.ui.click_ref(citation)
         self.ui.wait(lambda: "Source Viewer" in self.ui.text() and "GLACIER-ORBIT-417" in self.ui.text(), label="cited source viewer")
+        self.modal_spacing("Source viewer")
         self.record(self.case_id, "A real scoped model answer cited Atlas, the rendered receipt reported one selected/one excluded source with preserved context, and clicking the citation opened the actual source text.")
         self.ui.click_ref(self.ui.execute("return Array.from(document.querySelectorAll('span')).find(e=>e.textContent==='Source Viewer').parentElement.parentElement.parentElement.querySelector('button')"))
 

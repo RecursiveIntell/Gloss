@@ -101,6 +101,31 @@ class IntegratedReceiptPolicyTests(unittest.TestCase):
             self.assertNotEqual(driver.result_exit_code(candidate, require_integrated=True), 0, fault)
 
 
+class ModalSpacingGateTests(unittest.TestCase):
+    def workflow(self, **overrides):
+        workflow = object.__new__(driver.IntegratedWorkflow)
+        workflow.ui = Mock()
+        workflow.ui.execute.return_value = dict(rem=16, headerX=16, headerY=12,
+            bodyX=16, bodyY=16, closeWidth=24, closeHeight=24, **overrides)
+        workflow.check = lambda condition, detail: self.assertTrue(condition, detail)
+        return workflow
+
+    def test_native_computed_spacing_and_hit_target_pass(self):
+        self.workflow().modal_spacing("Settings")
+
+    def test_unlayered_reset_observation_fails(self):
+        workflow = self.workflow()
+        workflow.ui.execute.return_value.update(headerX=0, headerY=0, bodyX=0, bodyY=0)
+        with self.assertRaises(AssertionError):
+            workflow.modal_spacing("Settings")
+
+    def test_collapsed_close_target_fails(self):
+        workflow = self.workflow()
+        workflow.ui.execute.return_value.update(closeWidth=16, closeHeight=16)
+        with self.assertRaises(AssertionError):
+            workflow.modal_spacing("Source viewer")
+
+
 class MemoryProfileSelectionTests(unittest.TestCase):
     def workflow(self, current: str, rendered_text: str = "Memory profile applied"):
         workflow = object.__new__(driver.IntegratedWorkflow)

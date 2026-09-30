@@ -15,7 +15,7 @@ import { useToastStore } from "./stores/toastStore";
 import { useUiStore } from "./stores/uiStore";
 import { useSourceStore } from "./stores/sourceStore";
 import * as api from "./lib/tauri";
-import { onChatToken, onChatStatus, onChatError, onChatCancelled, onChatEvidence, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
+import { onChatStreamEvent, onSourceStatus, onSourcesBatchCreated, onBatchIngestionComplete, onJobCompleted } from "./lib/events";
 import { BookOpen, Database, Search, Sparkles } from "lucide-react";
 
 const SAMPLE_NOTEBOOK_SOURCES = [
@@ -41,7 +41,7 @@ function isHotkeyAllowed(event: KeyboardEvent): boolean {
   if (!isNotebookStoreAvailable(event.target)) return false;
   const editableTag = new Set(["INPUT", "TEXTAREA", "SELECT"]).has(event.target.tagName);
   if (editableTag || event.target.isContentEditable) return false;
-  if (event.defaultPrevented) return false;
+  if (event.defaultPrevented || document.querySelector('[aria-modal="true"]')) return false;
   if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) {
     // continue
   }
@@ -168,76 +168,19 @@ export function App() {
   // Listen for all Tauri events — consolidated cleanup
   useEffect(() => {
     const unlisteners: Promise<VoidFunction>[] = [];
-    const replayThenRehydrate = (notebookId: string, conversationId: string) => {
-      const chatStore = useChatStore.getState();
-      void chatStore
-        .replayChatEvents(notebookId, conversationId)
-        .catch((error) => {
-          console.warn("Failed to replay chat events:", error);
-        })
-        .finally(() => {
-          void useChatStore.getState().rehydrateConversation(notebookId, conversationId);
-        });
-    };
-
-    unlisteners.push(onChatToken((payload) => {
-      const chatStore = useChatStore.getState();
-      if (payload.token) {
-        chatStore.appendToken(
-          payload.notebook_id,
-          payload.conversation_id,
-          payload.message_id,
-          payload.token
-        );
-      }
-      if (payload.done) {
-        void chatStore.finalizeMessage(
-          payload.notebook_id,
-          payload.conversation_id,
-          payload.message_id
-        ).finally(() => replayThenRehydrate(payload.notebook_id, payload.conversation_id));
-      }
-    }));
-
-    unlisteners.push(onChatStatus((payload) => {
-      useChatStore.getState().setStreamingStatus(payload);
-    }));
-
-    unlisteners.push(onChatError((payload) => {
-      const chatStore = useChatStore.getState();
-      chatStore.setStreamingError(
-        payload.notebook_id,
-        payload.conversation_id,
-        payload.message_id,
-        payload.error
-      );
-      replayThenRehydrate(payload.notebook_id, payload.conversation_id);
-      useToastStore.getState().addToast({
-        type: 'error',
-        title: 'Chat Error',
-        message: payload.error,
-        duration: 8000,
-      });
-    }));
-
-    unlisteners.push(onChatCancelled((payload) => {
-      const chatStore = useChatStore.getState();
-      chatStore.handleChatCancelled(
-        payload.notebook_id,
-        payload.conversation_id,
-        payload.message_id,
-        payload.reason
-      );
-      replayThenRehydrate(payload.notebook_id, payload.conversation_id);
-    }));
-
-    unlisteners.push(onChatEvidence((payload) => {
-      useChatStore.getState().attachAssistantEvidence(
-        payload.notebook_id,
-        payload.conversation_id,
-        payload.message_id,
-        { citations: payload.citations, evidence: payload.evidence }
-      );
+    const replayTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    unlisteners.push(onChatStreamEvent((payload) => {
+      const key = `${payload.notebook_id}:${payload.conversation_id}`;
+      if (replayTimers.has(key)) return;
+      replayTimers.set(key, setTimeout(() => {
+        replayTimers.delete(key);
+        void useChatStore.getState().replayChatEvents(payload.notebook_id, payload.conversation_id)
+          .catch((error) => {
+            console.warn("Failed to recover chat events:", error);
+            useToastStore.getState().addToast({ type: 'error', title: 'Chat event recovery failed',
+              message: 'Return to this conversation to retry loading its saved response.', duration: 6000 });
+          });
+      }, 20));
     }));
 
     unlisteners.push(onSourceStatus((payload) => {
@@ -373,7 +316,9 @@ export function App() {
     }));
 
     return () => {
-      unlisteners.forEach(p => p.then(fn => fn()));
+      for (const timer of replayTimers.values()) clearTimeout(timer);
+      replayTimers.clear();
+      unlisteners.forEach(p => { void p.then(fn => fn()).catch(console.warn); });
       // Flush any pending status updates before clearing timers
       if (statusFlushTimerRef.current) {
         clearTimeout(statusFlushTimerRef.current);

@@ -70,7 +70,11 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("notes");
   const layoutRef = useRef<HTMLDivElement>(null);
   const [layoutWidth, setLayoutWidth] = useState(0);
-  const compact = layoutWidth > 0 && layoutWidth < leftWidth + rightWidth + 480;
+  const isCompactWidth = (width: number) => width > 0 && width < leftWidth + rightWidth + 480;
+  const compact = isCompactWidth(layoutWidth);
+  // Native input may arrive before the first ResizeObserver delivery, or
+  // between a resize and its delivery. Decisions must use the live host.
+  const compactNow = () => isCompactWidth(layoutRef.current?.getBoundingClientRect().width ?? layoutWidth);
 
   useEffect(() => {
     const host = layoutRef.current;
@@ -170,14 +174,14 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
           active={!leftCollapsed}
           count={stats?.source_count ?? 0}
           onClick={() => {
-            if (compact && leftCollapsed) setRightCollapsed(true);
+            if (compactNow() && leftCollapsed) setRightCollapsed(true);
             setLeftCollapsed((collapsed) => !collapsed);
           }}
         >
           {leftCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <FileText className="h-4 w-4" />}
         </RailAction>
         <RailAction label="Focus chat message" active={false} onClick={() => {
-          if (compact) { setLeftCollapsed(true); setRightCollapsed(true); }
+          if (compactNow()) { setLeftCollapsed(true); setRightCollapsed(true); }
           document.getElementById("gloss-chat-composer")?.focus();
         }}>
           <MessageSquare className="h-4 w-4" />
@@ -252,7 +256,7 @@ export function PanelLayout({ notebookId }: PanelLayoutProps) {
           active={!rightCollapsed}
           count={notes.length}
           onClick={() => {
-            if (compact && rightCollapsed) setLeftCollapsed(true);
+            if (compactNow() && rightCollapsed) setLeftCollapsed(true);
             setRightCollapsed((collapsed) => !collapsed);
           }}
         >

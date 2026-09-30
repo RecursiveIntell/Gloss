@@ -63,6 +63,7 @@ export interface NotebookPortableManifest {
   notebook_name: string;
   files: PortableFileManifestEntry[];
   manifest_digest: string;
+  projection_policy?: "rebuild_required";
 }
 
 export interface NotebookExportReceipt {
@@ -364,6 +365,7 @@ export interface PromptBudgetReceiptV1 {
   source_passage_count: number;
   prompt_digest: string;
   context_budgeted: boolean;
+  estimated_context_limit_exceeded?: boolean;
   estimated_prompt_tokens: number;
   recorded_at: string;
 }

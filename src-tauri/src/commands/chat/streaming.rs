@@ -172,25 +172,26 @@ pub(crate) async fn stream_chat_response<R: tauri::Runtime>(
     };
     let prompt_budget_receipt = PromptBudgetReceiptV1 {
         model_context_window: num_ctx,
-        system_prompt_chars: request_material.len(),
+        system_prompt_chars: system_prompt.chars().count(),
         message_count: history_msgs.len() + 1,
         source_passage_count: source_context.len(),
         prompt_digest: request_digest.clone(),
-        context_budgeted: num_ctx_result.context_budgeted,
+        context_budgeted: false,
+        estimated_context_limit_exceeded: num_ctx_result.estimated_context_limit_exceeded,
         estimated_prompt_tokens: num_ctx_result.prompt_tokens,
     };
     let prompt_budget_detail = serde_json::to_string(&prompt_budget_receipt).ok();
 
-    // Emit context-budgeted disclosure when prompt exceeds model context window
-    if num_ctx_result.context_budgeted {
+    // This is a limit warning, not an application-side trimming operation.
+    if num_ctx_result.estimated_context_limit_exceeded {
         emit_chat_status(
             app_handle,
             notebook_id,
             conversation_id,
             message_id,
-            "context_budgeted",
+            "context_limit_exceeded",
             &format!(
-                "Prompt (~{} tokens) exceeds model context window ({} tokens). Context was budgeted to fit.",
+                "Estimated prompt plus response budget (~{} tokens) exceeds the configured context limit ({} tokens). Gloss has not trimmed this request; the provider may reject or truncate it.",
                 num_ctx_result.needed, num_ctx
             ),
             Some(provider.provider_type().as_str()),
@@ -602,7 +603,27 @@ pub(crate) async fn stream_chat_response<R: tauri::Runtime>(
             chunks_seen += 1;
         }
 
-        full_response.push_str(&token);
+        // Cancellation wins before a buffered token can cross the byte boundary.
+        if execution_context.is_cancelled() {
+            return Err(GlossError::Other(CHAT_CANCELLED_USER_REQUEST.into()));
+        }
+        if let Err(error) = crate::chat_limits::append_response_token(
+            &mut full_response,
+            &token,
+            provider.provider_type().as_str(),
+        ) {
+            execution_context.cancellation.cancel();
+            receipts::record_chat_attempt_trace(
+                attempt_trace,
+                trace_data_dir,
+                "response_byte_limit",
+                Some(started.elapsed()),
+                Some("Chat response exceeds 8 MiB limit"),
+                Some("response_byte_limit"),
+                |_| {},
+            );
+            return Err(error);
+        }
 
         if done {
             let decision = provider_done_terminal_decision();

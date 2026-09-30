@@ -10,6 +10,7 @@ type StudioGenerationPhase =
   | "first_token_wait"
   | "streaming"
   | "fallback"
+  | "cancelling"
   | "cancelled"
   | "error";
 
@@ -44,6 +45,8 @@ interface StudioStore {
 
 type GenerationEntry = { notebookId: string; attemptId: string; promise: Promise<StudioOutput | null> };
 const generationByNotebook = new Map<string, GenerationEntry>();
+let viewEpoch = 0;
+let exportEpoch = 0;
 
 function newStudioAttemptId(): string {
   const random =
@@ -66,6 +69,8 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
   setActiveOutputId: (id) => set({ activeOutputId: id }),
 
   loadOutputs: async (notebookId) => {
+    const epoch = ++viewEpoch;
+    exportEpoch += 1;
     const existingGeneration = generationByNotebook.get(notebookId);
     set({
       loadedNotebookId: notebookId,
@@ -79,14 +84,14 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     });
     try {
       const outputs = await api.listStudioOutputs(notebookId);
-      if (get().loadedNotebookId !== notebookId) return;
+      if (get().loadedNotebookId !== notebookId || epoch !== viewEpoch) return;
       set(() => ({
         outputs,
         activeOutputId: outputs[0]?.id ?? null,
-        status: "idle",
+        status: get().activeGeneration ? "generating" : "idle",
       }));
     } catch (error) {
-      if (get().loadedNotebookId !== notebookId) return;
+      if (get().loadedNotebookId !== notebookId || epoch !== viewEpoch) return;
       set({
         status: "error",
         error: error instanceof Error ? error.message : String(error),
@@ -100,6 +105,8 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       return existing.promise;
     }
     if (get().loadedNotebookId == null) set({ loadedNotebookId: notebookId });
+    viewEpoch += 1;
+    exportEpoch += 1;
     const attemptId = newStudioAttemptId();
     set({
       status: "generating",
@@ -167,17 +174,27 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
     if (!active || active.notebookId !== notebookId) {
       return false;
     }
-    if (get().loadedNotebookId === notebookId) set({ generationPhase: "cancelled" });
-    return api.cancelStudioGeneration(notebookId, active.attemptId);
+    const owns = () => get().loadedNotebookId === notebookId && get().activeGeneration?.attemptId === active.attemptId;
+    try {
+      const accepted = await api.cancelStudioGeneration(notebookId, active.attemptId);
+      if (accepted && owns()) set({ generationPhase: "cancelling" });
+      return accepted;
+    } catch (error) {
+      if (owns()) set({ error: `Cancellation request failed: ${error instanceof Error ? error.message : String(error)}` });
+      return false; // Keep the generation owner until its real terminal result.
+    }
   },
 
   exportOutput: async (notebookId, outputId) => {
     if (get().loadedNotebookId !== notebookId) return null;
+    const epoch = ++exportEpoch;
+    const view = viewEpoch;
+    const owns = () => get().loadedNotebookId === notebookId && epoch === exportEpoch && view === viewEpoch;
     set({ status: "exporting", error: null });
     try {
       const receipt = await api.exportStudioOutput(notebookId, outputId);
       const outputs = await api.listStudioOutputs(notebookId);
-      if (get().loadedNotebookId !== notebookId) return receipt;
+      if (!owns()) return receipt;
       set({
         outputs,
         activeOutputId: outputId,
@@ -186,6 +203,7 @@ export const useStudioStore = create<StudioStore>((set, get) => ({
       });
       return receipt;
     } catch (error) {
+      if (!owns()) return null;
       set({
         status: "error",
         error: error instanceof Error ? error.message : String(error),

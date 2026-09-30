@@ -118,8 +118,12 @@ jobs:
           retention-days: 14
 
   linux-package:
-    # Build the configured AppImage and replay the extracted package through the
-    # real native driver and owned Ollama models. No signing or publication.
+    # Three planned fresh-runner/profile repetitions, not retry-until-green.
+    # Each retains independent build, package and native model evidence.
+    strategy:
+      fail-fast: false
+      matrix:
+        repetition: [1, 2, 3]
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
@@ -165,7 +169,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: linux-package-${{ github.sha }}
+          name: linux-package-${{ github.sha }}-repetition-${{ matrix.repetition }}-attempt-${{ github.run_attempt }}
           path: .codex-run-receipts/linux-package/
           include-hidden-files: true
           if-no-files-found: error

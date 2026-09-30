@@ -1,4 +1,4 @@
-import { memo, useState, useMemo, useCallback } from "react";
+import { memo, useState, useMemo, useCallback, useRef } from "react";
 import { useSourceStore } from "../../stores/sourceStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -432,53 +432,82 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
     }
   };
 
+  const draftInFlight = useRef(false);
+  const pasteVersion = useRef(0);
+  const urlVersion = useRef(0);
+  const [importingDraft, setImportingDraft] = useState(false);
+
   const handlePaste = async () => {
-    if (!pasteText.trim()) return;
+    if (!pasteText.trim() || draftInFlight.current) return;
+    draftInFlight.current = true;
+    setImportingDraft(true);
+    const version = pasteVersion.current;
     const title = pasteTitle || "Pasted Text";
     const text = pasteText;
     clearOperationError("paste");
     try {
       await addSourcePaste(notebookId, title, text);
-      setPasteTitle("");
-      setPasteText("");
-      setShowPaste(false);
+      if (pasteVersion.current === version) {
+        setPasteTitle("");
+        setPasteText("");
+        setShowPaste(false);
+      }
     } catch (e) {
       const retry = () => addSourcePaste(notebookId, title, text);
       addOperationError("paste", String(e), retry);
+    } finally {
+      draftInFlight.current = false;
+      setImportingDraft(false);
     }
   };
 
   const handleUrlImport = async () => {
     const trimmed = urlInput.trim();
-    if (!trimmed) return;
+    if (!trimmed || draftInFlight.current) return;
+    draftInFlight.current = true;
+    setImportingDraft(true);
+    const version = urlVersion.current;
     const consent = urlConsent;
     clearOperationError("urlImport");
     try {
       await addSourceUrl(notebookId, trimmed, consent);
-      setUrlInput("");
-      setUrlConsent(false);
-      setShowUrl(false);
+      if (urlVersion.current === version) {
+        setUrlInput("");
+        setUrlConsent(false);
+        setShowUrl(false);
+      }
     } catch (e) {
       const retry = () => addSourceUrl(notebookId, trimmed, consent);
       addOperationError("urlImport", String(e), retry);
+    } finally {
+      draftInFlight.current = false;
+      setImportingDraft(false);
     }
   };
 
   const handleYouTubeTranscriptImport = async () => {
     const trimmed = urlInput.trim();
-    if (!trimmed) return;
+    if (!trimmed || draftInFlight.current) return;
+    draftInFlight.current = true;
+    setImportingDraft(true);
+    const version = urlVersion.current;
     const lang = youtubeLanguage.trim() || "en";
     const consent = urlConsent;
     clearOperationError("youtubeImport");
     try {
       await addSourceYouTubeTranscript(notebookId, trimmed, lang, consent);
-      setUrlInput("");
-      setUrlConsent(false);
-      setShowUrl(false);
+      if (urlVersion.current === version) {
+        setUrlInput("");
+        setUrlConsent(false);
+        setShowUrl(false);
+      }
     } catch (e) {
       const retry = () =>
         addSourceYouTubeTranscript(notebookId, trimmed, lang, consent);
       addOperationError("youtubeImport", String(e), retry);
+    } finally {
+      draftInFlight.current = false;
+      setImportingDraft(false);
     }
   };
 
@@ -589,7 +618,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
       onDrop={handleDrop}
     >
       <div className="border-b border-border p-2">
-        <div className="flex gap-1">
+        <div className="flex flex-wrap gap-1">
           <button
             onClick={handleFileUpload}
             className="flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"
@@ -683,6 +712,8 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
                   setRetryingFailed(true);
                   try {
                     await retryFailedSources(notebookId);
+                  } catch {
+                    // The store owns the retry failure toast; consume its rejection.
                   } finally {
                     setRetryingFailed(false);
                   }
@@ -809,19 +840,22 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
           <input
             type="text"
             value={pasteTitle}
-            onChange={(e) => setPasteTitle(e.target.value)}
+            onChange={(e) => { pasteVersion.current += 1; setPasteTitle(e.target.value); }}
             placeholder="Title (optional)"
+            aria-label="Pasted source title"
             className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
           />
           <textarea
             value={pasteText}
-            onChange={(e) => setPasteText(e.target.value)}
+            onChange={(e) => { pasteVersion.current += 1; setPasteText(e.target.value); }}
             placeholder="Paste text here..."
+            aria-label="Source text"
             rows={4}
             className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent resize-none"
           />
           <button
             onClick={handlePaste}
+            disabled={importingDraft}
             className="w-full py-1 text-xs bg-accent text-white rounded hover:bg-accent-hover"
           >
             Add Source
@@ -834,7 +868,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
           <input
             type="url"
             value={urlInput}
-            onChange={(e) => setUrlInput(e.target.value)}
+            onChange={(e) => { urlVersion.current += 1; setUrlInput(e.target.value); }}
             placeholder="https://example.com/article"
             aria-label="URL to import"
             className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
@@ -843,7 +877,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
             <input
               type="checkbox"
               checked={urlConsent}
-              onChange={(e) => setUrlConsent(e.target.checked)}
+              onChange={(e) => { urlVersion.current += 1; setUrlConsent(e.target.checked); }}
               className="mt-0.5"
             />
             <span>Allow this one web fetch. No crawling, credentials, localhost, intranet hosts, video download, or authenticated YouTube access.</span>
@@ -851,21 +885,21 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
           <input
             type="text"
             value={youtubeLanguage}
-            onChange={(e) => setYoutubeLanguage(e.target.value)}
+            onChange={(e) => { urlVersion.current += 1; setYoutubeLanguage(e.target.value); }}
             placeholder="Transcript language, e.g. en"
             aria-label="YouTube transcript language"
             className="w-full px-2 py-1 text-xs bg-bg-tertiary border border-border rounded text-text placeholder:text-text-muted focus:outline-none focus:border-accent"
           />
           <button
             onClick={handleUrlImport}
-            disabled={!urlInput.trim() || !urlConsent}
+            disabled={importingDraft || !urlInput.trim() || !urlConsent}
             className="w-full py-1 text-xs bg-accent text-white rounded hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
           >
             Add URL
           </button>
           <button
             onClick={handleYouTubeTranscriptImport}
-            disabled={!urlInput.trim() || !urlConsent}
+            disabled={importingDraft || !urlInput.trim() || !urlConsent}
             className="w-full py-1 text-xs bg-bg-tertiary border border-border text-text rounded hover:bg-border disabled:cursor-not-allowed disabled:opacity-50"
           >
             Add YouTube Transcript

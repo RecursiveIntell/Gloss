@@ -101,6 +101,63 @@ class IntegratedReceiptPolicyTests(unittest.TestCase):
             self.assertNotEqual(driver.result_exit_code(candidate, require_integrated=True), 0, fault)
 
 
+class SourceToolbarGeometryTests(unittest.TestCase):
+    def test_clipped_import_button_is_rejected(self):
+        workflow = object.__new__(driver.IntegratedWorkflow)
+        workflow.ui = Mock()
+        workflow.ui.find_visible.return_value = None
+        workflow.ui.execute.return_value = [{"label": label, "inside": label != "Video", "reachable": label != "Video"}
+                                           for label in ("Upload", "Folder", "Paste", "URL", "Image", "Video")]
+        workflow.ui.wait.side_effect = lambda condition, **kwargs: condition()
+        workflow.check = lambda condition, detail: self.assertTrue(condition, detail)
+        with self.assertRaises(AssertionError):
+            workflow.source_toolbar_geometry()
+
+    def test_missing_import_button_cannot_pass_geometry(self):
+        workflow = object.__new__(driver.IntegratedWorkflow)
+        workflow.ui = Mock()
+        workflow.ui.execute.return_value = [{"label": "Upload", "inside": True, "reachable": True}]
+        workflow.ui.wait.side_effect = lambda condition, **kwargs: condition()
+        workflow.check = lambda condition, detail: self.assertTrue(condition, detail)
+        with self.assertRaises(AssertionError):
+            workflow.source_toolbar_geometry()
+
+    def test_wrapped_reachable_toolbar_is_accepted(self):
+        workflow = object.__new__(driver.IntegratedWorkflow)
+        workflow.ui = Mock()
+        workflow.ui.find_visible.return_value = None
+        workflow.ui.execute.return_value = [{"label": label, "inside": True, "reachable": True}
+                                           for label in ("Upload", "Folder", "Paste", "URL", "Image", "Video")]
+        workflow.ui.wait.side_effect = lambda condition, **kwargs: condition()
+        workflow.check = lambda condition, detail: self.assertTrue(condition, detail)
+        workflow.source_toolbar_geometry()
+
+
+class ModalSpacingGateTests(unittest.TestCase):
+    def workflow(self, **overrides):
+        workflow = object.__new__(driver.IntegratedWorkflow)
+        workflow.ui = Mock()
+        workflow.ui.execute.return_value = dict(rem=16, headerX=16, headerY=12,
+            bodyX=16, bodyY=16, closeWidth=24, closeHeight=24, **overrides)
+        workflow.check = lambda condition, detail: self.assertTrue(condition, detail)
+        return workflow
+
+    def test_native_computed_spacing_and_hit_target_pass(self):
+        self.workflow().modal_spacing("Settings")
+
+    def test_unlayered_reset_observation_fails(self):
+        workflow = self.workflow()
+        workflow.ui.execute.return_value.update(headerX=0, headerY=0, bodyX=0, bodyY=0)
+        with self.assertRaises(AssertionError):
+            workflow.modal_spacing("Settings")
+
+    def test_collapsed_close_target_fails(self):
+        workflow = self.workflow()
+        workflow.ui.execute.return_value.update(closeWidth=16, closeHeight=16)
+        with self.assertRaises(AssertionError):
+            workflow.modal_spacing("Source viewer")
+
+
 class MemoryProfileSelectionTests(unittest.TestCase):
     def workflow(self, current: str, rendered_text: str = "Memory profile applied"):
         workflow = object.__new__(driver.IntegratedWorkflow)

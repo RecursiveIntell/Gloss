@@ -50,9 +50,10 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
   const activeConversationId = useChatStore((s: ChatStoreState) => s.activeConversationId);
   const messages = useChatStore((s: ChatStoreState) => s.messages);
   const isStreaming = useChatStore((s: ChatStoreState) => s.isStreaming);
-  const streamingContent = useChatStore((s: ChatStoreState) => s.streamingContent);
+  const backgroundStream = useChatStore((s: ChatStoreState) => s.isStreaming && s.streamingNotebookId !== notebookId);
+  const streamingContent = useChatStore((s: ChatStoreState) => s.streamingNotebookId === notebookId ? s.streamingContent : "");
   const streamingError = useChatStore((s: ChatStoreState) => s.streamingError);
-  const streamingStatus = useChatStore((s: ChatStoreState) => s.streamingStatus);
+  const streamingStatus = useChatStore((s: ChatStoreState) => s.streamingNotebookId === notebookId ? s.streamingStatus : null);
   const sendMessage = useChatStore((s: ChatStoreState) => s.sendMessage);
   const stopStreaming = useChatStore((s: ChatStoreState) => s.stopStreaming);
   const createConversation = useChatStore((s: ChatStoreState) => s.createConversation);
@@ -237,7 +238,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
 
   const handleStop = async () => {
     cancelNavigation();
-    await stopStreaming(notebookId);
+    await stopStreaming(useChatStore.getState().streamingNotebookId ?? notebookId);
   };
 
   const handleCopy = async (content: string) => {
@@ -578,7 +579,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             ]
           )}
         >
-          <Virtuoso
+          {/* Initial position is consumed on mount: wait for actual history rows. */}
+          {messages.length > 0 ? <Virtuoso
             key={`${notebookId}:${activeConversationId ?? "new"}`}
             ref={listRef}
             data={messages}
@@ -587,13 +589,15 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             atBottomStateChange={(value) => setBottomState({ notebookId, conversationId: activeConversationId, atBottom: value })}
             totalListHeightChanged={followMeasuredHeight}
             followOutput="auto"
-            initialTopMostItemIndex={Math.max(messages.length - 1, 0)}
+            initialTopMostItemIndex={{ index: "LAST", align: "end" }}
             itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} />}
             components={CHAT_LIST_COMPONENTS}
-          />
+          /> : (isStreaming && !backgroundStream && streamingContent
+            ? <StreamingMessage content={streamingContent} /> : null)}
         </MessageRowContext.Provider>
 
-        {isStreaming && !streamingContent && (
+        {backgroundStream && <p role="status" className="p-3 text-xs text-text-muted">A response is finishing in another notebook. Stop it or wait before sending here.</p>}
+        {isStreaming && !backgroundStream && !streamingContent && (
           <div className="flex w-full justify-start">
             <div role="status" className="gloss-assistant-bubble flex items-center gap-2 px-3 py-2 text-sm text-text-secondary">
               <Loader2 className="w-4 h-4 text-text-muted animate-spin" />
@@ -910,7 +914,7 @@ export function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvi
         {evidence.prompt_budget_receipt && (
           <EvidenceRow
             label="Prompt budget"
-            value={`${evidence.prompt_budget_receipt.estimated_prompt_tokens} est tokens, context budgeted: ${evidence.prompt_budget_receipt.context_budgeted ? "yes" : "no"}`}
+            value={`${evidence.prompt_budget_receipt.estimated_prompt_tokens} est tokens, application trimming: ${evidence.prompt_budget_receipt.context_budgeted ? "reported by older receipt" : "none"}, estimated context limit exceeded: ${evidence.prompt_budget_receipt.estimated_context_limit_exceeded === undefined ? "unknown" : evidence.prompt_budget_receipt.estimated_context_limit_exceeded ? "yes" : "no"}`}
           />
         )}
         {evidence.candidate_backend && (

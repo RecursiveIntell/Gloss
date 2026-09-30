@@ -77,6 +77,8 @@ export function QuizWidget({ output }: { output: StudioOutput }) {
   const [score, setScore] = useState(0);
   const [answered, setAnswered] = useState(0);
   const [done, setDone] = useState(false);
+  const identity = output.id + ":" + output.raw_content;
+  const [previousIdentity, setPreviousIdentity] = useState(identity);
 
   const handleAnswer = useCallback(
     (optionIndex: number) => {
@@ -109,6 +111,12 @@ export function QuizWidget({ output }: { output: StudioOutput }) {
     setAnswered(0);
     setDone(false);
   }, []);
+
+  if (identity !== previousIdentity) {
+    setPreviousIdentity(identity);
+    handleRetry();
+    return null; // React immediately rerenders this newly owned session.
+  }
 
   if (questions.length === 0) {
     return (

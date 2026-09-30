@@ -621,6 +621,76 @@ pub(super) async fn bounded_json_response(
     Ok(body)
 }
 
+/// Model lists share the aggregate JSON byte bound and reject oversized or
+/// malformed registries before cloning strings into persistent model records.
+pub(super) async fn bounded_model_list_response(
+    provider: &str,
+    response: reqwest::Response,
+    array_key: &str,
+    id_key: &str,
+) -> Result<serde_json::Value, GlossError> {
+    let body =
+        bounded_json_response(provider, response, &LlmExecutionContext::uncancellable()).await?;
+    validate_model_list_schema(provider, &body, array_key, id_key)?;
+    Ok(body)
+}
+
+fn validate_model_list_schema(
+    provider: &str,
+    body: &serde_json::Value,
+    array_key: &str,
+    id_key: &str,
+) -> Result<(), GlossError> {
+    const MAX_MODELS: usize = 4096;
+    const MAX_MODEL_STRING_BYTES: usize = 1024;
+    let models = body
+        .get(array_key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| sse::protocol_error(provider, "Model list must contain an array"))?;
+    if models.len() > MAX_MODELS {
+        return Err(sse::protocol_error(
+            provider,
+            "Model list exceeds 4096-model limit",
+        ));
+    }
+    for model in models {
+        let id = model
+            .get(id_key)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                sse::protocol_error(
+                    provider,
+                    "Model list entry is missing its string identifier",
+                )
+            })?;
+        if id.trim().is_empty() || id.len() > MAX_MODEL_STRING_BYTES {
+            return Err(sse::protocol_error(
+                provider,
+                "Model identifier must be nonempty and at most 1024 bytes",
+            ));
+        }
+        for value in [
+            model.get("display_name"),
+            model.get("details").and_then(|v| v.get("parameter_size")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !value.is_string()
+                || value
+                    .as_str()
+                    .is_some_and(|v| v.len() > MAX_MODEL_STRING_BYTES)
+            {
+                return Err(sse::protocol_error(
+                    provider,
+                    "Model metadata strings must be at most 1024 bytes",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read only the bounded diagnostic prefix, and preserve cancellation while a
 /// failing server is still sending its body. Redirects are rejected immediately.
 pub async fn provider_http_failure(
@@ -2229,5 +2299,101 @@ mod tests {
             fixture.abort();
             result.expect("finish_reason is a provider terminal marker");
         }
+    }
+}
+
+#[cfg(test)]
+mod model_list_boundary_tests {
+    use super::*;
+    fn fixture_provider(kind: ProviderType, url: &str) -> Box<dyn LlmProvider> {
+        let client = build_shared_client().unwrap();
+        match kind {
+            ProviderType::Ollama => Box::new(ollama::OllamaProvider::new(url, client)),
+            ProviderType::OpenAI => Box::new(openai::OpenAIProvider::new(url, "fixture", client)),
+            ProviderType::Anthropic => {
+                Box::new(anthropic::AnthropicProvider::new(url, "fixture", client))
+            }
+            ProviderType::LlamaCpp => Box::new(llamacpp::LlamaCppProvider::new(url, client)),
+        }
+    }
+    #[tokio::test]
+    async fn provider_refresh_cannot_invent_models_on_http_or_connection_failure() {
+        for kind in [ProviderType::LlamaCpp, ProviderType::Anthropic] {
+            for status in [
+                "401 Unauthorized",
+                "404 Not Found",
+                "405 Method Not Allowed",
+                "500 Internal Server Error",
+                "302 Found",
+            ] {
+                let (url, fixture) = test_http::respond(
+                    status,
+                    b"fixture failure".to_vec(),
+                    "Location: http://127.0.0.1:1/\r\n",
+                )
+                .await;
+                let error = fixture_provider(kind, &url)
+                    .list_models()
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("HTTP"), "{kind:?}: {error}");
+                fixture.await.unwrap();
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            drop(listener);
+            assert!(fixture_provider(kind, &url).list_models().await.is_err());
+        }
+    }
+    #[tokio::test]
+    async fn actual_model_lists_bound_bytes_and_reject_malformed_schema() {
+        for kind in [
+            ProviderType::LlamaCpp,
+            ProviderType::Anthropic,
+            ProviderType::Ollama,
+            ProviderType::OpenAI,
+        ] {
+            for body in [
+                b"{}".to_vec(),
+                b"{invalid}".to_vec(),
+                vec![b' '; 8 * 1024 * 1024 + 1],
+            ] {
+                let (url, fixture) = test_http::respond("200 OK", body, "").await;
+                assert!(
+                    fixture_provider(kind, &url).list_models().await.is_err(),
+                    "{kind:?}"
+                );
+                fixture.await.unwrap();
+            }
+            let body = if kind == ProviderType::Ollama {
+                br#"{"models":[{"name":"fixture"}]}"#.to_vec()
+            } else {
+                br#"{"data":[{"id":"fixture"}]}"#.to_vec()
+            };
+            let (url, fixture) = test_http::respond("200 OK", body, "").await;
+            assert_eq!(
+                fixture_provider(kind, &url).list_models().await.unwrap()[0].id,
+                "fixture"
+            );
+            fixture.await.unwrap();
+        }
+    }
+    #[test]
+    fn model_schema_bounds_counts_ids_and_metadata() {
+        for body in [
+            serde_json::json!({"data": vec![serde_json::json!({"id":"m"}); 4097]}),
+            serde_json::json!({"data":[{"id":"x".repeat(1025)}]}),
+            serde_json::json!({"data":[{"id":"ok", "display_name":"x".repeat(1025)}]}),
+            serde_json::json!({"data":[{"id":""}]}),
+        ] {
+            assert!(validate_model_list_schema("fixture", &body, "data", "id").is_err());
+        }
+        assert!(validate_model_list_schema(
+            "fixture",
+            &serde_json::json!({"data": []}),
+            "data",
+            "id"
+        )
+        .is_ok());
     }
 }

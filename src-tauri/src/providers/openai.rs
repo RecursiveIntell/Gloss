@@ -186,10 +186,7 @@ impl LlmProvider for OpenAIProvider {
             });
         }
 
-        let body: serde_json::Value = resp.json().await.map_err(|e| GlossError::Provider {
-            provider: "openai".into(),
-            source: e.into(),
-        })?;
+        let body = super::bounded_model_list_response("openai", resp, "data", "id").await?;
 
         let models = body
             .get("data")

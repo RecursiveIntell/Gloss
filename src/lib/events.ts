@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import type {
   ChatTokenPayload,
+  ChatStreamEventV1,
   ChatStatusPayload,
   ChatErrorPayload,
   ChatCancelledPayload,
@@ -11,6 +12,10 @@ import type {
   JobCompletedPayload,
   ChatEvidenceEventPayload,
 } from "./types";
+
+export function onChatStreamEvent(callback: (payload: ChatStreamEventV1) => void): Promise<() => void> {
+  return listen<ChatStreamEventV1>("chat:stream_event", (event) => callback(event.payload));
+}
 
 export function onChatToken(
   callback: (payload: ChatTokenPayload) => void

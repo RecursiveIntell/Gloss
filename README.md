@@ -53,17 +53,17 @@ It is **not** currently a packaged end-user release, a hosted synchronization se
 
 ## What is verified
 
-The evidence states below are deliberately separate:
+Results are tied to the source revision and environment in each receipt.  The table describes the coverage of the [CI workflow](.github/workflows/ci.yml) and [canonical verifier](scripts/verify_release.py); check their results for the exact candidate you are using.
 
 | Surface | State in this snapshot | Boundary |
 | --- | --- | --- |
-| Frontend unit and contract tests | **Verified-executed** | The current canonical verifier runs the complete Vitest and static-contract suites |
-| Frontend production build | **Verified-executed** | `npm run build` passed; Vite emitted a non-blocking chunk-size advisory |
-| Rust default, semantic-memory, and TurboQuant profiles | **Verified-executed** | Cargo checks passed for all three profiles |
-| Rust test matrices | **Verified-executed** | Application, native-owner, and TurboQuant harness tests pass; explicitly environment-dependent live-model tests remain separate |
-| Strict Clippy | **Verified-executed** | `-D warnings` passed for the TurboQuant profile |
-| Dependency policy | **Verified-executed** | Rust advisories/licenses/sources and both production and development npm audits pass for the locked candidate |
-| Tauri debug desktop compile | **Verified-executed** | `npm run verify` built `target/debug/gloss` without bundling |
+| Frontend unit and contract tests | **Automated gate** | The current canonical verifier runs the complete Vitest and static-contract suites |
+| Frontend production build | **Automated gate** | `npm run build` checks TypeScript and builds the frontend; chunk-size advisories are reported separately |
+| Rust default, semantic-memory, and TurboQuant profiles | **Automated gate** | Cargo checks cover all three profiles |
+| Rust test matrices | **Automated gate** | Application, native-owner, and TurboQuant harness tests are required; environment-dependent live-model tests remain separate |
+| Strict Clippy | **Automated gate** | `-D warnings` is required for the TurboQuant profile |
+| Dependency policy | **Automated gate** | Rust advisories/licenses/sources and the production npm audit are required for the locked candidate |
+| Tauri debug desktop compile | **Automated gate** | `npm run verify` compiles the Tauri debug desktop without bundling |
 | Native desktop baseline | **Run-specific** | A real Tauri/WebKit driver is shipped and required in CI; a workflow result applies only to its exact candidate |
 | AppImage packaging | **Run-specific** | The locked builder and extracted-payload replay gate are shipped; this is not a tagged, signed, or installed release |
 | Installed package workflow | **Not release-certified** | Launch/replay evidence does not establish system installation, upgrade, rollback, or distribution signing |
@@ -133,7 +133,9 @@ The following are source-declared paths. They are covered by the repository's bu
 - Isolated notebook directories containing source files, SQLite state, conversations, notes, vector artifacts, and receipts.
 - Source-declared ingestion paths include individual files, folders, pasted text, URLs, public YouTube caption tracks, images, audio, video, and documents.
 - Source lifecycle, extraction/chunking state, background jobs, failed-import review, retry, quarantine, and deletion.
-- Portable `.glosspkg.tar.gz` notebook archives with manifest and per-file SHA-256 validation.
+- Portable `.glosspkg.tar.gz` notebook archives use a consistent SQLite snapshot, including committed WAL data, and verify the complete payload inventory with per-file SHA-256 hashes.
+- Restored notebooks retain canonical content, conversations, notes and citations.  Dense and semantic projections are marked for rebuild rather than reused under a new notebook identity.
+- Notebook deletion removes the registry entry after moving its data to a sibling `.deleted-<notebook-id>` recovery directory.  There is no automatic purge or restore UI; export first when you need a portable backup.
 
 ### Source-grounded chat
 
@@ -157,7 +159,8 @@ Source-level Studio paths define structured outputs and deterministic fallback a
 
 - Provider connectivity and model-list checks.
 - Embedding, dense-index, semantic-memory, and TurboQuant diagnostics.
-- Database doctor checks for source-count drift, orphan rows, failed imports, stale queue jobs, and missing notebook state.
+- Database doctor checks for source-count drift, orphan rows, failed imports, stale queue jobs, and missing notebook state.  Check mode uses read-only connections; repair is a separate action.
+- Startup makes interrupted, unowned imports retryable while retaining their source data and leaving durable queue-owned work alone.
 - Vector-artifact rebuild paths and redacted external-tool receipts.
 
 ## Source and provider boundaries
@@ -283,7 +286,7 @@ The CI workflow runs `npm run verify` on pull requests and pushes to the canonic
 7. production npm audit;
 8. a debug Tauri desktop compile without bundling.
 
-The current local evidence is source/build/test verified. Native desktop, provider/model, package replay, installation, and release remain separately scoped gates.
+The [repair audit and validation record](docs/audits/2026-09-30-hostile-repair.md) records the candidate findings, regressions and remaining limits.  Native desktop, provider/model, package replay, installation and release have separate, source-bound receipts.
 
 ## Repository map
 

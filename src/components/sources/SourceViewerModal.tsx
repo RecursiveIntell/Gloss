@@ -1,3 +1,4 @@
+import { useModalFocus } from "../../lib/useModalFocus";
 import { useEffect, useState } from "react";
 import { X, Loader2, BookMarked, AlertCircle } from "lucide-react";
 import type { Citation, SourceContent } from "../../lib/types";
@@ -16,6 +17,7 @@ export function SourceViewerModal({
   open,
   onClose,
 }: SourceViewerModalProps) {
+  const dialogRef = useModalFocus(open && citation !== null, onClose);
   const [content, setContent] = useState<SourceContent | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -66,7 +68,7 @@ export function SourceViewerModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4">
-      <div className="w-full max-w-3xl max-h-[85vh] overflow-hidden rounded-xl border border-border bg-bg-secondary shadow-2xl">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Source viewer" tabIndex={-1} className="w-full max-w-3xl max-h-[85vh] overflow-hidden rounded-xl border border-border bg-bg-secondary shadow-2xl">
         <div className="flex items-start justify-between gap-4 border-b border-border px-4 py-3">
           <div className="min-w-0">
             <div className="flex items-center gap-2 text-xs text-text-muted">
@@ -79,6 +81,7 @@ export function SourceViewerModal({
           </div>
           <button
             onClick={onClose}
+            aria-label="Close source viewer"
             className="rounded p-1 text-text-muted hover:bg-bg-tertiary hover:text-text"
           >
             <X className="w-4 h-4" />

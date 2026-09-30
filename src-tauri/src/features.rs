@@ -351,6 +351,9 @@ fn unsupported_control(id: &str) -> bool {
 
 pub fn validate_setting_update(app_db: &AppDb, key: &str, value: &str) -> Result<(), GlossError> {
     crate::settings_contract::validate_setting_value(key, value)?;
+    if key == "semantic_memory_search_timeout_ms" {
+        crate::settings_contract::validate_search_timeout_for_current_embedding(app_db, value)?;
+    }
     if key == "memory_backend" && value == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW {
         require_semantic_memory_preview_enabled(app_db)?;
     }

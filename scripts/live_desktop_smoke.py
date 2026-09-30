@@ -632,6 +632,7 @@ class IntegratedWorkflow:
         self.scope_checks: list[dict] = []
         self.default_surfaces: list[dict] = []
         self.conversations: dict[str, str] = {}
+        self.modal_keyboard_checked = False
 
     def check(self, condition: bool, description: str):
         if not condition:
@@ -647,6 +648,20 @@ class IntegratedWorkflow:
     def sources(self):
         if self.ui.find_visible('button[aria-label="Open sources"]'):
             self.ui.click('button[aria-label="Open sources"]')
+
+    def source_toolbar_geometry(self):
+        geometry = self.ui.wait(lambda: self.ui.execute("""const upload=Array.from(document.querySelectorAll('button')).find(e=>e.getClientRects().length && e.textContent.trim()==='Upload');
+if (!upload) return null;
+const toolbar=upload.parentElement, panel=toolbar.closest('.gloss-panel').getBoundingClientRect();
+return Array.from(toolbar.querySelectorAll('button')).filter(e=>e.getClientRects().length).map(e=>{
+ const r=e.getBoundingClientRect(), hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+ return {label:e.textContent.trim(), inside:r.left>=panel.left && r.right<=panel.right && r.top>=panel.top && r.bottom<=panel.bottom,
+ reachable:!!hit && (hit===e || e.contains(hit))};
+});"""), label="visible source import toolbar")
+        self.check({item["label"] for item in geometry} == {"Upload", "Folder", "Paste", "URL", "Image", "Video"},
+                   "fresh-profile source toolbar retains all six configured import controls")
+        self.check(bool(geometry) and all(item["inside"] and item["reachable"] for item in geometry),
+                   f"all rendered source import controls fit and are reachable: {geometry}")
 
     def inspector(self, tab: str):
         if self.ui.find_visible('button[aria-label="Open inspector"]'):
@@ -686,9 +701,39 @@ class IntegratedWorkflow:
         self.ui.wait(lambda: self.ui.find_visible("button:not(:disabled)", notebook), label="notebook after native restart")
         self.activate_notebook(notebook)
 
+    def modal_spacing(self, label: str):
+        # Read the actual compiled CSS in the native WebView, not class strings.
+        metrics = self.ui.execute("""const modal=document.querySelector('[role="dialog"][aria-label="'+arguments[0]+'"]');
+if (!modal) return null;
+const header=getComputedStyle(modal.children[0]), body=getComputedStyle(modal.children[1]);
+const close=modal.children[0].querySelector('button').getBoundingClientRect();
+const rem=parseFloat(getComputedStyle(document.documentElement).fontSize);
+return {rem, headerX:parseFloat(header.paddingLeft), headerY:parseFloat(header.paddingTop),
+bodyX:parseFloat(body.paddingLeft), bodyY:parseFloat(body.paddingTop), closeWidth:close.width, closeHeight:close.height};""", [label])
+        self.check(bool(metrics) and all(abs(metrics[key] - metrics["rem"] * factor) < 0.5
+                   for key, factor in (("headerX", 1), ("headerY", 0.75), ("bodyX", 1), ("bodyY", 1))),
+                   f"{label} compiled utility padding survives reset cascade: {metrics}")
+        self.check(metrics["closeWidth"] >= 24 and metrics["closeHeight"] >= 24,
+                   f"{label} close control retains a 24px hit target")
+
     def settings(self):
         self.ui.click_text("Settings")
         self.ui.wait(lambda: self.ui.find_visible('input[aria-label="Ollama server URL"]'), label="settings dialog")
+        if not self.modal_keyboard_checked:
+            self.modal_spacing("Settings")
+            self.check(self.ui.execute("return document.activeElement?.getAttribute('aria-label')==='Close settings' && !!document.activeElement.closest('[role=dialog][aria-modal=true]')"), "settings enters its named modal focus owner")
+            close = self.ui.find_visible('button[aria-label="Close settings"]')
+            self.ui.call("POST", f"/element/{close[ELEMENT_KEY]}/value", {"text": "\ue008\ue004\ue000"})
+            self.check(self.ui.execute("return !!document.activeElement.closest('[role=dialog][aria-label=Settings]') && document.activeElement.getAttribute('aria-label')!=='Close settings'"), "Shift+Tab stays in settings and wraps from first control")
+            last = self.ui.execute("return document.activeElement")
+            self.ui.call("POST", f"/element/{last[ELEMENT_KEY]}/value", {"text": "\ue004"})
+            self.check(self.ui.execute("return document.activeElement?.getAttribute('aria-label')==='Close settings'"), "Tab wraps back to first settings control")
+            self.ui.call("POST", f"/element/{close[ELEMENT_KEY]}/value", {"text": "\ue00c"})
+            self.ui.wait(lambda: not self.ui.find_visible('[role=dialog][aria-label=Settings]'), label="Escape dismisses settings")
+            self.check(self.ui.execute("return document.activeElement?.textContent.trim()==='Settings'"), "closing settings restores trigger focus")
+            self.modal_keyboard_checked = True
+            self.ui.click_text("Settings")
+            self.ui.wait(lambda: self.ui.find_visible('input[aria-label="Ollama server URL"]'), label="settings reopened after keyboard proof")
 
     def close_settings(self):
         self.ui.click_ref(self.ui.execute("return Array.from(document.querySelectorAll('h2')).find(e=>e.textContent==='Settings').parentElement.querySelector('button')"))
@@ -1005,6 +1050,8 @@ return {at_end, id:button?.getAttribute('aria-controls') || null,
         self.record(self.case_id, "Observed real streamed tokens, stopped through the UI, saw the explicit cancellation alert without a new completed answer, restarted and verified the prior saved answer, then used Edit and rerun for a successful explicit retry.")
 
         self.case_id = "folder_import_scope"
+        self.sources()
+        self.source_toolbar_geometry()
         folder = self.root / "folder-fixture"
         (folder / "facts").mkdir(parents=True)
         (folder / "other").mkdir()
@@ -1028,6 +1075,7 @@ return {at_end, id:button?.getAttribute('aria-controls') || null,
         citation = self.ui.wait(lambda: self.ui.execute("return Array.from(document.querySelectorAll('.gloss-assistant-bubble button')).filter(e=>e.getClientRects().length && e.textContent.includes('facts/atlas.md')).at(-1) || null"), label="Atlas citation button")
         self.ui.click_ref(citation)
         self.ui.wait(lambda: "Source Viewer" in self.ui.text() and "GLACIER-ORBIT-417" in self.ui.text(), label="cited source viewer")
+        self.modal_spacing("Source viewer")
         self.record(self.case_id, "A real scoped model answer cited Atlas, the rendered receipt reported one selected/one excluded source with preserved context, and clicking the citation opened the actual source text.")
         self.ui.click_ref(self.ui.execute("return Array.from(document.querySelectorAll('span')).find(e=>e.textContent==='Source Viewer').parentElement.parentElement.parentElement.querySelector('button')"))
 

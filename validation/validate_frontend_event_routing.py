@@ -6,7 +6,7 @@ root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('.')
 path = root/'src/App.tsx'
 text = path.read_text(encoding='utf-8')
 fail = []
-for event in ['onChatToken', 'onChatStatus', 'onChatError', 'onChatEvidence']:
+for event in ['onChatStreamEvent']:
     # Match both `const unlisten = {event}` and `unlisteners.push({event}`
     pattern_const = f'const unlisten = {event}'
     pattern_push = f'unlisteners.push({event}'
@@ -21,6 +21,11 @@ for event in ['onChatToken', 'onChatStatus', 'onChatError', 'onChatEvidence']:
     store_idx = block.find('useChatStore.getState()')
     if filter_idx != -1 and (store_idx == -1 or filter_idx < store_idx):
         fail.append(f'{event} filters activeNotebookId before chatStore handling')
+for legacy in ['onChatToken', 'onChatStatus', 'onChatError', 'onChatCancelled', 'onChatEvidence']:
+    if f'unlisteners.push({legacy}' in text:
+        fail.append(f'duplicate unsequenced lifecycle mutation path: {legacy}')
+if 'replayChatEvents(payload.notebook_id, payload.conversation_id)' not in text:
+    fail.append('sequenced event notification does not reach canonical replay owner')
 if fail:
     print('FAIL: frontend event routing can drop lifecycle events:')
     print('\n'.join(fail))

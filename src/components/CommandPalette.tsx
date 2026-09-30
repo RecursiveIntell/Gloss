@@ -1,3 +1,4 @@
+import { useModalFocus } from "../lib/useModalFocus";
 import {
   Command,
   CommandEmpty,
@@ -51,6 +52,7 @@ export function CommandPalette({
   onViewNotes,
   onViewStudio,
 }: CommandPaletteProps) {
+  const dialogRef = useModalFocus(open, onClose);
   const run = (action: () => void) => {
     onClose();
     action();
@@ -78,7 +80,7 @@ export function CommandPalette({
       onMouseDown={handleOutsideMouseDown}
       onKeyDown={handleKeyDown}
     >
-      <div className="gloss-command-dialog" onMouseDown={(event) => event.stopPropagation()}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Commands" tabIndex={-1} className="gloss-command-dialog" onMouseDown={(event) => event.stopPropagation()}>
         <Command className="gloss-command-root" shouldFilter>
           <div className="gloss-command-search-row">
             <CommandInput
@@ -97,7 +99,7 @@ export function CommandPalette({
                 onSelect={() => run(onNewChat)}
               >
                 <span className="gloss-command-label">New Chat</span>
-                <span className="gloss-command-meta">{labelForShortcut(shortcutText("N", true))}</span>
+                <span className="gloss-command-meta">{labelForShortcut(shortcutText("N"))}</span>
               </CommandItem>
 
               <CommandItem
@@ -105,7 +107,6 @@ export function CommandPalette({
                 onSelect={() => run(onNewNotebook)}
               >
                 <span className="gloss-command-label">New Notebook</span>
-                <span className="gloss-command-meta">{labelForShortcut(shortcutText("N"))}</span>
               </CommandItem>
 
               <CommandItem

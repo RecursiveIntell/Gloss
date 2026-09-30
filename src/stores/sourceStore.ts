@@ -209,12 +209,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         duration: 3000,
       });
     } catch (e) {
-      useToastStore.getState().addToast({
-        type: 'error',
-        title: 'Import Failed',
-        message: String(e),
-        duration: 5000,
-      });
+      throw e;
     }
   },
 
@@ -230,12 +225,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         duration: 3000,
       });
     } catch (e) {
-      useToastStore.getState().addToast({
-        type: 'error',
-        title: 'Folder Import Failed',
-        message: String(e),
-        duration: 5000,
-      });
+      throw e;
     }
   },
 
@@ -247,12 +237,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       await get().loadSources(notebookId);
       await get().loadStats(notebookId);
     } catch (e) {
-      useToastStore.getState().addToast({
-        type: 'error',
-        title: 'Paste Failed',
-        message: String(e),
-        duration: 5000,
-      });
+      throw e;
     }
   },
 
@@ -270,12 +255,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         duration: 3000,
       });
     } catch (e) {
-      useToastStore.getState().addToast({
-        type: 'error',
-        title: 'URL Import Failed',
-        message: String(e),
-        duration: 6000,
-      });
+      throw e;
     }
   },
 
@@ -293,12 +273,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         duration: 3000,
       });
     } catch (e) {
-      useToastStore.getState().addToast({
-        type: 'error',
-        title: 'YouTube Transcript Import Failed',
-        message: String(e),
-        duration: 6000,
-      });
+      throw e;
     }
   },
 

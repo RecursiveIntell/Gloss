@@ -123,6 +123,8 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
         return "streaming provider output";
       case "fallback":
         return "deterministic fallback returned";
+      case "cancelling":
+        return "cancellation requested";
       case "cancelled":
         return "generation cancelled";
       case "error":
@@ -273,7 +275,7 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
                 {status === "exporting" ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
               </button>
             </div>
-            <StudioOutputBody output={activeOutput} />
+            <StudioOutputBody key={activeOutput.id + ":" + activeOutput.raw_content} output={activeOutput} />
             <div className="border-t border-border px-3 py-1.5 text-[10px] text-text-muted">
               <span className="gloss-mono">sources {activeOutput.source_ids.length}</span>
               {activeOutput.config?.fallback_receipt && (

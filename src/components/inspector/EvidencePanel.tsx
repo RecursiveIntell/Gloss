@@ -18,7 +18,7 @@ export function EvidencePanel() {
     () =>
       [...messages]
         .reverse()
-        .find((m) => m.role === "assistant" && m.citations?.evidence),
+        .find((m) => m.role === "assistant"),
     [messages]
   );
 
@@ -48,6 +48,7 @@ export function EvidencePanel() {
 
   return (
     <div className="p-3 space-y-3 text-xs overflow-y-auto h-full">
+      {isStreaming && <p role="status" className="text-text-muted">Evidence for the previous completed response. Current response is still generating.</p>}
       {/* Retrieval Backend */}
       <Section title="Retrieval Backend">
         <KVRow label="Requested" value={evidence.backend_requested} />

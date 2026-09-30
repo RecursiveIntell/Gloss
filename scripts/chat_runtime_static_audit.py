@@ -28,7 +28,7 @@ def _(repo: Path):
     text = read(repo, "src/App.tsx")
     failures = []
     import re as _re
-    for event in ["onChatToken", "onChatStatus", "onChatError", "onChatEvidence"]:
+    for event in ["onChatStreamEvent"]:
         # Real shape is `unlisteners.push(onChatToken((payload) => { ... }))`
         # inside the listen-all call. Match the call-site (not the import)
         # via `event((payload` so we know we are looking at the handler.
@@ -41,6 +41,9 @@ def _(repo: Path):
         store_idx = block.find("useChatStore.getState()")
         if filter_idx != -1 and (store_idx == -1 or filter_idx < store_idx):
             failures.append(f"{event} filters activeNotebookId before chatStore")
+    for legacy in ["onChatToken", "onChatStatus", "onChatError", "onChatCancelled", "onChatEvidence"]:
+        if f"unlisteners.push({legacy}" in text:
+            failures.append(f"duplicate unsequenced lifecycle path: {legacy}")
     return not failures, "chat lifecycle events forward to chatStore" if not failures else "; ".join(failures)
 
 @check("frontend_has_stream_identity_state")

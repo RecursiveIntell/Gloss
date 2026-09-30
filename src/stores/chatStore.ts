@@ -32,6 +32,7 @@ interface ChatStore {
   pendingMessageIds: Record<string, true>;
   lastChatEventSeq: number;
   replayCursors: Record<string, number>;
+  streamReplayGap: boolean;
   suggestedQuestions: string[];
   style: string;
   customGoal: string;
@@ -61,6 +62,8 @@ interface ChatStore {
 
 // A newer read, send, or context change supersedes an outstanding history read.
 let hydrationEpoch = 0;
+// Live notifications and focus recovery share one serial reader per conversation.
+const replayReads = new Map<string, { again: boolean; promise: Promise<void> }>();
 
 export const useChatStore = create<ChatStore>((set, get) => ({
   conversations: [],
@@ -77,6 +80,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   pendingMessageIds: {},
   lastChatEventSeq: 0,
   replayCursors: {},
+  streamReplayGap: false,
   suggestedQuestions: [],
   style: 'default',
   customGoal: '',
@@ -96,6 +100,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   createConversation: async (notebookId, requestMessageId) => {
+    // Only the reserved first-send owner may create while a stream is active.
+    if (get().isStreaming && requestMessageId !== get().streamingMessageId) {
+      throw new Error('Stop the active response before starting a new chat');
+    }
     const previousConversationId = get().activeConversationId;
     const id = await api.createConversation(notebookId);
     await get().loadConversations(notebookId);
@@ -129,7 +137,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   setActiveConversation: (id) => {
     hydrationEpoch += 1;
-    set({ activeConversationId: id });
+    // Do not project the previous conversation while the new history awaits
+    // hydration. Re-selecting the same owner must preserve optimistic rows.
+    set((state) => ({ activeConversationId: id,
+      messages: state.activeConversationId === id ? state.messages : [],
+    }));
   },
 
   loadMessages: async (notebookId, conversationId) => {
@@ -169,45 +181,64 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   replayChatEvents: async (notebookId, conversationId) => {
     const replayKey = `${notebookId}:${conversationId}`;
-    const afterSeq = get().replayCursors[replayKey] ?? 0;
-    const events = await api.getChatEventsSince(notebookId, conversationId, afterSeq);
-    if (events.length === 0) return;
-    const maxSeq = events.reduce((max, event) => Math.max(max, event.seq), afterSeq);
-    set((state) => ({ replayCursors: { ...state.replayCursors, [replayKey]: maxSeq }, lastChatEventSeq: state.activeConversationId === conversationId && useNotebookStore.getState().activeNotebookId === notebookId ? maxSeq : state.lastChatEventSeq }));
-    for (const event of events) {
-      if (useNotebookStore.getState().activeNotebookId !== notebookId || get().activeConversationId !== conversationId) return;
-      if (event.notebook_id !== notebookId || event.conversation_id !== conversationId) continue;
-      const payload = event.payload as Record<string, unknown>;
-      const messageId = typeof payload.message_id === 'string' ? payload.message_id : event.message_id;
-      if (event.kind === 'token') {
-        const token = typeof payload.token === 'string' ? payload.token : '';
-        if (token) get().appendToken(event.notebook_id, event.conversation_id, messageId, token);
-      } else if (event.kind === 'done') {
-        await get().finalizeMessage(event.notebook_id, event.conversation_id, messageId);
-      } else if (event.kind === 'evidence') {
-        const citations = Array.isArray(payload.citations) ? payload.citations : [];
-        get().attachAssistantEvidence(event.notebook_id, event.conversation_id, messageId, {
-          citations,
-          evidence: payload.evidence as ChatEvidencePayload['evidence'],
-        });
-      } else if (event.kind === 'status') {
-        get().setStreamingStatus(payload as unknown as ChatStatusPayload);
-      } else if (event.kind === 'error') {
-        get().setStreamingError(
-          event.notebook_id,
-          event.conversation_id,
-          messageId,
-          typeof payload.error === 'string' ? payload.error : 'Chat request failed'
-        );
-      } else if (event.kind === 'cancelled') {
-        get().handleChatCancelled(
-          event.notebook_id,
-          event.conversation_id,
-          messageId,
-          typeof payload.reason === 'string' ? payload.reason : 'Chat cancelled'
-        );
-      }
-    }
+    const running = replayReads.get(replayKey);
+    if (running) { running.again = true; return running.promise; }
+    const read = { again: false, promise: Promise.resolve() };
+    read.promise = (async () => {
+      do {
+        read.again = false;
+        const afterSeq = get().replayCursors[replayKey] ?? 0;
+        const events = await api.getChatEventsSince(notebookId, conversationId, afterSeq);
+        for (const event of [...events].sort((a, b) => a.seq - b.seq)) {
+          if (event.notebook_id !== notebookId || event.conversation_id !== conversationId ||
+              !Number.isSafeInteger(event.seq) || event.seq <= (get().replayCursors[replayKey] ?? 0)) continue;
+          const payload = (event.payload && typeof event.payload === 'object' ? event.payload : {}) as Record<string, unknown>;
+          const messageId = event.message_id;
+          // Envelope identity is authoritative; a malformed payload cannot redirect it.
+          if ((typeof payload.message_id === 'string' && payload.message_id !== messageId) ||
+              (typeof payload.notebook_id === 'string' && payload.notebook_id !== notebookId) ||
+              (typeof payload.conversation_id === 'string' && payload.conversation_id !== conversationId)) continue;
+          if (event.kind === 'gap') {
+            if (get().isStreaming && get().streamingNotebookId === notebookId &&
+                (get().streamingStatus?.conversation_id ?? get().activeConversationId) === conversationId) {
+              set({ streamReplayGap: true, streamingContent: '', streamingStatus: {
+                notebook_id: notebookId, conversation_id: conversationId,
+                message_id: get().streamingMessageId ?? '', phase: 'replay_gap',
+                message: 'Live event history was interrupted. Waiting for the saved response; you can still stop generation.',
+                elapsed_ms: 0, truncated: true,
+              } });
+            }
+          } else if (event.kind === 'token') {
+            if (typeof payload.token === 'string') get().appendToken(notebookId, conversationId, messageId, payload.token);
+          } else if (event.kind === 'done') {
+            await get().finalizeMessage(notebookId, conversationId, messageId);
+          } else if (event.kind === 'evidence') {
+            get().attachAssistantEvidence(notebookId, conversationId, messageId, {
+              citations: Array.isArray(payload.citations) ? payload.citations : [],
+              evidence: payload.evidence as ChatEvidencePayload['evidence'],
+            });
+          } else if (event.kind === 'status') {
+            if (!get().streamReplayGap) get().setStreamingStatus(payload as unknown as ChatStatusPayload);
+          } else if (event.kind === 'error') {
+            get().setStreamingError(notebookId, conversationId, messageId,
+              typeof payload.error === 'string' ? payload.error : 'Chat request failed');
+            await get().rehydrateConversation(notebookId, conversationId);
+          } else if (event.kind === 'cancelled') {
+            get().handleChatCancelled(notebookId, conversationId, messageId,
+              typeof payload.reason === 'string' ? payload.reason : 'Chat cancelled');
+            await get().rehydrateConversation(notebookId, conversationId);
+          }
+          // Only applied records advance the cursor; never publish a snapshot maximum first.
+          set((state) => ({
+            replayCursors: { ...state.replayCursors, [replayKey]: Math.max(state.replayCursors[replayKey] ?? 0, event.seq) },
+            lastChatEventSeq: state.activeConversationId === conversationId && useNotebookStore.getState().activeNotebookId === notebookId
+              ? Math.max(state.lastChatEventSeq, event.seq) : state.lastChatEventSeq,
+          }));
+        }
+      } while (read.again);
+    })().finally(() => { if (replayReads.get(replayKey) === read) replayReads.delete(replayKey); });
+    replayReads.set(replayKey, read);
+    return read.promise;
   },
 
   sendMessage: async (notebookId, query, sourceScope, model, historyBeforeUserMessageId) => {
@@ -218,7 +249,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // Reserve the single frontend stream before any asynchronous conversation creation.
     set({
       isStreaming: true, streamingNotebookId: notebookId,
-      streamingMessageId: assistantMessageId, streamingContent: '',
+      streamingMessageId: assistantMessageId, streamingContent: '', streamReplayGap: false,
       preparingMessageId: assistantMessageId,
       streamingError: null, streamingStatus: null,
       pendingMessageIds: { [assistantMessageId]: true }, pendingEvidence: {},
@@ -350,7 +381,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       streamingMessageId,
       pendingMessageIds,
     } = get();
-    if (!isStreaming) return;
+    if (!isStreaming || get().streamReplayGap) return;
     if (streamingNotebookId !== notebookId) return;
     // Accept tokens for the currently-bound streamingMessageId OR any other
     // id we previously registered (covers the case where the backend returned
@@ -402,6 +433,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       streamingContent: '',
       streamingNotebookId: null,
       streamingMessageId: null,
+      streamReplayGap: false,
       streamingError: null,
       streamingStatus: null,
     }));
@@ -426,11 +458,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       pendingMessageIds[messageId];
     if (!accepted) return;
     set((state) => ({
-      streamingError: error,
+      streamingError: useNotebookStore.getState().activeNotebookId === _notebookId ? error : null,
       isStreaming: false,
       streamingContent: get().streamingContent,
       streamingNotebookId: null,
       streamingMessageId: null,
+      streamReplayGap: false,
       pendingEvidence: Object.fromEntries(
         Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
       ),
@@ -456,11 +489,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       pendingMessageIds[messageId];
     if (!accepted) return;
     set((state) => ({
-      streamingError: reason,
+      streamingError: useNotebookStore.getState().activeNotebookId === _notebookId ? reason : null,
       isStreaming: false,
       streamingContent: '',
       streamingNotebookId: null,
       streamingMessageId: null,
+      streamReplayGap: false,
       pendingEvidence: Object.fromEntries(
         Object.entries(state.pendingEvidence).filter(([id]) => id !== messageId)
       ),
@@ -498,7 +532,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       streamingContent: current.isStreaming ? current.streamingContent : '',
       streamingNotebookId: current.isStreaming ? current.streamingNotebookId : null,
       streamingMessageId: current.isStreaming ? current.streamingMessageId : null,
-      streamingError: current.isStreaming ? current.streamingError : null,
+      streamingError: null,
       streamingStatus: current.isStreaming ? current.streamingStatus : null,
       pendingEvidence: current.isStreaming ? current.pendingEvidence : {},
       pendingMessageIds: current.isStreaming ? current.pendingMessageIds : {},

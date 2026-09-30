@@ -120,3 +120,29 @@ describe('notebook activation serializes backend effects', () => {
     expect(useNotebookStore.getState().activationStatus).toBe('idle');
   });
 });
+
+
+describe('failed notebook deletion preserves selection ownership', () => {
+  it('restores its acknowledged active notebook after a failed delete', async () => {
+    vi.mocked(api.setActiveNotebook).mockResolvedValue(undefined);
+    vi.mocked(api.deleteNotebook).mockRejectedValue(new Error('busy'));
+    await expect(useNotebookStore.getState().deleteNotebook('initial')).rejects.toThrow('busy');
+    expect(useNotebookStore.getState().activeNotebookId).toBe('initial');
+    expect(useNotebookStore.getState().activationStatus).toBe('confirmed');
+    expect(vi.mocked(api.setActiveNotebook).mock.calls.map(([id]) => id)).toEqual([null, 'initial']);
+  });
+
+  it('does not restore over a later user selection after deletion fails', async () => {
+    const removal = deferred<void>();
+    vi.mocked(api.setActiveNotebook).mockResolvedValue(undefined);
+    vi.mocked(api.deleteNotebook).mockReturnValue(removal.promise);
+    const deleting = useNotebookStore.getState().deleteNotebook('initial');
+    const rejected = expect(deleting).rejects.toThrow('busy');
+    await vi.waitFor(() => expect(api.deleteNotebook).toHaveBeenCalledOnce());
+    await useNotebookStore.getState().setActive('other');
+    removal.reject(new Error('busy'));
+    await rejected;
+    expect(useNotebookStore.getState().activeNotebookId).toBe('other');
+    expect(vi.mocked(api.setActiveNotebook).mock.calls.map(([id]) => id)).toEqual([null, 'other']);
+  });
+});

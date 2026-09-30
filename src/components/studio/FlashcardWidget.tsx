@@ -65,6 +65,8 @@ export function FlashcardWidget({ output }: { output: StudioOutput }) {
   const [flipped, setFlipped] = useState(false);
   const [ratings, setRatings] = useState<CardState[]>(() => new Array(cards.length).fill(null));
   const [done, setDone] = useState(false);
+  const identity = output.id + ":" + output.raw_content;
+  const [previousIdentity, setPreviousIdentity] = useState(identity);
 
   const knownCount = ratings.filter((r) => r === "known").length;
   const reviewCount = ratings.filter((r) => r === "review").length;
@@ -96,6 +98,12 @@ export function FlashcardWidget({ output }: { output: StudioOutput }) {
     setRatings(new Array(cards.length).fill(null));
     setDone(false);
   }, [cards.length]);
+
+  if (identity !== previousIdentity) {
+    setPreviousIdentity(identity);
+    handleReset();
+    return null; // React immediately rerenders this newly owned session.
+  }
 
   if (cards.length === 0) {
     return (
@@ -172,7 +180,7 @@ export function FlashcardWidget({ output }: { output: StudioOutput }) {
         className="w-full max-w-md cursor-pointer perspective-[800px]"
         onClick={handleFlip}
         onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") handleFlip();
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleFlip(); }
         }}
         role="button"
         tabIndex={0}
@@ -224,6 +232,7 @@ export function FlashcardWidget({ output }: { output: StudioOutput }) {
       >
         <button
           type="button"
+          disabled={!flipped}
           onClick={(e) => {
             e.stopPropagation();
             handleRate("known");
@@ -234,6 +243,7 @@ export function FlashcardWidget({ output }: { output: StudioOutput }) {
         </button>
         <button
           type="button"
+          disabled={!flipped}
           onClick={(e) => {
             e.stopPropagation();
             handleRate("review");

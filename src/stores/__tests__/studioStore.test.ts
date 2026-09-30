@@ -30,6 +30,7 @@ describe("studioStore", () => {
   beforeEach(() => {
     useStudioStore.setState({
       outputs: [],
+      loadedNotebookId: "nb-1",
       activeOutputType: "report",
       activeOutputId: null,
       status: "idle",
@@ -73,7 +74,7 @@ describe("studioStore", () => {
     await expect(useStudioStore.getState().cancelGeneration("nb-1")).resolves.toBe(true);
 
     expect(api.cancelStudioGeneration).toHaveBeenCalledWith("nb-1", "studio-attempt-active");
-    expect(useStudioStore.getState().generationPhase).toBe("cancelled");
+    expect(useStudioStore.getState().generationPhase).toBe("cancelling");
   });
 
   it("keeps notebook generations independent and ignores a late A result after B activation", async () => {
@@ -101,5 +102,17 @@ describe("studioStore", () => {
     await useStudioStore.getState().loadOutputs("nb-b");
     expect(useStudioStore.getState().activeOutputId).toBeNull();
     expect(useStudioStore.getState().lastExportReceipt).toBeNull();
+  });
+});
+
+
+describe("Studio cancellation failure ownership", () => {
+  it("keeps live ownership and consumes failure instead of claiming cancellation", async () => {
+    useStudioStore.setState({loadedNotebookId: "nb-1", status: "generating", generationPhase: "streaming", activeGeneration: {notebookId: "nb-1", attemptId: "attempt", outputType: "summary"}, error: null});
+    vi.mocked(api.cancelStudioGeneration).mockRejectedValueOnce(new Error("transport failed"));
+    await expect(useStudioStore.getState().cancelGeneration("nb-1")).resolves.toBe(false);
+    expect(useStudioStore.getState().generationPhase).toBe("streaming");
+    expect(useStudioStore.getState().activeGeneration?.attemptId).toBe("attempt");
+    expect(useStudioStore.getState().error).toContain("Cancellation request failed");
   });
 });

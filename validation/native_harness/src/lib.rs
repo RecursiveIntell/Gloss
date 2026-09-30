@@ -23,8 +23,16 @@ pub mod memory {
 pub mod retrieval {
     pub use crate::source_scope;
 }
+#[path = "../../../src-tauri/src/db/doctor.rs"]
+pub mod doctor;
+#[path = "../../../src-tauri/src/db/notebook_lifecycle.rs"]
+pub mod notebook_lifecycle;
+#[path = "../../../src-tauri/src/db/portable.rs"]
+pub mod portable;
 pub mod db {
-    pub use crate::{app_db, migrations, notebook_db, notebook_pool};
+    pub use crate::{
+        app_db, doctor, migrations, notebook_db, notebook_lifecycle, notebook_pool, portable,
+    };
 }
 #[path = "../../../src-tauri/src/ingestion/chunk.rs"]
 pub mod chunk;
@@ -49,3 +57,15 @@ pub(crate) use agent_queue as queue_core;
 pub mod queue_policy;
 #[path = "../../../src-tauri/src/queue_task.rs"]
 pub mod queue_task;
+
+#[path = "../../../src-tauri/src/ingestion/embedding_cache.rs"]
+pub mod embedding_cache;
+
+#[path = "../../../src-tauri/src/commands/sources/url_fetch_policy.rs"]
+pub mod url_fetch_policy;
+#[path = "../../../src-tauri/src/commands/chat/prompt_budget.rs"]
+pub mod prompt_budget;
+#[path = "../../../src-tauri/src/chat_limits.rs"]
+pub mod chat_limits;
+#[path = "../../../src-tauri/src/memory/turbo_quant_proof.rs"]
+pub mod turbo_quant_proof;

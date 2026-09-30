@@ -1,3 +1,4 @@
+mod chat_limits;
 mod commands;
 mod db;
 mod error;
@@ -100,6 +101,11 @@ pub fn run_inner() -> tauri::Result<()> {
                 .build();
             let queue =
                 QueueManager::new(config).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+            let recovered_imports = state.recover_interrupted_source_ingestions(&queue)?;
+            if recovered_imports > 0 {
+                tracing::warn!(recovered_imports, "Interrupted imports preserved and made retryable");
+            }
 
             // Prune completed/failed/cancelled jobs older than 7 days to prevent
             // unbounded queue.db growth which slows count_by_status and adds

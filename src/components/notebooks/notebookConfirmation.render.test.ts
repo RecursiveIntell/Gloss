@@ -10,7 +10,7 @@ describe('notebook deletion review surface', () => {
     const html = renderToStaticMarkup(createElement(NotebookDeleteConfirmation, { name: 'Research', sourceCount: 7, pending: false, onConfirm, onCancel }));
     expect(html).toContain('Confirm deletion of notebook Research');
     expect(html).toContain('7 sources, chats and notes');
-    expect(html).toContain('This cannot be undone');
+    expect(html).toContain('Data is retained in a local recovery folder');
     expect(html).toContain('aria-label="Cancel notebook deletion"');
     expect(html).toContain('aria-label="Confirm delete notebook Research"');
     expect(onConfirm).not.toHaveBeenCalled();

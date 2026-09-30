@@ -51,7 +51,7 @@ function render(notebookId = 'nb') {
   fixture.index = 0;
   fixture.effects = [];
   const tree = ChatPanel({ notebookId });
-  if (list(tree).props.ref) list(tree).props.ref.current = { scrollToIndex: scroll };
+  if (list(tree)?.props.ref) list(tree).props.ref.current = { scrollToIndex: scroll };
   return tree;
 }
 function flush() { fixture.effects.forEach((effect) => effect()); }
@@ -84,6 +84,22 @@ beforeEach(() => {
 });
 
 describe('chat latest-message navigation', () => {
+  it('defers list mount until async history exists and opens its actual end', () => {
+    const history = fixture.chat.messages;
+    fixture.chat.messages = [];
+    expect(list(render())).toBeUndefined();
+    fixture.chat.messages = history;
+    expect(list(render()).props.initialTopMostItemIndex).toEqual({ index: 'LAST', align: 'end' });
+  });
+
+  it('does not mount an empty list merely because a request has started', () => {
+    fixture.chat.messages = [];
+    fixture.chat.isStreaming = true;
+    fixture.chat.streamingNotebookId = 'nb';
+    fixture.chat.streamingContent = '';
+    expect(list(render())).toBeUndefined();
+  });
+
   it('uses a real Jump control and waits for the virtualizer acknowledgement', () => {
     let tree = render();
     expect(list(tree).props.atBottomStateChange).toBeTypeOf('function');

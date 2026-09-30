@@ -137,7 +137,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   setActiveConversation: (id) => {
     hydrationEpoch += 1;
-    set({ activeConversationId: id });
+    // Do not project the previous conversation while the new history awaits
+    // hydration. Re-selecting the same owner must preserve optimistic rows.
+    set((state) => ({ activeConversationId: id,
+      messages: state.activeConversationId === id ? state.messages : [],
+    }));
   },
 
   loadMessages: async (notebookId, conversationId) => {

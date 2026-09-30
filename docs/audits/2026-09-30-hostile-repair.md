@@ -48,6 +48,7 @@ an existing user notebook are separate gates.
 | FE-09 | Slow successful import clears newer draft edits | Implemented synchronous in-flight owner and draft versions; callback regression |
 | FE-10 | Unlayered global reset overrides compiled Tailwind utility padding/margins | Found while inspecting first-head native screenshots. Reset moved to base layer; native computed padding and 24px close-hit-target gates added for Settings and Source viewer; final-head execution pending |
 | FE-11 | Focus/rail action before first ResizeObserver uses non-compact cached width and leaves a restored drawer covering chat | Native hit-testing and screenshot confirmed occlusion. Three delayed-observer callback probes fail before repair and pass after live host-width decisions; wide-layout preservation control passes |
+| FE-12 | Empty virtualizer mounts before asynchronous history and opens old rows at the top; changed conversation identity temporarily retains previous rows | Native restart screenshot showed history present but list-end unacknowledged. Deferred nonempty list mount uses LAST/end; identity changes clear rows until canonical hydration, same identity preserves optimistic content. Render/store regressions and existing navigation cancellation gates pass |
 | M1-01 | Recognized legacy-only/sharded cache cannot load | Implemented one read-only resolver for supported paths; HF/legacy, refs, ambiguity, partial/shard/direct-layout tests |
 | M1-02 | Strict TQ admission requires TQ already active | Implemented prospective proof readiness; exact-rerank/generation/digest gates retained |
 | M2-01 | Export copies main SQLite file and loses committed WAL rows | Implemented and isolated native regressions passed; integrated full gate pending |
@@ -165,3 +166,23 @@ the shared owner now requires the canonical backend identity. Its positive
 case now uses `TURBO_QUANT_BACKEND`; an explicit negative case retains rejection
 of the old spelling. The product predicate is unchanged. The failed full-suite
 receipt remains authoritative until the next exact-head full Tauri run passes.
+
+
+At `3633f85`, all three planned package repetitions passed while the native
+debug workflow exposed FE-12 after a Notes restart. Its screenshot showed
+saved history at the top and a visible Jump to latest, not data loss. The
+empty list had mounted before asynchronous history arrived. The follow-up
+mounts the virtualizer when history exists and starts at LAST/end, while
+retaining user-controlled navigation thereafter. Changing conversation clears
+old projected rows immediately; selecting the same identity preserves optimistic
+rows. Three new probes fail on the prior owner, a same-owner control passes,
+and all 189 frontend tests pass after repair. The full native workflow remains
+the decisive regression gate. The map now contains 24 roots.
+
+
+That head's full Tauri tests then passed. Canonical verification stopped at one
+new Clippy lint in portable schema range validation. The equivalent inclusive
+range expression passes the twelve portability owner tests; no lint is disabled
+in the application gate. A populated-history background-stream isolation probe
+also passes. The final frontend rerun has 190 passing tests plus contracts and
+production build; exact-head native/verification/package repetitions must rerun.

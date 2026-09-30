@@ -36,6 +36,26 @@ beforeEach(()=>{
 });
 const tokenEvent = (seq:number, token:string)=>({schema:'ChatStreamEventV1',seq,attempt_id:'msg-1',kind:'token',notebook_id:'nb-1',conversation_id:'conv-1',message_id:'msg-1',payload:{message_id:'msg-1',token}});
 describe('hostile frontend acceptance probes on 66399d3',()=>{
+ it('conversation identity change clears old rows before delayed hydration',async()=>{
+  const old=[{id:'old',conversation_id:'conv-1',role:'assistant',content:'OLD PRIVATE HISTORY'}] as any;
+  useChatStore.setState({messages:old,isStreaming:false});
+  const read=deferred<any[]>();vi.mocked(api.loadMessages).mockReturnValueOnce(read.promise);
+  const pending=useChatStore.getState().rehydrateConversation('nb-1','conv-1');
+  useChatStore.getState().setActiveConversation('conv-2');
+  expect(useChatStore.getState().messages).toEqual([]);
+  read.resolve(old);await pending;
+  expect(useChatStore.getState().activeConversationId).toBe('conv-2');
+  expect(useChatStore.getState().messages).toEqual([]);
+ });
+ it('same conversation selection preserves optimistic rows and stream ownership',()=>{
+  const rows=[{id:'pending',conversation_id:'conv-1',role:'user',content:'UNSAVED OPTIMISTIC TURN'}] as any;
+  useChatStore.setState({messages:rows});
+  useChatStore.getState().setActiveConversation('conv-1');
+  expect(useChatStore.getState().messages).toBe(rows);
+  expect(useChatStore.getState().streamingMessageId).toBe('msg-1');
+  expect(useChatStore.getState().isStreaming).toBe(true);
+ });
+
  it('sequenced replay delivers repeated legitimate tokens once despite duplicate wakeups',async()=>{
   vi.mocked(api.getChatEventsSince).mockResolvedValueOnce([tokenEvent(2,'ha'),tokenEvent(1,'ha')] as any);
   await useChatStore.getState().replayChatEvents('nb-1','conv-1');
@@ -117,6 +137,14 @@ describe('hostile frontend acceptance probes on 66399d3',()=>{
   useChatStore.getState().resetForNotebookSwitch();
   const markup=renderToStaticMarkup(createElement(ChatPanel,{notebookId:'nb-2'}));
   expect(markup).not.toContain('PRIVATE A ANSWER');
+ });
+ it('background A stream is absent from the footer of populated B history',()=>{
+  useNotebookStore.setState({activeNotebookId:'nb-2'});
+  useChatStore.setState({activeConversationId:'conv-b',streamingContent:'PRIVATE A ANSWER',
+    messages:[{id:'b-answer',conversation_id:'conv-b',role:'assistant',content:'B history'}] as any});
+  const markup=renderToStaticMarkup(createElement(ChatPanel,{notebookId:'nb-2'}));
+  expect(markup).not.toContain('PRIVATE A ANSWER');
+  expect(markup).toContain('A response is finishing in another notebook');
  });
  it('positive control: degraded source list cannot block explicit no-retrieval',()=>{
   expect(useSourceStore.getState().getSourceScope()).toEqual({kind:'none'});

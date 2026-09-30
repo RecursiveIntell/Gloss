@@ -579,7 +579,8 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             ]
           )}
         >
-          <Virtuoso
+          {/* Initial position is consumed on mount: wait for actual history rows. */}
+          {messages.length > 0 ? <Virtuoso
             key={`${notebookId}:${activeConversationId ?? "new"}`}
             ref={listRef}
             data={messages}
@@ -588,10 +589,11 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             atBottomStateChange={(value) => setBottomState({ notebookId, conversationId: activeConversationId, atBottom: value })}
             totalListHeightChanged={followMeasuredHeight}
             followOutput="auto"
-            initialTopMostItemIndex={Math.max(messages.length - 1, 0)}
+            initialTopMostItemIndex={{ index: "LAST", align: "end" }}
             itemContent={(_index, msg) => <MessageRow key={msg.id} msg={msg} />}
             components={CHAT_LIST_COMPONENTS}
-          />
+          /> : (isStreaming && !backgroundStream && streamingContent
+            ? <StreamingMessage content={streamingContent} /> : null)}
         </MessageRowContext.Provider>
 
         {backgroundStream && <p role="status" className="p-3 text-xs text-text-muted">A response is finishing in another notebook. Stop it or wait before sending here.</p>}

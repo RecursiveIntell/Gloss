@@ -303,7 +303,8 @@ describe('chatStore', () => {
     older.resolve(staleA);
     await oldLoad;
     expect(useChatStore.getState().activeConversationId).toBe('conv-a');
-    expect(useChatStore.getState().messages).toEqual(currentA);
+    // A new selection has no acknowledged snapshot yet; old A cannot refill it.
+    expect(useChatStore.getState().messages).toEqual([]);
 
     const freshLoad = useChatStore.getState().rehydrateConversation('nb-1', 'conv-a');
     fresh.resolve(freshA);

@@ -395,7 +395,7 @@ fn validate_database(path: &Path) -> Result<(), GlossError> {
     let version = version
         .parse::<i32>()
         .map_err(|_| GlossError::Config("Invalid notebook schema version".into()))?;
-    if version < 1 || version > crate::db::migrations::NOTEBOOK_SCHEMA_VERSION {
+    if !(1..=crate::db::migrations::NOTEBOOK_SCHEMA_VERSION).contains(&version) {
         return Err(GlossError::Config(format!(
             "Unsupported notebook database schema version: {version}"
         )));

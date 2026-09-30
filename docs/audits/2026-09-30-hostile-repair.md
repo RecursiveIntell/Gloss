@@ -47,6 +47,7 @@ an existing user notebook are separate gates.
 | FE-08 | Switching progressed quiz/cards to shorter output crashes | Implemented keyed session and guarded identity reset; callback regressions |
 | FE-09 | Slow successful import clears newer draft edits | Implemented synchronous in-flight owner and draft versions; callback regression |
 | FE-10 | Unlayered global reset overrides compiled Tailwind utility padding/margins | Found while inspecting first-head native screenshots. Reset moved to base layer; native computed padding and 24px close-hit-target gates added for Settings and Source viewer; final-head execution pending |
+| FE-11 | Focus/rail action before first ResizeObserver uses non-compact cached width and leaves a restored drawer covering chat | Native hit-testing and screenshot confirmed occlusion. Three delayed-observer callback probes fail before repair and pass after live host-width decisions; wide-layout preservation control passes |
 | M1-01 | Recognized legacy-only/sharded cache cannot load | Implemented one read-only resolver for supported paths; HF/legacy, refs, ambiguity, partial/shard/direct-layout tests |
 | M1-02 | Strict TQ admission requires TQ already active | Implemented prospective proof readiness; exact-rerank/generation/digest gates retained |
 | M2-01 | Export copies main SQLite file and loses committed WAL rows | Implemented and isolated native regressions passed; integrated full gate pending |
@@ -140,3 +141,18 @@ computed header/body padding and minimum close-control geometry in the actual
 native WebView, in addition to the existing keyboard gate. Driver policy tests
 reject observations with zero padding or collapsed 16px controls; they do not
 substitute for the required final-head native run.
+
+
+At follow-up head `e0b93e0`, native Settings and Source viewer both measured
+16px horizontal/body padding, 12px header vertical padding and 24px close
+controls. The native run then failed restart conversation selection: the
+Sources overlay covered a focused, enabled, in-viewport selector. This failed
+receipt is retained. FE-11 reproduces the delayed-measurement decision race
+with three failing callback probes and a passing wide-layout control; the
+repair uses current host geometry for focus and both drawer-open actions.
+The package run on that same head passed, showing why repeated fresh runs
+matter. There are now 23 remediation roots across the original twelve scopes.
+
+The final package job schedules three independent runner/profile repetitions
+with fail-fast disabled and distinct repetition/attempt artifact names. These
+are planned acceptance repetitions, not automatic retries until green.

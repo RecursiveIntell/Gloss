@@ -156,3 +156,12 @@ matter. There are now 23 remediation roots across the original twelve scopes.
 The final package job schedules three independent runner/profile repetitions
 with fail-fast disabled and distinct repetition/attempt artifact names. These
 are planned acceptance repetitions, not automatic retries until green.
+
+
+The same follow-up's canonical verification passed all three Tauri compile
+configurations, then reached 376 passing full Tauri tests and one failing
+legacy fixture. That fixture called `turbo_quant_sidecar` proven even though
+the shared owner now requires the canonical backend identity. Its positive
+case now uses `TURBO_QUANT_BACKEND`; an explicit negative case retains rejection
+of the old spelling. The product predicate is unchanged. The failed full-suite
+receipt remains authoritative until the next exact-head full Tauri run passes.

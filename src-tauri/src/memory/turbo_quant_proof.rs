@@ -181,6 +181,7 @@ mod readiness_tests {
             |s: &mut VectorArtifactStatus| {
                 s.candidate_backend = Some("unproven_turbo_quant".into())
             },
+            |s: &mut VectorArtifactStatus| s.candidate_backend = Some("turbo_quant_sidecar".into()),
         ] {
             let mut status = ready();
             mutate(&mut status);

@@ -5330,7 +5330,7 @@ mod tests {
         let proven = VectorArtifactStatus {
             compiled_turbo_quant: true,
             runtime_turbo_quant_enabled: true,
-            candidate_backend: Some("turbo_quant_sidecar".into()),
+            candidate_backend: Some(crate::memory::turbo_quant_proof::TURBO_QUANT_BACKEND.into()),
             artifact_generation_id: Some("generation".into()),
             vector_artifact_manifest_digest: Some("manifest".into()),
             vector_artifact_missing_count: 0,
@@ -5341,6 +5341,10 @@ mod tests {
             last_error: None,
         };
         assert!(proven.turbo_quant_effective());
+
+        let mut legacy_backend = proven.clone();
+        legacy_backend.candidate_backend = Some("turbo_quant_sidecar".into());
+        assert!(!legacy_backend.turbo_quant_effective());
 
         let mut only_compiled = proven.clone();
         only_compiled.runtime_turbo_quant_enabled = false;

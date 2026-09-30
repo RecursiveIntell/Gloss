@@ -14,6 +14,7 @@ interface NotebookStore {
   activationTargetId: string | null;
   activationError: string | null;
   loading: boolean;
+  listRequestId: number;
   loadNotebooks: () => Promise<void>;
   createNotebook: (name: string) => Promise<string>;
   renameNotebook: (id: string, name: string) => Promise<void>;
@@ -42,13 +43,17 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
   activationTargetId: null,
   activationError: null,
   loading: false,
+  listRequestId: 0,
 
   loadNotebooks: async () => {
-    set({ loading: true });
+    const listRequestId = get().listRequestId + 1;
+    set({ loading: true, listRequestId });
     try {
       const notebooks = await api.listNotebooks();
+      if (get().listRequestId !== listRequestId) return;
       set({ notebooks, loading: false });
     } catch (e) {
+      if (get().listRequestId !== listRequestId) return;
       console.warn('Failed to load notebooks:', e);
       set({ loading: false });
     }

@@ -1,7 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useSourceStore } from '../sourceStore';
 import { useNotebookStore } from '../notebookStore';
 import * as api from '../../lib/tauri';
+import type { Source } from '../../lib/types';
 
 // Mock the Tauri API layer
 vi.mock('../../lib/tauri', () => ({
@@ -62,6 +63,26 @@ const localStorageMock = (() => {
 vi.stubGlobal('localStorage', localStorageMock);
 
 describe('sourceStore', () => {
+  afterEach(async () => {
+    if (vi.isFakeTimers()) await vi.runOnlyPendingTimersAsync();
+    vi.useRealTimers();
+  });
+  it.each(['toggleSource', 'toggleGroup'] as const)('does not widen explicit scope when %s sees stale selected identities', async (action) => {
+    vi.useFakeTimers();
+    const source = (id: string, title: string) => ({ id, title, selected: false } as Source);
+    useNotebookStore.setState({ activeNotebookId: 'nb-1', activationStatus: 'confirmed' });
+    useSourceStore.setState({ sources: [source('gone', 'old/file'), source('A', 'group/file'), source('C', 'other/file')], selectedSourceIds: new Set(), sourceScopeMode: 'none', sourceListStatus: 'ready' });
+    useSourceStore.getState().toggleSource('gone');
+    // Deletion/refresh can complete before the debounced selection write.
+    vi.mocked(api.listSources).mockResolvedValueOnce([source('A', 'group/file'), source('C', 'other/file')]);
+    await useSourceStore.getState().deleteSource('nb-1', 'gone');
+    expect(useSourceStore.getState().selectedSourceIds.has('gone')).toBe(true);
+    if (action === 'toggleSource') useSourceStore.getState().toggleSource('A');
+    else useSourceStore.getState().toggleGroup('group');
+    expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'explicit', ids: ['gone', 'A'] });
+    await vi.runAllTimersAsync();
+    vi.useRealTimers();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     useSourceStore.setState({

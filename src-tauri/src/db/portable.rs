@@ -344,7 +344,16 @@ pub fn validate_notebook_package(
         }
     }
     validate_database(&package_dir.join("notebook.db"))?;
-    validate_snapshot_sources(package_dir)?;
+    let owned_sources = validate_snapshot_sources(package_dir)?;
+    let packaged_sources = listed
+        .into_iter()
+        .filter(|path| path.starts_with("sources/"))
+        .collect::<HashSet<_>>();
+    if owned_sources != packaged_sources {
+        return Err(GlossError::Config(
+            "Notebook package contains source assets without a canonical source owner".into(),
+        ));
+    }
     Ok(manifest)
 }
 
@@ -409,13 +418,33 @@ fn validate_database(path: &Path) -> Result<(), GlossError> {
 
 fn copy_snapshot_sources(source_dir: &Path, output: &Path) -> Result<(), GlossError> {
     let source_root = source_dir.join("sources");
-    if source_root.exists() {
-        copy_source_tree(&source_root, &output.join("sources"), 0, &mut 0)?;
+    let db = NotebookDb::open_read_only(&output.join("notebook.db"))?;
+    let mut statement = db.conn().prepare(
+        "SELECT DISTINCT file_path FROM sources WHERE file_path IS NOT NULL AND file_path != ''",
+    )?;
+    let paths = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut bytes = 0u64;
+    for (index, path) in paths.enumerate() {
+        let path = path?;
+        if index >= MAX_PORTABLE_ARCHIVE_FILES {
+            return Err(GlossError::Config(
+                "Source asset entry limit exceeded".into(),
+            ));
+        }
+        validate_relative_package_path(&path)?;
+        require_safe_descendant(&source_root, &path)?;
+        let asset = source_root.join(&path);
+        bytes = bytes
+            .checked_add(fs::metadata(&asset)?.len())
+            .filter(|total| *total <= MAX_PORTABLE_ARCHIVE_UNPACKED_BYTES)
+            .ok_or_else(|| GlossError::Config("Source asset byte limit exceeded".into()))?;
+        copy_required_file(&asset, &output.join("sources").join(&path))?;
     }
-    validate_snapshot_sources(output)
+    validate_snapshot_sources(output)?;
+    Ok(())
 }
 
-fn validate_snapshot_sources(output: &Path) -> Result<(), GlossError> {
+fn validate_snapshot_sources(output: &Path) -> Result<HashSet<String>, GlossError> {
     let db = NotebookDb::open_read_only(&output.join("notebook.db"))?;
     let mut stmt = db.conn().prepare(
         "SELECT file_path, file_hash FROM sources WHERE file_path IS NOT NULL AND file_path != ''",
@@ -423,9 +452,11 @@ fn validate_snapshot_sources(output: &Path) -> Result<(), GlossError> {
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
     })?;
+    let mut owned = HashSet::new();
     for row in rows {
         let (relative, expected_hash) = row?;
         validate_relative_package_path(&relative)?;
+        owned.insert(format!("sources/{relative}"));
         require_safe_descendant(&output.join("sources"), &relative)?;
         let to = output.join("sources").join(&relative);
         require_regular_file(&to)?;
@@ -437,38 +468,7 @@ fn validate_snapshot_sources(output: &Path) -> Result<(), GlossError> {
             }
         }
     }
-    Ok(())
-}
-
-fn copy_source_tree(
-    source: &Path,
-    destination: &Path,
-    depth: usize,
-    count: &mut usize,
-) -> Result<(), GlossError> {
-    if depth > 64 {
-        return Err(GlossError::Config(
-            "Source directory nesting limit exceeded".into(),
-        ));
-    }
-    require_regular_directory(source)?;
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        *count += 1;
-        if *count > MAX_PORTABLE_ARCHIVE_FILES {
-            return Err(GlossError::Config(
-                "Source asset entry limit exceeded".into(),
-            ));
-        }
-        let target = destination.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_source_tree(&entry.path(), &target, depth + 1, count)?;
-        } else {
-            copy_required_file(&entry.path(), &target)?;
-        }
-    }
-    Ok(())
+    Ok(owned)
 }
 
 fn require_regular_file(path: &Path) -> Result<(), GlossError> {
@@ -891,7 +891,10 @@ mod tests {
         app_db
             .create_notebook("nb1", "Portable", &notebook_dir.to_string_lossy())
             .unwrap();
-        NotebookDb::open(&notebook_dir.join("notebook.db")).unwrap();
+        NotebookDb::open(&notebook_dir.join("notebook.db"))
+            .unwrap()
+            .insert_source(&source("s1", "source.txt"))
+            .unwrap();
 
         let package_dir = dir.path().join("portable-package");
         export_notebook_package(&app_db, "nb1", &package_dir).unwrap();
@@ -920,7 +923,10 @@ mod tests {
         app_db
             .create_notebook("nb1", "Portable", &notebook_dir.to_string_lossy())
             .unwrap();
-        NotebookDb::open(&notebook_dir.join("notebook.db")).unwrap();
+        NotebookDb::open(&notebook_dir.join("notebook.db"))
+            .unwrap()
+            .insert_source(&source("s1", "source.txt"))
+            .unwrap();
 
         let archive_path = dir.path().join("portable-package.glosspkg.tar.gz");
         let export_receipt = export_notebook_archive(&app_db, "nb1", &archive_path).unwrap();
@@ -968,7 +974,10 @@ mod tests {
         app_db
             .create_notebook("nb1", "Portable", &notebook_dir.to_string_lossy())
             .unwrap();
-        NotebookDb::open(&notebook_dir.join("notebook.db")).unwrap();
+        NotebookDb::open(&notebook_dir.join("notebook.db"))
+            .unwrap()
+            .insert_source(&source("s1", "source.txt"))
+            .unwrap();
 
         let archive_path = dir.path().join("portable-package.glosspkg.tar.gz");
         export_notebook_archive(&app_db, "nb1", &archive_path).unwrap();
@@ -1010,6 +1019,56 @@ mod boundary_regressions {
         assert!(import_notebook_package(app, package, destination, None).is_err());
         assert_eq!(app.list_notebooks().unwrap().len(), before);
         assert!(!destination.exists() || fs::read_dir(destination).unwrap().count() == 0);
+    }
+
+    #[test]
+    fn export_includes_only_assets_owned_by_the_database_snapshot() {
+        let root = tempdir().unwrap();
+        let (app, db, original) = fixture(root.path());
+        fs::create_dir_all(original.join("sources/nested")).unwrap();
+        fs::write(original.join("sources/nested/kept.txt"), "canonical").unwrap();
+        fs::write(
+            original.join("sources/deleted-secret.txt"),
+            "must stay local",
+        )
+        .unwrap();
+        fs::write(original.join("sources/inflight.txt"), "not registered yet").unwrap();
+        db.conn().execute("INSERT INTO sources (id, source_type, title, file_path) VALUES ('kept', 'text', 'Kept', 'nested/kept.txt')", []).unwrap();
+        let package = root.path().join("package");
+        export_notebook_package(&app, "original", &package).unwrap();
+        let manifest = validate_notebook_package(&package).unwrap();
+        assert!(package.join("sources/nested/kept.txt").is_file());
+        assert!(!package.join("sources/deleted-secret.txt").exists());
+        assert!(!package.join("sources/inflight.txt").exists());
+        assert_eq!(
+            manifest
+                .files
+                .iter()
+                .filter(|f| f.path.starts_with("sources/"))
+                .count(),
+            1
+        );
+        assert!(original.join("sources/deleted-secret.txt").exists());
+        let restored =
+            import_notebook_package(&app, &package, &root.path().join("imports"), None).unwrap();
+        assert_eq!(
+            fs::read(Path::new(&restored.imported_notebook_dir).join("sources/nested/kept.txt"))
+                .unwrap(),
+            b"canonical"
+        );
+    }
+
+    #[test]
+    fn a_self_consistent_manifest_cannot_admit_unowned_source_assets() {
+        let root = tempdir().unwrap();
+        let (app, _db, _) = fixture(root.path());
+        let package = root.path().join("package");
+        export_notebook_package(&app, "original", &package).unwrap();
+        fs::write(package.join("sources/unowned.txt"), "unowned").unwrap();
+        rewrite_manifest(&package, |m| {
+            m.files = collect_manifest_files(&package).unwrap()
+        });
+        assert_rejected_without_publication(&app, &package, &root.path().join("imports"));
     }
 
     #[test]

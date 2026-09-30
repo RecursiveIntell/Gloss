@@ -13,6 +13,14 @@ const persistSelectedSourcesPending = new Map<string, string[]>();
 export type SourceListStatus = 'idle' | 'loading' | 'partial' | 'ready' | 'empty' | 'error';
 export type SourceScopeMode = 'none' | 'all' | 'explicit';
 
+function selectionScopeMode(sources: Source[], selected: Set<string>): SourceScopeMode {
+  if (selected.size === 0) return 'none';
+  // Equal cardinality does not imply equal identity after deletion/refresh.
+  // Preserve stale explicit IDs for backend diagnostics; never widen the set.
+  return selected.size === sources.length && sources.every(source => selected.has(source.id))
+    ? 'all' : 'explicit';
+}
+
 function buildSourceScope(
   sources: Source[],
   selectedSourceIds: Set<string>,
@@ -446,8 +454,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       const next = new Set(state.selectedSourceIds);
       if (next.has(sourceId)) next.delete(sourceId);
       else next.add(sourceId);
-      const sourceScopeMode: SourceScopeMode =
-        next.size === 0 ? 'none' : next.size === state.sources.length ? 'all' : 'explicit';
+      const sourceScopeMode = selectionScopeMode(state.sources, next);
       persistSelectedSources(next);
       clearSuggestedQuestions();
       return { selectedSourceIds: next, sourceScopeMode };
@@ -466,8 +473,7 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
         if (allSelected) next.delete(s.id);
         else next.add(s.id);
       }
-      const sourceScopeMode: SourceScopeMode =
-        next.size === 0 ? 'none' : next.size === state.sources.length ? 'all' : 'explicit';
+      const sourceScopeMode = selectionScopeMode(state.sources, next);
       persistSelectedSources(next);
       clearSuggestedQuestions();
       return { selectedSourceIds: next, sourceScopeMode };

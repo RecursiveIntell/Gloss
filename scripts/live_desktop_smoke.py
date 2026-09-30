@@ -470,13 +470,13 @@ class WebDriver:
         })
         self.call("POST", f"/element/{identifier}/value", {"text": "\ue007"})
 
-    def click_when_unobstructed(self, selector: str):
+    def click_when_unobstructed(self, selector: str, text: str | None = None):
         previous_target = None
         scroll_prepared = None
         def ready():
             nonlocal previous_target, scroll_prepared
             observation = self.execute("""const nodes=Array.from(document.querySelectorAll(arguments[0]))
-                .filter(e=>e.getClientRects().length);
+                .filter(e=>e.getClientRects().length && (!arguments[1] || e.textContent.trim()===arguments[1]));
                 if(nodes.length!==1) return {ready:false, matches:nodes.length};
                 const button=nodes[0], r=button.getBoundingClientRect();
                 const left=Math.max(0,r.left), right=Math.min(innerWidth,r.right);
@@ -484,10 +484,11 @@ class WebDriver:
                 const inView=right>left && bottom>top;
                 const hit=inView ? document.elementFromPoint((left+right)/2,(top+bottom)/2) : null;
                 const owned=!!hit && (hit===button || button.contains(hit));
-                const enabled=!button.disabled;
-                return {ready:inView && owned && enabled, button, inView, owned, enabled,
+                const inert=!!button.closest('[inert]');
+                const enabled=!button.disabled && button.getAttribute('aria-disabled')!=='true';
+                return {ready:inView && owned && enabled && !inert, button, inView, owned, enabled, inert,
                     rect:{x:r.x,y:r.y,width:r.width,height:r.height},
-                    hit:hit ? {tag:hit.tagName,label:hit.getAttribute('aria-label'),title:hit.title} : null};""", [selector])
+                    hit:hit ? {tag:hit.tagName,label:hit.getAttribute('aria-label'),title:hit.title} : null};""", [selector, text])
             button = observation.get("button")
             if (button and observation.get("inView") and observation.get("enabled")
                     and not observation.get("owned") and button != scroll_prepared):
@@ -717,7 +718,8 @@ bodyX:parseFloat(body.paddingLeft), bodyY:parseFloat(body.paddingTop), closeWidt
                    f"{label} close control retains a 24px hit target")
 
     def settings(self):
-        self.ui.click_text("Settings")
+        self.ui.wait(lambda: not self.ui.find_visible('[role=dialog][aria-label="Source viewer"]'), label="source viewer closed before settings")
+        self.ui.click_when_unobstructed("button", "Settings")
         self.ui.wait(lambda: self.ui.find_visible('input[aria-label="Ollama server URL"]'), label="settings dialog")
         if not self.modal_keyboard_checked:
             self.modal_spacing("Settings")

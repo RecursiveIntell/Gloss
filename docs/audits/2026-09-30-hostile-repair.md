@@ -186,3 +186,35 @@ range expression passes the twelve portability owner tests; no lint is disabled
 in the application gate. A populated-history background-stream isolation probe
 also passes. The final frontend rerun has 190 passing tests plus contracts and
 production build; exact-head native/verification/package repetitions must rerun.
+
+
+## Final admission and reachability follow-up
+
+At `76ebff4`, all eighteen canonical build/contract gates passed, including
+full Tauri tests, strict application Clippy, dependency policy/audit and native
+compilation. Three package repetitions also passed. A separate native debug
+baseline still failed deleting an empty notebook because a transient runtime
+mutex contention was immediately returned as busy by the new safety guard.
+That failure is retained rather than treated as a flaky success.
+
+Deletion now distinguishes typed pre-mutation admission contention from
+operation failure. It waits at most two seconds for live owners/runtime locks
+to drain, releasing every acquired guard and the pool fence before each async
+wait. Poison/closed gates and any quarantine/registry error are terminal;
+quarantine is never automatically retried. Persistent contention leaves
+canonical rows/files intact. The frontend restores its previously active
+notebook on failure only while it still owns the activation request, preserving
+later user selections. Pool cache removal during admission is a cache effect,
+not a claim of zero side effects. Five actual pool/mutex regressions cover
+transient drain, fence release, persistent no-mutation, one-shot injected
+registry failure and poison. The failed-selection regression fails before its
+repair and passes afterward; the later-selection control remains passing.
+
+The restored spacing also exposed clipped Image/Video controls in the narrow
+Sources drawer. Its import toolbar now wraps, and the native workflow requires
+all six default-enabled import labels plus in-panel bounds and actual hit-test
+ownership. Missing or clipped controls cannot pass the geometry gate.
+
+Local checkpoint: 232 native unit + five integration tests, 8 + 7 locked
+TurboQuant tests, 192 frontend tests/contracts/build, and 128 script tests pass.
+Exact-head canonical/native/three-package verification remains mandatory.

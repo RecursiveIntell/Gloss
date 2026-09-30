@@ -618,7 +618,7 @@ export function SourcesPanel({ notebookId }: SourcesPanelProps) {
       onDrop={handleDrop}
     >
       <div className="border-b border-border p-2">
-        <div className="flex gap-1">
+        <div className="flex flex-wrap gap-1">
           <button
             onClick={handleFileUpload}
             className="flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-secondary hover:bg-border hover:text-text"

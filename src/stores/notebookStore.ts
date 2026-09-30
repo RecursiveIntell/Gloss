@@ -75,10 +75,25 @@ export const useNotebookStore = create<NotebookStore>((set, get) => ({
     const { activeNotebookId } = get();
     // Clear active notebook BEFORE deletion so the backend stops summary jobs
     // and the UI resets immediately (prevents race with summary loop)
+    let clearedRequest: number | null = null;
     if (activeNotebookId === id) {
+      clearedRequest = get().activationRequestId + 1;
       await get().setActive(null);
     }
-    await api.deleteNotebook(id);
+    try {
+      await api.deleteNotebook(id);
+    } catch (error) {
+      const current = get();
+      if (clearedRequest !== null && current.activationRequestId === clearedRequest &&
+          current.activeNotebookId === null && current.activationTargetId === null) {
+        try {
+          await current.setActive(id);
+        } catch (restoreError) {
+          throw new Error(`Deletion failed: ${String(error)}; restoring the active notebook also failed: ${String(restoreError)}`);
+        }
+      }
+      throw error;
+    }
     await get().loadNotebooks();
   },
 

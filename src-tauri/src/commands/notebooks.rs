@@ -1,5 +1,8 @@
 use crate::db::app_db::Notebook;
 use crate::db::doctor::{run_db_doctor, DbDoctorReceipt};
+use crate::db::notebook_pool::{
+    try_lifecycle_lock, wait_for_notebook_admission, NotebookCloseAttempt,
+};
 use crate::db::portable::{
     export_notebook_archive as export_notebook_archive_package, export_notebook_package,
     import_notebook_archive as import_notebook_archive_package, import_notebook_package,
@@ -235,54 +238,63 @@ pub async fn delete_notebook(
         let _ = state.set_active_notebook(None, None);
     }
     jobs::cancel_jobs_matching(&queue, |job, _status| job.notebook_id() == id);
-    let result = state.notebook_pools.with_notebook_closed(&id, || {
-        let busy = || {
-            GlossError::Config(
-                "Notebook work is still draining; retry deletion after it stops".into(),
-            )
-        };
-        let _gpu = state.gpu_gate.try_acquire().map_err(|_| busy())?;
-        let _llm = state.llm_gate.try_acquire().map_err(|_| busy())?;
-        if state
-            .ingestion_active
-            .load(std::sync::atomic::Ordering::SeqCst)
-            != 0
-            || !state
-                .active_chat_attempts
-                .try_lock()
-                .map_err(|_| busy())?
-                .is_empty()
-            || !state
-                .active_studio_attempts
-                .try_lock()
-                .map_err(|_| busy())?
-                .is_empty()
-        {
-            return Err(busy());
-        }
-        let app_db = state.app_db.try_lock().map_err(|_| {
-            GlossError::Config(
-                "Notebook runtime is busy; retry deletion after active work drains".into(),
-            )
-        })?;
-        let mut indices = state.hnsw_indices.try_lock().map_err(|_| {
-            GlossError::Config(
-                "Notebook runtime is busy; retry deletion after active work drains".into(),
-            )
-        })?;
-        let mut dimensions = state.hnsw_index_dims.try_lock().map_err(|_| {
-            GlossError::Config(
-                "Notebook runtime is busy; retry deletion after active work drains".into(),
-            )
-        })?;
-        let projection =
-            crate::memory::semantic_memory_adapter::semantic_memory_base_dir(&state.data_dir, &id);
-        let receipt =
-            crate::db::notebook_lifecycle::quarantine_notebook(&app_db, &id, &projection)?;
-        indices.remove(&id);
-        dimensions.remove(&id);
-        Ok(receipt)
-    });
+    let result = wait_for_notebook_admission(std::time::Duration::from_secs(2), || {
+        state.notebook_pools.with_notebook_closed(&id, || {
+            let _gpu = match state.gpu_gate.try_acquire() {
+                Ok(permit) => permit,
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    return Ok(NotebookCloseAttempt::RetryAdmission)
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(GlossError::Other("GPU gate closed".into()))
+                }
+            };
+            let _llm = match state.llm_gate.try_acquire() {
+                Ok(permit) => permit,
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    return Ok(NotebookCloseAttempt::RetryAdmission)
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(GlossError::Other("LLM gate closed".into()))
+                }
+            };
+            let Some(chat_attempts) = try_lifecycle_lock(&state.active_chat_attempts)? else {
+                return Ok(NotebookCloseAttempt::RetryAdmission);
+            };
+            let Some(studio_attempts) = try_lifecycle_lock(&state.active_studio_attempts)? else {
+                return Ok(NotebookCloseAttempt::RetryAdmission);
+            };
+            if state
+                .ingestion_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != 0
+                || !chat_attempts.is_empty()
+                || !studio_attempts.is_empty()
+            {
+                return Ok(NotebookCloseAttempt::RetryAdmission);
+            }
+            let Some(app_db) = try_lifecycle_lock(&state.app_db)? else {
+                return Ok(NotebookCloseAttempt::RetryAdmission);
+            };
+            let Some(mut indices) = try_lifecycle_lock(&state.hnsw_indices)? else {
+                return Ok(NotebookCloseAttempt::RetryAdmission);
+            };
+            let Some(mut dimensions) = try_lifecycle_lock(&state.hnsw_index_dims)? else {
+                return Ok(NotebookCloseAttempt::RetryAdmission);
+            };
+            // No RetryAdmission is returned after this first canonical mutation.
+            let projection = crate::memory::semantic_memory_adapter::semantic_memory_base_dir(
+                &state.data_dir,
+                &id,
+            );
+            let receipt =
+                crate::db::notebook_lifecycle::quarantine_notebook(&app_db, &id, &projection)?;
+            indices.remove(&id);
+            dimensions.remove(&id);
+            Ok(NotebookCloseAttempt::Complete(receipt))
+        })
+    })
+    .await;
     let receipt = match result {
         Ok(receipt) => receipt,
         Err(error) => {

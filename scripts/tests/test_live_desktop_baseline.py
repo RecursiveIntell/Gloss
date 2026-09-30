@@ -101,6 +101,38 @@ class IntegratedReceiptPolicyTests(unittest.TestCase):
             self.assertNotEqual(driver.result_exit_code(candidate, require_integrated=True), 0, fault)
 
 
+class SourceToolbarGeometryTests(unittest.TestCase):
+    def test_clipped_import_button_is_rejected(self):
+        workflow = object.__new__(driver.IntegratedWorkflow)
+        workflow.ui = Mock()
+        workflow.ui.find_visible.return_value = None
+        workflow.ui.execute.return_value = [{"label": label, "inside": label != "Video", "reachable": label != "Video"}
+                                           for label in ("Upload", "Folder", "Paste", "URL", "Image", "Video")]
+        workflow.ui.wait.side_effect = lambda condition, **kwargs: condition()
+        workflow.check = lambda condition, detail: self.assertTrue(condition, detail)
+        with self.assertRaises(AssertionError):
+            workflow.source_toolbar_geometry()
+
+    def test_missing_import_button_cannot_pass_geometry(self):
+        workflow = object.__new__(driver.IntegratedWorkflow)
+        workflow.ui = Mock()
+        workflow.ui.execute.return_value = [{"label": "Upload", "inside": True, "reachable": True}]
+        workflow.ui.wait.side_effect = lambda condition, **kwargs: condition()
+        workflow.check = lambda condition, detail: self.assertTrue(condition, detail)
+        with self.assertRaises(AssertionError):
+            workflow.source_toolbar_geometry()
+
+    def test_wrapped_reachable_toolbar_is_accepted(self):
+        workflow = object.__new__(driver.IntegratedWorkflow)
+        workflow.ui = Mock()
+        workflow.ui.find_visible.return_value = None
+        workflow.ui.execute.return_value = [{"label": label, "inside": True, "reachable": True}
+                                           for label in ("Upload", "Folder", "Paste", "URL", "Image", "Video")]
+        workflow.ui.wait.side_effect = lambda condition, **kwargs: condition()
+        workflow.check = lambda condition, detail: self.assertTrue(condition, detail)
+        workflow.source_toolbar_geometry()
+
+
 class ModalSpacingGateTests(unittest.TestCase):
     def workflow(self, **overrides):
         workflow = object.__new__(driver.IntegratedWorkflow)

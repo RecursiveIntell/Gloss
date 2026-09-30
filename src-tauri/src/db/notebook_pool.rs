@@ -25,6 +25,44 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// notebook database.  Configurable at pool construction time.
 pub const DEFAULT_MAX_READ_CONNS: usize = 4;
 
+/// Admission contention is not an operation failure and never implies mutation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotebookCloseAttempt<T> {
+    RetryAdmission,
+    Complete(T),
+}
+
+pub fn try_lifecycle_lock<T>(mutex: &Mutex<T>) -> Result<Option<MutexGuard<'_, T>>, GlossError> {
+    match mutex.try_lock() {
+        Ok(guard) => Ok(Some(guard)),
+        Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+        Err(std::sync::TryLockError::Poisoned(error)) => Err(GlossError::Other(error.to_string())),
+    }
+}
+
+/// Only typed pre-mutation contention can retry. All guards from an attempt
+/// must be dropped before this async wait; any operation error is terminal.
+pub async fn wait_for_notebook_admission<T>(
+    budget: std::time::Duration,
+    mut attempt: impl FnMut() -> Result<NotebookCloseAttempt<T>, GlossError>,
+) -> Result<T, GlossError> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match attempt()? {
+            NotebookCloseAttempt::Complete(value) => return Ok(value),
+            NotebookCloseAttempt::RetryAdmission => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(GlossError::Config(
+                        "Notebook is busy; active work did not drain within the deletion wait budget. Retry after it stops".into(),
+                    ));
+                }
+                tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pool
 // ---------------------------------------------------------------------------
@@ -349,27 +387,23 @@ impl NotebookDbPools {
     pub fn with_notebook_closed<T>(
         &self,
         notebook_id: &str,
-        operation: impl FnOnce() -> Result<T, GlossError>,
-    ) -> Result<T, GlossError> {
-        let mut pools = self
-            .pools
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
+        operation: impl FnOnce() -> Result<NotebookCloseAttempt<T>, GlossError>,
+    ) -> Result<NotebookCloseAttempt<T>, GlossError> {
+        let Some(mut pools) = try_lifecycle_lock(&self.pools)? else {
+            return Ok(NotebookCloseAttempt::RetryAdmission);
+        };
         if pools
             .get(notebook_id)
             .is_some_and(|pool| Arc::strong_count(pool) != 1)
         {
-            return Err(GlossError::Config(
-                "Notebook is busy; wait for active work to stop and retry deletion".into(),
-            ));
+            return Ok(NotebookCloseAttempt::RetryAdmission);
         }
-        let mut closed = self
-            .closed
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
+        let Some(mut closed) = try_lifecycle_lock(&self.closed)? else {
+            return Ok(NotebookCloseAttempt::RetryAdmission);
+        };
         pools.remove(notebook_id);
         let result = operation();
-        if result.is_ok() {
+        if matches!(result, Ok(NotebookCloseAttempt::Complete(_))) {
             closed.insert(notebook_id.to_string());
         }
         result
@@ -637,19 +671,22 @@ mod lifecycle_regressions {
         let path = root.path().join("notebook.db");
         let pool = pools.get_or_create("n", || Ok(path.clone())).unwrap();
         let ran = std::cell::Cell::new(false);
-        assert!(pools
-            .with_notebook_closed("n", || {
-                ran.set(true);
-                Ok(())
-            })
-            .is_err());
+        assert!(matches!(
+            pools
+                .with_notebook_closed("n", || {
+                    ran.set(true);
+                    Ok(NotebookCloseAttempt::Complete(()))
+                })
+                .unwrap(),
+            NotebookCloseAttempt::RetryAdmission
+        ));
         assert!(!ran.get());
         assert!(pool.read(|db| db.source_count()).is_ok());
         drop(pool);
         pools
             .with_notebook_closed("n", || {
                 ran.set(true);
-                Ok(())
+                Ok(NotebookCloseAttempt::Complete(()))
             })
             .unwrap();
         assert!(ran.get());
@@ -663,9 +700,9 @@ mod lifecycle_regressions {
         let path = root.path().join("notebook.db");
         drop(pools.get_or_create("n", || Ok(path.clone())).unwrap());
         assert!(pools
-            .with_notebook_closed("n", || Err::<(), _>(GlossError::Other(
-                "injected rename failure".into()
-            )))
+            .with_notebook_closed("n", || Err::<NotebookCloseAttempt<()>, _>(
+                GlossError::Other("injected rename failure".into())
+            ))
             .is_err());
         assert!(pools
             .get_or_create("n", || Ok(path))
@@ -695,12 +732,164 @@ mod lifecycle_regressions {
             })
         };
         barrier.wait();
-        pools.with_notebook_closed("n", || Ok(())).unwrap();
+        assert!(matches!(
+            pools
+                .with_notebook_closed("n", || Ok(NotebookCloseAttempt::Complete(())))
+                .unwrap(),
+            NotebookCloseAttempt::Complete(())
+        ));
         barrier.wait();
         assert!(child.join().unwrap());
         assert!(
             !path.exists(),
             "A stale resolved path must not recreate a deleted DB"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_regressions {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn transient_owner_drains_before_one_lifecycle_mutation() {
+        let root = tempdir().unwrap();
+        let pools = NotebookDbPools::new(root.path());
+        let path = root.path().join("notebook.db");
+        let owner = pools.get_or_create("n", || Ok(path)).unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(owner);
+        });
+        let mutations = Cell::new(0);
+        wait_for_notebook_admission(Duration::from_secs(1), || {
+            pools.with_notebook_closed("n", || {
+                mutations.set(mutations.get() + 1);
+                Ok(NotebookCloseAttempt::Complete(()))
+            })
+        })
+        .await
+        .unwrap();
+        release.await.unwrap();
+        assert_eq!(mutations.get(), 1);
+        assert!(pools
+            .get_or_create("n", || Ok(root.path().join("notebook.db")))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_mutex_contention_releases_fence_before_wait() {
+        let root = tempdir().unwrap();
+        let pools = Arc::new(NotebookDbPools::new(root.path()));
+        let runtime = Arc::new(Mutex::new(()));
+        let held_runtime = runtime.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let holder = std::thread::spawn(move || {
+            let _guard = held_runtime.lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let polls = Cell::new(0);
+        // Releasing an actual runtime lock while admission is pending must not
+        // need the pool fence that the pending attempt previously held.
+        let attempt = wait_for_notebook_admission(Duration::from_secs(1), || {
+            polls.set(polls.get() + 1);
+            pools.with_notebook_closed("n", || {
+                let Some(_guard) = try_lifecycle_lock(&runtime)? else {
+                    return Ok(NotebookCloseAttempt::RetryAdmission);
+                };
+                Ok(NotebookCloseAttempt::Complete(()))
+            })
+        });
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(pools.pools.try_lock().is_ok());
+            assert!(pools.closed.try_lock().is_ok());
+            release_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(attempt, release);
+        holder.join().unwrap();
+        result.unwrap();
+        assert!(polls.get() > 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_owner_times_out_without_registry_or_file_mutation() {
+        use crate::db::notebook_lifecycle::{create_notebook_staged, quarantine_notebook};
+        let root = tempdir().unwrap();
+        let app = crate::db::app_db::AppDb::open(&root.path().join("app.db")).unwrap();
+        let notebooks = root.path().join("notebooks");
+        let id = create_notebook_staged(&app, &notebooks, "Retain me").unwrap();
+        let path = notebooks.join(&id).join("notebook.db");
+        let pools = NotebookDbPools::new(root.path());
+        let owner = pools.get_or_create(&id, || Ok(path.clone())).unwrap();
+        let mutations = Cell::new(0);
+        let result = wait_for_notebook_admission(Duration::from_millis(20), || {
+            pools.with_notebook_closed(&id, || {
+                mutations.set(mutations.get() + 1);
+                quarantine_notebook(&app, &id, &root.path().join("projection"))
+                    .map(NotebookCloseAttempt::Complete)
+            })
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(mutations.get(), 0);
+        assert!(app.get_notebook(&id).is_ok());
+        assert!(path.exists());
+        assert!(owner.read(|db| db.source_count()).is_ok());
+        assert!(!notebooks.join(format!(".deleted-{id}")).exists());
+    }
+
+    #[tokio::test]
+    async fn operation_failure_is_never_retried() {
+        use crate::db::notebook_lifecycle::{create_notebook_staged, quarantine_notebook};
+        let root = tempdir().unwrap();
+        let app = crate::db::app_db::AppDb::open(&root.path().join("app.db")).unwrap();
+        let notebooks = root.path().join("notebooks");
+        let id = create_notebook_staged(&app, &notebooks, "Retain me").unwrap();
+        app.conn().execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON notebooks BEGIN SELECT RAISE(ABORT, 'injected registry failure'); END;").unwrap();
+        let pools = NotebookDbPools::new(root.path());
+        let calls = Cell::new(0);
+        let result = wait_for_notebook_admission(Duration::from_secs(1), || {
+            pools.with_notebook_closed(&id, || {
+                calls.set(calls.get() + 1);
+                quarantine_notebook(&app, &id, &root.path().join("projection"))
+                    .map(NotebookCloseAttempt::Complete)
+            })
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
+        assert!(app.get_notebook(&id).is_ok());
+        assert!(notebooks.join(&id).join("notebook.db").exists());
+        assert!(!notebooks.join(format!(".deleted-{id}")).exists());
+    }
+
+    #[tokio::test]
+    async fn poisoned_runtime_mutex_is_terminal_not_contention() {
+        let mutex = Arc::new(Mutex::new(()));
+        let poison = mutex.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("injected poison");
+        })
+        .join()
+        .is_err());
+        let calls = Cell::new(0);
+        let result = wait_for_notebook_admission(Duration::from_secs(1), || {
+            calls.set(calls.get() + 1);
+            let Some(_guard) = try_lifecycle_lock(&mutex)? else {
+                return Ok(NotebookCloseAttempt::RetryAdmission);
+            };
+            Ok(NotebookCloseAttempt::Complete(()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
     }
 }

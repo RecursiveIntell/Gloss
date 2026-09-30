@@ -649,6 +649,20 @@ class IntegratedWorkflow:
         if self.ui.find_visible('button[aria-label="Open sources"]'):
             self.ui.click('button[aria-label="Open sources"]')
 
+    def source_toolbar_geometry(self):
+        geometry = self.ui.wait(lambda: self.ui.execute("""const upload=Array.from(document.querySelectorAll('button')).find(e=>e.getClientRects().length && e.textContent.trim()==='Upload');
+if (!upload) return null;
+const toolbar=upload.parentElement, panel=toolbar.closest('.gloss-panel').getBoundingClientRect();
+return Array.from(toolbar.querySelectorAll('button')).filter(e=>e.getClientRects().length).map(e=>{
+ const r=e.getBoundingClientRect(), hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+ return {label:e.textContent.trim(), inside:r.left>=panel.left && r.right<=panel.right && r.top>=panel.top && r.bottom<=panel.bottom,
+ reachable:!!hit && (hit===e || e.contains(hit))};
+});"""), label="visible source import toolbar")
+        self.check({item["label"] for item in geometry} == {"Upload", "Folder", "Paste", "URL", "Image", "Video"},
+                   "fresh-profile source toolbar retains all six configured import controls")
+        self.check(bool(geometry) and all(item["inside"] and item["reachable"] for item in geometry),
+                   f"all rendered source import controls fit and are reachable: {geometry}")
+
     def inspector(self, tab: str):
         if self.ui.find_visible('button[aria-label="Open inspector"]'):
             self.ui.click_when_unobstructed('button[aria-label="Open inspector"]')
@@ -1036,6 +1050,8 @@ return {at_end, id:button?.getAttribute('aria-controls') || null,
         self.record(self.case_id, "Observed real streamed tokens, stopped through the UI, saw the explicit cancellation alert without a new completed answer, restarted and verified the prior saved answer, then used Edit and rerun for a successful explicit retry.")
 
         self.case_id = "folder_import_scope"
+        self.sources()
+        self.source_toolbar_geometry()
         folder = self.root / "folder-fixture"
         (folder / "facts").mkdir(parents=True)
         (folder / "other").mkdir()

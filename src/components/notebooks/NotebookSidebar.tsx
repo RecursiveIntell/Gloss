@@ -376,7 +376,7 @@ export function NotebookDeleteConfirmation({ name, sourceCount, pending, disable
 }) {
   return <div role="group" aria-label={`Confirm deletion of notebook ${name}`} className="mt-2 space-y-2 rounded border border-error/40 bg-error/5 p-2"
     onKeyDown={(event) => { if (event.key === "Escape" && !disabled) { event.preventDefault(); onCancel(); } }}>
-    <p className="break-words text-xs text-text-secondary">Delete “{name}” and its {sourceCount} sources, chats and notes? This cannot be undone. Export it first if you need a backup.</p>
+    <p className="break-words text-xs text-text-secondary">Delete “{name}” and its {sourceCount} sources, chats and notes? It will leave this list. Data is retained in a local recovery folder; export first for a portable backup.</p>
     <div className="flex flex-wrap gap-2">
       <button type="button" onClick={onCancel} disabled={disabled} autoFocus aria-label="Cancel notebook deletion"
         className="rounded border border-border px-2 py-1 text-xs text-text-secondary disabled:opacity-50">Cancel</button>

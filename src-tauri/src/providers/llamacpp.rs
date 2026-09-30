@@ -30,47 +30,42 @@ impl LlamaCppProvider {
 impl LlmProvider for LlamaCppProvider {
     async fn list_models(&self) -> Result<Vec<ModelInfo>, GlossError> {
         let url = format!("{}/models", self.base_url);
-        let resp = self.client.get(&url).send().await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                let body: serde_json::Value = r.json().await.map_err(|e| GlossError::Provider {
-                    provider: "llamacpp".into(),
-                    source: e.into(),
-                })?;
-
-                let models = body
-                    .get("data")
-                    .and_then(|d| d.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| {
-                                let id = m.get("id")?.as_str()?.to_string();
-                                Some(ModelInfo {
-                                    display_name: id.clone(),
-                                    id,
-                                    provider: ProviderType::LlamaCpp,
-                                    parameter_size: None,
-                                    context_window: None,
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                Ok(models)
-            }
-            _ => {
-                // Older llama.cpp versions may not support /models — return placeholder
-                Ok(vec![ModelInfo {
-                    id: "llama.cpp-loaded-model".into(),
-                    display_name: "llama.cpp (loaded model)".into(),
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|error| GlossError::Provider {
+                provider: "llamacpp".into(),
+                source: error.into(),
+            })?;
+        if !resp.status().is_success() {
+            return Err(provider_http_failure(
+                "llamacpp",
+                resp,
+                &LlmExecutionContext::uncancellable(),
+            )
+            .await);
+        }
+        let body = super::bounded_model_list_response("llamacpp", resp, "data", "id").await?;
+        Ok(body["data"]
+            .as_array()
+            .expect("validated model array")
+            .iter()
+            .map(|model| {
+                let id = model["id"]
+                    .as_str()
+                    .expect("validated model identifier")
+                    .to_string();
+                ModelInfo {
+                    display_name: id.clone(),
+                    id,
                     provider: ProviderType::LlamaCpp,
                     parameter_size: None,
                     context_window: None,
-                }])
-            }
-        }
+                }
+            })
+            .collect())
     }
 
     async fn chat(

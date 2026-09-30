@@ -49,6 +49,11 @@ describe('chatStore', () => {
       streamingStatus: null,
       pendingEvidence: {},
       conversations: [],
+      replayCursors: {},
+      lastChatEventSeq: 0,
+      streamReplayGap: false,
+      pendingMessageIds: {},
+      preparingMessageId: null,
       activeConversationId: null,
       suggestedQuestions: [],
     });

@@ -3,14 +3,13 @@ use crate::{db::app_db::AppDb, error::GlossError, providers};
 use serde::Deserialize;
 
 pub const DEFAULT_SEMANTIC_SEARCH_TIMEOUT_MS: u64 = 60_000;
-pub const MAX_SEMANTIC_SEARCH_TIMEOUT_MS: u64 = 300_000;
+pub const MAX_SEMANTIC_SEARCH_TIMEOUT_MS: u64 = 305_000;
 const SEMANTIC_SEARCH_TIMEOUT_GRACE_MS: u64 = 5_000;
 
 pub fn minimum_semantic_search_timeout_ms(embedding_timeout_secs: u64) -> u64 {
     embedding_timeout_secs
         .saturating_mul(1_000)
         .saturating_add(SEMANTIC_SEARCH_TIMEOUT_GRACE_MS)
-        .min(MAX_SEMANTIC_SEARCH_TIMEOUT_MS)
 }
 
 pub fn proven_semantic_search_timeout_ms(
@@ -142,6 +141,44 @@ pub fn save_embedding_settings(db: &AppDb, config: &EmbeddingSettings) -> Result
     Ok(identity_changed)
 }
 
+/// Validate scalar search writes against the same persisted embedding snapshot.
+/// Call while holding the app-db owner lock, before the write.
+pub fn validate_search_timeout_for_current_embedding(
+    db: &AppDb,
+    value: &str,
+) -> Result<(), GlossError> {
+    validate_setting_value("semantic_memory_search_timeout_ms", value)?;
+    if db
+        .get_setting("semantic_memory_embedding_provider")?
+        .as_deref()
+        == Some("ollama")
+    {
+        let timeout = db
+            .get_setting("semantic_memory_embedding_timeout_secs")?
+            .unwrap_or_else(|| "10".into());
+        validate_setting_value("semantic_memory_embedding_timeout_secs", &timeout)?;
+        let minimum =
+            minimum_semantic_search_timeout_ms(timeout.parse::<u64>().expect("validated timeout"));
+        if value.parse::<u64>().expect("validated timeout") < minimum {
+            return Err(GlossError::Config(format!("semantic_memory_search_timeout_ms must allow embedding timeout plus retrieval overhead (minimum {minimum} ms); reapply embedding settings")));
+        }
+    }
+    Ok(())
+}
+
+/// Independent writes would bypass the embedding/search cross-field invariant.
+pub fn requires_atomic_embedding_update(key: &str) -> bool {
+    matches!(
+        key,
+        "semantic_memory_embedding_provider"
+            | "semantic_memory_embedding_url"
+            | "semantic_memory_embedding_model"
+            | "semantic_memory_embedding_timeout_secs"
+            | "semantic_memory_search_timeout_ms"
+            | "fastembed_download_consent"
+    )
+}
+
 pub fn validate_setting_value(key: &str, value: &str) -> Result<(), GlossError> {
     let invalid = || GlossError::Config(format!("Invalid value for {key}"));
     let integer = |min: u64, max: u64| -> Result<(), GlossError> {
@@ -174,7 +211,7 @@ pub fn validate_setting_value(key: &str, value: &str) -> Result<(), GlossError> 
         }
         "semantic_memory_embedding_model" => Err(invalid()),
         "semantic_memory_embedding_timeout_secs" => integer(2, 300),
-        "semantic_memory_search_timeout_ms" => integer(100, 300_000),
+        "semantic_memory_search_timeout_ms" => integer(100, MAX_SEMANTIC_SEARCH_TIMEOUT_MS),
         "chunk_target_tokens" => integer(100, 3000),
         "generation_temperature" => number(0.0, 2.0),
         "generation_top_p" | "generation_min_p" => {
@@ -403,5 +440,82 @@ mod tests {
             proven_semantic_search_timeout_ms(8_000, 300, 300_000, true),
             MAX_SEMANTIC_SEARCH_TIMEOUT_MS
         );
+    }
+}
+
+#[cfg(test)]
+mod timeout_boundary_tests {
+    use super::*;
+    #[test]
+    fn all_accepted_embedding_timeouts_have_unclipped_grace_and_atomic_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let db = AppDb::open(&path).unwrap();
+        for secs in [2, 60, 295, 296, 299, 300] {
+            let minimum = secs * 1000 + 5000;
+            assert_eq!(minimum_semantic_search_timeout_ms(secs), minimum);
+            let mut settings = EmbeddingSettings {
+                provider: "ollama".into(),
+                url: "http://localhost:11434".into(),
+                model: "fixture".into(),
+                timeout_secs: secs,
+                download_consent: false,
+                search_timeout_ms: minimum,
+                chunk_target_tokens: 1100,
+            };
+            save_embedding_settings(&db, &settings).unwrap();
+            assert!(crate::features::validate_setting_update(
+                &db,
+                "semantic_memory_search_timeout_ms",
+                &minimum.to_string()
+            )
+            .is_ok());
+            assert!(crate::features::validate_setting_update(
+                &db,
+                "semantic_memory_search_timeout_ms",
+                &(minimum - 1).to_string()
+            )
+            .is_err());
+            settings.search_timeout_ms -= 1;
+            settings.model = "must-not-persist".into();
+            assert!(save_embedding_settings(&db, &settings).is_err());
+            assert_eq!(
+                db.get_setting("semantic_memory_embedding_model")
+                    .unwrap()
+                    .as_deref(),
+                Some("fixture")
+            );
+            assert_eq!(
+                db.get_setting("semantic_memory_search_timeout_ms").unwrap(),
+                Some(minimum.to_string())
+            );
+        }
+        drop(db);
+        let db = AppDb::open(&path).unwrap();
+        assert_eq!(
+            db.get_setting("semantic_memory_search_timeout_ms")
+                .unwrap()
+                .as_deref(),
+            Some("305000")
+        );
+        assert!(requires_atomic_embedding_update(
+            "semantic_memory_search_timeout_ms"
+        ));
+        assert!(validate_setting_value("semantic_memory_search_timeout_ms", "305001").is_err());
+    }
+    #[test]
+    fn local_embeddings_do_not_inherit_remote_timeout_coupling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AppDb::open(&dir.path().join("app.db")).unwrap();
+        let settings = EmbeddingSettings {
+            provider: "fastembed".into(),
+            url: "".into(),
+            model: "".into(),
+            timeout_secs: 300,
+            download_consent: false,
+            search_timeout_ms: 100,
+            chunk_target_tokens: 1100,
+        };
+        save_embedding_settings(&db, &settings).unwrap();
     }
 }

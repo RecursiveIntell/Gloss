@@ -18,8 +18,6 @@ use tauri::AppHandle;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-const CHAT_STREAM_REPLAY_CAPACITY: usize = 4096;
-
 /// Release builds keep native dense indexing enabled. Ingestion still runs
 /// through bounded single-source work and the GPU gate so fallback/degradation
 /// is visible instead of silently skipping dense vectors.
@@ -288,7 +286,8 @@ pub struct AppState {
     /// Bounded replay buffer for chat transport events. The database remains
     /// the source of truth for messages; this buffer only lets the frontend
     /// recover recent missed stream/status/terminal events after listener loss.
-    pub chat_stream_events: Mutex<VecDeque<crate::commands::chat::ChatStreamEventV1>>,
+    pub chat_stream_events:
+        Mutex<crate::chat_limits::ReplayBuffer<crate::commands::chat::ChatStreamEventV1>>,
     pub chat_stream_next_seq: AtomicU64,
 }
 
@@ -382,6 +381,54 @@ impl AppState {
         }
 
         Ok(())
+    }
+
+    /// Call once after durable queue load and before starting any ingestion worker.
+    pub fn recover_interrupted_source_ingestions(
+        &self,
+        queue: &tauri_queue::QueueManager,
+    ) -> Result<usize, GlossError> {
+        let jobs = queue.list_jobs_with_data().map_err(|error| {
+            GlossError::Other(format!(
+                "Cannot inspect durable ingestion ownership: {error}"
+            ))
+        })?;
+        let mut queued =
+            std::collections::HashMap::<String, std::collections::HashSet<String>>::new();
+        for (_, status, data) in jobs {
+            if !matches!(status.as_str(), "pending" | "processing") {
+                continue;
+            }
+            if let Ok(job) = serde_json::from_str::<crate::jobs::GlossJob>(&data) {
+                if !matches!(job, crate::jobs::GlossJob::SummarizeSource { .. }) {
+                    queued
+                        .entry(job.notebook_id().to_string())
+                        .or_default()
+                        .insert(job.source_id().to_string());
+                }
+            }
+        }
+        let notebooks = self
+            .app_db
+            .lock()
+            .map_err(|error| GlossError::Other(error.to_string()))?
+            .list_notebooks()?;
+        let mut recovered = 0;
+        for notebook in notebooks {
+            let path = PathBuf::from(&notebook.directory).join("notebook.db");
+            if !path.is_file() {
+                continue;
+            }
+            let owners = queued.remove(&notebook.id).unwrap_or_default();
+            match NotebookDb::connect(&path)
+                .and_then(|db| db.recover_interrupted_ingestions(&owners))
+            {
+                Ok(count) => recovered += count,
+                Err(error) => tracing::error!(notebook_id = %notebook.id, error = %error,
+                    "Interrupted import recovery failed; notebook data retained for diagnosis"),
+            }
+        }
+        Ok(recovered)
     }
 
     fn recover_interrupted_chat_attempts(app_db: &AppDb) -> Result<usize, GlossError> {
@@ -549,7 +596,7 @@ impl AppState {
                     .unwrap_or_default()
                     .as_millis() as u64,
             ),
-            chat_stream_events: Mutex::new(VecDeque::new()),
+            chat_stream_events: Mutex::new(crate::chat_limits::ReplayBuffer::default()),
             chat_stream_next_seq: AtomicU64::new(1),
         })
     }
@@ -570,6 +617,11 @@ impl AppState {
         message_id: &str,
         payload: serde_json::Value,
     ) -> crate::commands::chat::ChatStreamEventV1 {
+        // Allocate and insert under the same lock: replay order is sequence order.
+        let mut events = self
+            .chat_stream_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let seq = self.chat_stream_next_seq.fetch_add(1, Ordering::SeqCst);
         let event = crate::commands::chat::ChatStreamEventV1 {
             seq,
@@ -581,11 +633,21 @@ impl AppState {
             payload,
             recorded_at: chrono::Utc::now().to_rfc3339(),
         };
-        if let Ok(mut events) = self.chat_stream_events.lock() {
-            events.push_back(event.clone());
-            while events.len() > CHAT_STREAM_REPLAY_CAPACITY {
-                events.pop_front();
-            }
+        if crate::chat_limits::serialized_bytes(&event)
+            > crate::chat_limits::CHAT_STREAM_REPLAY_BYTES
+        {
+            events.push(crate::commands::chat::ChatStreamEventV1 {
+                seq: event.seq,
+                attempt_id: event.attempt_id.clone(),
+                kind: "gap".into(),
+                notebook_id: event.notebook_id.clone(),
+                conversation_id: event.conversation_id.clone(),
+                message_id: event.message_id.clone(),
+                recorded_at: event.recorded_at.clone(),
+                payload: serde_json::json!({"reason": "replay_event_byte_limit"}),
+            });
+        } else {
+            events.push(event.clone());
         }
         event
     }
@@ -1207,15 +1269,33 @@ fn filter_chat_events_since(
     after_seq: Option<u64>,
 ) -> Vec<crate::commands::chat::ChatStreamEventV1> {
     let after_seq = after_seq.unwrap_or(0);
-    events
-        .iter()
-        .filter(|event| {
-            event.seq > after_seq
-                && event.notebook_id == notebook_id
-                && event.conversation_id == conversation_id
-        })
-        .cloned()
-        .collect()
+    let mut replay = Vec::new();
+    // Conservative global-buffer boundary: a missing prefix is never presented
+    // as a complete answer. Canonical persisted messages recover the terminal.
+    if let Some(oldest) = events
+        .front()
+        .filter(|event| event.seq > after_seq.saturating_add(1))
+    {
+        replay.push(crate::commands::chat::ChatStreamEventV1 {
+            seq: oldest.seq - 1,
+            attempt_id: String::new(), kind: "gap".into(),
+            notebook_id: notebook_id.into(), conversation_id: conversation_id.into(),
+            message_id: String::new(),
+            payload: serde_json::json!({"reason": "replay_history_evicted", "oldest_available_seq": oldest.seq}),
+            recorded_at: oldest.recorded_at.clone(),
+        });
+    }
+    replay.extend(
+        events
+            .iter()
+            .filter(|event| {
+                event.seq > after_seq
+                    && event.notebook_id == notebook_id
+                    && event.conversation_id == conversation_id
+            })
+            .cloned(),
+    );
+    replay
 }
 
 /// RAII guard for background activity counters that must not remain elevated
@@ -1530,6 +1610,30 @@ mod tests {
             .set_setting("summary_mode", SUMMARY_MODE_MANUAL)
             .unwrap();
         assert!(AppState::summary_mode_starts_paused(&app_db).unwrap());
+    }
+
+    #[test]
+    fn replay_buffer_discloses_eviction_before_the_remaining_tail() {
+        let events = std::collections::VecDeque::from([crate::commands::chat::ChatStreamEventV1 {
+            seq: 50,
+            attempt_id: "attempt".into(),
+            kind: "token".into(),
+            notebook_id: "nb".into(),
+            conversation_id: "conv".into(),
+            message_id: "msg".into(),
+            payload: serde_json::json!({"token":"tail"}),
+            recorded_at: "now".into(),
+        }]);
+        let replay = filter_chat_events_since(&events, "nb", "conv", Some(3));
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].kind, "gap");
+        assert_eq!(replay[0].seq, 49);
+        assert_eq!(replay[1].seq, 50);
+        assert_eq!(
+            filter_chat_events_since(&events, "nb", "conv", Some(49)).len(),
+            1
+        );
+        assert!(filter_chat_events_since(&events, "nb", "conv", Some(50)).is_empty());
     }
 
     #[test]

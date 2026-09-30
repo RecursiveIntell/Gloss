@@ -37,7 +37,10 @@ require("rehydrateConversation" in chat_store, "chatStore must define rehydrateC
 require("loadMessages" in chat_store and "rehydrateConversation" in chat_store, "chatStore must use loadMessages in reconciliation path")
 require("getChatEventsSince" in chat_store or "get_chat_events_since" in chat_store or "getChatEventsSince" in app, "frontend must call stream replay API")
 require("focus" in app.lower() or "visibilitychange" in app.lower(), "App must rehydrate/replay on window focus or visibility change")
-require("chat:done" in app or "onChatDone" in app or "done" in app and "rehydrate" in app.lower(), "terminal event path must trigger reconciliation")
+require("onChatStreamEvent" in app and "replayChatEvents(payload.notebook_id, payload.conversation_id)" in app
+        and "event.kind === 'done'" in chat_store and "await get().finalizeMessage(notebookId, conversationId, messageId)" in chat_store
+        and "await get().rehydrateConversation(notebookId, conversationId)" in chat_store,
+        "sequenced terminal event path must trigger canonical reconciliation")
 require("ChatStreamEvent" in chat_mod + chat_stream + state, "backend must define/use ChatStreamEvent")
 require("get_chat_events_since" in chat_mod + chat_stream + state, "backend must expose get_chat_events_since command")
 require("attempt_id" in chat_mod + chat_stream + state, "chat runtime must carry durable attempt_id")

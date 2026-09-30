@@ -156,29 +156,15 @@ impl LlmProvider for AnthropicProvider {
             })?;
 
         if !resp.status().is_success() {
-            // If model listing is unavailable, return well-known models
-            return Ok(vec![
-                ModelInfo {
-                    id: "claude-sonnet-4-5-20250929".into(),
-                    display_name: "Claude Sonnet 4.5".into(),
-                    provider: ProviderType::Anthropic,
-                    parameter_size: None,
-                    context_window: Some(200000),
-                },
-                ModelInfo {
-                    id: "claude-haiku-4-5-20251001".into(),
-                    display_name: "Claude Haiku 4.5".into(),
-                    provider: ProviderType::Anthropic,
-                    parameter_size: None,
-                    context_window: Some(200000),
-                },
-            ]);
+            return Err(provider_http_failure(
+                "anthropic",
+                resp,
+                &LlmExecutionContext::uncancellable(),
+            )
+            .await);
         }
 
-        let body: serde_json::Value = resp.json().await.map_err(|e| GlossError::Provider {
-            provider: "anthropic".into(),
-            source: e.into(),
-        })?;
+        let body = super::bounded_model_list_response("anthropic", resp, "data", "id").await?;
 
         let models = body
             .get("data")

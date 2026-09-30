@@ -1,6 +1,7 @@
 pub mod chunk;
 pub mod dense;
 pub mod embed;
+pub mod embedding_cache;
 pub mod embedding_contract;
 pub mod extract;
 pub mod import_capability;

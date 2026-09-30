@@ -632,6 +632,7 @@ class IntegratedWorkflow:
         self.scope_checks: list[dict] = []
         self.default_surfaces: list[dict] = []
         self.conversations: dict[str, str] = {}
+        self.modal_keyboard_checked = False
 
     def check(self, condition: bool, description: str):
         if not condition:
@@ -689,6 +690,20 @@ class IntegratedWorkflow:
     def settings(self):
         self.ui.click_text("Settings")
         self.ui.wait(lambda: self.ui.find_visible('input[aria-label="Ollama server URL"]'), label="settings dialog")
+        if not self.modal_keyboard_checked:
+            self.check(self.ui.execute("return document.activeElement?.getAttribute('aria-label')==='Close settings' && !!document.activeElement.closest('[role=dialog][aria-modal=true]')"), "settings enters its named modal focus owner")
+            close = self.ui.find_visible('button[aria-label="Close settings"]')
+            self.ui.call("POST", f"/element/{close[ELEMENT_KEY]}/value", {"text": "\ue008\ue004\ue000"})
+            self.check(self.ui.execute("return !!document.activeElement.closest('[role=dialog][aria-label=Settings]') && document.activeElement.getAttribute('aria-label')!=='Close settings'"), "Shift+Tab stays in settings and wraps from first control")
+            last = self.ui.execute("return document.activeElement")
+            self.ui.call("POST", f"/element/{last[ELEMENT_KEY]}/value", {"text": "\ue004"})
+            self.check(self.ui.execute("return document.activeElement?.getAttribute('aria-label')==='Close settings'"), "Tab wraps back to first settings control")
+            self.ui.call("POST", f"/element/{close[ELEMENT_KEY]}/value", {"text": "\ue00c"})
+            self.ui.wait(lambda: not self.ui.find_visible('[role=dialog][aria-label=Settings]'), label="Escape dismisses settings")
+            self.check(self.ui.execute("return document.activeElement?.textContent.trim()==='Settings'"), "closing settings restores trigger focus")
+            self.modal_keyboard_checked = True
+            self.ui.click_text("Settings")
+            self.ui.wait(lambda: self.ui.find_visible('input[aria-label="Ollama server URL"]'), label="settings reopened after keyboard proof")
 
     def close_settings(self):
         self.ui.click_ref(self.ui.execute("return Array.from(document.querySelectorAll('h2')).find(e=>e.textContent==='Settings').parentElement.querySelector('button')"))

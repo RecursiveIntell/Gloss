@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 const APP_SCHEMA_VERSION: i32 = 4;
-const NOTEBOOK_SCHEMA_VERSION: i32 = 7;
+pub(crate) const NOTEBOOK_SCHEMA_VERSION: i32 = 7;
 
 /// Apply pragmas for performance and correctness.
 ///

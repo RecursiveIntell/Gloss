@@ -389,6 +389,45 @@ impl NotebookDb {
         Ok(db)
     }
 
+    /// Inspect an existing notebook without migrations, FTS rebuilds, or writes.
+    /// Never fall back to a creating/read-write connection for diagnostics.
+    pub fn open_read_only(path: &Path) -> Result<Self, GlossError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(15))?;
+        conn.execute_batch("PRAGMA query_only=ON")?;
+        Ok(Self { conn })
+    }
+
+    /// A restored DB has canonical content but no atomically paired external
+    /// vector artifacts. Preserve receipts/backpointers as historical evidence,
+    /// invalidate admission, and require an explicit projection rebuild.
+    pub fn invalidate_restored_projections(&self) -> Result<(), GlossError> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.mark_embedding_index_status(
+            NATIVE_HNSW_INDEX_ID,
+            EmbeddingIndexMetadataStatus::Stale,
+            Some("portable import: native artifact omitted; rebuild required"),
+        )?;
+        self.mark_embedding_index_status(
+            SEMANTIC_MEMORY_INDEX_ID,
+            EmbeddingIndexMetadataStatus::Stale,
+            Some("portable import: semantic projection omitted; rebuild required"),
+        )?;
+        self.conn.execute_batch(
+            "UPDATE chunks SET embedding_id = NULL, embedding_model = NULL;
+             UPDATE semantic_memory_links SET sync_status = 'stale';
+             UPDATE semantic_memory_projection_status SET status = 'stale',
+                 artifact_generation_id = NULL, vector_artifact_manifest_digest = NULL;
+             UPDATE source_processing_state SET dense_index_status = 'missing',
+                 semantic_projection_status = 'stale';",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // -- Sources --
 
     /// List all sources (without content_text — use get_source for full content).
@@ -2066,9 +2105,28 @@ impl NotebookDb {
         Ok(())
     }
 
+    /// Startup-only reconciliation before any worker is admitted. Durable queue
+    /// ownership is supplied by the queue owner; canonical content is preserved.
+    pub fn recover_interrupted_ingestions(
+        &self,
+        queued_sources: &std::collections::HashSet<String>,
+    ) -> Result<usize, GlossError> {
+        self.with_dense_index_transaction(|db| {
+            let mut statement = db.conn.prepare("SELECT id, status FROM sources WHERE status IN ('pending','extracting','chunking','embedding','processing')")?;
+            let abandoned = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?.into_iter().filter(|(id, _)| !queued_sources.contains(id)).collect::<Vec<_>>();
+            let has_processing: bool = db.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_processing_state')", [], |row| row.get(0))?;
+            for (id, status) in &abandoned {
+                let reason = format!("interrupted_by_restart: import stopped during {status}; retained source data is available for Retry");
+                db.conn.execute("UPDATE sources SET status='error', error_message=?1, updated_at=datetime('now') WHERE id=?2", rusqlite::params![reason,id])?;
+                if has_processing { db.update_source_lifecycle_status(id, "error", Some(&reason))?; }
+            }
+            Ok(abandoned.len())
+        })
+    }
+
     /// Close attempts that cannot still be running after a process restart.
-    /// Canonical messages and prior terminal outcomes are preserved; only
-    /// non-terminal transport state is superseded by an explicit terminal row.
+    /// Canonical messages and prior terminal outcomes are preserved.
     pub fn recover_interrupted_chat_attempts(&self) -> Result<usize, GlossError> {
         let changed = self.conn.execute(
             "UPDATE chat_attempts
@@ -2675,6 +2733,38 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_notebook.db");
         NotebookDb::open(&path).unwrap()
+    }
+
+    #[test]
+    fn interrupted_ingestion_recovery_preserves_data_and_durable_queue_owners() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("notebook.db");
+        {
+            let db = NotebookDb::open(&path).unwrap();
+            for (id, status) in [
+                ("abandoned", "pending"),
+                ("queued", "pending"),
+                ("ready", "ready"),
+            ] {
+                db.conn().execute("INSERT INTO sources(id,source_type,title,status,content_text) VALUES (?1,'paste',?1,?2,'preserved content')", rusqlite::params![id,status]).unwrap();
+            }
+        }
+        let db = NotebookDb::connect(&path).unwrap();
+        let queued = std::collections::HashSet::from(["queued".to_string()]);
+        assert_eq!(db.recover_interrupted_ingestions(&queued).unwrap(), 1);
+        assert_eq!(db.recover_interrupted_ingestions(&queued).unwrap(), 0);
+        let source = db.get_source("abandoned").unwrap();
+        assert_eq!(source.status, "error");
+        assert_eq!(source.content_text.as_deref(), Some("preserved content"));
+        assert!(source
+            .error_message
+            .unwrap()
+            .contains("interrupted_by_restart"));
+        assert_eq!(db.get_source("queued").unwrap().status, "pending");
+        assert_eq!(db.get_source("ready").unwrap().status, "ready");
+        db.reset_source_for_reingestion("notebook", "abandoned")
+            .unwrap();
+        assert_eq!(db.get_source("abandoned").unwrap().status, "pending");
     }
 
     #[test]

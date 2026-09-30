@@ -35,4 +35,8 @@ zeroize = "1"
 regex = "1"
 agent-queue = "=0.2.0"
 
+chrono = "0.4"
+flate2 = "1"
+tar = "0.4"
+
 [workspace]

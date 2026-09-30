@@ -23,10 +23,6 @@ pub enum EmbeddingBackend {
 /// The canonical local embedding model (candle, CPU, 768 dims).
 pub const CANDLE_EMBEDDING_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
 
-fn hf_cache_repo_dir(hf_home: &Path) -> std::path::PathBuf {
-    hf_home.join("models--nomic-ai--nomic-embed-text-v1.5")
-}
-
 /// The hf-hub cache root, mirroring the `hf-hub` crate resolution:
 /// `$HF_HOME/hub`, else `$HOME/.cache/huggingface/hub`.
 pub fn hf_hub_cache_dir() -> std::path::PathBuf {
@@ -43,93 +39,9 @@ pub fn hf_hub_cache_dir() -> std::path::PathBuf {
         .join("hub")
 }
 
-fn snapshot_has_model_files(snapshot: &Path) -> bool {
-    let has_weights = snapshot.join("model.safetensors").exists()
-        || std::fs::read_dir(snapshot)
-            .map(|entries| {
-                entries.flatten().any(|entry| {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    name.starts_with("model-") && name.ends_with(".safetensors")
-                })
-            })
-            .unwrap_or(false);
-    snapshot.join("config.json").exists() && has_weights && snapshot.join("tokenizer.json").exists()
-}
-
-/// True when the local candle model's files are present in either the hf-hub
-/// cache or the legacy `data_dir/models` cache. This is what makes the CPU
-/// local Candle loading work without download consent when the model already exists.
+/// Cache detection and loading use the same read-only, supported-layout resolver.
 pub fn candle_model_is_cached(hf_home: &Path, legacy_cache: &Path) -> bool {
-    [
-        hf_cache_repo_dir(hf_home),
-        legacy_cache.join("models--nomic-ai--nomic-embed-text-v1.5"),
-    ]
-    .iter()
-    .any(|repo_dir| {
-        let snapshots = repo_dir.join("snapshots");
-        if !snapshots.is_dir() {
-            return false;
-        }
-        // hf-hub layout: snapshots/<revision>/<files>
-        if std::fs::read_dir(&snapshots)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .any(|entry| entry.path().is_dir() && snapshot_has_model_files(&entry.path()))
-            })
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        // Some partial downloaders leave symlinks directly under snapshots/.
-        snapshot_has_model_files(&snapshots)
-    })
-}
-
-/// Repair a missing/empty `refs/main` revision pointer when exactly one usable
-/// snapshot revision exists, so hf-hub can resolve the model offline. A broken
-/// pointer (e.g. an empty `refs/main`) otherwise forces a network re-fetch even
-/// though every model file is already cached.
-fn repair_hf_refs_if_needed(repo_dir: &Path) {
-    let refs_main = repo_dir.join("refs").join("main");
-    let existing = std::fs::read_to_string(&refs_main).unwrap_or_default();
-    if !existing.trim().is_empty() {
-        return;
-    }
-    let snapshots = repo_dir.join("snapshots");
-    let Ok(entries) = std::fs::read_dir(&snapshots) else {
-        return;
-    };
-    let revisions: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.is_dir() && snapshot_has_model_files(&path) {
-                Some(entry.file_name().to_string_lossy().to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-    if revisions.len() != 1 {
-        return;
-    }
-    let _ = std::fs::create_dir_all(repo_dir.join("refs"));
-    if let Err(e) = std::fs::write(&refs_main, &revisions[0]) {
-        tracing::warn!(error = %e, "Failed to repair hf-hub refs/main pointer");
-    } else {
-        tracing::info!(revision = %revisions[0], "Repaired hf-hub refs/main pointer");
-    }
-}
-
-fn resolve_snapshot_revision(repo_dir: &Path) -> Option<String> {
-    repair_hf_refs_if_needed(repo_dir);
-    let refs_main = repo_dir.join("refs").join("main");
-    let revision = std::fs::read_to_string(&refs_main).ok()?.trim().to_string();
-    if revision.is_empty() || !repo_dir.join("snapshots").join(&revision).is_dir() {
-        return None;
-    }
-    Some(revision)
+    super::embedding_cache::resolve_cached_snapshot(hf_home, legacy_cache).is_some()
 }
 
 /// In-process CPU embedder for `nomic-ai/nomic-embed-text-v1.5` built directly
@@ -260,16 +172,9 @@ impl EmbeddingService {
         _use_gpu: bool,
         download_consent: bool,
     ) -> Result<Self, GlossError> {
-        let repo_dir = hf_cache_repo_dir(hf_home);
-        let cached = candle_model_is_cached(hf_home, cache_dir);
-
-        let (config_path, weights_path, tokenizer_path) = if cached {
-            // Make the snapshot resolvable even when refs/main was left empty
-            // by an interrupted download or a partial cache tool.
-            let revision = resolve_snapshot_revision(&repo_dir).ok_or_else(|| {
-                GlossError::Embedding("cached nomic model snapshot is not resolvable".into())
-            })?;
-            let snapshot = repo_dir.join("snapshots").join(&revision);
+        let (config_path, weights_path, tokenizer_path) = if let Some(snapshot) =
+            super::embedding_cache::resolve_cached_snapshot(hf_home, cache_dir)
+        {
             (
                 snapshot.join("config.json"),
                 snapshot.join("model.safetensors"),
@@ -508,54 +413,6 @@ mod tests {
 
         std::mem::forget(reloaded);
         std::mem::forget(index);
-    }
-
-    #[test]
-    fn candle_model_cache_detection_and_ref_repair() {
-        let dir = tempfile::tempdir().unwrap();
-        let hf_home = dir.path().join("hf");
-        let repo = hf_cache_repo_dir(&hf_home);
-        let snapshot = repo.join("snapshots").join("deadbeef");
-        std::fs::create_dir_all(&snapshot).unwrap();
-        std::fs::write(snapshot.join("config.json"), "{}").unwrap();
-        std::fs::write(snapshot.join("model.safetensors"), "fake").unwrap();
-        std::fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
-
-        // Files present in a snapshot revision → cached (no consent needed).
-        assert!(candle_model_is_cached(&hf_home, Path::new("/nonexistent")));
-
-        // Empty refs/main gets repaired when exactly one revision exists.
-        std::fs::create_dir_all(repo.join("refs")).unwrap();
-        std::fs::write(repo.join("refs").join("main"), "").unwrap();
-        repair_hf_refs_if_needed(&repo);
-        assert_eq!(
-            std::fs::read_to_string(repo.join("refs").join("main")).unwrap(),
-            "deadbeef"
-        );
-
-        // Missing model files → not cached.
-        let empty = tempfile::tempdir().unwrap();
-        assert!(!candle_model_is_cached(
-            empty.path(),
-            Path::new("/nonexistent")
-        ));
-
-        // Sharded weights also count as cached.
-        let sharded = tempfile::tempdir().unwrap();
-        let shard_repo = hf_cache_repo_dir(sharded.path());
-        let shard_snapshot = shard_repo.join("snapshots").join("abc123");
-        std::fs::create_dir_all(&shard_snapshot).unwrap();
-        std::fs::write(shard_snapshot.join("config.json"), "{}").unwrap();
-        std::fs::write(
-            shard_snapshot.join("model-00001-of-00002.safetensors"),
-            "fake",
-        )
-        .unwrap();
-        std::fs::write(shard_snapshot.join("tokenizer.json"), "{}").unwrap();
-        assert!(candle_model_is_cached(
-            sharded.path(),
-            Path::new("/nonexistent")
-        ));
     }
 
     #[test]

@@ -70,13 +70,20 @@ pub fn run_db_doctor(app_db: &AppDb, repair: bool) -> Result<DbDoctorReceipt, Gl
     for notebook in &notebooks {
         let notebook_db_path = PathBuf::from(&notebook.directory).join("notebook.db");
         if !notebook_db_path.exists() {
+            let quarantine = PathBuf::from(&notebook.directory)
+                .parent()
+                .map(|parent| parent.join(format!(".deleted-{}", notebook.id)));
+            let recovery = quarantine.filter(|path| path.join("notebook/notebook.db").is_file());
             findings.push(DbDoctorFinding {
                 notebook_id: notebook.id.clone(),
-                code: "missing_notebook_db".to_string(),
+                code: if recovery.is_some() { "interrupted_notebook_delete" } else { "missing_notebook_db" }.to_string(),
                 severity: DbDoctorSeverity::Error,
                 count: 1,
                 repaired: false,
-                detail: "Notebook registry entry points at a missing notebook.db; automatic repair is not safe.".to_string(),
+                detail: recovery.map_or_else(
+                    || "Notebook registry entry points at a missing notebook.db; automatic repair is not safe.".to_string(),
+                    |path| format!("Notebook deletion was interrupted; canonical data and intent are retained at {}. Registry still owns {}. Restore its notebook subdirectory to {} before retrying; diagnosis made no changes.", path.display(), notebook.id, notebook.directory)
+                ),
             });
             notebook_reports.push(DbDoctorNotebookReport {
                 notebook_id: notebook.id.clone(),
@@ -94,7 +101,62 @@ pub fn run_db_doctor(app_db: &AppDb, repair: bool) -> Result<DbDoctorReceipt, Gl
             continue;
         }
 
-        let notebook_db = NotebookDb::open(&notebook_db_path)?;
+        let notebook_db = if repair {
+            NotebookDb::open(&notebook_db_path)
+        } else {
+            NotebookDb::open_read_only(&notebook_db_path)
+        };
+        let notebook_db = match notebook_db {
+            Ok(db) => db,
+            Err(error) => {
+                findings.push(DbDoctorFinding {
+                    notebook_id: notebook.id.clone(), code: "notebook_inspection_failed".into(),
+                    severity: DbDoctorSeverity::Error, count: 1, repaired: false,
+                    detail: format!("Notebook could not be inspected: {error}; no automatic recovery attempted."),
+                });
+                notebook_reports.push(uninspected_report(&notebook.id, notebook.source_count));
+                continue;
+            }
+        };
+        // Legacy/partial schemas are findings, never an invitation to migrate
+        // from check mode. Avoid interpreting unavailable checks as healthy.
+        if !repair {
+            let required = [
+                ("sources", &["id", "status", "selected"][..]),
+                ("chunks", &["id"][..]),
+                ("source_processing_state", &["source_id"][..]),
+                ("semantic_memory_projection_status", &["source_id"][..]),
+                (
+                    "semantic_memory_links",
+                    &[
+                        "source_id",
+                        "chunk_id",
+                        "gloss_chunk_id",
+                        "projection_unit_kind",
+                        "projection_unit_id",
+                    ][..],
+                ),
+            ];
+            let mut incomplete = false;
+            for (table, columns) in required {
+                if !table_has_columns(&notebook_db, table, columns)? {
+                    incomplete = true;
+                    findings.push(DbDoctorFinding {
+                        notebook_id: notebook.id.clone(), code: "notebook_schema_repair_required".into(),
+                        severity: DbDoctorSeverity::Warning, count: 1, repaired: false,
+                        detail: format!("{table} is missing or lacks diagnostic columns; explicit migration/repair is required. Check mode made no schema changes."),
+                    });
+                }
+            }
+            if incomplete {
+                let mut report = uninspected_report(&notebook.id, notebook.source_count);
+                if table_exists(&notebook_db, "sources")? {
+                    report.source_count_actual = notebook_db.source_count().ok();
+                }
+                notebook_reports.push(report);
+                continue;
+            }
+        }
         let actual_source_count = notebook_db.source_count()?;
         let source_count_repaired = repair && actual_source_count != notebook.source_count;
         if actual_source_count != notebook.source_count {
@@ -239,6 +301,43 @@ pub fn run_db_doctor(app_db: &AppDb, repair: bool) -> Result<DbDoctorReceipt, Gl
         stale_queue_jobs: 0,
         repaired_stale_queue_jobs: 0,
     })
+}
+
+fn uninspected_report(id: &str, recorded: i32) -> DbDoctorNotebookReport {
+    DbDoctorNotebookReport {
+        notebook_id: id.into(),
+        notebook_db_present: true,
+        source_count_recorded: recorded,
+        source_count_actual: None,
+        orphan_source_processing_state_rows: 0,
+        orphan_projection_status_rows: 0,
+        orphan_semantic_memory_link_rows: 0,
+        failed_import_sources: 0,
+        quarantined_failed_import_sources: 0,
+        receipt_id: None,
+        supersedes_receipt_id: None,
+    }
+}
+
+fn table_has_columns(db: &NotebookDb, table: &str, required: &[&str]) -> Result<bool, GlossError> {
+    let mut statement = db
+        .conn()
+        .prepare("SELECT name FROM pragma_table_info(?1)")?;
+    let columns = statement
+        .query_map([table], |row| row.get::<_, String>(0))?
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    Ok(required.iter().all(|column| columns.contains(*column)))
+}
+
+/// Queue diagnosis needs only source identity, not the migrating list_sources
+/// projection. Missing tables are surfaced as errors rather than cancelled jobs.
+pub fn inspect_source_ids(
+    path: &std::path::Path,
+) -> Result<std::collections::HashSet<String>, GlossError> {
+    let db = NotebookDb::open_read_only(path)?;
+    let mut statement = db.conn().prepare("SELECT id FROM sources")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 fn table_exists(db: &NotebookDb, table: &str) -> Result<bool, GlossError> {
@@ -693,5 +792,151 @@ mod tests {
             source.processing_state.unwrap().lifecycle_status,
             "quarantined_failed_import"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_only_regressions {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn current_schema_check_and_queue_inspection_do_not_commit_or_rebuild_fts() {
+        let root = tempdir().unwrap();
+        let app = AppDb::open(&root.path().join("app.db")).unwrap();
+        let notebook = root.path().join("notebook");
+        std::fs::create_dir(&notebook).unwrap();
+        app.create_notebook("n", "Notebook", &notebook.to_string_lossy())
+            .unwrap();
+        let path = notebook.join("notebook.db");
+        let db = NotebookDb::open(&path).unwrap();
+        db.conn().execute_batch("INSERT INTO sources (id, source_type, title) VALUES ('s', 'text', 'Source');
+            INSERT INTO chunks (id, source_id, chunk_index, content) VALUES ('c', 's', 0, 'search term');
+            PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let observer = rusqlite::Connection::open(&path).unwrap();
+        let version: i64 = observer
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap();
+        let schema = schema_dump(&observer);
+        let bytes = std::fs::read(&path).unwrap();
+        let receipt = run_db_doctor(&app, false).unwrap();
+        assert_eq!(receipt.notebooks_checked, 1);
+        assert_eq!(
+            inspect_source_ids(&path)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["s"]
+        );
+        assert_eq!(
+            observer
+                .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            version
+        );
+        assert_eq!(schema_dump(&observer), schema);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            observer
+                .query_row(
+                    "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'search'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    fn schema_dump(conn: &rusqlite::Connection) -> Vec<(String, Option<String>)> {
+        conn.prepare("SELECT name, sql FROM sqlite_master ORDER BY name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn legacy_and_missing_table_checks_report_migration_without_mutation() {
+        for missing_sources in [false, true] {
+            let root = tempdir().unwrap();
+            let app = AppDb::open(&root.path().join("app.db")).unwrap();
+            let notebook = root.path().join("notebook");
+            std::fs::create_dir(&notebook).unwrap();
+            app.create_notebook("legacy", "Legacy", &notebook.to_string_lossy())
+                .unwrap();
+            let path = notebook.join("notebook.db");
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE _meta (key TEXT, value TEXT); INSERT INTO _meta VALUES ('schema_version', '1');").unwrap();
+            if !missing_sources {
+                conn.execute_batch(
+                    "CREATE TABLE sources (id TEXT); INSERT INTO sources VALUES ('s');",
+                )
+                .unwrap();
+            }
+            let schema = schema_dump(&conn);
+            let bytes = std::fs::read(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap();
+            let receipt = run_db_doctor(&app, false).unwrap();
+            assert!(receipt
+                .findings
+                .iter()
+                .any(|f| f.code == "notebook_schema_repair_required" && !f.repaired));
+            if missing_sources {
+                assert!(inspect_source_ids(&path).is_err());
+            } else {
+                assert!(inspect_source_ids(&path).unwrap().contains("s"));
+            }
+            assert_eq!(
+                conn.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                version
+            );
+            assert_eq!(schema_dump(&conn), schema);
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn diagnostic_open_does_not_create_missing_database() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("missing.db");
+        assert!(NotebookDb::open_read_only(&path).is_err());
+        assert!(inspect_source_ids(&path).is_err());
+        assert!(!path.exists());
+    }
+}
+
+#[cfg(test)]
+mod deletion_recovery_regression {
+    use super::*;
+    #[test]
+    fn interrupted_delete_reports_exact_retained_location_without_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let app = AppDb::open(&root.path().join("app.db")).unwrap();
+        let original = root.path().join("n");
+        std::fs::create_dir(&original).unwrap();
+        drop(NotebookDb::open(&original.join("notebook.db")).unwrap());
+        app.create_notebook("n", "Notebook", &original.to_string_lossy())
+            .unwrap();
+        let quarantine = root.path().join(".deleted-n");
+        std::fs::create_dir(&quarantine).unwrap();
+        std::fs::rename(&original, quarantine.join("notebook")).unwrap();
+        let report = run_db_doctor(&app, false).unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == "interrupted_notebook_delete")
+            .unwrap();
+        assert!(finding
+            .detail
+            .contains(&quarantine.to_string_lossy().to_string()));
+        assert!(!finding.repaired);
+        assert!(app.get_notebook("n").is_ok());
+        assert!(quarantine.join("notebook/notebook.db").exists());
+        assert!(!original.exists());
     }
 }

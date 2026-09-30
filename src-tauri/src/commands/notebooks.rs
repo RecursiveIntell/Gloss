@@ -84,14 +84,7 @@ fn inspect_queue_for_doctor(
             continue;
         }
         if !source_cache.contains_key(job.notebook_id()) {
-            let source_ids = crate::db::notebook_db::NotebookDb::open(&notebook_db_path)
-                .and_then(|db| db.list_sources())
-                .map(|sources| {
-                    sources
-                        .into_iter()
-                        .map(|source| source.id)
-                        .collect::<HashSet<_>>()
-                })?;
+            let source_ids = crate::db::doctor::inspect_source_ids(&notebook_db_path)?;
             source_cache.insert(job.notebook_id().to_string(), source_ids);
         }
         if source_cache
@@ -200,31 +193,15 @@ pub async fn create_notebook(
     name: String,
     state: State<'_, AppState>,
 ) -> Result<String, GlossError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let nb_dir = state.data_dir.join("notebooks").join(&id);
-
-    // Create notebook directories
-    std::fs::create_dir_all(nb_dir.join("sources"))?;
-    std::fs::create_dir_all(nb_dir.join("embeddings"))?;
-    std::fs::create_dir_all(nb_dir.join("audio"))?;
-    std::fs::create_dir_all(nb_dir.join("exports"))?;
-
-    let dir_str = nb_dir.to_string_lossy().to_string();
-
-    // Register in app DB
-    {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        app_db.create_notebook(&id, &name, &dir_str)?;
-    }
-
-    // Create the notebook DB and run its initial migrations once.
-    crate::db::notebook_db::NotebookDb::open(&nb_dir.join("notebook.db"))?;
-
-    tracing::info!(id = %id, name = %name, "Created notebook");
-    Ok(id)
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    crate::db::notebook_lifecycle::create_notebook_staged(
+        &app_db,
+        &state.data_dir.join("notebooks"),
+        &name,
+    )
 }
 
 #[tauri::command]
@@ -246,83 +223,78 @@ pub async fn rename_notebook(
     Ok(())
 }
 
-fn notebook_owned_paths(
-    data_dir: &std::path::Path,
-    notebook_dir: &std::path::Path,
-    notebook_id: &str,
-) -> [std::path::PathBuf; 2] {
-    [
-        notebook_dir.to_path_buf(),
-        crate::memory::semantic_memory_adapter::semantic_memory_base_dir(data_dir, notebook_id),
-    ]
-}
-
-fn remove_rebuildable_notebook_projection(
-    data_dir: &std::path::Path,
-    notebook_id: &str,
-) -> Result<(), GlossError> {
-    let projection =
-        crate::memory::semantic_memory_adapter::semantic_memory_base_dir(data_dir, notebook_id);
-    if projection.exists() {
-        std::fs::remove_dir_all(projection)?;
-    }
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn delete_notebook(
     id: String,
     state: State<'_, AppState>,
     queue: State<'_, Arc<QueueManager>>,
 ) -> Result<(), GlossError> {
-    // Resolve ownership before mutating runtime or registry state. The semantic
-    // projection is rebuildable, so remove it first; failure leaves the
-    // canonical notebook registered and retryable instead of orphaning it.
-    let dir = {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        app_db.get_notebook(&id)?.directory
-    };
-    let dir_path = std::path::PathBuf::from(&dir);
-    let owned_paths = notebook_owned_paths(&state.data_dir, &dir_path, &id);
-    remove_rebuildable_notebook_projection(&state.data_dir, &id)?;
-
-    // If this is the active notebook, clear it and bump epoch so the summary
-    // loop stops picking up jobs for it immediately.
-    if state.get_active_notebook_id().as_deref() == Some(id.as_str()) {
+    // Cancel scheduling first, then refuse to detach any active DB owner.
+    let was_active = state.get_active_notebook_id().as_deref() == Some(id.as_str());
+    if was_active {
         let _ = state.set_active_notebook(None, None);
     }
-
-    let cancelled = jobs::cancel_jobs_matching(&queue, |job, _status| job.notebook_id() == id);
-    if cancelled > 0 {
-        tracing::info!(notebook_id = %id, cancelled, "Cancelled queued jobs for deleted notebook");
-    }
-
-    {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        app_db.delete_notebook(&id)?;
-    }
-
-    state.notebook_pools.remove(&id);
-
-    {
-        let mut indices = state
-            .hnsw_indices
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
+    jobs::cancel_jobs_matching(&queue, |job, _status| job.notebook_id() == id);
+    let result = state.notebook_pools.with_notebook_closed(&id, || {
+        let busy = || {
+            GlossError::Config(
+                "Notebook work is still draining; retry deletion after it stops".into(),
+            )
+        };
+        let _gpu = state.gpu_gate.try_acquire().map_err(|_| busy())?;
+        let _llm = state.llm_gate.try_acquire().map_err(|_| busy())?;
+        if state
+            .ingestion_active
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+            || !state
+                .active_chat_attempts
+                .try_lock()
+                .map_err(|_| busy())?
+                .is_empty()
+            || !state
+                .active_studio_attempts
+                .try_lock()
+                .map_err(|_| busy())?
+                .is_empty()
+        {
+            return Err(busy());
+        }
+        let app_db = state.app_db.try_lock().map_err(|_| {
+            GlossError::Config(
+                "Notebook runtime is busy; retry deletion after active work drains".into(),
+            )
+        })?;
+        let mut indices = state.hnsw_indices.try_lock().map_err(|_| {
+            GlossError::Config(
+                "Notebook runtime is busy; retry deletion after active work drains".into(),
+            )
+        })?;
+        let mut dimensions = state.hnsw_index_dims.try_lock().map_err(|_| {
+            GlossError::Config(
+                "Notebook runtime is busy; retry deletion after active work drains".into(),
+            )
+        })?;
+        let projection =
+            crate::memory::semantic_memory_adapter::semantic_memory_base_dir(&state.data_dir, &id);
+        let receipt =
+            crate::db::notebook_lifecycle::quarantine_notebook(&app_db, &id, &projection)?;
         indices.remove(&id);
-    }
-
-    if owned_paths[0].exists() {
-        std::fs::remove_dir_all(&owned_paths[0])?;
-    }
-
-    tracing::info!(id = %id, "Deleted notebook and rebuildable semantic projection");
+        dimensions.remove(&id);
+        Ok(receipt)
+    });
+    let receipt = match result {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            // A failed deletion must not leave a still-visible notebook inactive.
+            if was_active && state.get_active_notebook_id().is_none() {
+                state.set_active_notebook(Some(id.clone()), None);
+            }
+            return Err(error);
+        }
+    };
+    tracing::info!(id = %id, quarantine = %receipt.quarantine_directory,
+        "Deleted notebook retained in recoverable quarantine");
     Ok(())
 }
 
@@ -399,9 +371,7 @@ pub async fn set_active_notebook(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        inspect_queue_for_doctor, notebook_owned_paths, remove_rebuildable_notebook_projection,
-    };
+    use super::inspect_queue_for_doctor;
     use crate::db::app_db::AppDb;
     use crate::db::notebook_db::{NotebookDb, Source};
     use crate::jobs::GlossJob;
@@ -434,28 +404,27 @@ mod tests {
     }
 
     #[test]
-    fn notebook_owned_paths_exclude_the_application_model_cache() {
+    fn notebook_quarantine_preserves_model_cache_and_canonical_data() {
         let root = tempdir().unwrap();
-        let notebook_dir = root.path().join("notebooks").join("nb1");
-        let paths = notebook_owned_paths(root.path(), &notebook_dir, "nb1");
-        assert_eq!(paths[0], notebook_dir);
-        assert_eq!(paths[1], root.path().join("semantic-memory").join("nb1"));
-        assert!(!paths.iter().any(|path| path == &root.path().join("models")));
-    }
-
-    #[test]
-    fn notebook_projection_cleanup_removes_only_rebuildable_notebook_state() {
-        let root = tempdir().unwrap();
-        let projection = root.path().join("semantic-memory").join("nb1");
+        let app_db = AppDb::open(&root.path().join("app.db")).unwrap();
+        let id = crate::db::notebook_lifecycle::create_notebook_staged(
+            &app_db,
+            &root.path().join("notebooks"),
+            "Fixture",
+        )
+        .unwrap();
+        let projection =
+            crate::memory::semantic_memory_adapter::semantic_memory_base_dir(root.path(), &id);
         let model_cache = root.path().join("models");
         std::fs::create_dir_all(&projection).unwrap();
         std::fs::create_dir_all(&model_cache).unwrap();
         std::fs::write(projection.join("memory.db"), b"projection").unwrap();
         std::fs::write(model_cache.join("model.bin"), b"model").unwrap();
-
-        remove_rebuildable_notebook_projection(root.path(), "nb1").unwrap();
-
-        assert!(!projection.exists());
+        let receipt =
+            crate::db::notebook_lifecycle::quarantine_notebook(&app_db, &id, &projection).unwrap();
+        let retained = std::path::Path::new(&receipt.quarantine_directory);
+        assert!(retained.join("notebook/notebook.db").exists());
+        assert!(retained.join("projection/memory.db").exists());
         assert!(model_cache.join("model.bin").exists());
     }
 

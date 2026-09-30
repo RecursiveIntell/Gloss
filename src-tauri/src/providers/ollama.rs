@@ -213,10 +213,7 @@ impl LlmProvider for OllamaProvider {
             });
         }
 
-        let body: serde_json::Value = resp.json().await.map_err(|e| GlossError::Provider {
-            provider: "ollama".into(),
-            source: e.into(),
-        })?;
+        let body = super::bounded_model_list_response("ollama", resp, "models", "name").await?;
 
         let models = body
             .get("models")

@@ -1,3 +1,6 @@
+mod url_fetch_policy;
+use url_fetch_policy::{canonical_url_for_fetch, pinned_url_client};
+
 use crate::db::app_db::ModelRecord;
 use crate::db::notebook_db::{Chunk, NotebookStats, SemanticMemoryProjectionSummary, Source};
 use crate::error::GlossError;
@@ -28,7 +31,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -185,39 +187,7 @@ pub struct SemanticMemoryBackfillReceipt {
     pub projection_summary: SemanticMemoryProjectionSummary,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct VectorArtifactStatus {
-    pub compiled_turbo_quant: bool,
-    pub runtime_turbo_quant_enabled: bool,
-    pub candidate_backend: Option<String>,
-    pub artifact_generation_id: Option<String>,
-    pub vector_artifact_manifest_digest: Option<String>,
-    pub vector_artifact_missing_count: usize,
-    pub vector_artifact_stale_count: usize,
-    pub exact_rerank: bool,
-    pub exact_rerank_count: usize,
-    pub last_receipt_id: Option<String>,
-    pub last_error: Option<String>,
-}
-
-impl VectorArtifactStatus {
-    /// True only when TurboQuant is compiled, selected by the runtime profile,
-    /// and backed by fresh notebook-scoped artifact plus exact-rerank proof.
-    pub fn turbo_quant_effective(&self) -> bool {
-        self.compiled_turbo_quant
-            && self.runtime_turbo_quant_enabled
-            && self
-                .candidate_backend
-                .as_deref()
-                .is_some_and(|backend| backend.contains("turbo_quant"))
-            && self.artifact_generation_id.is_some()
-            && self.vector_artifact_manifest_digest.is_some()
-            && self.vector_artifact_missing_count == 0
-            && self.vector_artifact_stale_count == 0
-            && self.exact_rerank
-            && self.exact_rerank_count > 0
-    }
-}
+pub use crate::memory::turbo_quant_proof::VectorArtifactStatus;
 
 #[derive(Debug, Serialize)]
 pub struct RetrievalDiagnostics {
@@ -584,7 +554,7 @@ fn run_ingestion_inner(
     // finalizes the counter on early returns or panic unwind.
     let _ingestion_guard = ActiveCounterGuard::new(&state.ingestion_active, "ingestion_active");
 
-    let result = (|| -> Result<IngestionTerminalState, GlossError> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<IngestionTerminalState, GlossError> {
         // Get notebook dir + source record
         let nb_dir = {
             // Poison recovery: a one-off panic elsewhere must not brick imports.
@@ -810,7 +780,10 @@ fn run_ingestion_inner(
             "Ingestion complete"
         );
         Ok(IngestionTerminalState::Ready)
-    })();
+    })).unwrap_or_else(|_| Err(GlossError::Ingestion {
+        source_id: source_id.to_string(),
+        message: "ingestion_panicked: import was interrupted; retained source data can be retried".into(),
+    }));
 
     if let Err(e) = &result {
         if is_deleted_source_error(e, source_id) {
@@ -1980,126 +1953,6 @@ fn youtube_import_error(message: impl Into<String>) -> GlossError {
     }
 }
 
-fn canonical_url_for_fetch(raw_url: &str, network_consent: bool) -> Result<Url, GlossError> {
-    if !network_consent {
-        return Err(url_import_error(
-            "URL import requires explicit per-import network consent.",
-        ));
-    }
-    let mut parsed = Url::parse(raw_url.trim())
-        .map_err(|e| url_import_error(format!("Invalid URL import input: {e}")))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(url_import_error(
-            "URL import only supports explicit http:// or https:// URLs.",
-        ));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(url_import_error(
-            "URL import rejects URLs with embedded credentials.",
-        ));
-    }
-    parsed.set_fragment(None);
-    validate_url_host_boundary(&parsed)?;
-    Ok(parsed)
-}
-
-fn validate_url_host_boundary(url: &Url) -> Result<(), GlossError> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| url_import_error("URL import requires a host."))?
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    if host.is_empty()
-        || host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || !host.contains('.')
-    {
-        return Err(url_import_error(
-            "URL import rejects localhost, intranet, and single-label hosts.",
-        ));
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_disallowed_url_import_ip(ip) {
-            return Err(url_import_error(
-                "URL import rejects private, local, multicast, and reserved IP hosts.",
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn validate_url_dns_boundary(url: &Url) -> Result<(), GlossError> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| url_import_error("URL import requires a host."))?
-        .trim_end_matches('.')
-        .to_string();
-    if host.parse::<IpAddr>().is_ok() {
-        return Ok(());
-    }
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| url_import_error("URL import requires a known port for http or https."))?;
-    let addrs = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .map_err(|e| url_import_error(format!("URL import DNS lookup failed: {e}")))?
-        .collect::<Vec<_>>();
-    if addrs.is_empty() {
-        return Err(url_import_error(
-            "URL import DNS lookup returned no addresses.",
-        ));
-    }
-    if addrs
-        .iter()
-        .any(|addr| is_disallowed_url_import_ip(addr.ip()))
-    {
-        return Err(url_import_error(
-            "URL import DNS resolved to a private, local, multicast, or reserved address.",
-        ));
-    }
-    Ok(())
-}
-
-fn is_disallowed_url_import_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(addr) => is_disallowed_url_import_ipv4(addr),
-        IpAddr::V6(addr) => is_disallowed_url_import_ipv6(addr),
-    }
-}
-
-fn is_disallowed_url_import_ipv4(addr: Ipv4Addr) -> bool {
-    let [a, b, c, d] = addr.octets();
-    addr.is_private()
-        || addr.is_loopback()
-        || addr.is_link_local()
-        || addr.is_broadcast()
-        || addr.is_multicast()
-        || addr.is_unspecified()
-        || a == 0
-        || a >= 224
-        || (a == 100 && (64..=127).contains(&b))
-        || (a == 192 && b == 0 && c == 0)
-        || (a == 192 && b == 0 && c == 2)
-        || (a == 198 && b == 18)
-        || (a == 198 && b == 19)
-        || (a == 198 && b == 51 && c == 100)
-        || (a == 203 && b == 0 && c == 113)
-        || (a == 255 && b == 255 && c == 255 && d == 255)
-}
-
-fn is_disallowed_url_import_ipv6(addr: Ipv6Addr) -> bool {
-    let segments = addr.segments();
-    addr.is_loopback()
-        || addr.is_unspecified()
-        || addr.is_multicast()
-        || (segments[0] & 0xfe00) == 0xfc00
-        || (segments[0] & 0xffc0) == 0xfe80
-        || (segments[0] & 0xff00) == 0xff00
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-}
-
 fn url_host_for_receipt(url: &Url) -> String {
     url.host_str()
         .unwrap_or("unknown")
@@ -2227,18 +2080,13 @@ async fn fetch_bounded_textual_url(
     user_agent: &'static str,
 ) -> Result<(Url, String, String, u16, usize, usize, u128), GlossError> {
     let started = Instant::now();
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(URL_IMPORT_TIMEOUT_SECS))
-        .user_agent(user_agent)
-        .build()
-        .map_err(|e| url_import_error(format!("Failed to build bounded fetch client: {e}")))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(URL_IMPORT_TIMEOUT_SECS);
     let mut current = url;
     let mut redirects_followed = 0usize;
 
     loop {
-        validate_url_host_boundary(&current)?;
-        validate_url_dns_boundary(&current).await?;
+        // Resolve, validate and pin again for every redirect, under one import deadline.
+        let client = pinned_url_client(&current, deadline, user_agent).await?;
         let response = client
             .get(current.clone())
             .send()
@@ -2547,18 +2395,13 @@ async fn fetch_url_source(
 ) -> Result<UrlFetchResult, GlossError> {
     let original_url = canonical_url_for_fetch(raw_url, network_consent)?;
     let started = Instant::now();
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(URL_IMPORT_TIMEOUT_SECS))
-        .user_agent("GlossUrlImport/1.0")
-        .build()
-        .map_err(|e| url_import_error(format!("Failed to build URL import client: {e}")))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(URL_IMPORT_TIMEOUT_SECS);
     let mut current = original_url.clone();
     let mut redirects_followed = 0usize;
 
     loop {
-        validate_url_host_boundary(&current)?;
-        validate_url_dns_boundary(&current).await?;
+        // Resolve, validate and pin again for every redirect, under one import deadline.
+        let client = pinned_url_client(&current, deadline, "GlossUrlImport/1.0").await?;
         let response = client
             .get(current.clone())
             .send()
@@ -5270,7 +5113,7 @@ mod tests {
     use crate::db::notebook_db::NotebookDb;
     use crate::provider_config_store::SecretStore;
     use crate::providers::ModelRegistry;
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -5320,7 +5163,7 @@ mod tests {
             active_epoch: AtomicU64::new(1),
             chat_grace_until: Mutex::new(0),
             last_user_activity: Mutex::new(0),
-            chat_stream_events: Mutex::new(VecDeque::new()),
+            chat_stream_events: Mutex::new(crate::chat_limits::ReplayBuffer::default()),
             chat_stream_next_seq: AtomicU64::new(1),
         };
 

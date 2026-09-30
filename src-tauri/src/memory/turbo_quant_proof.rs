@@ -1,6 +1,7 @@
 //! Gloss acceptance of evidence produced by the canonical semantic-memory runtime.
 //! This module never implements a codec or promotes a configured backend to an observed one.
 use crate::db::notebook_db::SemanticMemoryProjectionStatus;
+use serde::Serialize;
 use serde_json::Value;
 
 pub const TURBO_QUANT_BACKEND: &str = "turbo_quant_candidate_then_exact_f32";
@@ -100,4 +101,125 @@ pub fn projection_artifact_proof(
         proof.manifest_digest = None;
     }
     proof
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VectorArtifactStatus {
+    pub compiled_turbo_quant: bool,
+    pub runtime_turbo_quant_enabled: bool,
+    pub candidate_backend: Option<String>,
+    pub artifact_generation_id: Option<String>,
+    pub vector_artifact_manifest_digest: Option<String>,
+    pub vector_artifact_missing_count: usize,
+    pub vector_artifact_stale_count: usize,
+    pub exact_rerank: bool,
+    pub exact_rerank_count: usize,
+    pub last_receipt_id: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl VectorArtifactStatus {
+    /// Admission for a requested profile depends on proof, not current activation.
+    pub fn turbo_quant_proof_ready(&self) -> bool {
+        self.compiled_turbo_quant
+            && self
+                .candidate_backend
+                .as_deref()
+                .is_some_and(|backend| backend == TURBO_QUANT_BACKEND)
+            && self
+                .artifact_generation_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .vector_artifact_manifest_digest
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self.vector_artifact_missing_count == 0
+            && self.vector_artifact_stale_count == 0
+            && self.exact_rerank
+            && self.exact_rerank_count > 0
+    }
+
+    /// Current effective status additionally requires runtime activation.
+    pub fn turbo_quant_effective(&self) -> bool {
+        self.runtime_turbo_quant_enabled && self.turbo_quant_proof_ready()
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    fn ready() -> VectorArtifactStatus {
+        VectorArtifactStatus {
+            compiled_turbo_quant: true,
+            runtime_turbo_quant_enabled: false,
+            candidate_backend: Some(TURBO_QUANT_BACKEND.into()),
+            artifact_generation_id: Some("gen".into()),
+            vector_artifact_manifest_digest: Some("digest".into()),
+            vector_artifact_missing_count: 0,
+            vector_artifact_stale_count: 0,
+            exact_rerank: true,
+            exact_rerank_count: 2,
+            last_receipt_id: Some("probe".into()),
+            last_error: None,
+        }
+    }
+    #[test]
+    fn strict_prospective_proof_does_not_require_current_activation() {
+        let mut status = ready();
+        assert!(status.turbo_quant_proof_ready());
+        assert!(!status.turbo_quant_effective());
+        status.runtime_turbo_quant_enabled = true;
+        assert!(status.turbo_quant_proof_ready());
+        assert!(status.turbo_quant_effective());
+        for mutate in [
+            |s: &mut VectorArtifactStatus| s.vector_artifact_stale_count = 1,
+            |s: &mut VectorArtifactStatus| s.vector_artifact_missing_count = 1,
+            |s: &mut VectorArtifactStatus| s.artifact_generation_id = Some(" ".into()),
+            |s: &mut VectorArtifactStatus| s.vector_artifact_manifest_digest = None,
+            |s: &mut VectorArtifactStatus| s.exact_rerank = false,
+            |s: &mut VectorArtifactStatus| {
+                s.candidate_backend = Some("unproven_turbo_quant".into())
+            },
+        ] {
+            let mut status = ready();
+            mutate(&mut status);
+            assert!(!status.turbo_quant_proof_ready());
+        }
+    }
+    #[test]
+    fn retained_proof_must_match_current_source_generation() {
+        let status = SemanticMemoryProjectionStatus {
+            notebook_id: "nb".into(),
+            source_id: "source".into(),
+            status: "synced".into(),
+            chunk_count: 1,
+            projected_chunk_count: 1,
+            healthy_link_count: 1,
+            degraded_link_count: 0,
+            last_receipt_id: Some("receipt".into()),
+            last_error: None,
+            artifact_generation_id: Some("gen".into()),
+            vector_artifact_manifest_digest: Some("digest".into()),
+            updated_at: String::new(),
+        };
+        let mut proof = serde_json::json!({"candidate_backend": TURBO_QUANT_BACKEND, "exact_rerank": true, "exact_rerank_count": 1, "approximate_scanned_count": 1, "approximate_returned_count": 1, "artifact_corruption_count": 0, "vector_artifact_missing_count": 0, "vector_artifact_stale_count": 0, "artifact_generation_id": "gen", "vector_artifact_manifest_digest": "digest", "fallback": null});
+        assert!(
+            projection_artifact_proof(&[("source".into(), 1)], &[status.clone()], Some(&proof))
+                .probe_matches
+        );
+        assert!(
+            !projection_artifact_proof(
+                &[("other-source".into(), 1)],
+                &[status.clone()],
+                Some(&proof)
+            )
+            .probe_matches
+        );
+        proof["artifact_generation_id"] = serde_json::json!("other-generation");
+        assert!(
+            !projection_artifact_proof(&[("source".into(), 1)], &[status], Some(&proof))
+                .probe_matches
+        );
+    }
 }

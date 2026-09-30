@@ -873,14 +873,7 @@ pub async fn update_setting(
             "Use select_chat_model to update provider and model atomically".into(),
         ));
     }
-    if matches!(
-        key.as_str(),
-        "semantic_memory_embedding_provider"
-            | "semantic_memory_embedding_url"
-            | "semantic_memory_embedding_model"
-            | "semantic_memory_embedding_timeout_secs"
-            | "fastembed_download_consent"
-    ) {
+    if crate::settings_contract::requires_atomic_embedding_update(&key) {
         return Err(GlossError::Config(
             "Apply the complete embedding configuration together".into(),
         ));
@@ -1096,7 +1089,7 @@ pub async fn set_memory_backend_profile(
                 state.clone(),
             )
             .await?;
-            if !tq_status.turbo_quant_effective() {
+            if !tq_status.turbo_quant_proof_ready() {
                 blocked = true;
                 next_action =
                     Some("run_retrieval_probe_and_rebuild_turbo_quant_artifacts".to_string());
@@ -1517,6 +1510,7 @@ pub async fn repair_and_set_memory_profile(
                 .app_db
                 .lock()
                 .map_err(|error| GlossError::Other(error.to_string()))?;
+            crate::settings_contract::validate_search_timeout_for_current_embedding(&app_db, &value)?;
             app_db.set_setting("semantic_memory_search_timeout_ms", &value)?;
             if app_db
                 .get_setting("semantic_memory_search_timeout_ms")?
@@ -1535,7 +1529,7 @@ pub async fn repair_and_set_memory_profile(
                 state.clone(),
             )
             .await?;
-            if !tq_status.turbo_quant_effective() {
+            if !tq_status.turbo_quant_proof_ready() {
                 return Err(GlossError::Config(
                     "TurboQuant artifacts or exact-rerank probe are not current".to_string(),
                 ));

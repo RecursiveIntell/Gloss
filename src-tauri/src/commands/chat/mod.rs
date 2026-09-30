@@ -33,8 +33,10 @@ use tauri_queue::QueueManager;
 mod emit;
 mod gates;
 mod history;
+mod prompt_budget;
 pub(crate) mod receipts;
 mod streaming;
+use prompt_budget::compute_dynamic_num_ctx;
 mod types;
 
 // Re-export helpers used by send_message / stream_chat_response and other
@@ -60,11 +62,10 @@ const CHAT_FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(168);
 const CHAT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(84);
 const DEFAULT_CHAT_TEMPERATURE: f32 = 0.7;
 #[cfg(feature = "semantic-memory-backend")]
-const SEMANTIC_MEMORY_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
-const DEFAULT_CONTEXT_WINDOW_TOKENS: u32 = 8_192;
-const MAX_CONTEXT_WINDOW_TOKENS: u32 = 32_768;
+const SEMANTIC_MEMORY_SEARCH_TIMEOUT: Duration =
+    Duration::from_millis(crate::settings_contract::DEFAULT_SEMANTIC_SEARCH_TIMEOUT_MS);
 /// Total character budget for retrieved passages injected into the user turn.
-/// Keeps the prompt inside MAX_CONTEXT_WINDOW_TOKENS even at the largest top_k.
+/// Bounds retrieved text only; the complete prompt can still exceed context.
 const MAX_CONTEXT_CHARS_TOTAL: usize = 32_000;
 
 /// A degraded optional engine does not invalidate context from an available
@@ -1008,7 +1009,9 @@ struct ProjectionReadiness {
 fn semantic_memory_search_timeout_from_setting(value: Option<String>) -> Duration {
     value
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|millis| *millis > 0)
+        .filter(|millis| {
+            (100..=crate::settings_contract::MAX_SEMANTIC_SEARCH_TIMEOUT_MS).contains(millis)
+        })
         .map(Duration::from_millis)
         .unwrap_or(SEMANTIC_MEMORY_SEARCH_TIMEOUT)
 }
@@ -1112,47 +1115,6 @@ fn load_cached_suggested_questions(
         }
     }
     Ok(Vec::new())
-}
-
-fn estimate_tokens(text: &str) -> u32 {
-    let chars = text.chars().count() as u32;
-    (chars / 4).max(1)
-}
-
-fn compute_dynamic_num_ctx(
-    system_prompt: &str,
-    messages: &[ChatMessage],
-    model_context_window: Option<i32>,
-    max_tokens: u32,
-) -> ContextBudgetResult {
-    let prompt_tokens = estimate_tokens(system_prompt)
-        + messages
-            .iter()
-            .map(|message| estimate_tokens(&message.content))
-            .sum::<u32>();
-    let needed = prompt_tokens
-        .saturating_add(max_tokens)
-        .saturating_add(1_024);
-    let model_limit = model_context_window
-        .and_then(|window| u32::try_from(window).ok())
-        .filter(|window| *window > 0)
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
-        .min(MAX_CONTEXT_WINDOW_TOKENS);
-
-    let num_ctx = needed.clamp(DEFAULT_CONTEXT_WINDOW_TOKENS.min(model_limit), model_limit);
-    ContextBudgetResult {
-        num_ctx,
-        needed,
-        prompt_tokens,
-        context_budgeted: needed > model_limit,
-    }
-}
-
-struct ContextBudgetResult {
-    num_ctx: u32,
-    needed: u32,
-    prompt_tokens: u32,
-    context_budgeted: bool,
 }
 
 #[tauri::command]
@@ -2135,6 +2097,14 @@ pub async fn send_message(
                 );
 
                 let preview_result = tokio::time::timeout(semantic_memory_search_timeout, async {
+                    // Validate legacy persisted settings only when retrieval is actually
+                    // requested. Errors use the existing visible fallback/strict path.
+                    {
+                        let app_db = state.app_db.lock().map_err(|error| GlossError::Other(error.to_string()))?;
+                        let value = app_db.get_setting("semantic_memory_search_timeout_ms")?
+                            .unwrap_or_else(|| crate::settings_contract::DEFAULT_SEMANTIC_SEARCH_TIMEOUT_MS.to_string());
+                        crate::settings_contract::validate_search_timeout_for_current_embedding(&app_db, &value)?;
+                    }
                     let _inference =
                         crate::ingestion::native_gates::acquire(&state.gpu_gate, &state.llm_gate)
                             .await?;
@@ -4022,6 +3992,7 @@ mod tests {
         Panics,
         CancelDuringStream,
         SuccessfulDone,
+        ResponseByteLimit,
     }
 
     struct ScriptedLifecycleProvider {
@@ -4089,6 +4060,14 @@ mod tests {
                     "scripted lifecycle provider failure".to_string(),
                 )),
                 ScriptedLifecycleMode::Panics => panic!("scripted lifecycle panic"),
+                ScriptedLifecycleMode::ResponseByteLimit => {
+                    Ok(Box::pin(stream::iter((0..130).map(|frame| {
+                        Ok(ChatToken {
+                            token: "x".repeat(64 * 1024),
+                            done: frame == 129,
+                        })
+                    }))))
+                }
                 ScriptedLifecycleMode::SuccessfulDone => Ok(Box::pin(stream::iter([
                     Ok(ChatToken {
                         token: "complete response".to_string(),
@@ -4638,6 +4617,30 @@ mod tests {
 
         assert_spawned_terminal_contract(&outcome, "error", "error", "assistant_persist_error");
         assert!(!outcome.events.iter().any(|event| event.kind == "done"));
+    }
+
+    #[tokio::test]
+    async fn spawned_lifecycle_response_byte_limit_is_one_error_without_late_tokens_or_done() {
+        let outcome =
+            run_spawned_lifecycle_case(ScriptedLifecycleMode::ResponseByteLimit, false, false)
+                .await;
+        assert_spawned_terminal_contract(&outcome, "error", "error", "stream_error");
+        assert_eq!(
+            outcome
+                .events
+                .iter()
+                .filter(|event| event.kind == "token")
+                .count(),
+            128
+        );
+        assert!(!outcome.events.iter().any(|event| event.kind == "done"));
+        assert!(outcome.events.iter().any(|event| event.kind == "error"
+            && event.payload["error"]
+                .as_str()
+                .is_some_and(|value| value.contains("response_byte_limit"))));
+        let next =
+            run_spawned_lifecycle_case(ScriptedLifecycleMode::SuccessfulDone, false, false).await;
+        assert_spawned_terminal_contract(&next, "done", "succeeded", "assistant_persisted");
     }
 
     #[tokio::test]

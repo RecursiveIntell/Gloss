@@ -140,6 +140,7 @@ pub(crate) struct PromptBudgetReceiptV1 {
     pub source_passage_count: usize,
     pub prompt_digest: String,
     pub context_budgeted: bool,
+    pub estimated_context_limit_exceeded: bool,
     pub estimated_prompt_tokens: u32,
 }
 
@@ -313,16 +314,4 @@ pub(crate) struct ProjectionReadiness {
     pub healthy_links: usize,
     pub missing_links: usize,
     pub skipped_no_chunks: usize,
-}
-
-// ---------------------------------------------------------------------------
-// Context budget result
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-pub(crate) struct ContextBudgetResult {
-    pub num_ctx: u32,
-    pub needed: u32,
-    pub prompt_tokens: u32,
-    pub context_budgeted: bool,
 }

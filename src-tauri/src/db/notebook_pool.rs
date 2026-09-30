@@ -17,7 +17,7 @@ use crate::db::notebook_db::NotebookDb;
 use crate::error::GlossError;
 use log::{info, warn};
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -272,6 +272,7 @@ impl NotebookDbPool {
 /// references without holding the registry lock for the entire operation.
 pub struct NotebookDbPools {
     pools: Mutex<HashMap<String, Arc<NotebookDbPool>>>,
+    closed: Mutex<HashSet<String>>,
     #[allow(dead_code)]
     data_dir: PathBuf,
 }
@@ -280,6 +281,7 @@ impl NotebookDbPools {
     pub fn new(data_dir: &Path) -> Self {
         Self {
             pools: Mutex::new(HashMap::new()),
+            closed: Mutex::new(HashSet::new()),
             data_dir: data_dir.to_path_buf(),
         }
     }
@@ -302,30 +304,75 @@ impl NotebookDbPools {
                 .pools
                 .lock()
                 .map_err(|e| GlossError::Other(e.to_string()))?;
+            if self
+                .closed
+                .lock()
+                .map_err(|e| GlossError::Other(e.to_string()))?
+                .contains(notebook_id)
+            {
+                return Err(GlossError::NotFound(format!(
+                    "Notebook {notebook_id} was deleted"
+                )));
+            }
             if let Some(pool) = pools.get(notebook_id) {
                 return Ok(Arc::clone(pool));
             }
         }
-
-        // Not found — resolve the path and create the pool outside the lock
-        // to avoid holding it while doing I/O.
+        // Path resolution may acquire AppDb: never hold the pool map then.
         let db_path = resolve_path()?;
-        let pool = Arc::new(NotebookDbPool::new(&db_path)?);
-
         let mut pools = self
             .pools
             .lock()
             .map_err(|e| GlossError::Other(e.to_string()))?;
-
-        // Another thread might have inserted between our first check and now.
-        let canonical_pool = pools.entry(notebook_id.to_string()).or_insert(pool);
-        Ok(Arc::clone(canonical_pool))
+        // Lifecycle could have completed while the path was being resolved.
+        if self
+            .closed
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?
+            .contains(notebook_id)
+        {
+            return Err(GlossError::NotFound(format!(
+                "Notebook {notebook_id} was deleted"
+            )));
+        }
+        if let Some(pool) = pools.get(notebook_id) {
+            return Ok(Arc::clone(pool));
+        }
+        let pool = Arc::new(NotebookDbPool::new(&db_path)?);
+        pools.insert(notebook_id.to_string(), Arc::clone(&pool));
+        Ok(pool)
     }
 
-    /// Remove a pool from the registry (e.g. when a notebook is deleted).
-    pub fn remove(&self, notebook_id: &str) {
-        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+    /// Fence new DB admissions and close all idle connections before a
+    /// filesystem lifecycle operation. Busy owners are never detached or
+    /// force-closed; the user can retry after cancellation has drained them.
+    pub fn with_notebook_closed<T>(
+        &self,
+        notebook_id: &str,
+        operation: impl FnOnce() -> Result<T, GlossError>,
+    ) -> Result<T, GlossError> {
+        let mut pools = self
+            .pools
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
+        if pools
+            .get(notebook_id)
+            .is_some_and(|pool| Arc::strong_count(pool) != 1)
+        {
+            return Err(GlossError::Config(
+                "Notebook is busy; wait for active work to stop and retry deletion".into(),
+            ));
+        }
+        let mut closed = self
+            .closed
+            .lock()
+            .map_err(|e| GlossError::Other(e.to_string()))?;
         pools.remove(notebook_id);
+        let result = operation();
+        if result.is_ok() {
+            closed.insert(notebook_id.to_string());
+        }
+        result
     }
 
     /// Check whether a pool exists for the given notebook.
@@ -575,5 +622,85 @@ mod tests {
             })
             .unwrap();
         assert!(Arc::ptr_eq(&first, &canonical));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_regressions {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn lifecycle_refuses_live_owner_and_releases_idle_connections() {
+        let root = tempdir().unwrap();
+        let pools = NotebookDbPools::new(root.path());
+        let path = root.path().join("notebook.db");
+        let pool = pools.get_or_create("n", || Ok(path.clone())).unwrap();
+        let ran = std::cell::Cell::new(false);
+        assert!(pools
+            .with_notebook_closed("n", || {
+                ran.set(true);
+                Ok(())
+            })
+            .is_err());
+        assert!(!ran.get());
+        assert!(pool.read(|db| db.source_count()).is_ok());
+        drop(pool);
+        pools
+            .with_notebook_closed("n", || {
+                ran.set(true);
+                Ok(())
+            })
+            .unwrap();
+        assert!(ran.get());
+        assert!(pools.get_or_create("n", || Ok(path)).is_err());
+    }
+
+    #[test]
+    fn failed_lifecycle_operation_reopens_registered_notebook() {
+        let root = tempdir().unwrap();
+        let pools = NotebookDbPools::new(root.path());
+        let path = root.path().join("notebook.db");
+        drop(pools.get_or_create("n", || Ok(path.clone())).unwrap());
+        assert!(pools
+            .with_notebook_closed("n", || Err::<(), _>(GlossError::Other(
+                "injected rename failure".into()
+            )))
+            .is_err());
+        assert!(pools
+            .get_or_create("n", || Ok(path))
+            .unwrap()
+            .read(|db| db.source_count())
+            .is_ok());
+    }
+
+    #[test]
+    fn deletion_fences_a_pool_open_that_already_resolved_a_path() {
+        let root = tempdir().unwrap();
+        let pools = Arc::new(NotebookDbPools::new(root.path()));
+        let path = root.path().join("notebook.db");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let child = {
+            let pools = pools.clone();
+            let barrier = barrier.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                pools
+                    .get_or_create("n", || {
+                        barrier.wait();
+                        barrier.wait();
+                        Ok(path)
+                    })
+                    .is_err()
+            })
+        };
+        barrier.wait();
+        pools.with_notebook_closed("n", || Ok(())).unwrap();
+        barrier.wait();
+        assert!(child.join().unwrap());
+        assert!(
+            !path.exists(),
+            "A stale resolved path must not recreate a deleted DB"
+        );
     }
 }

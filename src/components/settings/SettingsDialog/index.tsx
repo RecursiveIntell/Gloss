@@ -1,3 +1,4 @@
+import { useModalFocus } from "../../../lib/useModalFocus";
 import { useEffect, useMemo, useState } from "react";
 import type React from "react";
 import { ChatTemperatureControl } from "./ChatTemperatureControl";
@@ -303,6 +304,7 @@ function FeatureToggleRow({
       </div>
       <input
         type="checkbox"
+        aria-label={flag.label}
         checked={flag.enabled}
         disabled={disabled}
         onChange={(e) => onToggle(flag.id, e.target.checked)}
@@ -313,6 +315,7 @@ function FeatureToggleRow({
 }
 
 export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
+  const dialogRef = useModalFocus(open, onClose);
   const {
     models,
     settings,
@@ -376,15 +379,14 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const editEmbedding = (setter: (value: string) => void, value: string) => {
     setter(value); setEmbeddingDirty(true); setEmbeddingSaveError(null);
   };
-  const minimumSearchTimeoutMs = Math.min(
-    300000,
-    Math.max(100, Math.trunc(Number(embeddingTimeout) * 1000) + 5000),
-  );
+  const minimumSearchTimeoutMs = embeddingProvider === "ollama"
+    ? Math.max(100, Math.trunc(Number(embeddingTimeout) * 1000) + 5000)
+    : 100;
   const editEmbeddingTimeout = (value: string) => {
     setEmbeddingTimeout(value);
     const timeoutSeconds = Number(value);
-    if (Number.isFinite(timeoutSeconds) && timeoutSeconds >= 2) {
-      const minimum = Math.min(300000, Math.trunc(timeoutSeconds * 1000) + 5000);
+    if (embeddingProvider === "ollama" && Number.isFinite(timeoutSeconds) && timeoutSeconds >= 2 && timeoutSeconds <= 300) {
+      const minimum = Math.trunc(timeoutSeconds * 1000) + 5000;
       if (!Number.isFinite(Number(searchTimeout)) || Number(searchTimeout) < minimum) {
         setSearchTimeout(String(minimum));
       }
@@ -794,11 +796,12 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
       onClick={handleBackdropClick}
     >
-      <div className="flex max-h-[84vh] w-[680px] max-w-[calc(100vw-24px)] flex-col rounded-lg border border-border bg-bg-secondary shadow-xl">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Settings" tabIndex={-1} className="flex max-h-[84vh] w-[680px] max-w-[calc(100vw-24px)] flex-col rounded-lg border border-border bg-bg-secondary shadow-xl">
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <h2 className="text-sm font-semibold text-text">Settings</h2>
           <button
             onClick={onClose}
+            aria-label="Close settings"
             className="rounded p-1 text-text-secondary hover:bg-bg-tertiary hover:text-text"
           >
             <X className="h-4 w-4" />
@@ -1417,7 +1420,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
               />
               <input
                 type="number"
-                min={minimumSearchTimeoutMs} max="300000"
+                min={minimumSearchTimeoutMs} max="305000"
                 value={searchTimeout}
                 disabled={savingEmbedding}
                 onChange={(e) => editEmbedding(setSearchTimeout, e.target.value)}

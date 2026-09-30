@@ -1321,11 +1321,13 @@
       "emitters": [
         "src-tauri/src/commands/chat/emit.rs"
       ],
-      "listeners": [],
+      "listeners": [
+        "src/lib/events.ts"
+      ],
       "payload_schema_ref": "ChatStreamEventV1",
-      "sequence_scope": "per-chat-attempt monotonic seq",
+      "sequence_scope": "process-global monotonic sequence; canonical replay applied once per conversation",
       "terminal_status": "conditional",
-      "rationale": "Replay transport; consumed through get_chat_events_since rather than a live listener."
+      "rationale": "Live notifications trigger coalesced canonical replay; unsequenced events never mutate frontend chat state."
     },
     "chat:token": {
       "emitters": [

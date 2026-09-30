@@ -207,7 +207,7 @@ global.innerWidth=1400;global.innerHeight=900;
 let visible=true,disabled=false,rect={left:1348,right:1400,top:60,bottom:98,x:1348,y:60,width:52,height:38};
 const child={tagName:'svg',getAttribute:()=>null};
 const button={getClientRects:()=>visible?[{}]:[],getBoundingClientRect:()=>rect,
- get disabled(){return disabled},contains:e=>e===child,tagName:'BUTTON',getAttribute:()=>null};
+ get disabled(){return disabled},contains:e=>e===child,tagName:'BUTTON',getAttribute:()=>null,closest:()=>null};
 const blocker={tagName:'BUTTON',getAttribute:()=> 'Dismiss notification'};
 let nodes=[button],hit=blocker;
 global.document={querySelectorAll:()=>nodes,elementFromPoint:()=>hit};

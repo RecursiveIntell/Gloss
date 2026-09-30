@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri_queue::{JobContext, JobHandler, JobResult, QueueError, QueueManager};
 
+mod media_workspace;
 pub mod queue_policy;
+use media_workspace::{create_media_workspace, MediaWorkspaceKind};
 pub use queue_policy::GlossJob;
 pub(crate) use queue_policy::{
     cancel_disallowed_auto_summaries, cancel_jobs_matching,
@@ -404,7 +406,7 @@ async fn execute_audio_metadata(
     let metadata = serde_json::from_slice::<serde_json::Value>(&output.stdout)
         .map_err(|e| QueueError::Execution(format!("ffprobe audio metadata was not JSON: {e}")))?;
     let duration = audio_duration_seconds(&metadata);
-    let transcription = maybe_transcribe_audio(source_title, &full_path, &nb_dir, duration).await?;
+    let transcription = maybe_transcribe_audio(source_title, &full_path, duration).await?;
     let mut tool_receipts = vec![receipt];
     if let Some(receipt) = transcription.tool_receipt.clone() {
         tool_receipts.push(receipt);
@@ -516,7 +518,6 @@ fn cached_whisper_model_path(model: &str, model_dir: &Path) -> PathBuf {
 async fn maybe_transcribe_audio(
     source_title: &str,
     full_path: &Path,
-    nb_dir: &Path,
     duration: Option<f64>,
 ) -> Result<AudioTranscriptionAttempt, QueueError> {
     let model = whisper_model_name();
@@ -560,12 +561,9 @@ async fn maybe_transcribe_audio(
         });
     }
 
-    let output_dir = nb_dir
-        .join("tmp")
-        .join("audio_transcripts")
-        .join(uuid::Uuid::new_v4().to_string());
-    std::fs::create_dir_all(&output_dir)
+    let transcript_workspace = create_media_workspace(MediaWorkspaceKind::AudioTranscript)
         .map_err(|e| QueueError::Execution(format!("failed to create transcript temp dir: {e}")))?;
+    let output_dir = transcript_workspace.path().to_path_buf();
     let args = vec![
         full_path.to_string_lossy().to_string(),
         "--model".to_string(),
@@ -615,7 +613,6 @@ async fn maybe_transcribe_audio(
     .map_err(|e| QueueError::Execution(e.to_string()))?;
     let receipt = output.receipt;
     if !receipt.success {
-        let _ = std::fs::remove_dir_all(&output_dir);
         return Ok(AudioTranscriptionAttempt {
             status: if receipt.timed_out {
                 "timeout"
@@ -638,7 +635,7 @@ async fn maybe_transcribe_audio(
     })?;
     let (transcript_text, segment_count) = whisper_transcript_text(source_title, &model, &raw)
         .map_err(|e| QueueError::Execution(e.to_string()))?;
-    let _ = std::fs::remove_dir_all(&output_dir);
+
     Ok(AudioTranscriptionAttempt {
         status: "transcribed",
         model,
@@ -1332,13 +1329,11 @@ async fn execute_describe_video(
         "Extracting frames from video"
     );
 
-    // Create temp directory for frames
-    let temp_dir = nb_dir.join("_tmp_frames_").join(source_id);
-    let temp_dir_clone = temp_dir.clone();
-    tokio::task::spawn_blocking(move || std::fs::create_dir_all(&temp_dir_clone))
-        .await
-        .map_err(|e| QueueError::Execution(e.to_string()))?
-        .map_err(|e| QueueError::Execution(format!("Failed to create temp dir: {}", e)))?;
+    // Source IDs may come from imported canonical rows. Never interpret them
+    // as paths, or reuse a prior job's directory as a cleanup target.
+    let frame_workspace = create_media_workspace(MediaWorkspaceKind::VideoFrames)
+        .map_err(|e| QueueError::Execution(format!("Failed to create frame workspace: {e}")))?;
+    let temp_dir = frame_workspace.path().to_path_buf();
 
     // Extract frames with ffmpeg (async process)
     let frame_pattern = temp_dir.join("frame_%04d.jpg");
@@ -1380,8 +1375,6 @@ async fn execute_describe_video(
         tool_receipts.push(ffmpeg_receipt);
         match (timed_out, exit_code) {
             (false, Some(code)) => {
-                let td = temp_dir.clone();
-                let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
                 let msg = format!("ffmpeg exited with status {code}");
                 if let Err(e) = db.update_source_status(source_id, "error", Some(&msg)) {
                     tracing::warn!("failed to update source status to error: {e}");
@@ -1389,8 +1382,6 @@ async fn execute_describe_video(
                 return Err(QueueError::Execution(msg));
             }
             (false, None) => {
-                let td = temp_dir.clone();
-                let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
                 let msg = "Failed to run ffmpeg";
                 if let Err(e) = db.update_source_status(source_id, "error", Some(msg)) {
                     tracing::warn!("failed to update source status to error: {e}");
@@ -1398,8 +1389,6 @@ async fn execute_describe_video(
                 return Err(QueueError::Execution(msg.to_string()));
             }
             (true, _) => {
-                let td = temp_dir.clone();
-                let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
                 let msg = "ffmpeg timed out while extracting video frames";
                 if let Err(e) = db.update_source_status(source_id, "error", Some(msg)) {
                     tracing::warn!("failed to update source status to error: {e}");
@@ -1428,8 +1417,6 @@ async fn execute_describe_video(
     frame_paths.sort();
 
     if frame_paths.is_empty() {
-        let td = temp_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
         let msg = "ffmpeg extracted 0 frames from video";
         if let Err(e) = db.update_source_status(source_id, "error", Some(msg)) {
             tracing::warn!("failed to update source status to error: {e}");
@@ -1456,8 +1443,6 @@ async fn execute_describe_video(
             if let Err(e) = db.update_source_status(source_id, "pending", None) {
                 tracing::warn!("failed to update source status to pending: {e}");
             }
-            let td = temp_dir.clone();
-            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
             return Err(QueueError::Cancelled);
         }
 
@@ -1502,8 +1487,6 @@ async fn execute_describe_video(
                 if let Err(e) = db.update_source_status(source_id, "pending", None) {
                     tracing::warn!("failed to update source status to pending: {e}");
                 }
-                let td = temp_dir.clone();
-                let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
                 return Err(QueueError::Cancelled);
             }
 
@@ -1563,14 +1546,11 @@ async fn execute_describe_video(
         if let Err(e) = db.update_source_status(source_id, "pending", None) {
             tracing::warn!("failed to update source status to pending: {e}");
         }
-        let td = temp_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
         return Err(QueueError::Cancelled);
     }
 
-    // Cleanup temp frames
-    let td = temp_dir.clone();
-    let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&td)).await;
+    // Release private scratch after all frame reads; early returns use RAII.
+    drop(frame_workspace);
 
     // Combine into full description
     let duration_label = duration_secs

@@ -62,6 +62,7 @@ interface ChatStore {
 
 // A newer read, send, or context change supersedes an outstanding history read.
 let hydrationEpoch = 0;
+let conversationListEpoch = 0;
 // Live notifications and focus recovery share one serial reader per conversation.
 const replayReads = new Map<string, { again: boolean; promise: Promise<void> }>();
 
@@ -87,13 +88,18 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   responseLength: 'default',
 
   loadConversations: async (notebookId) => {
+    if (useNotebookStore.getState().activeNotebookId !== notebookId) return;
+    const epoch = ++conversationListEpoch;
+    const activationRequestId = useNotebookStore.getState().activationRequestId;
+    const ownsRead = () => epoch === conversationListEpoch &&
+      useNotebookStore.getState().activeNotebookId === notebookId &&
+      useNotebookStore.getState().activationRequestId === activationRequestId;
     try {
       const conversations = await api.listConversations(notebookId);
-      if (useNotebookStore.getState().activeNotebookId !== notebookId) {
-        return;
-      }
+      if (!ownsRead()) return;
       set({ conversations });
     } catch (e) {
+      if (!ownsRead()) return;
       console.warn('Failed to load conversations:', e);
       useToastStore.getState().addToast({ type: 'error', title: 'Load Failed', message: 'Failed to load conversations', duration: 5000 });
     }
@@ -522,6 +528,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   resetForNotebookSwitch: () => {
+    conversationListEpoch += 1;
     hydrationEpoch += 1;
     const current = get();
     set({

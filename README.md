@@ -55,6 +55,8 @@ It is **not** currently a packaged end-user release, a hosted synchronization se
 
 Results are tied to the source revision and environment in each receipt.  The table describes the coverage of the [CI workflow](.github/workflows/ci.yml) and [canonical verifier](scripts/verify_release.py); check their results for the exact candidate you are using.
 
+The [second hostile audit](docs/audits/2026-09-30-merged-source-audit.md) records twelve fresh review scopes against the merged first repair, executable counterexamples, and the follow-up regression gates. Its local checks do not replace the candidate's full native/package CI or acceptance on an existing user notebook.
+
 | Surface | State in this snapshot | Boundary |
 | --- | --- | --- |
 | Frontend unit and contract tests | **Automated gate** | The current canonical verifier runs the complete Vitest and static-contract suites |
@@ -134,6 +136,7 @@ The following are source-declared paths. They are covered by the repository's bu
 - Source-declared ingestion paths include individual files, folders, pasted text, URLs, public YouTube caption tracks, images, audio, video, and documents.
 - Source lifecycle, extraction/chunking state, background jobs, failed-import review, retry, quarantine, and deletion.
 - Portable `.glosspkg.tar.gz` notebook archives use a consistent SQLite snapshot, including committed WAL data, and verify the complete payload inventory with per-file SHA-256 hashes.
+- Exported source assets must have a canonical owner in that database snapshot. Leftover deleted files and unregistered imports remain local; packages with unowned source payloads are rejected.
 - Restored notebooks retain canonical content, conversations, notes and citations.  Dense and semantic projections are marked for rebuild rather than reused under a new notebook identity.
 - Notebook deletion removes the registry entry after moving its data to a sibling `.deleted-<notebook-id>` recovery directory.  There is no automatic purge or restore UI; export first when you need a portable backup.
 
@@ -141,6 +144,7 @@ The following are source-declared paths. They are covered by the repository's bu
 
 - Source-level provider adapters exist for Ollama, llama.cpp, OpenAI, and Anthropic. Automated transport contracts do not turn one live endpoint/model run into proof for every provider.
 - `all`, explicit selected-source, and `none` retrieval scope.
+- Selection changes compare source identities before admitting `all`; stale selected IDs remain explicit diagnostics and cannot silently widen retrieval.
 - SQLite FTS5/BM25 and local HNSW dense retrieval with reciprocal-rank fusion.
 - Bounded query rewriting with fallback to the original query when refinement is unavailable.
 - Partial, cancelled, errored, and completed attempt persistence.
@@ -160,6 +164,7 @@ Source-level Studio paths define structured outputs and deterministic fallback a
 - Provider connectivity and model-list checks.
 - Embedding, dense-index, semantic-memory, and TurboQuant diagnostics.
 - Database doctor checks for source-count drift, orphan rows, failed imports, stale queue jobs, and missing notebook state.  Check mode uses read-only connections; repair is a separate action.
+- Video frame and audio transcript jobs use private per-job scratch directories; imported source IDs cannot select their write or cleanup paths.
 - Startup makes interrupted, unowned imports retryable while retaining their source data and leaving durable queue-owned work alone.
 - Vector-artifact rebuild paths and redacted external-tool receipts.
 
@@ -174,8 +179,8 @@ The canonical source owner is [`import_capability.rs`](src-tauri/src/ingestion/i
 | Text, Markdown, reStructuredText, code, config | Local UTF-8 extraction with format/language metadata | Source text is not automatically summarized or normalized |
 | CSV/TSV | Plain-text import | Table normalization is not claimed |
 | PDF | Bounded local extraction | OCR, forms, and layout fidelity are not claimed |
-| DOCX/XLSX/PPTX | Bounded OOXML text/value extraction | Rendering fidelity is not claimed |
-| Legacy DOC/XLS/PPT | Optional `antiword`, `xls2csv`, and `catppt` tools | Timeout, output-size, and redacted receipt boundaries apply |
+| DOCX/XLSX/PPTX | Bounded OOXML text/value extraction, manifest-defined slide/sheet order, rich shared-string items, and cell identities | Malformed relationships/references fail visibly; rendering, formula evaluation, and number-format fidelity are not claimed |
+| Legacy DOC/XLS/PPT | Optional `antiword`, `xls2csv`, and `catppt` tools | Anonymous output captures, Unix owner-only permissions, timeout, observed-size checks, and redacted receipts; polling is not an OS disk quota |
 | EPUB | Bounded spine/XHTML extraction | DRM and layout fidelity are not supported |
 | HTML files | Source-text import | Readability extraction is not applied |
 | URL | One consented HTTP(S) fetch | Public-host, redirect, content-type, timeout, and byte limits; no crawling/authenticated fetch |

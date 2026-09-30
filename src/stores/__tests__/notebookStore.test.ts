@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useNotebookStore } from '../notebookStore';
 import * as api from '../../lib/tauri';
+import type { Notebook } from '../../lib/types';
 
 vi.mock('../../lib/tauri', () => ({
   setActiveNotebook: vi.fn(), listNotebooks: vi.fn(), createNotebook: vi.fn(),
@@ -26,6 +27,34 @@ beforeEach(() => {
 });
 
 describe('notebook activation serializes backend effects', () => {
+  it('does not reintroduce a deleted notebook from a superseded list read', async () => {
+    const stale = deferred<Notebook[]>();
+    const fresh = deferred<Notebook[]>();
+    vi.mocked(api.listNotebooks).mockReturnValueOnce(stale.promise).mockReturnValueOnce(fresh.promise);
+    const oldRead = useNotebookStore.getState().loadNotebooks();
+    const deleting = useNotebookStore.getState().deleteNotebook('deleted');
+    await vi.waitFor(() => expect(api.listNotebooks).toHaveBeenCalledTimes(2));
+    fresh.resolve([{ id: 'current' } as Notebook]);
+    await deleting;
+    stale.resolve([{ id: 'deleted' } as Notebook]);
+    await oldRead;
+    expect(useNotebookStore.getState().notebooks.map(n => n.id)).toEqual(['current']);
+  });
+
+  it('does not let an old failed list read clear the current loading state', async () => {
+    const stale = deferred<Notebook[]>();
+    const fresh = deferred<Notebook[]>();
+    vi.mocked(api.listNotebooks).mockReturnValueOnce(stale.promise).mockReturnValueOnce(fresh.promise);
+    const oldRead = useNotebookStore.getState().loadNotebooks();
+    const newRead = useNotebookStore.getState().loadNotebooks();
+    stale.reject(new Error('old read failed'));
+    await oldRead;
+    expect(useNotebookStore.getState().loading).toBe(true);
+    fresh.resolve([]);
+    await newRead;
+    expect(useNotebookStore.getState().loading).toBe(false);
+  });
+
   it('cannot let A finish after B and confirm a different notebook from the backend', async () => {
     const a = deferred<void>();
     const b = deferred<void>();

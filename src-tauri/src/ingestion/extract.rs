@@ -7,7 +7,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path};
 use std::process::{Command, Stdio};
@@ -297,22 +297,17 @@ fn extract_docx(source: &Source, path: &Path) -> Result<String, GlossError> {
 fn extract_pptx(source: &Source, path: &Path) -> Result<String, GlossError> {
     let mut archive = open_document_archive(source, path)?;
     require_entry(&mut archive, source, "[Content_Types].xml")?;
-    let mut slide_names = archive
-        .file_names()
-        .filter(|name| {
-            name.starts_with("ppt/slides/slide")
-                && name.ends_with(".xml")
-                && is_safe_zip_entry_name(name)
-        })
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    slide_names.sort();
-    if slide_names.is_empty() {
-        return Err(extraction_error(source, "pptx has no slide XML entries"));
-    }
+    let slides = ordered_office_parts(
+        &mut archive,
+        source,
+        "ppt",
+        "presentation",
+        "sldId",
+        "slide",
+    )?;
 
     let mut out = String::new();
-    for (index, name) in slide_names.iter().enumerate() {
+    for (index, (_, name)) in slides.iter().enumerate() {
         let xml = read_zip_text_entry(&mut archive, source, name)?;
         append_document_line(source, &mut out, &format!("Slide {}", index + 1))?;
         let slide_text = xml_text_nodes(source, &xml, &["t"], &[])?;
@@ -324,36 +319,111 @@ fn extract_pptx(source: &Source, path: &Path) -> Result<String, GlossError> {
 fn extract_xlsx(source: &Source, path: &Path) -> Result<String, GlossError> {
     let mut archive = open_document_archive(source, path)?;
     require_entry(&mut archive, source, "[Content_Types].xml")?;
-    let shared_strings = match read_zip_text_entry(&mut archive, source, "xl/sharedStrings.xml") {
-        Ok(xml) => xml_text_list(source, &xml, &["t"], &[])?,
-        Err(_) => Vec::new(),
-    };
-
-    let mut sheet_names = archive
+    let shared_strings = if archive
         .file_names()
-        .filter(|name| {
-            name.starts_with("xl/worksheets/sheet")
-                && name.ends_with(".xml")
-                && is_safe_zip_entry_name(name)
-        })
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    sheet_names.sort();
-    if sheet_names.is_empty() {
-        return Err(extraction_error(
-            source,
-            "xlsx has no worksheet XML entries",
-        ));
-    }
+        .any(|name| name == "xl/sharedStrings.xml")
+    {
+        let xml = read_zip_text_entry(&mut archive, source, "xl/sharedStrings.xml")?;
+        xml_text_groups(source, &xml, &["t"], &["rPh"], &["si"], true)?
+    } else {
+        Vec::new()
+    };
+    let sheets =
+        ordered_office_parts(&mut archive, source, "xl", "workbook", "sheet", "worksheet")?;
 
     let mut out = String::new();
-    for (index, name) in sheet_names.iter().enumerate() {
-        let xml = read_zip_text_entry(&mut archive, source, name)?;
-        append_document_line(source, &mut out, &format!("Worksheet {}", index + 1))?;
+    for (label, path) in sheets {
+        let xml = read_zip_text_entry(&mut archive, source, &path)?;
+        append_document_line(source, &mut out, &format!("Worksheet {label}"))?;
         let values = xlsx_sheet_values(source, &xml, &shared_strings)?;
-        append_document_line(source, &mut out, &values.join("\t"))?;
+        for row in values {
+            append_document_line(source, &mut out, &row)?;
+        }
     }
     non_empty_document_text(source, "xlsx", out)
+}
+
+/// The package manifest owns order and identity. Unreferenced parts are never
+/// promoted into source text, and relationships cannot escape this archive.
+fn ordered_office_parts(
+    archive: &mut ZipArchive<File>,
+    source: &Source,
+    root: &str,
+    owner: &str,
+    item: &str,
+    kind: &str,
+) -> Result<Vec<(String, String)>, GlossError> {
+    let manifest = read_zip_text_entry(archive, source, &format!("{root}/{owner}.xml"))?;
+    let relationships =
+        read_zip_text_entry(archive, source, &format!("{root}/_rels/{owner}.xml.rels"))?;
+    let mut by_id = BTreeMap::new();
+    for attrs in attrs_for_element(source, &relationships, "Relationship")? {
+        let id = attrs
+            .get("Id")
+            .ok_or_else(|| extraction_error(source, "Office relationship has no Id"))?;
+        if by_id.insert(id.clone(), attrs).is_some() {
+            return Err(extraction_error(
+                source,
+                "Office relationship has duplicate Id",
+            ));
+        }
+    }
+    let mut parts = Vec::new();
+    let mut seen = BTreeSet::new();
+    for attrs in attrs_for_element(source, &manifest, item)? {
+        let references = attrs
+            .iter()
+            .filter(|(key, _)| key.ends_with(":id"))
+            .collect::<Vec<_>>();
+        if references.len() != 1 {
+            return Err(extraction_error(
+                source,
+                "Office part must name one relationship",
+            ));
+        }
+        let relation = by_id
+            .get(references[0].1)
+            .ok_or_else(|| extraction_error(source, "Office part relationship is missing"))?;
+        if relation
+            .get("TargetMode")
+            .is_some_and(|mode| mode != "Internal")
+            || !relation
+                .get("Type")
+                .is_some_and(|value| value.ends_with(&format!("/{kind}")))
+        {
+            return Err(extraction_error(
+                source,
+                "Office part has an external or incorrect relationship",
+            ));
+        }
+        let target = relation
+            .get("Target")
+            .ok_or_else(|| extraction_error(source, "Office part relationship has no target"))?;
+        let path = if let Some(absolute) = target.strip_prefix('/') {
+            is_safe_zip_entry_name(absolute).then(|| absolute.to_string())
+        } else {
+            safe_join_zip_path(root, target)
+        }
+        .ok_or_else(|| extraction_error(source, "Office part relationship path is unsafe"))?;
+        if !seen.insert(path.clone()) {
+            return Err(extraction_error(
+                source,
+                "Office manifest references a part twice",
+            ));
+        }
+        let label = attrs
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| (parts.len() + 1).to_string());
+        parts.push((label, path));
+    }
+    if parts.is_empty() {
+        return Err(extraction_error(
+            source,
+            "Office manifest has no readable parts",
+        ));
+    }
+    Ok(parts)
 }
 
 fn extract_epub(source: &Source, path: &Path) -> Result<String, GlossError> {
@@ -422,42 +492,53 @@ fn extract_legacy_office(
         source.id,
         uuid::Uuid::new_v4()
     );
-    let stdout_path = std::env::temp_dir().join(format!("{receipt_id}.stdout"));
-    let stderr_path = std::env::temp_dir().join(format!("{receipt_id}.stderr"));
-    let stdout_file = File::create(&stdout_path).map_err(|e| {
-        extraction_error(source, &format!("failed to create extractor stdout: {e}"))
-    })?;
-    let stderr_file = File::create(&stderr_path).map_err(|e| {
-        extraction_error(source, &format!("failed to create extractor stderr: {e}"))
-    })?;
+    // Anonymous, owner-only handles: plaintext is never exposed at a named
+    // shared-temp path, and every return path closes and removes the capture.
+    let mut stdout_file = private_extractor_output(source)?;
+    let mut stderr_file = private_extractor_output(source)?;
 
     let start = Instant::now();
-    let mut child = Command::new(extractor)
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .map_err(|e| {
-            cleanup_temp_file(&stdout_path);
-            cleanup_temp_file(&stderr_path);
-            extraction_error(
-                source,
-                &format!("legacy Office extractor '{extractor}' is unavailable: {e}"),
-            )
-        })?;
+    let mut child = ExtractorChild(
+        Command::new(extractor)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout_file.try_clone()?))
+            .stderr(Stdio::from(stderr_file.try_clone()?))
+            .spawn()
+            .map_err(|e| {
+                extraction_error(
+                    source,
+                    &format!("legacy Office extractor '{extractor}' is unavailable: {e}"),
+                )
+            })?,
+    );
 
-    let wait_result = child
-        .wait_timeout(Duration::from_millis(LEGACY_OFFICE_TIMEOUT_MS))
-        .map_err(|e| {
-            extraction_error(source, &format!("legacy Office extractor wait failed: {e}"))
-        })?;
-    let timed_out = wait_result.is_none();
+    let deadline = start + Duration::from_millis(LEGACY_OFFICE_TIMEOUT_MS);
+    let mut output_limit_exceeded = false;
+    let wait_result = loop {
+        if stdout_file.metadata()?.len() > (MAX_DOCUMENT_TEXT_CHARS * 4) as u64
+            || stderr_file.metadata()?.len() > 64 * 1024
+        {
+            output_limit_exceeded = true;
+            break None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break None;
+        }
+        if let Some(status) = child
+            .0
+            .wait_timeout(remaining.min(Duration::from_millis(10)))?
+        {
+            break Some(status);
+        }
+    };
+    let timed_out = wait_result.is_none() && !output_limit_exceeded;
     let exit_status = if let Some(status) = wait_result {
         status
     } else {
-        let _ = child.kill();
-        child.wait().map_err(|e| {
+        let _ = child.0.kill();
+        child.0.wait().map_err(|e| {
             extraction_error(
                 source,
                 &format!("legacy Office extractor kill wait failed: {e}"),
@@ -466,10 +547,8 @@ fn extract_legacy_office(
     };
     let elapsed_ms = start.elapsed().as_millis();
 
-    let stdout = read_bounded_temp_file(source, &stdout_path, MAX_DOCUMENT_TEXT_CHARS * 4)?;
-    let stderr = read_bounded_temp_file(source, &stderr_path, 64 * 1024)?;
-    cleanup_temp_file(&stdout_path);
-    cleanup_temp_file(&stderr_path);
+    let stdout = read_bounded_output(source, &mut stdout_file, MAX_DOCUMENT_TEXT_CHARS * 4)?;
+    let stderr = read_bounded_output(source, &mut stderr_file, 64 * 1024)?;
 
     let text = String::from_utf8_lossy(&stdout.bytes).into_owned();
     let stderr_text = String::from_utf8_lossy(&stderr.bytes).into_owned();
@@ -484,7 +563,11 @@ fn extract_legacy_office(
         timeout_ms: LEGACY_OFFICE_TIMEOUT_MS,
         elapsed_ms,
         exit_code: exit_status.code(),
-        success: exit_status.success() && !timed_out,
+        success: exit_status.success()
+            && !timed_out
+            && !output_limit_exceeded
+            && !stdout.truncated
+            && !stderr.truncated,
         timed_out,
         stdout_sha256: sha256_hex(&stdout.bytes),
         stdout_bytes: stdout.bytes.len(),
@@ -494,6 +577,12 @@ fn extract_legacy_office(
         output_truncated: stdout.truncated || stderr.truncated,
     };
 
+    if output_limit_exceeded || stdout.truncated || stderr.truncated {
+        return Err(extraction_error(
+            source,
+            "legacy Office extractor output exceeded capture limit",
+        ));
+    }
     if timed_out {
         return Err(extraction_error(
             source,
@@ -510,13 +599,6 @@ fn extract_legacy_office(
             ),
         ));
     }
-    if stdout.truncated {
-        return Err(extraction_error(
-            source,
-            "legacy Office extractor output exceeded bounded read limit",
-        ));
-    }
-
     Ok((non_empty_document_text(source, format, text)?, receipt))
 }
 
@@ -534,13 +616,35 @@ struct BoundedBytes {
     truncated: bool,
 }
 
-fn read_bounded_temp_file(
+struct ExtractorChild(std::process::Child);
+impl Drop for ExtractorChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn private_extractor_output(source: &Source) -> Result<File, GlossError> {
+    let file = tempfile::tempfile().map_err(|e| {
+        extraction_error(
+            source,
+            &format!("failed to create private extractor capture: {e}"),
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+fn read_bounded_output(
     source: &Source,
-    path: &Path,
+    file: &mut File,
     max_bytes: usize,
 ) -> Result<BoundedBytes, GlossError> {
-    let mut file = File::open(path)
-        .map_err(|e| extraction_error(source, &format!("failed to open extractor output: {e}")))?;
+    file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
     let mut limited = file.by_ref().take(max_bytes as u64 + 1);
     limited
@@ -551,10 +655,6 @@ fn read_bounded_temp_file(
         bytes.truncate(max_bytes);
     }
     Ok(BoundedBytes { bytes, truncated })
-}
-
-fn cleanup_temp_file(path: &Path) {
-    let _ = std::fs::remove_file(path);
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -669,50 +769,77 @@ fn xml_text_nodes(
     target_names: &[&str],
     ignored_ancestors: &[&str],
 ) -> Result<String, GlossError> {
-    let values = xml_text_list(source, xml, target_names, ignored_ancestors)?;
+    let values = xml_text_groups(
+        source,
+        xml,
+        target_names,
+        ignored_ancestors,
+        &["p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr"],
+        false,
+    )?;
     let mut out = String::new();
     for value in values {
-        append_document_text(source, &mut out, &value)?;
+        append_document_line(source, &mut out, &value)?;
     }
     Ok(out)
 }
 
-fn xml_text_list(
+fn xml_text_groups(
     source: &Source,
     xml: &str,
     target_names: &[&str],
     ignored_ancestors: &[&str],
+    group_names: &[&str],
+    preserve_empty: bool,
 ) -> Result<Vec<String>, GlossError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
     let mut stack: Vec<String> = Vec::new();
     let mut values = Vec::new();
+    let mut current = String::new();
+    let mut total_bytes = 0usize;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(event)) => {
                 stack.push(local_xml_name(event.name().as_ref()));
             }
-            Ok(Event::End(_)) => {
+            Ok(Event::End(event)) => {
+                if group_names.contains(&local_xml_name(event.name().as_ref()).as_str()) {
+                    let value = collapse_inline_whitespace(&current);
+                    if preserve_empty || !value.is_empty() {
+                        values.push(value);
+                    }
+                    current.clear();
+                }
                 stack.pop();
             }
-            Ok(Event::Text(event)) => {
-                let current = stack.last().map(String::as_str);
+            Ok(Event::Empty(event)) => {
+                let name = local_xml_name(event.name().as_ref());
+                if preserve_empty && group_names.contains(&name.as_str()) {
+                    values.push(String::new());
+                } else if matches!(name.as_str(), "br" | "tab") {
+                    current.push(' ');
+                }
+            }
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_))) => {
+                let element = stack.last().map(String::as_str);
                 let target_matches = target_names.is_empty()
-                    || current
+                    || element
                         .map(|name| target_names.contains(&name))
                         .unwrap_or(false);
                 let ignored = stack
                     .iter()
                     .any(|name| ignored_ancestors.contains(&name.as_str()));
                 if target_matches && !ignored {
-                    let decoded = event
-                        .decode()
-                        .map_err(|e| extraction_error(source, &format!("invalid XML text: {e}")))?;
-                    let normalized = collapse_inline_whitespace(decoded.as_ref());
-                    if !normalized.is_empty() {
-                        values.push(normalized);
+                    let decoded = decoded_xml_text(source, event)?;
+                    total_bytes += decoded.len();
+                    if total_bytes > MAX_DOCUMENT_TEXT_CHARS {
+                        return Err(extraction_error(
+                            source,
+                            "document extracted text exceeds bounded output limit",
+                        ));
                     }
+                    current.push_str(&decoded);
                 }
             }
             Ok(Event::Eof) => break,
@@ -725,7 +852,28 @@ fn xml_text_list(
             _ => {}
         }
     }
+    if !current.trim().is_empty() {
+        values.push(collapse_inline_whitespace(&current));
+    }
     Ok(values)
+}
+
+fn decoded_xml_text(source: &Source, event: Event<'_>) -> Result<String, GlossError> {
+    match event {
+        Event::Text(value) => value.decode().map(|text| text.into_owned()),
+        Event::CData(value) => value.decode().map(|text| text.into_owned()),
+        Event::GeneralRef(value) => {
+            let name = value
+                .decode()
+                .map_err(|e| extraction_error(source, &format!("invalid XML reference: {e}")))?;
+            let raw = format!("&{name};");
+            return quick_xml::escape::unescape(&raw)
+                .map(|text| text.into_owned())
+                .map_err(|e| extraction_error(source, &format!("unsupported XML reference: {e}")));
+        }
+        _ => return Ok(String::new()),
+    }
+    .map_err(|e| extraction_error(source, &format!("invalid XML text: {e}")))
 }
 
 fn xlsx_sheet_values(
@@ -734,49 +882,88 @@ fn xlsx_sheet_values(
     shared_strings: &[String],
 ) -> Result<Vec<String>, GlossError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
     let mut values = Vec::new();
     let mut current_cell_type: Option<String> = None;
     let mut in_value = false;
     let mut value_buf = String::new();
+    let mut cell_ref = String::new();
+    let mut row = Vec::new();
+    let mut row_number = 0usize;
+    let mut row_label = String::new();
+    let mut cell_number = 0usize;
+    let mut output_bytes = 0usize;
+    let mut phonetic_depth = 0usize;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(event)) => {
                 let name = local_xml_name(event.name().as_ref());
-                if name == "c" {
+                if name == "rPh" {
+                    phonetic_depth += 1;
+                } else if name == "c" {
                     current_cell_type = attr_value(&reader, &event, "t")?;
+                    cell_number += 1;
+                    cell_ref = attr_value(&reader, &event, "r")?
+                        .unwrap_or_else(|| format!("cell {cell_number}"));
+                    value_buf.clear();
+                } else if name == "row" {
+                    row_number += 1;
+                    row_label =
+                        attr_value(&reader, &event, "r")?.unwrap_or_else(|| row_number.to_string());
+                    cell_number = 0;
                 } else if name == "v" || name == "t" {
                     in_value = true;
-                    value_buf.clear();
                 }
             }
             Ok(Event::End(event)) => {
                 let name = local_xml_name(event.name().as_ref());
-                if name == "v" || name == "t" {
+                if name == "rPh" {
+                    phonetic_depth = phonetic_depth.saturating_sub(1);
+                } else if name == "v" || name == "t" {
                     in_value = false;
+                } else if name == "c" {
                     let raw = value_buf.trim();
                     if !raw.is_empty() {
-                        if current_cell_type.as_deref() == Some("s") {
-                            if let Ok(index) = raw.parse::<usize>() {
-                                if let Some(value) = shared_strings.get(index) {
-                                    values.push(value.clone());
-                                }
-                            }
+                        let value = if current_cell_type.as_deref() == Some("s") {
+                            let index = raw.parse::<usize>().map_err(|_| {
+                                extraction_error(source, "invalid shared string index")
+                            })?;
+                            shared_strings.get(index).cloned().ok_or_else(|| {
+                                extraction_error(source, "shared string index is out of range")
+                            })?
                         } else {
-                            values.push(collapse_inline_whitespace(raw));
-                        }
+                            collapse_inline_whitespace(raw)
+                        };
+                        output_bytes = output_bytes
+                            .checked_add(cell_ref.len() + value.len() + 32)
+                            .filter(|bytes| *bytes <= MAX_DOCUMENT_TEXT_CHARS)
+                            .ok_or_else(|| {
+                                extraction_error(
+                                    source,
+                                    "worksheet expanded text exceeds bounded output limit",
+                                )
+                            })?;
+                        row.push(format!("{cell_ref}: {value}"));
                     }
                     value_buf.clear();
-                } else if name == "c" {
                     current_cell_type = None;
+                } else if name == "row" {
+                    if !row.is_empty() {
+                        values.push(format!("Row {row_label}: {}", row.join(" | ")));
+                    }
+                    row.clear();
                 }
             }
-            Ok(Event::Text(event)) if in_value => {
-                let decoded = event.decode().map_err(|e| {
-                    extraction_error(source, &format!("invalid worksheet text: {e}"))
-                })?;
-                value_buf.push_str(decoded.as_ref());
+            Ok(event @ (Event::Text(_) | Event::CData(_) | Event::GeneralRef(_)))
+                if in_value && phonetic_depth == 0 =>
+            {
+                value_buf.push_str(&decoded_xml_text(source, event)?);
+                if value_buf.len() > MAX_DOCUMENT_TEXT_CHARS {
+                    return Err(extraction_error(
+                        source,
+                        "worksheet cell exceeds bounded output limit",
+                    ));
+                }
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -861,7 +1048,7 @@ fn attrs_for_element(
                     let attr = attr.map_err(|e| {
                         extraction_error(source, &format!("invalid XML attribute: {e}"))
                     })?;
-                    let key = local_xml_name(attr.key.as_ref());
+                    let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
                     #[allow(deprecated)]
                     let value = attr
                         .decode_and_unescape_value(reader.decoder())
@@ -950,24 +1137,6 @@ fn local_xml_name(name: &[u8]) -> String {
     String::from_utf8_lossy(local).into_owned()
 }
 
-fn append_document_text(source: &Source, out: &mut String, text: &str) -> Result<(), GlossError> {
-    let text = collapse_inline_whitespace(text);
-    if text.is_empty() {
-        return Ok(());
-    }
-    if !out.is_empty() && !out.ends_with(['\n', ' ']) {
-        out.push(' ');
-    }
-    if out.len() + text.len() > MAX_DOCUMENT_TEXT_CHARS {
-        return Err(extraction_error(
-            source,
-            "document extracted text exceeds bounded output limit",
-        ));
-    }
-    out.push_str(&text);
-    Ok(())
-}
-
 fn append_document_line(source: &Source, out: &mut String, text: &str) -> Result<(), GlossError> {
     let text = collapse_inline_whitespace(text);
     if text.is_empty() {
@@ -1024,6 +1193,84 @@ mod tests {
     use tempfile::tempdir;
     use zip::write::SimpleFileOptions;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_extractor_capture_is_private_and_cleaned_on_success_failure_and_overflow() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in ["success", "failure", "overflow"] {
+            let root = tempdir().unwrap();
+            let bin = root.path().join("bin");
+            let temp = root.path().join("temp");
+            fs::create_dir(&bin).unwrap();
+            fs::create_dir(&temp).unwrap();
+            let tool = bin.join("antiword");
+            fs::write(
+                &tool,
+                r#"#!/bin/sh
+exec 3>&1
+stat -Lc '%a %h' /proc/$$/fd/3 > "$GLOSS_CAPTURE_METADATA"
+case "$GLOSS_CAPTURE_MODE" in
+ success) printf 'private fixture text' ;;
+ failure) printf 'private partial text'; exit 7 ;;
+ overflow) head -c 5000000 /dev/zero; sleep 2 ;;
+esac
+"#,
+            )
+            .unwrap();
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+            let test_name = format!(
+                "{}::legacy_extractor_capture_child",
+                module_path!().split_once("::").unwrap().1
+            );
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--ignored", "--nocapture"])
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("TMPDIR", &temp)
+                .env("GLOSS_CAPTURE_MODE", mode)
+                .env("GLOSS_CAPTURE_ROOT", root.path())
+                .env("GLOSS_CAPTURE_METADATA", root.path().join("metadata"))
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+            assert_eq!(
+                fs::read_to_string(root.path().join("metadata"))
+                    .unwrap()
+                    .trim(),
+                "600 0"
+            );
+            assert_eq!(fs::read_dir(&temp).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "spawned by the parent capture test in an isolated environment"]
+    fn legacy_extractor_capture_child() {
+        let root = std::path::PathBuf::from(std::env::var_os("GLOSS_CAPTURE_ROOT").unwrap());
+        fs::create_dir(root.join("sources")).unwrap();
+        fs::write(root.join("sources/fixture.doc"), b"fixture").unwrap();
+        let result = extract_text(&source_for("fixture.doc", "doc"), &root);
+        match std::env::var("GLOSS_CAPTURE_MODE").unwrap().as_str() {
+            "success" => assert_eq!(result.unwrap(), "private fixture text"),
+            "failure" => assert!(result.unwrap_err().to_string().contains("failed with code")),
+            "overflow" => assert!(result.unwrap_err().to_string().contains("capture limit")),
+            _ => panic!("unknown fixture mode"),
+        }
+    }
+
     fn source_for(filename: &str, language: &str) -> Source {
         Source {
             id: format!("source-{language}"),
@@ -1045,6 +1292,51 @@ mod tests {
             updated_at: String::new(),
             processing_state: None,
         }
+    }
+
+    #[test]
+    fn repeated_shared_strings_cannot_amplify_worksheet_output_past_the_limit() {
+        let source = source_for("fixture.xlsx", "xlsx");
+        let xml = "<worksheet><row><c t=\"s\"><v>0</v></c><c t=\"s\"><v>0</v></c><c t=\"s\"><v>0</v></c></row></worksheet>";
+        assert!(xlsx_sheet_values(&source, xml, &["x".repeat(500_000)]).is_err());
+    }
+
+    #[test]
+    fn shared_string_items_preserve_empty_entries_and_reject_invalid_indices() {
+        let source = source_for("fixture.xlsx", "xlsx");
+        let strings = xml_text_groups(
+            &source,
+            "<sst><si/><si><r><t>A</t></r><r><t>B</t></r></si></sst>",
+            &["t"],
+            &["rPh"],
+            &["si"],
+            true,
+        )
+        .unwrap();
+        assert_eq!(strings, ["", "AB"]);
+        assert!(xlsx_sheet_values(
+            &source,
+            "<worksheet><row><c t=\"s\"><v>2</v></c></row></worksheet>",
+            &strings
+        )
+        .is_err());
+        let values = xlsx_sheet_values(
+            &source,
+            "<worksheet><row r=\"50\"><c r=\"D50\" t=\"s\"><v>1</v></c></row></worksheet>",
+            &strings,
+        )
+        .unwrap();
+        assert_eq!(values, ["Row 50: D50: AB"]);
+    }
+
+    #[test]
+    fn inline_strings_exclude_phonetic_annotations() {
+        let source = source_for("fixture.xlsx", "xlsx");
+        let xml = "<worksheet><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>漢字</t><rPh sb=\"0\" eb=\"2\"><t>かんじ</t></rPh></is></c></row></worksheet>";
+        assert_eq!(
+            xlsx_sheet_values(&source, xml, &[]).unwrap(),
+            ["Row 1: A1: 漢字"]
+        );
     }
 
     fn write_zip(path: &Path, entries: &[(&str, &str)]) {
@@ -1117,6 +1409,14 @@ mod tests {
             &[
                 ("[Content_Types].xml", "<Types/>"),
                 (
+                    "ppt/presentation.xml",
+                    r#"<p:presentation><p:sldIdLst><p:sldId id="1" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+                ),
+                (
+                    "ppt/_rels/presentation.xml.rels",
+                    r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#,
+                ),
+                (
                     "ppt/slides/slide1.xml",
                     r#"<p:sld><p:cSld><a:t>Beta slide text</a:t></p:cSld></p:sld>"#,
                 ),
@@ -1130,6 +1430,14 @@ mod tests {
             &sources.join("sample.xlsx"),
             &[
                 ("[Content_Types].xml", "<Types/>"),
+                (
+                    "xl/workbook.xml",
+                    r#"<workbook><sheets><sheet name="Sheet 1" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+                ),
                 (
                     "xl/sharedStrings.xml",
                     r#"<sst><si><t>Gamma header</t></si><si><t>Delta cell</t></si></sst>"#,
@@ -1231,5 +1539,73 @@ mod tests {
         assert_eq!(value["argv_redacted"][1], "[source_document_path]");
         assert_eq!(value["timeout_ms"], LEGACY_OFFICE_TIMEOUT_MS);
         assert!(!value.to_string().contains("/home/example/private"));
+    }
+}
+
+#[cfg(test)]
+mod fresh_document_regressions {
+    use super::extract_text;
+    use crate::db::notebook_db::Source;
+    use std::{fs::File, io::Write};
+    use zip::write::SimpleFileOptions;
+    fn extract(ext: &str, entries: &[(&str, &str)]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sources")).unwrap();
+        let name = format!("fixture.{ext}");
+        let mut zip =
+            zip::ZipWriter::new(File::create(dir.path().join("sources").join(&name)).unwrap());
+        for (path, text) in entries {
+            zip.start_file(*path, SimpleFileOptions::default()).unwrap();
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        let source = Source {
+            id: "fixture".into(),
+            source_type: "document".into(),
+            title: name.clone(),
+            original_filename: Some(name.clone()),
+            file_hash: None,
+            url: None,
+            file_path: Some(name),
+            content_text: None,
+            word_count: None,
+            metadata: None,
+            summary: None,
+            summary_model: None,
+            status: "pending".into(),
+            error_message: None,
+            selected: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            processing_state: None,
+        };
+        extract_text(&source, dir.path()).unwrap()
+    }
+    #[test]
+    fn docx_preserves_entities_cdata_and_adjacent_formatting_runs() {
+        let text = extract("docx", &[("[Content_Types].xml", "<Types/>"),
+        ("word/document.xml", "<w:document><w:body><w:p><w:r><w:t>micro</w:t></w:r><w:r><w:t>scope &amp; </w:t></w:r><w:r><w:t><![CDATA[<secret>]]></w:t></w:r></w:p></w:body></w:document>")]);
+        assert!(text.contains("microscope & <secret>"), "{text:?}");
+    }
+    #[test]
+    fn pptx_uses_presentation_order_not_archive_filenames() {
+        let text = extract("pptx", &[("[Content_Types].xml", "<Types/>"),
+        ("ppt/presentation.xml", "<p:presentation><p:sldIdLst><p:sldId id=\"1\" r:id=\"rId2\"/><p:sldId id=\"2\" r:id=\"rId1\"/></p:sldIdLst></p:presentation>"),
+        ("ppt/_rels/presentation.xml.rels", "<Relationships><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide2.xml\"/></Relationships>"),
+        ("ppt/slides/slide1.xml", "<p:sld><a:t>SECOND</a:t></p:sld>"),
+        ("ppt/slides/slide2.xml", "<p:sld><a:t>FIRST</a:t></p:sld>")]);
+        assert!(
+            text.find("FIRST").unwrap() < text.find("SECOND").unwrap(),
+            "{text:?}"
+        );
+    }
+    #[test]
+    fn xlsx_shared_string_indices_count_items_not_rich_text_runs() {
+        let text = extract("xlsx", &[("[Content_Types].xml", "<Types/>"),
+        ("xl/workbook.xml", "<workbook><sheets><sheet name=\"Ledger\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"),
+        ("xl/_rels/workbook.xml.rels", "<Relationships><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>"),
+        ("xl/sharedStrings.xml", "<sst><si><r><t>Alpha</t></r><r><t>Beta</t></r></si><si><t>Correct second item</t></si></sst>"),
+        ("xl/worksheets/sheet1.xml", "<worksheet><sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>1</v></c></row></sheetData></worksheet>")]);
+        assert!(text.contains("Correct second item"), "{text:?}");
     }
 }

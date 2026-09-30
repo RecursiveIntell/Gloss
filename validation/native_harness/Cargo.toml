@@ -38,5 +38,9 @@ agent-queue = "=0.2.0"
 chrono = "0.4"
 flate2 = "1"
 tar = "0.4"
+quick-xml = "0.41"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+pdf-extract = "0.12"
+wait-timeout = "0.2"
 
 [workspace]

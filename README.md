@@ -57,6 +57,8 @@ Results are tied to the source revision and environment in each receipt.  The ta
 
 The [second hostile audit](docs/audits/2026-09-30-merged-source-audit.md) records twelve fresh review scopes against the merged first repair, executable counterexamples, and the follow-up regression gates. Its local checks do not replace the candidate's full native/package CI or acceptance on an existing user notebook.
 
+The [source-ownership case study](docs/case-studies/gloss-source-ownership-2026-09-30.md) connects PR #10's repair mechanisms to pinned source, historical qualification logs, and an October 8 baseline-versus-repair regression replay. It distinguishes reproduced checks from PR-reported runtime receipt details and preserves the Linux fresh-profile limits.
+
 | Surface | State in this snapshot | Boundary |
 | --- | --- | --- |
 | Frontend unit and contract tests | **Automated gate** | The current canonical verifier runs the complete Vitest and static-contract suites |

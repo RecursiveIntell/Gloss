@@ -1,0 +1,14 @@
+
+> gloss@1.0.0 test:unit
+> vitest run src/stores/__tests__/notebookStore.test.ts src/stores/__tests__/conversationFreshness.test.ts src/stores/__tests__/sourceStore.test.ts
+
+
+ RUN  v4.1.11 /workspace/scratch/8a8d88778a19/Gloss
+
+
+ Test Files  3 passed (3)
+      Tests  22 passed (22)
+   Start at  16:03:59
+   Duration  518ms (transform 197ms, setup 0ms, import 325ms, tests 260ms, environment 0ms)
+
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.

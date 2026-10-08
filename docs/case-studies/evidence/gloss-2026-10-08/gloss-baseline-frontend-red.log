@@ -1,0 +1,227 @@
+
+> gloss@1.0.0 test:unit
+> vitest run src/stores/__tests__/notebookStore.test.ts src/stores/__tests__/conversationFreshness.test.ts src/stores/__tests__/sourceStore.test.ts
+
+
+ RUN  v4.1.11 /workspace/scratch/8a8d88778a19/Gloss-baseline
+
+ ❯ src/stores/__tests__/conversationFreshness.test.ts (4 tests | 4 failed) 13ms
+   × keeps the latest list when an older same-notebook read finishes last 7ms
+   × rejects an old A read after A to B to A, even before the next A read 2ms
+   × does not show an obsolete list failure in the new notebook 2ms
+   × does not let a background refresh supersede the active notebook request 1ms
+ ❯ src/stores/__tests__/sourceStore.test.ts (8 tests | 2 failed) 16ms
+     × does not widen explicit scope when toggleSource sees stale selected identities 11ms
+     × does not widen explicit scope when toggleGroup sees stale selected identities 2ms
+ ❯ src/stores/__tests__/notebookStore.test.ts (10 tests | 2 failed) 224ms
+     × does not reintroduce a deleted notebook from a superseded list read 59ms
+     × does not let an old failed list read clear the current loading state 2ms
+
+ Test Files  3 failed (3)
+      Tests  8 failed | 14 passed (22)
+   Start at  16:03:58
+   Duration  478ms (transform 209ms, setup 0ms, import 337ms, tests 252ms, environment 0ms)
+
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+stderr | src/stores/__tests__/conversationFreshness.test.ts > does not show an obsolete list failure in the new notebook
+Failed to load conversations: Error: obsolete A read
+    at /workspace/scratch/8a8d88778a19/Gloss-baseline/src/stores/__tests__/conversationFreshness.test.ts:49:14
+    at file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:302:11
+    at file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:1903:26
+    at file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:2326:20
+    at new Promise (<anonymous>)
+    at runWithCancel (file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:2323:10)
+    at file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:2305:20
+    at new Promise (<anonymous>)
+    at runWithTimeout (file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:2272:10)
+    at file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:2956:64
+
+stderr | src/stores/__tests__/notebookStore.test.ts > notebook activation serializes backend effects > does not let an old failed list read clear the current loading state
+Failed to load notebooks: Error: old read failed
+    at /workspace/scratch/8a8d88778a19/Gloss-baseline/src/stores/__tests__/notebookStore.test.ts:50:18
+    at file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:302:11
+    at file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:1903:26
+    at file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:2326:20
+    at new Promise (<anonymous>)
+    at runWithCancel (file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:2323:10)
+    at file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:2305:20
+    at new Promise (<anonymous>)
+    at runWithTimeout (file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:2272:10)
+    at file:///workspace/scratch/8a8d88778a19/Gloss/node_modules/@vitest/runner/dist/chunk-artifact.js:2956:64
+
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 8 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/stores/__tests__/conversationFreshness.test.ts > keeps the latest list when an older same-notebook read finishes last
+AssertionError: expected [ 'deleted' ] to deeply equal [ 'current' ]
+
+- Expected
++ Received
+
+  [
+-   "current",
++   "deleted",
+  ]
+
+ ❯ src/stores/__tests__/conversationFreshness.test.ts:29:64
+     27|   old.resolve([row('deleted')]);
+     28|   await first;
+     29|   expect(useChatStore.getState().conversations.map(c => c.id)).toEqual…
+       |                                                                ^
+     30| });
+     31| it('rejects an old A read after A to B to A, even before the next A re…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/8]⎯
+
+ FAIL  src/stores/__tests__/conversationFreshness.test.ts > rejects an old A read after A to B to A, even before the next A read
+AssertionError: expected [ { id: 'old-A' } ] to deeply equal []
+
+- Expected
++ Received
+
+- []
++ [
++   {
++     "id": "old-A",
++   },
++ ]
+
+ ❯ src/stores/__tests__/conversationFreshness.test.ts:41:49
+     39|   old.resolve([row('old-A')]);
+     40|   await first;
+     41|   expect(useChatStore.getState().conversations).toEqual([]);
+       |                                                 ^
+     42| });
+     43| it('does not show an obsolete list failure in the new notebook', async…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/8]⎯
+
+ FAIL  src/stores/__tests__/conversationFreshness.test.ts > does not show an obsolete list failure in the new notebook
+AssertionError: expected [ { type: 'error', …(4) } ] to deeply equal []
+
+- Expected
++ Received
+
+- []
++ [
++   {
++     "duration": 5000,
++     "id": "toast-1",
++     "message": "Failed to load conversations",
++     "title": "Load Failed",
++     "type": "error",
++   },
++ ]
+
+ ❯ src/stores/__tests__/conversationFreshness.test.ts:51:43
+     49|   old.reject(new Error('obsolete A read'));
+     50|   await first;
+     51|   expect(useToastStore.getState().toasts).toEqual([]);
+       |                                           ^
+     52| });
+     53| it('does not let a background refresh supersede the active notebook re…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/8]⎯
+
+ FAIL  src/stores/__tests__/conversationFreshness.test.ts > does not let a background refresh supersede the active notebook request
+AssertionError: expected "vi.fn()" to be called 1 times, but got 2 times
+ ❯ src/stores/__tests__/conversationFreshness.test.ts:60:33
+     58|   current.resolve([row('current')]);
+     59|   await first;
+     60|   expect(api.listConversations).toHaveBeenCalledTimes(1);
+       |                                 ^
+     61|   expect(useChatStore.getState().conversations.map(c => c.id)).toEqual…
+     62| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/8]⎯
+
+ FAIL  src/stores/__tests__/notebookStore.test.ts > notebook activation serializes backend effects > does not reintroduce a deleted notebook from a superseded list read
+AssertionError: expected [ 'deleted' ] to deeply equal [ 'current' ]
+
+- Expected
++ Received
+
+  [
+-   "current",
++   "deleted",
+  ]
+
+ ❯ src/stores/__tests__/notebookStore.test.ts:41:66
+     39|     stale.resolve([{ id: 'deleted' } as Notebook]);
+     40|     await oldRead;
+     41|     expect(useNotebookStore.getState().notebooks.map(n => n.id)).toEqu…
+       |                                                                  ^
+     42|   });
+     43|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/8]⎯
+
+ FAIL  src/stores/__tests__/notebookStore.test.ts > notebook activation serializes backend effects > does not let an old failed list read clear the current loading state
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ src/stores/__tests__/notebookStore.test.ts:52:49
+     50|     stale.reject(new Error('old read failed'));
+     51|     await oldRead;
+     52|     expect(useNotebookStore.getState().loading).toBe(true);
+       |                                                 ^
+     53|     fresh.resolve([]);
+     54|     await newRead;
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/8]⎯
+
+ FAIL  src/stores/__tests__/sourceStore.test.ts > sourceStore > does not widen explicit scope when toggleSource sees stale selected identities
+AssertionError: expected { kind: 'all' } to deeply equal { kind: 'explicit', …(1) }
+
+- Expected
++ Received
+
+  {
+-   "ids": [
+-     "gone",
+-     "A",
+-   ],
+-   "kind": "explicit",
++   "kind": "all",
+  }
+
+ ❯ src/stores/__tests__/sourceStore.test.ts:82:56
+     80|     if (action === 'toggleSource') useSourceStore.getState().toggleSou…
+     81|     else useSourceStore.getState().toggleGroup('group');
+     82|     expect(useSourceStore.getState().getSourceScope()).toEqual({ kind:…
+       |                                                        ^
+     83|     await vi.runAllTimersAsync();
+     84|     vi.useRealTimers();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/8]⎯
+
+ FAIL  src/stores/__tests__/sourceStore.test.ts > sourceStore > does not widen explicit scope when toggleGroup sees stale selected identities
+AssertionError: expected { kind: 'all' } to deeply equal { kind: 'explicit', …(1) }
+
+- Expected
++ Received
+
+  {
+-   "ids": [
+-     "gone",
+-     "A",
+-   ],
+-   "kind": "explicit",
++   "kind": "all",
+  }
+
+ ❯ src/stores/__tests__/sourceStore.test.ts:82:56
+     80|     if (action === 'toggleSource') useSourceStore.getState().toggleSou…
+     81|     else useSourceStore.getState().toggleGroup('group');
+     82|     expect(useSourceStore.getState().getSourceScope()).toEqual({ kind:…
+       |                                                        ^
+     83|     await vi.runAllTimersAsync();
+     84|     vi.useRealTimers();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/8]⎯
+

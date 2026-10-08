@@ -1,0 +1,157 @@
+{
+  "finished_at": "2026-09-30T15:28:10.119212+00:00",
+  "gates": [
+    {
+      "command": "cargo fmt --all -- --check",
+      "elapsed_seconds": 0.733,
+      "exit_code": 0,
+      "name": "cargo_fmt",
+      "status": "passed"
+    },
+    {
+      "command": "python3 validation/verify_tauri_contract.py .",
+      "elapsed_seconds": 0.617,
+      "exit_code": 0,
+      "name": "tauri_contract",
+      "status": "passed"
+    },
+    {
+      "command": "bash validation/run_all_gloss_repair_gates.sh .",
+      "elapsed_seconds": 1.653,
+      "exit_code": 0,
+      "name": "rust_static_repair_gates",
+      "status": "passed"
+    },
+    {
+      "command": "python3 -m unittest discover -s scripts/tests -v",
+      "elapsed_seconds": 2.06,
+      "exit_code": 0,
+      "name": "python_script_contracts",
+      "status": "passed"
+    },
+    {
+      "command": "python3 -m unittest discover -s validation/tests -v",
+      "elapsed_seconds": 15.748,
+      "exit_code": 0,
+      "name": "python_validation_contracts",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --locked --manifest-path validation/native_harness/Cargo.toml",
+      "elapsed_seconds": 12.483,
+      "exit_code": 0,
+      "name": "native_owner_contracts",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --locked --manifest-path validation/turbo_quant_harness/Cargo.toml",
+      "elapsed_seconds": 67.957,
+      "exit_code": 0,
+      "name": "turbo_quant_runtime_contracts",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --locked --manifest-path src-tauri/Cargo.toml",
+      "elapsed_seconds": 14.407,
+      "exit_code": 0,
+      "name": "cargo_check_default",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --locked --manifest-path src-tauri/Cargo.toml --no-default-features --features semantic-memory-backend",
+      "elapsed_seconds": 9.905,
+      "exit_code": 0,
+      "name": "cargo_check_semantic_memory_backend",
+      "status": "passed"
+    },
+    {
+      "command": "cargo check --locked --manifest-path src-tauri/Cargo.toml --no-default-features --features semantic-memory-turbo-quant",
+      "elapsed_seconds": 9.395,
+      "exit_code": 0,
+      "name": "cargo_check_semantic_memory_turbo_quant",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --locked --manifest-path src-tauri/Cargo.toml --no-default-features --features semantic-memory-turbo-quant",
+      "elapsed_seconds": 34.687,
+      "exit_code": 0,
+      "name": "cargo_test_semantic_memory_turbo_quant",
+      "status": "passed"
+    },
+    {
+      "command": "npm run test:unit",
+      "elapsed_seconds": 3.696,
+      "exit_code": 0,
+      "name": "npm_unit_tests",
+      "status": "passed"
+    },
+    {
+      "command": "npm run test:contracts",
+      "elapsed_seconds": 0.106,
+      "exit_code": 0,
+      "name": "npm_static_contract_tests",
+      "status": "passed"
+    },
+    {
+      "command": "npm run build",
+      "elapsed_seconds": 7.28,
+      "exit_code": 0,
+      "name": "npm_build",
+      "status": "passed"
+    },
+    {
+      "command": "cargo clippy --locked --manifest-path src-tauri/Cargo.toml --features semantic-memory-turbo-quant -- -D warnings",
+      "elapsed_seconds": 14.76,
+      "exit_code": 0,
+      "name": "cargo_clippy",
+      "status": "passed"
+    },
+    {
+      "command": "cargo deny check advisories licenses sources",
+      "elapsed_seconds": 4.463,
+      "exit_code": 0,
+      "name": "cargo_deny",
+      "status": "passed"
+    },
+    {
+      "command": "npm audit --omit=dev --audit-level=high",
+      "elapsed_seconds": 0.345,
+      "exit_code": 0,
+      "name": "npm_production_audit",
+      "status": "passed"
+    },
+    {
+      "command": "npm exec -- tauri build --debug --no-bundle --features semantic-memory-turbo-quant",
+      "elapsed_seconds": 32.002,
+      "exit_code": 0,
+      "name": "desktop_compile",
+      "status": "passed"
+    }
+  ],
+  "remaining_runtime_gates": [
+    "live_desktop",
+    "live_provider",
+    "package_replay",
+    "native_leak_check"
+  ],
+  "schema": "GlossBuildVerificationV2",
+  "scope": "build_and_contracts_only",
+  "source_after": {
+    "revision": "1da3f3975a3091985c54a3ddcc6839ba43aa1c44",
+    "schema": "GlossSourceSnapshotV1",
+    "source_sha256": "05f5bc242b8700c68067684f59678698867a73aa9ad5452dab7872d387c49719",
+    "tree_sha": "52c87e50eb19ef8e6c41fce3e03748bf9bde872b",
+    "worktree_clean": true
+  },
+  "source_before": {
+    "revision": "1da3f3975a3091985c54a3ddcc6839ba43aa1c44",
+    "schema": "GlossSourceSnapshotV1",
+    "source_sha256": "05f5bc242b8700c68067684f59678698867a73aa9ad5452dab7872d387c49719",
+    "tree_sha": "52c87e50eb19ef8e6c41fce3e03748bf9bde872b",
+    "worktree_clean": true
+  },
+  "source_unchanged": true,
+  "started_at": "2026-09-30T15:24:17.691801+00:00",
+  "status": "passed",
+  "unrun_gates": []
+}

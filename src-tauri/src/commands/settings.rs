@@ -106,6 +106,14 @@ pub struct MemoryRepairWorkflowReceipt {
 
 static MEMORY_REPAIR_WORKFLOW_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
+fn admit_memory_settings_change() -> Result<tokio::sync::SemaphorePermit<'static>, GlossError> {
+    MEMORY_REPAIR_WORKFLOW_GATE.try_acquire().map_err(|_| {
+        GlossError::Config(
+            "Memory profile repair is in progress; retry settings changes after it finishes".into(),
+        )
+    })
+}
+
 const MEMORY_PROFILE_SETTING_KEYS: [&str; 9] = [
     features::EXPERIMENTAL_FEATURES_ENABLED,
     "memory_backend",
@@ -259,7 +267,7 @@ fn secret_setting_key(provider_type: ProviderType) -> Option<&'static str> {
 }
 
 fn provider_type_from_id(provider_id: &str) -> Result<ProviderType, GlossError> {
-    ProviderType::from_str(provider_id.trim())
+    ProviderType::from_id(provider_id.trim())
         .ok_or_else(|| GlossError::Config(format!("Unknown provider id '{provider_id}'")))
 }
 
@@ -268,7 +276,7 @@ fn model_records_to_infos(records: Vec<ModelRecord>) -> Vec<ModelInfo> {
         .into_iter()
         .filter(|m| m.available && !m.stale)
         .filter_map(|m| {
-            ProviderType::from_str(&m.provider_id).map(|provider| ModelInfo {
+            ProviderType::from_id(&m.provider_id).map(|provider| ModelInfo {
                 id: m.id,
                 display_name: m.display_name,
                 provider,
@@ -280,10 +288,26 @@ fn model_records_to_infos(records: Vec<ModelRecord>) -> Vec<ModelInfo> {
 }
 
 fn rebuild_model_registry(state: &AppState) -> Result<(), GlossError> {
+    rebuild_model_registry_with_checkpoints(state, || {}, || {})
+}
+
+fn rebuild_model_registry_with_checkpoints<BeforeLock, AfterLock>(
+    state: &AppState,
+    before_app_db_lock: BeforeLock,
+    after_app_db_lock: AfterLock,
+) -> Result<(), GlossError>
+where
+    BeforeLock: FnOnce(),
+    AfterLock: FnOnce(),
+{
+    // Keep the same app_db -> model_registry order as chat and Studio.
+    // Both guards stay in this synchronous scope; no provider call is made.
+    before_app_db_lock();
     let app_db = state
         .app_db
         .lock()
         .map_err(|e| GlossError::Other(e.to_string()))?;
+    after_app_db_lock();
     let new_registry = ModelRegistry::new(&app_db, &state.secret_store)?;
     let mut registry = state
         .model_registry
@@ -291,6 +315,19 @@ fn rebuild_model_registry(state: &AppState) -> Result<(), GlossError> {
         .map_err(|e| GlossError::Other(e.to_string()))?;
     *registry = new_registry;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn rebuild_model_registry_for_test<BeforeLock, AfterLock>(
+    state: &AppState,
+    before_app_db_lock: BeforeLock,
+    after_app_db_lock: AfterLock,
+) -> Result<(), GlossError>
+where
+    BeforeLock: FnOnce(),
+    AfterLock: FnOnce(),
+{
+    rebuild_model_registry_with_checkpoints(state, before_app_db_lock, after_app_db_lock)
 }
 
 #[tauri::command]
@@ -303,7 +340,7 @@ pub async fn get_providers(state: State<'_, AppState>) -> Result<Vec<Provider>, 
     drop(app_db);
 
     for provider in &mut providers {
-        if let Some(provider_type) = ProviderType::from_str(&provider.id) {
+        if let Some(provider_type) = ProviderType::from_id(&provider.id) {
             if let Some(secret_key) = secret_setting_key(provider_type) {
                 provider.has_api_key = state.secret_store.contains(secret_key)?;
             }
@@ -321,7 +358,7 @@ pub async fn update_provider(
     api_key: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
-    let provider_type = ProviderType::from_str(&id).ok_or_else(|| {
+    let provider_type = ProviderType::from_id(&id).ok_or_else(|| {
         GlossError::Other(format!(
             "Unrecognized provider type '{id}'; cannot update an unknown provider"
         ))
@@ -834,6 +871,8 @@ pub async fn update_embedding_settings(
     config: crate::settings_contract::EmbeddingSettings,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, GlossError> {
+    // A failed profile repair must not roll back a newer acknowledged Apply.
+    let _settings_guard = admit_memory_settings_change()?;
     let app_db = state
         .app_db
         .lock()
@@ -868,6 +907,11 @@ pub async fn update_setting(
     value: String,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
+    let _settings_guard = if MEMORY_PROFILE_SETTING_KEYS.contains(&key.as_str()) {
+        Some(admit_memory_settings_change()?)
+    } else {
+        None
+    };
     if matches!(key.as_str(), "default_model" | "default_provider") {
         return Err(GlossError::Config(
             "Use select_chat_model to update provider and model atomically".into(),
@@ -1037,6 +1081,7 @@ pub async fn update_feature_flag(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<Vec<FeatureFlagStatus>, GlossError> {
+    let _settings_guard = admit_memory_settings_change()?;
     let app_db = state
         .app_db
         .lock()
@@ -1047,6 +1092,15 @@ pub async fn update_feature_flag(
 
 #[tauri::command]
 pub async fn set_memory_backend_profile(
+    profile: String,
+    notebook_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<MemoryBackendProfileReceipt, GlossError> {
+    let _settings_guard = admit_memory_settings_change()?;
+    set_memory_backend_profile_inner(profile, notebook_id, state).await
+}
+
+async fn set_memory_backend_profile_inner(
     profile: String,
     notebook_id: Option<String>,
     state: State<'_, AppState>,
@@ -1336,9 +1390,12 @@ pub async fn repair_and_set_memory_profile(
         )
     };
     if requested == MemoryProfile::GlossLocal {
-        let final_profile =
-            set_memory_backend_profile(requested_profile.clone(), Some(notebook_id.clone()), state)
-                .await?;
+        let final_profile = set_memory_backend_profile_inner(
+            requested_profile.clone(),
+            Some(notebook_id.clone()),
+            state,
+        )
+        .await?;
         return Ok(MemoryRepairWorkflowReceipt {
             schema: "MemoryRepairWorkflowReceiptV1",
             receipt_id: workflow_receipt_id,
@@ -1373,7 +1430,7 @@ pub async fn repair_and_set_memory_profile(
     let staging_profile_id = staging_profile.id().to_string();
 
     let workflow = async {
-        let staging = set_memory_backend_profile(
+        let staging = set_memory_backend_profile_inner(
             staging_profile_id.clone(),
             Some(notebook_id.clone()),
             state.clone(),
@@ -1536,7 +1593,7 @@ pub async fn repair_and_set_memory_profile(
             }
         }
 
-        let final_profile = set_memory_backend_profile(
+        let final_profile = set_memory_backend_profile_inner(
             requested_profile.clone(),
             Some(notebook_id.clone()),
             state.clone(),
@@ -1708,6 +1765,69 @@ pub async fn check_external_tools(
 #[cfg(test)]
 mod tests {
     use super::{restore_memory_profile_settings, snapshot_memory_profile_settings, MemoryProfile};
+    #[tokio::test]
+    async fn profile_repair_blocks_external_settings_writes_before_acknowledgement() {
+        use tauri::Manager;
+        let root = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_app();
+        app.manage(crate::state::AppState::initialize_for_test(root.path()).unwrap());
+        let state = app.state::<crate::state::AppState>();
+        let before = state.app_db.lock().unwrap().get_settings().unwrap();
+        let repair = super::MEMORY_REPAIR_WORKFLOW_GATE.acquire().await.unwrap();
+        let config = crate::settings_contract::EmbeddingSettings {
+            provider: "ollama".into(),
+            url: "http://localhost:11434".into(),
+            model: "synthetic-model".into(),
+            timeout_secs: 10,
+            download_consent: false,
+            search_timeout_ms: 60000,
+            chunk_target_tokens: 1100,
+        };
+        let errors = [
+            super::update_embedding_settings(config, state.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            super::update_setting(
+                "memory_backend_fallback".into(),
+                "false".into(),
+                state.clone(),
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            super::update_feature_flag("semantic_memory_preview".into(), true, state.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            super::set_memory_backend_profile("gloss-local".into(), None, state.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+        ];
+        assert!(errors
+            .iter()
+            .all(|error| error.contains("Memory profile repair is in progress")));
+        assert_eq!(state.app_db.lock().unwrap().get_settings().unwrap(), before);
+        drop(repair);
+        super::update_setting(
+            "memory_backend_fallback".into(),
+            "false".into(),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .app_db
+                .lock()
+                .unwrap()
+                .get_setting("memory_backend_fallback")
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+    }
     use crate::db::app_db::AppDb;
 
     #[test]

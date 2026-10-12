@@ -293,6 +293,7 @@ impl<R: tauri::Runtime> SpawnedChatAttempt<R> {
             &conversation_id,
             &message_id,
             epoch,
+            &execution_context.cancellation,
             &app_state.gpu_gate,
             Duration::from_secs(120),
             "GPU gate",
@@ -307,7 +308,7 @@ impl<R: tauri::Runtime> SpawnedChatAttempt<R> {
                     &trace_data_dir,
                     "cancelled",
                     Some(Duration::ZERO),
-                    Some("GPU gate wait cancelled by notebook switch"),
+                    Some("GPU gate wait cancelled"),
                     Some("chat cancelled before acquiring GPU gate"),
                     |_| {},
                 );
@@ -372,6 +373,7 @@ impl<R: tauri::Runtime> SpawnedChatAttempt<R> {
             &conversation_id,
             &message_id,
             epoch,
+            &execution_context.cancellation,
             &app_state.llm_gate,
             Duration::from_secs(120),
             "LLM gate",
@@ -388,7 +390,7 @@ impl<R: tauri::Runtime> SpawnedChatAttempt<R> {
                     &trace_data_dir,
                     "cancelled",
                     Some(Duration::ZERO),
-                    Some("LLM gate wait cancelled by notebook switch"),
+                    Some("LLM gate wait cancelled"),
                     Some("chat cancelled before acquiring LLM gate"),
                     |_| {},
                 );
@@ -1058,6 +1060,7 @@ fn retrieval_reason_code_from_text(value: &str) -> Option<RetrievalReasonCode> {
         "semantic-memory-not-compiled" | "semantic_memory_build_feature_missing" => {
             Some(RetrievalReasonCode::SemanticMemoryBuildFeatureMissing)
         }
+        "semantic-memory-config-invalid" => Some(RetrievalReasonCode::EmbedderUnavailable),
         "semantic-memory-flag-off"
         | "semantic_memory_feature_disabled"
         | "semantic-memory-feature-disabled-fallback" => {
@@ -1191,6 +1194,253 @@ pub async fn get_chat_events_since(
     state: State<'_, AppState>,
 ) -> Result<Vec<ChatStreamEventV1>, GlossError> {
     Ok(state.chat_events_since(&notebook_id, &conversation_id, after_seq))
+}
+
+/// Resolve against one consistent app-db/registry snapshot. The callback is a
+/// no-op in production and lets owner regressions checkpoint the first lock.
+fn lookup_chat_provider_config<F: FnOnce()>(
+    state: &AppState,
+    model: &str,
+    after_app_db_lock: F,
+) -> Result<(providers::ProviderConfig, Option<i32>), GlossError> {
+    // Canonical paired-lock order: app_db -> model_registry. No await/provider call.
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    after_app_db_lock();
+    let registry = state
+        .model_registry
+        .lock()
+        .map_err(|e| GlossError::Other(e.to_string()))?;
+    let resolved =
+        providers::resolve_llm_config(&app_db, &state.secret_store, Some(&registry), Some(model))?;
+    Ok((resolved.config, resolved.model_context_window))
+}
+
+/// Keep fallible lookup inside the terminal owner: `?` in the lookup function
+/// returns here, where the existing error/trace/ledger contract handles it.
+#[allow(clippy::too_many_arguments)]
+fn resolve_chat_provider_config<R: tauri::Runtime>(
+    state: &AppState,
+    app_handle: &tauri::AppHandle<R>,
+    notebook_id: &str,
+    conversation_id: &str,
+    attempt_id: &str,
+    message_id: &str,
+    user_message_id: &str,
+    model: &str,
+    attempt_trace: &Arc<Mutex<ChatAttemptTraceV1>>,
+    trace_data_dir: &std::path::Path,
+) -> Result<(providers::ProviderConfig, Option<i32>), GlossError> {
+    match lookup_chat_provider_config(state, model, || {}) {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let error = err.to_string();
+            emit_chat_status(
+                app_handle,
+                notebook_id,
+                conversation_id,
+                message_id,
+                "provider_config_error",
+                "Provider configuration failed",
+                None,
+                Some(model),
+                None,
+                None,
+                None,
+                Duration::ZERO,
+                None,
+                false,
+                Some(&error),
+            );
+            emit_chat_error(app_handle, notebook_id, conversation_id, message_id, &error);
+            record_chat_attempt_trace(
+                attempt_trace,
+                trace_data_dir,
+                "provider_config_error",
+                Some(Duration::ZERO),
+                Some("Provider configuration failed before retrieval"),
+                Some(&error),
+                |_| {},
+            );
+            persist_chat_attempt_status(
+                state,
+                notebook_id,
+                conversation_id,
+                attempt_id,
+                message_id,
+                Some(user_message_id),
+                None,
+                Some(model),
+                "error",
+                Some("provider_config_error"),
+                Some("provider_config_error"),
+                Some(&error),
+                None,
+                true,
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Inventory is optional for requested no-retrieval chat. Keep the fallible
+/// read and its terminal handling in the production preparation owner so a
+/// failed All/Explicit request cannot silently become a wider or empty scope.
+#[allow(clippy::too_many_arguments)]
+fn load_chat_source_inventory<'a, R: tauri::Runtime>(
+    state: &'a AppState,
+    active_chat_attempt_lease: crate::state::ActiveChatAttemptLease<'a>,
+    app_handle: &tauri::AppHandle<R>,
+    notebook_id: &str,
+    conversation_id: &str,
+    attempt_id: &str,
+    message_id: &str,
+    user_message_id: &str,
+    source_scope: &SourceScope,
+    provider: &str,
+    model: &str,
+    attempt_trace: &Arc<Mutex<ChatAttemptTraceV1>>,
+    trace_data_dir: &std::path::Path,
+) -> Result<(Vec<Source>, crate::state::ActiveChatAttemptLease<'a>), GlossError> {
+    if matches!(source_scope, SourceScope::None) {
+        record_chat_attempt_trace(
+            attempt_trace,
+            trace_data_dir,
+            "source_inventory_skipped",
+            Some(Duration::ZERO),
+            Some(
+                "Requested no retrieval; source inventory and excluded-source count were not read",
+            ),
+            None,
+            |_| {},
+        );
+        return Ok((Vec::new(), active_chat_attempt_lease));
+    }
+
+    match state.with_notebook_db(notebook_id, |db| db.list_sources()) {
+        Ok(sources) => Ok((sources, active_chat_attempt_lease)),
+        Err(err) => {
+            let error = err.to_string();
+            emit_chat_status(
+                app_handle,
+                notebook_id,
+                conversation_id,
+                message_id,
+                "source_inventory_error",
+                "Requested source inventory could not be loaded",
+                Some(provider),
+                Some(model),
+                None,
+                None,
+                None,
+                Duration::ZERO,
+                None,
+                false,
+                Some(&error),
+            );
+            emit_chat_error(app_handle, notebook_id, conversation_id, message_id, &error);
+            record_chat_attempt_trace(
+                attempt_trace,
+                trace_data_dir,
+                "source_inventory_error",
+                Some(Duration::ZERO),
+                Some("Requested source inventory failed before retrieval or provider start"),
+                Some(&error),
+                |_| {},
+            );
+            persist_pre_stream_chat_error(
+                state,
+                notebook_id,
+                conversation_id,
+                attempt_id,
+                message_id,
+                user_message_id,
+                provider,
+                model,
+                "source_inventory_error",
+                "source_inventory_error",
+                &error,
+            );
+            Err(err)
+        }
+    }
+}
+
+/// The preparation admission check owns the cancellation event, trace and
+/// durable terminal row together. Failure drops the existing attempt lease;
+/// successful admission returns it to send_message for stream activation.
+#[allow(clippy::too_many_arguments)]
+fn check_chat_pre_provider_epoch<'a, R: tauri::Runtime>(
+    state: &'a AppState,
+    active_chat_attempt_lease: crate::state::ActiveChatAttemptLease<'a>,
+    app_handle: &tauri::AppHandle<R>,
+    notebook_id: &str,
+    request_epoch: u64,
+    conversation_id: &str,
+    attempt_id: &str,
+    message_id: &str,
+    user_message_id: &str,
+    provider: &str,
+    model: &str,
+    attempt_trace: &Arc<Mutex<ChatAttemptTraceV1>>,
+    trace_data_dir: &std::path::Path,
+) -> Result<crate::state::ActiveChatAttemptLease<'a>, GlossError> {
+    if state.is_active_notebook_epoch(notebook_id, request_epoch) {
+        return Ok(active_chat_attempt_lease);
+    }
+
+    let error = "Chat cancelled before provider start because the active notebook changed";
+    tracing::info!(
+        notebook_id,
+        epoch = request_epoch,
+        "Notebook changed during chat preparation; skipping stream start"
+    );
+    emit_chat_status(
+        app_handle,
+        notebook_id,
+        conversation_id,
+        message_id,
+        "cancelled",
+        error,
+        None,
+        Some(model),
+        None,
+        None,
+        None,
+        Duration::ZERO,
+        None,
+        false,
+        Some(error),
+    );
+    emit_chat_error(app_handle, notebook_id, conversation_id, message_id, error);
+    record_chat_attempt_trace(
+        attempt_trace,
+        trace_data_dir,
+        "cancelled",
+        Some(Duration::ZERO),
+        Some("Active notebook epoch changed before provider start"),
+        Some(error),
+        |_| {},
+    );
+    persist_chat_attempt_status(
+        state,
+        notebook_id,
+        conversation_id,
+        attempt_id,
+        message_id,
+        Some(user_message_id),
+        Some(provider),
+        Some(model),
+        "cancelled",
+        Some("cancelled_before_provider_start"),
+        Some("notebook_changed"),
+        Some(error),
+        None,
+        true,
+    );
+    Err(GlossError::Other(error.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1500,88 +1750,18 @@ pub async fn send_message(
         |_| {},
     );
 
-    // Get provider config (short lock, no await)
-    let provider_lookup: Result<(providers::ProviderConfig, Option<i32>), GlossError> = {
-        let registry = state
-            .model_registry
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        let provider_config =
-            registry.get_provider_config_for_model(&model, &app_db, &state.secret_store)?;
-        let selected_provider_id = app_db.get_setting("default_provider")?;
-        let model_context_window = app_db
-            .get_all_models()?
-            .into_iter()
-            .find(|record| {
-                record.id == model
-                    && selected_provider_id
-                        .as_deref()
-                        .map(|provider_id| provider_id == record.provider_id)
-                        .unwrap_or(true)
-            })
-            .and_then(|record| record.context_window);
-        Ok((provider_config, model_context_window))
-    };
-    let (provider_config, model_context_window) = match provider_lookup {
-        Ok(value) => value,
-        Err(err) => {
-            let error = err.to_string();
-            emit_chat_status(
-                &app_handle,
-                &notebook_id,
-                &conversation_id,
-                &message_id,
-                "provider_config_error",
-                "Provider configuration failed",
-                None,
-                Some(&model),
-                None,
-                None,
-                None,
-                Duration::ZERO,
-                None,
-                false,
-                Some(&error),
-            );
-            emit_chat_error(
-                &app_handle,
-                &notebook_id,
-                &conversation_id,
-                &message_id,
-                &error,
-            );
-            record_chat_attempt_trace(
-                &attempt_trace,
-                &trace_data_dir,
-                "provider_config_error",
-                Some(Duration::ZERO),
-                Some("Provider configuration failed before retrieval"),
-                Some(&error),
-                |_| {},
-            );
-            persist_chat_attempt_status(
-                &state,
-                &notebook_id,
-                &conversation_id,
-                &attempt_id,
-                &message_id,
-                Some(&user_msg.id),
-                None,
-                Some(&model),
-                "error",
-                Some("provider_config_error"),
-                Some("provider_config_error"),
-                Some(&error),
-                None,
-                true,
-            );
-            return Err(err);
-        }
-    };
+    let (provider_config, model_context_window) = resolve_chat_provider_config(
+        &state,
+        &app_handle,
+        &notebook_id,
+        &conversation_id,
+        &attempt_id,
+        &message_id,
+        &user_msg.id,
+        &model,
+        &attempt_trace,
+        &trace_data_dir,
+    )?;
     record_chat_attempt_trace(
         &attempt_trace,
         &trace_data_dir,
@@ -1612,8 +1792,24 @@ pub async fn send_message(
     );
 
     // --- RAG context assembly ---
-    // 1. Load notebook sources upfront for scope resolution and manifest assembly.
-    let all_sources: Vec<Source> = state.with_notebook_db(&notebook_id, |db| db.list_sources())?;
+    // 1. Requested None needs no inventory; requested retrieval fails visibly
+    // and terminally if inventory cannot be read. Never downgrade that failure.
+    let source_inventory_skipped = matches!(source_scope, SourceScope::None);
+    let (all_sources, active_chat_attempt_lease) = load_chat_source_inventory(
+        &state,
+        active_chat_attempt_lease,
+        &app_handle,
+        &notebook_id,
+        &conversation_id,
+        &attempt_id,
+        &message_id,
+        &user_msg.id,
+        &source_scope,
+        provider_config.provider_type.as_str(),
+        &model,
+        &attempt_trace,
+        &trace_data_dir,
+    )?;
     let resolved_scope = source_scope.resolve(&all_sources);
     let requested_source_ids = match &source_scope {
         SourceScope::All | SourceScope::None => Vec::new(),
@@ -1749,12 +1945,7 @@ pub async fn send_message(
     );
 
     #[cfg(feature = "semantic-memory-backend")]
-    let (
-        memory_backend,
-        semantic_fallback_allowed,
-        semantic_memory_runtime_config,
-        semantic_memory_search_timeout,
-    ) = {
+    let (memory_backend, semantic_fallback_allowed, semantic_memory_search_timeout) = {
         let app_db = state
             .app_db
             .lock()
@@ -1764,24 +1955,6 @@ pub async fn send_message(
                 .get_setting("memory_backend")?
                 .unwrap_or_else(|| MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string()),
             setting_is_enabled(app_db.get_setting("memory_backend_fallback")?),
-            semantic_memory_adapter::runtime_config_from_settings(
-                app_db.get_setting("semantic_memory_embedding_provider")?,
-                app_db.get_setting("semantic_memory_embedding_url")?,
-                app_db.get_setting("semantic_memory_embedding_model")?,
-                app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
-                crate::providers::lan_local_providers_allowed(&app_db),
-                setting_is_enabled(app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?),
-                features::turbo_quant_requested(&app_db)?,
-                setting_is_enabled(
-                    app_db.get_setting(
-                        features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS,
-                    )?,
-                ),
-                setting_is_enabled(
-                    app_db
-                        .get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?,
-                ),
-            ),
             semantic_memory_search_timeout_from_setting(
                 app_db.get_setting("semantic_memory_search_timeout_ms")?,
             ),
@@ -1825,6 +1998,7 @@ pub async fn send_message(
     };
     let memory_backend = if memory_backend == MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW
         && !semantic_preview_gate_open
+        && !resolved_scope.is_none()
     {
         if semantic_fallback_allowed {
             retrieval_fallback_reason = Some("semantic-memory-flag-off".to_string());
@@ -1892,7 +2066,91 @@ pub async fn send_message(
         && !resolved_scope.is_none()
     {
         #[cfg(feature = "semantic-memory-backend")]
-        {
+        'semantic_preview: {
+            // Read strict embedding settings only when this turn actually uses
+            // semantic retrieval. Configuration failures share the visible
+            // fallback/terminal contract with search failures.
+            let semantic_memory_runtime_config =
+                match crate::commands::sources::semantic_memory_runtime_config_from_state(&state) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        let error_text = format!("semantic-memory-config-invalid: {error}");
+                        emit_chat_status(
+                            &app_handle,
+                            &notebook_id,
+                            &conversation_id,
+                            &message_id,
+                            "semantic_memory_config_error",
+                            "semantic-memory embedding configuration is invalid",
+                            None,
+                            Some(&model),
+                            None,
+                            Some("semantic-memory"),
+                            None,
+                            Duration::ZERO,
+                            None,
+                            semantic_fallback_allowed,
+                            Some(&error_text),
+                        );
+                        record_chat_attempt_trace(
+                            &attempt_trace,
+                            &trace_data_dir,
+                            "semantic_memory_config_error",
+                            Some(Duration::ZERO),
+                            Some(
+                                "semantic-memory embedding configuration rejected before retrieval",
+                            ),
+                            Some(&error_text),
+                            |_| {},
+                        );
+                        if semantic_fallback_allowed {
+                            retrieval_fallback_reason =
+                                Some("semantic-memory-config-invalid".to_string());
+                            retrieval_degradation_markers
+                                .push("semantic-memory-config-invalid".to_string());
+                            force_gloss_local_retrieval = true;
+                            emit_chat_status(
+                                &app_handle,
+                                &notebook_id,
+                                &conversation_id,
+                                &message_id,
+                                "semantic_memory_search_fallback",
+                                "Falling back to Gloss local retrieval",
+                                None,
+                                Some(&model),
+                                None,
+                                Some("gloss-local"),
+                                retrieval_fallback_reason.as_deref(),
+                                Duration::ZERO,
+                                None,
+                                true,
+                                Some(&error_text),
+                            );
+                            break 'semantic_preview None;
+                        }
+                        emit_chat_error(
+                            &app_handle,
+                            &notebook_id,
+                            &conversation_id,
+                            &message_id,
+                            &error_text,
+                        );
+                        persist_pre_stream_chat_error(
+                            &state,
+                            &notebook_id,
+                            &conversation_id,
+                            &attempt_id,
+                            &message_id,
+                            &user_msg.id,
+                            provider_config.provider_type.as_str(),
+                            &model,
+                            "semantic_memory_config_error",
+                            "semantic_memory_config_invalid",
+                            &error_text,
+                        );
+                        return Err(error);
+                    }
+                };
             let db_path = state.notebook_db_path(&notebook_id)?;
             let links = {
                 let nb_db = NotebookDb::connect(&db_path)?;
@@ -2683,13 +2941,13 @@ pub async fn send_message(
         };
         if force_gloss_local_retrieval {
             local_outcome.degraded = true;
-            if !local_outcome
-                .fallback_chain
-                .contains(&RetrievalReasonCode::SemanticMemoryFeatureDisabled)
+            if let Some(reason) = retrieval_fallback_reason
+                .as_deref()
+                .and_then(retrieval_reason_code_from_text)
             {
-                local_outcome
-                    .fallback_chain
-                    .push(RetrievalReasonCode::SemanticMemoryFeatureDisabled);
+                if !local_outcome.fallback_chain.contains(&reason) {
+                    local_outcome.fallback_chain.push(reason);
+                }
             }
             local_outcome.user_visible_summary = format!(
                 "{} semantic-memory preview fell back to local retrieval.",
@@ -2914,13 +3172,13 @@ pub async fn send_message(
         .and_then(|value| value.as_str())
         .map(bounded_semantic_fallback_reason)
         .map(str::to_string);
-    let retrieval_fallback_reason_code = retrieval_outcome_for_evidence
-        .as_ref()
-        .and_then(|outcome| outcome.fallback_chain.first().cloned())
+    let retrieval_fallback_reason_code = retrieval_fallback_reason
+        .as_deref()
+        .and_then(retrieval_reason_code_from_text)
         .or_else(|| {
-            retrieval_fallback_reason
-                .as_deref()
-                .and_then(retrieval_reason_code_from_text)
+            retrieval_outcome_for_evidence
+                .as_ref()
+                .and_then(|outcome| outcome.fallback_chain.first().cloned())
         })
         .or_else(|| {
             semantic_memory_fallback_reason
@@ -3042,7 +3300,11 @@ pub async fn send_message(
         citation_filter_reasons: Vec::new(),
         omitted_candidate_count: 0,
         source_scope_preserved: source_scope_integrity.preserved,
-        index_status: if resolved_scope.is_none() {
+        index_status: if source_inventory_skipped {
+            // Preserve requested None separately from empty Explicit, which
+            // read inventory even when its resolved scope has no sources.
+            "scope-none (source counts unavailable)".to_string()
+        } else if resolved_scope.is_none() {
             "scope-none".to_string()
         } else {
             native_index_status
@@ -3073,48 +3335,21 @@ pub async fn send_message(
         prompt_budget_receipt: None,
     };
 
-    if !state.is_active_notebook_epoch(&notebook_id, request_epoch) {
-        let error = "Chat cancelled before provider start because the active notebook changed";
-        tracing::info!(
-            notebook_id = %notebook_id,
-            epoch = request_epoch,
-            "Notebook changed during chat preparation; skipping stream start"
-        );
-        emit_chat_status(
-            &app_handle,
-            &notebook_id,
-            &conversation_id,
-            &message_id,
-            "cancelled",
-            error,
-            None,
-            Some(&model),
-            None,
-            None,
-            None,
-            Duration::ZERO,
-            None,
-            false,
-            Some(error),
-        );
-        emit_chat_error(
-            &app_handle,
-            &notebook_id,
-            &conversation_id,
-            &message_id,
-            error,
-        );
-        record_chat_attempt_trace(
-            &attempt_trace,
-            &trace_data_dir,
-            "cancelled",
-            Some(Duration::ZERO),
-            Some("Active notebook epoch changed before provider start"),
-            Some(error),
-            |_| {},
-        );
-        return Err(GlossError::Other(error.to_string()));
-    }
+    let active_chat_attempt_lease = check_chat_pre_provider_epoch(
+        &state,
+        active_chat_attempt_lease,
+        &app_handle,
+        &notebook_id,
+        request_epoch,
+        &conversation_id,
+        &attempt_id,
+        &message_id,
+        &user_msg.id,
+        provider_config.provider_type.as_str(),
+        &model,
+        &attempt_trace,
+        &trace_data_dir,
+    )?;
 
     // For streaming, we spawn an async task
     let msg_id = message_id.clone();
@@ -3262,7 +3497,7 @@ pub async fn debug_chat_provider_smoke(
     prompt: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ChatAttemptTraceV1, GlossError> {
-    let provider_type = providers::ProviderType::from_str(provider_id.trim())
+    let provider_type = providers::ProviderType::from_id(provider_id.trim())
         .ok_or_else(|| GlossError::Config(format!("Unknown provider id '{provider_id}'")))?;
     let message_id = uuid::Uuid::new_v4().to_string();
     let attempt_trace = Arc::new(Mutex::new(new_chat_attempt_trace(
@@ -3579,6 +3814,888 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream;
     use tokio::sync::{oneshot, Mutex as AsyncMutex};
+
+    fn provider_resolution_fixture() -> (tempfile::TempDir, AppState) {
+        let data_dir = tempfile::tempdir().expect("temporary provider-resolution profile");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        let notebook_id = "provider-resolution-notebook";
+        let notebook_dir = data_dir.path().join("notebooks").join(notebook_id);
+        std::fs::create_dir_all(&notebook_dir).expect("temporary notebook directory");
+        NotebookDb::open(&notebook_dir.join("notebook.db")).expect("temporary notebook database");
+        state
+            .app_db
+            .lock()
+            .expect("app database lock")
+            .create_notebook(
+                notebook_id,
+                "Provider resolution fixture",
+                notebook_dir.to_str().expect("UTF-8 fixture directory"),
+            )
+            .expect("register fixture notebook");
+        state
+            .with_notebook_db_write(notebook_id, |db| db.create_conversation("conversation"))
+            .expect("fixture conversation");
+        (data_dir, state)
+    }
+
+    fn damage_source_inventory(state: &AppState) {
+        state
+            .with_notebook_db_write("provider-resolution-notebook", |db| {
+                db.conn().execute(
+                    "INSERT INTO sources(id, source_type, title, word_count, status)
+                     VALUES('damaged-source', 'text', 'Damaged source', 'not-an-integer', 'ready')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("selectively damaged source fixture");
+        let stored_type: String = state
+            .with_notebook_db("provider-resolution-notebook", |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT typeof(word_count) FROM sources WHERE id = 'damaged-source'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("fixture word_count storage type");
+        assert_eq!(stored_type, "text");
+        assert!(
+            state
+                .with_notebook_db("provider-resolution-notebook", |db| db.list_sources())
+                .is_err(),
+            "the actual inventory read must fail before exercising its owner"
+        );
+    }
+
+    fn seed_preparation_attempt(
+        state: &AppState,
+        assistant_message_id: &str,
+        scope_mode: &str,
+    ) -> (Arc<Mutex<ChatAttemptTraceV1>>, String) {
+        let notebook_id = "provider-resolution-notebook";
+        let user_message_id = format!("user-{assistant_message_id}");
+        let user = Message {
+            id: user_message_id.clone(),
+            conversation_id: "conversation".to_string(),
+            role: "user".to_string(),
+            content: "prepared user query".to_string(),
+            citations: None,
+            model_used: None,
+            tokens_prompt: None,
+            tokens_response: None,
+            created_at: String::new(),
+        };
+        state
+            .with_notebook_db_write(notebook_id, |db| db.insert_message(&user))
+            .expect("user history remains writable despite damaged sources");
+        let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
+            notebook_id,
+            "conversation",
+            assistant_message_id,
+            "fixture-model",
+            Some(MEMORY_BACKEND_GLOSS_LOCAL.to_string()),
+            Some(false),
+            Some(scope_mode.to_string()),
+        )));
+        let attempt_id = chat_attempt_trace_snapshot(&trace).attempt_id;
+        persist_chat_attempt_status(
+            state,
+            notebook_id,
+            "conversation",
+            &attempt_id,
+            assistant_message_id,
+            Some(&user_message_id),
+            Some("ollama"),
+            Some("fixture-model"),
+            "running",
+            Some("provider_config_resolved"),
+            None,
+            None,
+            None,
+            false,
+        );
+        let running: bool = state
+            .with_notebook_db(notebook_id, |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT status = 'running' AND terminal_at IS NULL
+                           FROM chat_attempts WHERE attempt_id = ?1",
+                        [&attempt_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("ledger remains writable despite damaged sources");
+        assert!(running);
+        assert!(state
+            .with_notebook_db(notebook_id, |db| db.load_messages("conversation"))
+            .expect("history remains readable despite damaged sources")
+            .iter()
+            .any(|message| message.id == user_message_id));
+        (trace, user_message_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_preparation_terminal(
+        state: &AppState,
+        trace: &Arc<Mutex<ChatAttemptTraceV1>>,
+        assistant_message_id: &str,
+        user_message_id: &str,
+        status: &str,
+        phase: &str,
+        error_code: &str,
+        trace_phase: &str,
+        error: &str,
+    ) {
+        let notebook_id = "provider-resolution-notebook";
+        let events = state.chat_events_since(notebook_id, "conversation", None);
+        let events = events
+            .iter()
+            .filter(|event| event.message_id == assistant_message_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind.as_str(), "done" | "error" | "cancelled"))
+                .count(),
+            1,
+            "one terminal event for the actual preparation owner"
+        );
+        assert_eq!(
+            events.iter().filter(|event| event.kind == "error").count(),
+            1
+        );
+        assert_eq!(
+            events.iter().filter(|event| event.kind == "status").count(),
+            1
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "status" && event.payload["phase"] == trace_phase));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.kind.as_str(), "done" | "token" | "evidence")));
+        let snapshot = chat_attempt_trace_snapshot(trace);
+        let stored = state
+            .with_notebook_db(notebook_id, |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT status, phase, error_code, error_message, user_message_id,
+                                assistant_message_id, provider, model, terminal_at IS NOT NULL
+                           FROM chat_attempts WHERE attempt_id = ?1",
+                        [&snapshot.attempt_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, String>(7)?,
+                                row.get::<_, bool>(8)?,
+                            ))
+                        },
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("terminal ledger is readable");
+        assert_eq!(stored.0, status);
+        assert_eq!(stored.1, phase);
+        assert_eq!(stored.2, error_code);
+        assert_eq!(stored.3, error);
+        assert_eq!(stored.4, user_message_id);
+        assert_eq!(stored.5, assistant_message_id);
+        assert_eq!(stored.6, "ollama");
+        assert_eq!(stored.7, "fixture-model");
+        assert!(stored.8, "the accepted attempt must have terminal_at");
+        let persisted_trace: ChatAttemptTraceV1 = serde_json::from_slice(
+            &std::fs::read(
+                state
+                    .data_dir
+                    .join("chat-attempt-traces")
+                    .join(format!("{}.json", snapshot.attempt_id)),
+            )
+            .expect("production owner persisted its trace"),
+        )
+        .expect("persisted trace decodes");
+        assert_eq!(persisted_trace.error.as_deref(), Some(error));
+        assert_eq!(persisted_trace.events.last().unwrap().phase, trace_phase);
+        assert_eq!(persisted_trace.events.len(), 1);
+        assert!(!persisted_trace.first_token_seen);
+        assert!(!persisted_trace.done_seen);
+        assert!(!persisted_trace.assistant_persisted);
+        let messages = state
+            .with_notebook_db(notebook_id, |db| db.load_messages("conversation"))
+            .expect("user history survives preparation failure");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.id == user_message_id)
+                .count(),
+            1
+        );
+        assert!(messages.iter().any(|message| {
+            message.id == user_message_id
+                && message.role == "user"
+                && message.content == "prepared user query"
+        }));
+        assert!(messages.iter().all(|message| message.role == "user"));
+        assert!(state.active_chat_attempts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_inventory_none_bypasses_real_decode_failure_without_scope_widening() {
+        let (_data_dir, state) = provider_resolution_fixture();
+        damage_source_inventory(&state);
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state = app.state::<AppState>();
+        let notebook_id = "provider-resolution-notebook";
+        let (trace, user_message_id) = seed_preparation_attempt(&state, "none-assistant", "none");
+        let attempt_id = chat_attempt_trace_snapshot(&trace).attempt_id;
+        let lease = state
+            .lease_active_chat_attempt(notebook_id, "conversation", &attempt_id, &user_message_id)
+            .expect("accepted no-retrieval attempt");
+        let (sources, lease) = load_chat_source_inventory(
+            &state,
+            lease,
+            app.handle(),
+            notebook_id,
+            "conversation",
+            &attempt_id,
+            "none-assistant",
+            &user_message_id,
+            &SourceScope::None,
+            "ollama",
+            "fixture-model",
+            &trace,
+            &state.data_dir,
+        )
+        .unwrap_or_else(|error| panic!("None must not read damaged inventory: {error}"));
+        assert!(sources.is_empty());
+        let resolved = SourceScope::None.resolve(&sources);
+        assert!(resolved.is_none());
+        assert!(resolved.source_ids().is_empty());
+        assert!(resolved.manifest_sources().is_empty());
+        assert!(!resolved.allows("damaged-source"));
+        assert!(state
+            .chat_events_since(notebook_id, "conversation", None)
+            .is_empty());
+        let snapshot = chat_attempt_trace_snapshot(&trace);
+        assert!(snapshot.error.is_none());
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events[0].phase, "source_inventory_skipped");
+        assert!(snapshot.events[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("were not read"));
+        assert_eq!(state.active_chat_attempts.lock().unwrap().len(), 1);
+        drop(lease);
+    }
+
+    #[test]
+    fn source_inventory_requested_retrieval_failure_terminalizes_and_releases_retry() {
+        let (_data_dir, state) = provider_resolution_fixture();
+        damage_source_inventory(&state);
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state = app.state::<AppState>();
+        let notebook_id = "provider-resolution-notebook";
+        for (case, source_scope) in [
+            ("all", SourceScope::All),
+            (
+                "explicit",
+                SourceScope::Explicit(vec!["damaged-source".to_string()]),
+            ),
+            ("empty-explicit", SourceScope::Explicit(Vec::new())),
+            (
+                "stale-explicit",
+                SourceScope::Explicit(vec!["missing".to_string()]),
+            ),
+        ] {
+            for retry in 0..2 {
+                let assistant = format!("{case}-assistant-{retry}");
+                let scope_mode = if case == "all" { "all" } else { "explicit" };
+                let (trace, user_message_id) =
+                    seed_preparation_attempt(&state, &assistant, scope_mode);
+                let attempt_id = chat_attempt_trace_snapshot(&trace).attempt_id;
+                let lease = state
+                    .lease_active_chat_attempt(
+                        notebook_id,
+                        "conversation",
+                        &attempt_id,
+                        &user_message_id,
+                    )
+                    .expect("same conversation retry admitted without manual cleanup");
+                let error = match load_chat_source_inventory(
+                    &state,
+                    lease,
+                    app.handle(),
+                    notebook_id,
+                    "conversation",
+                    &attempt_id,
+                    &assistant,
+                    &user_message_id,
+                    &source_scope,
+                    "ollama",
+                    "fixture-model",
+                    &trace,
+                    &state.data_dir,
+                ) {
+                    Ok(_) => {
+                        panic!("requested retrieval must not hide actual inventory decode failure")
+                    }
+                    Err(error) => error.to_string(),
+                };
+                assert_preparation_terminal(
+                    &state,
+                    &trace,
+                    &assistant,
+                    &user_message_id,
+                    "error",
+                    "source_inventory_error",
+                    "source_inventory_error",
+                    "source_inventory_error",
+                    &error,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pre_provider_epoch_gate_cancels_returned_notebook_and_admits_fresh_retry() {
+        let (_data_dir, state) = provider_resolution_fixture();
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state = app.state::<AppState>();
+        let notebook_id = "provider-resolution-notebook";
+        assert!(state.set_active_notebook(Some(notebook_id.to_string()), Some(7)));
+        let request_epoch = state.get_active_epoch();
+        let (trace, user_message_id) = seed_preparation_attempt(&state, "epoch-assistant", "none");
+        let attempt_id = chat_attempt_trace_snapshot(&trace).attempt_id;
+        let lease = state
+            .lease_active_chat_attempt(notebook_id, "conversation", &attempt_id, &user_message_id)
+            .expect("accepted epoch fixture");
+        let lease = check_chat_pre_provider_epoch(
+            &state,
+            lease,
+            app.handle(),
+            notebook_id,
+            request_epoch,
+            "conversation",
+            &attempt_id,
+            "epoch-assistant",
+            &user_message_id,
+            "ollama",
+            "fixture-model",
+            &trace,
+            &state.data_dir,
+        )
+        .unwrap_or_else(|error| panic!("matching epoch must retain admission: {error}"));
+        assert!(state
+            .chat_events_since(notebook_id, "conversation", None)
+            .is_empty());
+        assert!(chat_attempt_trace_snapshot(&trace).events.is_empty());
+        assert!(state.set_active_notebook(Some("another-notebook".to_string()), None));
+        assert!(state.set_active_notebook(Some(notebook_id.to_string()), None));
+        assert_ne!(state.get_active_epoch(), request_epoch);
+        let error = match check_chat_pre_provider_epoch(
+            &state,
+            lease,
+            app.handle(),
+            notebook_id,
+            request_epoch,
+            "conversation",
+            &attempt_id,
+            "epoch-assistant",
+            &user_message_id,
+            "ollama",
+            "fixture-model",
+            &trace,
+            &state.data_dir,
+        ) {
+            Ok(_) => panic!("returning to the same notebook must not admit its stale epoch"),
+            Err(error) => error.to_string(),
+        };
+        assert_preparation_terminal(
+            &state,
+            &trace,
+            "epoch-assistant",
+            &user_message_id,
+            "cancelled",
+            "cancelled_before_provider_start",
+            "notebook_changed",
+            "cancelled",
+            &error,
+        );
+        let retry = state
+            .lease_active_chat_attempt(
+                notebook_id,
+                "conversation",
+                "fresh-epoch-attempt",
+                "fresh-user",
+            )
+            .expect("cancelled preparation releases the conversation");
+        let retry = check_chat_pre_provider_epoch(
+            &state,
+            retry,
+            app.handle(),
+            notebook_id,
+            state.get_active_epoch(),
+            "conversation",
+            "fresh-epoch-attempt",
+            "fresh-assistant",
+            "fresh-user",
+            "ollama",
+            "fixture-model",
+            &trace,
+            &state.data_dir,
+        )
+        .unwrap_or_else(|error| panic!("fresh epoch must admit retry: {error}"));
+        drop(retry);
+    }
+
+    #[test]
+    fn chat_resolver_context_matches_live_provider_with_missing_or_invalid_selection() {
+        let (data_dir, state) = provider_resolution_fixture();
+        let notebook_id = "provider-resolution-notebook";
+        let model = "shared-context-identity-model";
+        {
+            let app_db = state.app_db.lock().expect("fixture app database");
+            for (provider, context, available, stale) in [
+                ("llamacpp", 32768, false, true),
+                ("ollama", 8192, true, false),
+            ] {
+                app_db
+                    .replace_models(
+                        provider,
+                        &[crate::db::app_db::ModelRecord {
+                            id: model.to_string(),
+                            provider_id: provider.to_string(),
+                            display_name: "Shared model ID fixture".to_string(),
+                            parameter_size: None,
+                            context_window: Some(context),
+                            capabilities: None,
+                            available,
+                            stale,
+                            last_error: stale.then(|| "Synthetic stale provider row".to_string()),
+                        }],
+                    )
+                    .expect("seed cached model identity rows");
+            }
+            app_db
+                .set_setting("default_model", "different-uncached-default-model")
+                .expect("set a distinct default to prove the exact model override");
+            let first = app_db
+                .get_all_models()
+                .expect("read fixture model order")
+                .into_iter()
+                .find(|record| record.id == model)
+                .expect("stale same-ID row sorts first");
+            assert_eq!(first.provider_id, "llamacpp");
+            assert_eq!(first.context_window, Some(32768));
+            assert!(first.stale);
+        }
+        crate::commands::settings::rebuild_model_registry_for_test(&state, || {}, || {})
+            .expect("real registry from fixture model rows");
+        {
+            let registry = state.model_registry.lock().expect("fixture model registry");
+            let candidates = registry
+                .cached_models
+                .iter()
+                .filter(|record| record.id == model)
+                .collect::<Vec<_>>();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].provider, providers::ProviderType::Ollama);
+        }
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state = app.state::<AppState>();
+        for selected_provider in [None, Some("invalid-provider")] {
+            {
+                let app_db = state.app_db.lock().expect("fixture app database");
+                if let Some(provider) = selected_provider {
+                    app_db
+                        .set_setting("default_provider", provider)
+                        .expect("invalid provider selection fixture");
+                } else {
+                    app_db
+                        .conn()
+                        .execute("DELETE FROM settings WHERE key = 'default_provider'", [])
+                        .expect("missing provider selection fixture");
+                }
+            }
+            let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
+                notebook_id,
+                "conversation",
+                "identity-assistant",
+                model,
+                None,
+                None,
+                Some("none".to_string()),
+            )));
+            let attempt_id = chat_attempt_trace_snapshot(&trace).attempt_id;
+            // The production chat owner uses the requested model and the
+            // resolved provider identity despite an earlier stale same-ID row.
+            let (config, context) = resolve_chat_provider_config(
+                &state,
+                app.handle(),
+                notebook_id,
+                "conversation",
+                &attempt_id,
+                "identity-assistant",
+                "identity-user",
+                model,
+                &trace,
+                data_dir.path(),
+            )
+            .expect("single live candidate resolves independently of invalid selection");
+            assert_eq!(config.provider_type, providers::ProviderType::Ollama);
+            assert_eq!(context, Some(8192));
+        }
+        assert!(state
+            .chat_events_since(notebook_id, "conversation", None)
+            .is_empty());
+    }
+
+    #[test]
+    fn provider_resolution_lookup_rejection_is_terminal() {
+        let (data_dir, state) = provider_resolution_fixture();
+        let notebook_id = "provider-resolution-notebook";
+        let model = "uncached-provider-resolution-model";
+        let user_message = Message {
+            id: "lookup-user".to_string(),
+            conversation_id: "conversation".to_string(),
+            role: "user".to_string(),
+            content: "Synthetic provider lookup fixture".to_string(),
+            citations: None,
+            model_used: None,
+            tokens_prompt: None,
+            tokens_response: None,
+            created_at: String::new(),
+        };
+        state
+            .with_notebook_db_write(notebook_id, |db| db.insert_message(&user_message))
+            .expect("fixture user turn");
+        let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
+            notebook_id,
+            "conversation",
+            "lookup-assistant",
+            model,
+            None,
+            None,
+            Some("none".to_string()),
+        )));
+        let attempt_id = chat_attempt_trace_snapshot(&trace).attempt_id;
+        persist_chat_attempt_status(
+            &state,
+            notebook_id,
+            "conversation",
+            &attempt_id,
+            "lookup-assistant",
+            Some(&user_message.id),
+            None,
+            Some(model),
+            "running",
+            Some("user_message_persisted"),
+            None,
+            None,
+            None,
+            false,
+        );
+        let running: String = state
+            .with_notebook_db(notebook_id, |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT status FROM chat_attempts WHERE attempt_id = ?1",
+                        [&attempt_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(GlossError::from)
+            })
+            .expect("running attempt witness");
+        assert_eq!(running, "running");
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state = app.state::<AppState>();
+        // This is the production owner called by send_message, not an injected
+        // error or a test-only persistence path. The real registry rejects the
+        // missing cached model before any provider construction or network call.
+        let error = match resolve_chat_provider_config(
+            &state,
+            app.handle(),
+            notebook_id,
+            "conversation",
+            &attempt_id,
+            "lookup-assistant",
+            &user_message.id,
+            model,
+            &trace,
+            data_dir.path(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("uncached model must be rejected by the actual registry"),
+        };
+        assert!(matches!(error, GlossError::Config(_)));
+        let error = error.to_string();
+        assert!(error.contains(model));
+        assert!(error.contains("not available in the model registry"));
+        let stored = state
+            .with_notebook_db(notebook_id, |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT status, phase, error_code, error_message,
+                                terminal_at IS NOT NULL, user_message_id,
+                                assistant_message_id, model
+                           FROM chat_attempts WHERE attempt_id = ?1",
+                        [&attempt_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, bool>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, String>(7)?,
+                            ))
+                        },
+                    )
+                    .map_err(GlossError::from)
+            })
+            .expect("terminal attempt witness");
+        assert_eq!(stored.0, "error");
+        assert_eq!(stored.1, "provider_config_error");
+        assert_eq!(stored.2, "provider_config_error");
+        assert_eq!(stored.3, error);
+        assert!(stored.4);
+        assert_eq!(stored.5, user_message.id);
+        assert_eq!(stored.6, "lookup-assistant");
+        assert_eq!(stored.7, model);
+        let messages = state
+            .with_notebook_db(notebook_id, |db| db.load_messages("conversation"))
+            .expect("retained fixture messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, user_message.id);
+        assert_eq!(messages[0].role, "user");
+
+        let persisted: ChatAttemptTraceV1 = serde_json::from_str(
+            &std::fs::read_to_string(
+                data_dir
+                    .path()
+                    .join("chat-attempt-traces")
+                    .join(format!("{attempt_id}.json")),
+            )
+            .expect("persisted lookup trace"),
+        )
+        .expect("parse lookup trace");
+        assert_eq!(persisted.error.as_deref(), Some(error.as_str()));
+        assert_eq!(
+            persisted.events.last().unwrap().phase,
+            "provider_config_error"
+        );
+        assert!(!persisted.first_token_seen);
+        assert!(!persisted.done_seen);
+        assert!(!persisted.assistant_persisted);
+        let events = state.chat_events_since(notebook_id, "conversation", None);
+        assert_eq!(
+            events.iter().filter(|event| event.kind == "error").count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "status" && event.payload["phase"] == "provider_config_error"
+                })
+                .count(),
+            1,
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.kind.as_str(), "token" | "done")));
+    }
+
+    #[test]
+    fn provider_resolution_owners_use_one_lock_order_concurrently() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let (_data_dir, state) = provider_resolution_fixture();
+        let model = "cached-provider-resolution-model";
+        {
+            let app_db = state.app_db.lock().expect("fixture app database");
+            app_db
+                .replace_models(
+                    "ollama",
+                    &[crate::db::app_db::ModelRecord {
+                        id: model.to_string(),
+                        provider_id: "ollama".to_string(),
+                        display_name: "Synthetic cached model".to_string(),
+                        parameter_size: None,
+                        context_window: Some(8192),
+                        capabilities: None,
+                        available: true,
+                        stale: false,
+                        last_error: None,
+                    }],
+                )
+                .expect("seed cached model only");
+            app_db
+                .select_chat_model("ollama", model)
+                .expect("fixture selection");
+            assert!(app_db
+                .list_providers()
+                .unwrap()
+                .iter()
+                .filter(|provider| matches!(provider.id.as_str(), "openai" | "anthropic"))
+                .all(|provider| !provider.enabled));
+        }
+        crate::commands::settings::rebuild_model_registry_for_test(&state, || {}, || {})
+            .expect("initial registry from cached rows");
+        let state = Arc::new(state);
+        let deadline = Duration::from_secs(5);
+
+        // Prove each actual owner's first lock independently before combining
+        // them. With the registry held, an inverted owner cannot reach its
+        // app-db checkpoint. Release the held guard before joining/failing so
+        // the regression does not leave a blocked worker behind.
+        for owner in ["chat", "studio", "settings"] {
+            let registry = state.model_registry.lock().expect("held registry");
+            let (arrived_tx, arrived_rx) = mpsc::channel();
+            let worker_state = Arc::clone(&state);
+            let worker = thread::spawn(move || -> Result<(), String> {
+                match owner {
+                    "chat" => lookup_chat_provider_config(&worker_state, model, || {
+                        let _ = arrived_tx.send(());
+                    })
+                    .map(|(config, context)| {
+                        assert_eq!(config.provider_type, providers::ProviderType::Ollama);
+                        assert_eq!(context, Some(8192));
+                    })
+                    .map_err(|error| error.to_string()),
+                    "studio" => crate::commands::studio::resolve_studio_provider_config_for_test(
+                        &worker_state,
+                        "lock-order-fixture",
+                        || {},
+                        || {
+                            let _ = arrived_tx.send(());
+                        },
+                    )
+                    .map(|resolved| {
+                        assert_eq!(
+                            resolved.config.provider_type,
+                            providers::ProviderType::Ollama
+                        );
+                        assert_eq!(resolved.model, model);
+                        assert_eq!(resolved.model_context_window, Some(8192));
+                    }),
+                    _ => crate::commands::settings::rebuild_model_registry_for_test(
+                        &worker_state,
+                        || {},
+                        || {
+                            let _ = arrived_tx.send(());
+                        },
+                    )
+                    .map_err(|error| error.to_string()),
+                }
+            });
+            let reached_app_db = arrived_rx.recv_timeout(deadline);
+            drop(registry);
+            let result = worker.join().expect("owner probe thread");
+            assert!(
+                reached_app_db.is_ok(),
+                "{owner} must acquire app_db before registry"
+            );
+            result.expect("owner probe result");
+        }
+
+        // Deterministic overlap: chat owns app_db while the test holds registry;
+        // both other production owners enter before chat can acquire registry.
+        let registry = state.model_registry.lock().expect("held registry");
+        let (chat_tx, chat_rx) = mpsc::channel();
+        let chat_state = Arc::clone(&state);
+        let chat = thread::spawn(move || {
+            lookup_chat_provider_config(&chat_state, model, || {
+                let _ = chat_tx.send(());
+            })
+            .map(|(config, context)| (config.provider_type, context))
+            .map_err(|error| error.to_string())
+        });
+        let chat_arrived = chat_rx.recv_timeout(deadline);
+        if chat_arrived.is_err() {
+            drop(registry);
+            let _ = chat.join();
+            panic!("chat must reach app_db checkpoint before overlap");
+        }
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let studio_state = Arc::clone(&state);
+        let studio_tx = entered_tx.clone();
+        let studio = thread::spawn(move || {
+            crate::commands::studio::resolve_studio_provider_config_for_test(
+                &studio_state,
+                "concurrent-owner-fixture",
+                || {
+                    let _ = studio_tx.send("studio");
+                },
+                || {},
+            )
+            .map(|resolved| {
+                (
+                    resolved.config.provider_type,
+                    resolved.model,
+                    resolved.model_context_window,
+                )
+            })
+        });
+        let settings_state = Arc::clone(&state);
+        let settings = thread::spawn(move || {
+            crate::commands::settings::rebuild_model_registry_for_test(
+                &settings_state,
+                || {
+                    let _ = entered_tx.send("settings");
+                },
+                || {},
+            )
+            .map_err(|error| error.to_string())
+        });
+        let first = entered_rx.recv_timeout(deadline);
+        let second = entered_rx.recv_timeout(deadline);
+        drop(registry);
+        // Guards are released before any assertion and all workers are joined.
+        let chat_result = chat.join().expect("chat owner thread");
+        let studio_result = studio.join().expect("Studio owner thread");
+        let settings_result = settings.join().expect("settings owner thread");
+        let mut entered = vec![
+            first.expect("first owner entry"),
+            second.expect("second owner entry"),
+        ];
+        entered.sort_unstable();
+        assert_eq!(entered, ["settings", "studio"]);
+        assert_eq!(
+            chat_result.expect("chat lookup"),
+            (providers::ProviderType::Ollama, Some(8192))
+        );
+        assert_eq!(
+            studio_result.expect("Studio lookup"),
+            (
+                providers::ProviderType::Ollama,
+                model.to_string(),
+                Some(8192)
+            )
+        );
+        settings_result.expect("settings rebuild");
+        let registry = state.model_registry.lock().expect("final registry");
+        assert_eq!(registry.cached_models.len(), 1);
+        assert_eq!(registry.cached_models[0].id, model);
+    }
 
     #[test]
     fn pre_stream_error_is_terminal_in_durable_attempt_ledger() {
@@ -3998,6 +5115,7 @@ mod tests {
     struct ScriptedLifecycleProvider {
         mode: ScriptedLifecycleMode,
         first_token_sent: Option<Arc<AsyncMutex<Option<oneshot::Sender<()>>>>>,
+        calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
     }
 
     #[async_trait]
@@ -4014,6 +5132,9 @@ mod tests {
             std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatToken, GlossError>> + Send>>,
             GlossError,
         > {
+            if let Some(calls) = &self.calls {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             match self.mode {
                 ScriptedLifecycleMode::ProviderStartNeverReturns => {
                     futures::future::pending::<
@@ -4127,6 +5248,10 @@ mod tests {
 
     #[test]
     fn retrieval_fallback_text_maps_to_typed_reason_codes() {
+        assert_eq!(
+            retrieval_reason_code_from_text("semantic-memory-config-invalid"),
+            Some(RetrievalReasonCode::EmbedderUnavailable)
+        );
         assert_eq!(
             retrieval_reason_code_from_text("search-timeout"),
             Some(RetrievalReasonCode::SemanticMemoryTimeout)
@@ -4255,6 +5380,7 @@ mod tests {
             provider: Box::new(ScriptedLifecycleProvider {
                 mode: ScriptedLifecycleMode::ProviderReturnsError,
                 first_token_sent: None,
+                calls: None,
             }),
             terminal: ChatTerminalEmitter::new(
                 app.handle().clone(),
@@ -4324,12 +5450,28 @@ mod tests {
         status: String,
         phase: Option<String>,
         terminal_at: Option<String>,
+        provider_calls: usize,
     }
 
     async fn run_spawned_lifecycle_case(
         mode: ScriptedLifecycleMode,
         persistence_failure: bool,
         cancel_after_first_token: bool,
+    ) -> SpawnedLifecycleOutcome {
+        run_spawned_lifecycle_case_with_blocked_gate(
+            mode,
+            persistence_failure,
+            cancel_after_first_token,
+            None,
+        )
+        .await
+    }
+
+    async fn run_spawned_lifecycle_case_with_blocked_gate(
+        mode: ScriptedLifecycleMode,
+        persistence_failure: bool,
+        cancel_after_first_token: bool,
+        blocked_gate: Option<&str>,
     ) -> SpawnedLifecycleOutcome {
         let data_dir = tempfile::tempdir().expect("temporary state directory");
         let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
@@ -4377,6 +5519,15 @@ mod tests {
             .expect("active test attempt");
         let app = tauri::test::mock_app();
         app.manage(state);
+        let gate_state = app.state::<AppState>();
+        let initial_gpu_permits = gate_state.gpu_gate.available_permits();
+        let initial_llm_permits = gate_state.llm_gate.available_permits();
+        let held_permit = match blocked_gate {
+            Some("GPU gate") => Some(gate_state.gpu_gate.acquire().await.unwrap()),
+            Some("LLM gate") => Some(gate_state.llm_gate.acquire().await.unwrap()),
+            None => None,
+            Some(gate) => panic!("unknown fixture gate: {gate}"),
+        };
         let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
             notebook_id,
             conversation_id,
@@ -4461,12 +5612,14 @@ mod tests {
         } else {
             (None, None)
         };
+        let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let job = SpawnedChatAttempt {
             handle: app.handle().clone(),
             active_chat_attempt,
             provider: Box::new(ScriptedLifecycleProvider {
                 mode,
                 first_token_sent,
+                calls: Some(Arc::clone(&provider_calls)),
             }),
             terminal: ChatTerminalEmitter::new(
                 app.handle().clone(),
@@ -4501,7 +5654,35 @@ mod tests {
             },
         };
 
-        if let Some(mut first_token_received) = first_token_received {
+        if let Some(gate) = blocked_gate {
+            let mut run = Box::pin(job.run_with_panic_boundary());
+            assert!(futures::poll!(&mut run).is_pending());
+            assert!(gate_state
+                .chat_events_since(notebook_id, conversation_id, None)
+                .iter()
+                .any(|event| event.kind == "status"
+                    && event.payload["phase"] == "waiting_gate"
+                    && event.payload["gate"] == gate));
+            if gate == "GPU gate" {
+                assert_eq!(gate_state.llm_gate.available_permits(), initial_llm_permits);
+            } else {
+                assert_eq!(gate_state.gpu_gate.available_permits(), 0);
+            }
+            let stop = stop_chat(notebook_id.to_string(), app.state::<AppState>())
+                .await
+                .expect("cancel the registered queued attempt");
+            assert!(stop.cancellation_requested);
+            assert_eq!(stop.attempts[0].attempt_id, attempt_id);
+            tokio::time::timeout(Duration::from_millis(250), &mut run)
+                .await
+                .expect("queued cancellation must finish without releasing the held gate");
+            assert!(gate_state.is_active_notebook_epoch(notebook_id, 7));
+            assert_eq!(provider_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(gate_state.gate_owners_snapshot().is_empty());
+            if gate == "LLM gate" {
+                assert_eq!(gate_state.gpu_gate.available_permits(), initial_gpu_permits);
+            }
+        } else if let Some(mut first_token_received) = first_token_received {
             let mut run = Box::pin(job.run_with_panic_boundary());
             tokio::select! {
                 _ = &mut run => panic!("lifecycle ended before the scripted first token"),
@@ -4516,6 +5697,14 @@ mod tests {
         } else {
             job.run_with_panic_boundary().await;
         }
+        drop(held_permit);
+        assert_eq!(gate_state.gpu_gate.available_permits(), initial_gpu_permits);
+        assert_eq!(gate_state.llm_gate.available_permits(), initial_llm_permits);
+        assert!(gate_state
+            .active_chat_attempts
+            .lock()
+            .expect("active-attempt fixture lock")
+            .is_empty());
 
         let state = app.state::<AppState>();
         let events = state.chat_events_since(notebook_id, conversation_id, None);
@@ -4535,6 +5724,7 @@ mod tests {
             status,
             phase,
             terminal_at,
+            provider_calls: provider_calls.load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -4560,6 +5750,32 @@ mod tests {
         assert_eq!(outcome.status, status);
         assert_eq!(outcome.phase.as_deref(), Some(phase));
         assert!(outcome.terminal_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn spawned_lifecycle_stop_chat_cancels_gpu_queue_without_provider_start() {
+        let outcome = run_spawned_lifecycle_case_with_blocked_gate(
+            ScriptedLifecycleMode::SuccessfulDone,
+            false,
+            false,
+            Some("GPU gate"),
+        )
+        .await;
+        assert_spawned_terminal_contract(&outcome, "cancelled", "cancelled", "gpu_gate_cancelled");
+        assert_eq!(outcome.provider_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn spawned_lifecycle_stop_chat_cancels_llm_queue_and_releases_gpu() {
+        let outcome = run_spawned_lifecycle_case_with_blocked_gate(
+            ScriptedLifecycleMode::SuccessfulDone,
+            false,
+            false,
+            Some("LLM gate"),
+        )
+        .await;
+        assert_spawned_terminal_contract(&outcome, "cancelled", "cancelled", "llm_gate_cancelled");
+        assert_eq!(outcome.provider_calls, 0);
     }
 
     #[tokio::test]

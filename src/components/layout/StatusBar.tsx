@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { useState, useEffect, useCallback } from "react";
 import { useHealthStore } from "../../stores/healthStore";
+import type { EmbeddingModelPayload } from "../../lib/types";
 
 export function StatusBar() {
   const activeModel = useSettingsStore((s) => s.activeModel);
@@ -25,9 +26,11 @@ export function StatusBar() {
   const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
   const chatConnected = useHealthStore((s) => s.chatConnected);
   const backgroundConnected = useHealthStore((s) => s.backgroundConnected);
-  const [embeddingStatus, setEmbeddingStatus] = useState<string | null>(null);
+  const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingModelPayload | null>(null);
   const queueStatus = useHealthStore((s) => s.queueStatus);
   const memoryStatus = useHealthStore((s) => s.memoryStatus);
+  const memoryState = useHealthStore((s) => s.memoryState);
+  const memoryError = useHealthStore((s) => s.memoryError);
   const profileStatus = useHealthStore((s) => s.profileStatus);
   const startHealthPolling = useHealthStore((s) => s.startPolling);
   const stopHealthPolling = useHealthStore((s) => s.stopPolling);
@@ -55,11 +58,9 @@ export function StatusBar() {
   // Listen for embedding model status events
   useEffect(() => {
     const unlisten = onEmbeddingModelStatus((payload) => {
-      if (payload.state === "downloading") {
-        setEmbeddingStatus(payload.message);
-      } else {
-        setEmbeddingStatus(null);
-      }
+      // Native initialization and failure events also carry useful reasons.
+      // Only a ready event clears the last non-ready state.
+      setEmbeddingStatus(payload.state === "ready" ? null : { ...payload, message: payload.message.slice(0, 500) });
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -120,11 +121,12 @@ export function StatusBar() {
   const canGenerate = needsSummaries && summaryBackendReady && backgroundConnected === true;
   const summaryDiagnostic = queueStatus?.summary_backend.diagnostic ?? null;
   const memoryBackendLabel = memoryStatus
-    ? memoryStatus.backend_used !== memoryStatus.active_backend
+    ? `${memoryStatus.backend_used !== memoryStatus.active_backend
       ? `${memoryStatus.backend_used} fallback`
-      : memoryStatus.active_backend
-    : "gloss-local";
+      : memoryStatus.active_backend}${memoryStatus.available ? "" : " (unavailable)"}`
+    : `${memoryState === "unavailable" ? "unavailable" : "checking"} (requested ${settings["memory_backend"] || "unknown"})`;
   const memoryTooltip =
+    memoryError ||
     memoryStatus?.fallback_reason ||
     memoryStatus?.diagnostic ||
     memoryStatus?.semantic_memory_path ||
@@ -173,7 +175,9 @@ export function StatusBar() {
         title={memoryTooltip}
         aria-label="Health status"
       >
-        {memoryStatus?.degraded ? (
+        {memoryState === "checking" ? (
+          <Loader2 className="w-3 h-3 animate-spin" />
+        ) : !memoryStatus || memoryStatus.degraded || !memoryStatus.available ? (
           <AlertTriangle className="w-3 h-3 text-warning" />
         ) : (
           <Database className="w-3 h-3" />
@@ -188,11 +192,14 @@ export function StatusBar() {
           <div className="absolute bottom-7 left-0 z-40 w-80 rounded border border-border bg-bg-secondary p-3 text-left text-xs shadow-xl">
             <div className="mb-2 font-medium text-text">Health</div>
             <div className="space-y-1 text-text-secondary">
-              <HealthLine label="Backend requested" value={memoryStatus?.active_backend ?? "gloss-local"} />
-              <HealthLine label="Backend used" value={memoryStatus?.backend_used ?? "gloss-local"} />
-              <HealthLine label="Default backend" value={memoryStatus?.default_backend ?? "gloss-local"} />
-              <HealthLine label="Fallback" value={memoryStatus?.fallback_reason ?? "none"} />
-              <HealthLine label="Fallback code" value={memoryStatus?.fallback_reason_code ?? "none"} />
+              <HealthLine label="Status read" value={memoryState} />
+              {memoryError && <HealthLine label="Read error" value={memoryError} />}
+              <HealthLine label="Backend requested" value={memoryStatus?.active_backend ?? settings["memory_backend"] ?? "unknown"} />
+              <HealthLine label="Backend used" value={memoryStatus?.backend_used ?? "unknown"} />
+              <HealthLine label="Default backend" value={memoryStatus?.default_backend ?? "unknown"} />
+              <HealthLine label="Availability" value={memoryStatus ? memoryStatus.available ? "available" : "unavailable" : "unknown"} />
+              <HealthLine label="Fallback" value={memoryStatus ? memoryStatus.fallback_reason ?? (memoryStatus.backend_used !== memoryStatus.active_backend ? "reason not reported" : "none") : "unknown"} />
+              <HealthLine label="Fallback code" value={memoryStatus ? memoryStatus.fallback_reason_code ?? "none" : "unknown"} />
               <HealthLine label="Index state" value={memoryStatus?.index_sync_status ?? "unknown"} />
               {memoryStatus?.embedding_index_metadata?.map((metadata) => (
                 <HealthLine
@@ -202,10 +209,10 @@ export function StatusBar() {
                 />
               ))}
               <HealthLine label="Sources" value={`${stats?.source_count ?? 0}`} />
-              <HealthLine label="Preview feature" value={memoryStatus?.semantic_memory_feature_enabled ? "enabled" : "disabled"} />
-              <HealthLine label="Preview availability" value={memoryStatus?.semantic_memory_available ? "available" : "not active"} />
-              <HealthLine label="Compiled semantic" value={profileStatus?.compiled_semantic_memory ? "yes" : "no"} />
-              <HealthLine label="Compiled TQ" value={profileStatus?.compiled_turbo_quant ? "yes" : "no"} />
+              <HealthLine label="Preview feature" value={memoryStatus ? memoryStatus.semantic_memory_feature_enabled ? "enabled" : "disabled" : "unknown"} />
+              <HealthLine label="Preview availability" value={memoryStatus ? memoryStatus.semantic_memory_available ? "available" : "not active" : "unknown"} />
+              <HealthLine label="Compiled semantic" value={profileStatus ? profileStatus.compiled_semantic_memory ? "yes" : "no" : "unknown"} />
+              <HealthLine label="Compiled TQ" value={profileStatus ? profileStatus.compiled_turbo_quant ? "yes" : "no" : "unknown"} />
               <HealthLine
                 label="Projection"
                 value={
@@ -225,7 +232,7 @@ export function StatusBar() {
               {memoryStatus?.degradation_markers.length ? (
                 <HealthLine label="Degraded" value={memoryStatus.degradation_markers.join(", ")} />
               ) : (
-                <HealthLine label="Degraded" value="no" />
+                <HealthLine label="Degraded" value={memoryStatus ? memoryStatus.degraded ? "yes" : "no" : "unknown"} />
               )}
             </div>
           </div>
@@ -246,8 +253,8 @@ export function StatusBar() {
       </div>
 
       {embeddingStatus && (
-        <div className="flex items-center gap-1.5 text-accent">
-          <span className="animate-pulse">{embeddingStatus}</span>
+        <div className="flex items-center gap-1.5 text-warning">
+          <span>Embedding {embeddingStatus.state}: {embeddingStatus.message}</span>
         </div>
       )}
 

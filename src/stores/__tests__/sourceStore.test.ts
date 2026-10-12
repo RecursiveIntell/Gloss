@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { useSourceStore } from '../sourceStore';
 import { useNotebookStore } from '../notebookStore';
+import { useToastStore } from '../toastStore';
 import * as api from '../../lib/tauri';
-import type { Source } from '../../lib/types';
+import type { Source, IndexSourceReceipt, SemanticMemoryBackfillReceipt } from '../../lib/types';
 
 // Mock the Tauri API layer
 vi.mock('../../lib/tauri', () => ({
@@ -30,8 +31,8 @@ vi.mock('../../lib/tauri', () => ({
     failed_sources: 0,
     errors: [],
   }),
-  semanticMemoryReindexSource: vi.fn().mockResolvedValue(undefined),
-  semanticMemoryBackfillNotebook: vi.fn().mockResolvedValue({ projected_sources: 0, skipped_no_chunks: 0, failed_sources: 0 }),
+  semanticMemoryReindexSource: vi.fn(),
+  semanticMemoryBackfillNotebook: vi.fn(),
   getNotebookStats: vi.fn().mockResolvedValue({ source_count: 0, note_count: 0, conversation_count: 0 }),
 }));
 
@@ -85,6 +86,7 @@ describe('sourceStore', () => {
   });
   beforeEach(() => {
     vi.clearAllMocks();
+    useToastStore.setState({ toasts: [] });
     useSourceStore.setState({
       sources: [],
       selectedSourceIds: new Set<string>(),
@@ -113,6 +115,52 @@ describe('sourceStore', () => {
     expect(state.sourceListStatus).toBe('error');
     expect(state.sourceListError).toBe('Something broke');
   });
+
+  it.each([
+    ['idle', 1],
+    ['loading', 1],
+    ['partial', 1],
+    ['error', 1],
+    ['ready', 1],
+    ['empty', 0],
+  ] as const)('preserves declared all with an empty %s inventory and source count %i', (sourceListStatus, sourceCount) => {
+    useSourceStore.setState({
+      sources: [],
+      selectedSourceIds: new Set(sourceCount > 0 ? ['known'] : []),
+      sourceScopeMode: 'all',
+      sourceListStatus,
+      stats: {
+        source_count: sourceCount,
+        ready_count: 0,
+        error_count: 0,
+        missing_summaries: 0,
+        chunk_count: 0,
+        sources_with_chunks: 0,
+        total_words: 0,
+      },
+    });
+
+    expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'all' });
+    expect(useSourceStore.getState().sourceScopeMode).toBe('all');
+  });
+
+  it.each(['idle', 'loading', 'partial', 'error', 'ready', 'empty'] as const)(
+    'preserves none and exact explicit intent with an empty %s inventory', (sourceListStatus) => {
+      useSourceStore.setState({
+        sources: [],
+        selectedSourceIds: new Set(['missing-source']),
+        sourceScopeMode: 'none',
+        sourceListStatus,
+      });
+      expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'none' });
+
+      useSourceStore.setState({ sourceScopeMode: 'explicit' });
+      expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'explicit', ids: ['missing-source'] });
+
+      useSourceStore.setState({ selectedSourceIds: new Set() });
+      expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'explicit', ids: [] });
+    },
+  );
 
   it('preserves all-source retrieval when source list is partial but has source information', () => {
     useSourceStore.setState({
@@ -174,5 +222,72 @@ describe('sourceStore', () => {
     expect(api.retrySourceIngestion).not.toHaveBeenCalled();
     expect(api.listSources).toHaveBeenCalledTimes(1);
     expect(api.getNotebookStats).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['synced', null, 'success', 'Reindex Complete'],
+    ['skipped_no_chunks', null, 'info', 'Reindex Skipped'],
+    ['partial', 'one chunk failed', 'warning', 'Reindex Incomplete'],
+    ['failed', 'model unavailable', 'error', 'Reindex Failed'],
+    ['synced', 'receipt reports an error', 'error', 'Reindex Failed'],
+  ] as const)('shows the %s source receipt outcome', async (syncStatus, error, type, title) => {
+    const receipt: IndexSourceReceipt = {
+      backend_id: 'semantic-memory-preview', notebook_id: 'nb-1', source_id: 'src-1',
+      receipt_id: 'receipt-fixture', indexed_chunks: syncStatus === 'skipped_no_chunks' ? 0 : 2, sync_status: syncStatus, error,
+    };
+    vi.mocked(api.semanticMemoryReindexSource).mockResolvedValueOnce(receipt);
+    await useSourceStore.getState().reindexSource('nb-1', 'src-1');
+    const toasts = useToastStore.getState().toasts;
+    expect(toasts[toasts.length - 1]).toMatchObject({ type, title });
+    if (error) expect(toasts[toasts.length - 1]?.message).toContain(error);
+  });
+
+  it.each(['failed', 'partial', 'stale', 'healthy'])('reports %s notebook backfill truth', async (outcome) => {
+    const failed = outcome === 'failed';
+    const partial = outcome === 'partial';
+    const stale = outcome === 'stale';
+    const receipt = {
+      notebook_id: 'nb-1', receipt_id: 'receipt-fixture', total_sources: 2,
+      chunk_bearing_sources: 2, projected_sources: failed || partial ? 1 : 2,
+      skipped_no_chunks: 0, failed_sources: failed ? 1 : 0,
+      stale_sources: stale ? 1 : 0, total_chunks: 4, projected_chunks: partial ? 3 : 4,
+      errors: failed ? [{ source_id: 'src-2', title: 'Fixture', error: 'projection failed' }] : [],
+      projection_summary: {
+        notebook_id: 'nb-1', total_sources: 2, chunk_bearing_sources: 2, zero_chunk_sources: 0,
+        projected_sources: failed || partial ? 1 : 2, failed_sources: failed ? 1 : 0,
+        skipped_no_chunks: 0, stale_sources: stale ? 1 : 0,
+        partial_sources: partial ? 1 : 0, projecting_sources: 0,
+        healthy_links: partial ? 3 : 4, degraded_links: failed ? 1 : 0, missing_links: 0,
+        total_chunks: 4, projected_chunks: partial ? 3 : 4, projection_required: outcome !== 'healthy',
+      },
+    } satisfies SemanticMemoryBackfillReceipt;
+    vi.mocked(api.semanticMemoryBackfillNotebook).mockResolvedValueOnce(receipt);
+    await useSourceStore.getState().reindexNotebook('nb-1');
+    const toasts = useToastStore.getState().toasts;
+    expect(toasts[toasts.length - 1]).toMatchObject({
+      type: outcome === 'healthy' ? 'success' : 'warning',
+      title: outcome === 'healthy' ? 'Projection Backfill Complete' : 'Projection Backfill Needs Attention',
+    });
+    expect(toasts[toasts.length - 1]?.message).toContain(`${receipt.projected_chunks} chunks projected`);
+  });
+
+  it('warns when fresh projection summary requires more work after the backfill snapshot', async () => {
+    const receipt: SemanticMemoryBackfillReceipt = {
+      notebook_id: 'nb-1', receipt_id: 'receipt-snapshot', total_sources: 1,
+      chunk_bearing_sources: 1, projected_sources: 1, skipped_no_chunks: 0,
+      failed_sources: 0, stale_sources: 0, total_chunks: 1, projected_chunks: 1, errors: [],
+      projection_summary: {
+        notebook_id: 'nb-1', total_sources: 2, chunk_bearing_sources: 2, zero_chunk_sources: 0,
+        projected_sources: 1, failed_sources: 0, skipped_no_chunks: 0, stale_sources: 0,
+        partial_sources: 0, projecting_sources: 0, healthy_links: 1, degraded_links: 0,
+        missing_links: 1, total_chunks: 2, projected_chunks: 1, projection_required: true,
+      },
+    };
+    vi.mocked(api.semanticMemoryBackfillNotebook).mockResolvedValueOnce(receipt);
+    await useSourceStore.getState().reindexNotebook('nb-1');
+    const toasts = useToastStore.getState().toasts;
+    expect(toasts[toasts.length - 1]).toMatchObject({
+      type: 'warning', title: 'Projection Backfill Needs Attention',
+    });
   });
 });

@@ -226,6 +226,42 @@ class RuntimeConfigPolicyTests(unittest.TestCase):
                        {"Context": "1 passages, preserved: no"}, {"Fallback": "yes"}, {"Backend used": "unknown"}):
             with self.assertRaises(RuntimeError): driver.require_scope_evidence({**values, **change}, 1, 1, True)
 
+    def test_requested_none_accepts_its_rendered_count_unavailable_receipt(self):
+        values = {"Scope": "none (retrieval off)", "Index": "scope-none (source counts unavailable)",
+                  "Invalid scope IDs": "0 recorded", "Requested source IDs": "0 recorded",
+                  "Selected source IDs": "0 recorded", "Excluded source IDs": "not recorded while retrieval is off",
+                  "Context": "0 passages, preserved: yes", "Backend requested": "gloss-local",
+                  "Backend used": "gloss-local", "Retrieval": "gloss-local", "Fallback": "no"}
+        driver.require_scope_evidence(values, 0, 0, False, requested_none=True)
+        # A numeric empty All/Explicit expectation cannot silently become None.
+        with self.assertRaises(RuntimeError): driver.require_scope_evidence(values, 0, 0, False)
+        for change in ({"Scope": "all (0 selected, 0 excluded, 0 invalid)"},
+                       {"Scope": "explicit (0 selected, 0 excluded, 0 invalid)"},
+                       {"Scope": "none (0 selected, 0 excluded, 0 invalid)"},
+                       {"Index": "scope-none"}, {"Index": "ready"},
+                       {"Invalid scope IDs": "1 recorded"}, {"Requested source IDs": "1 recorded"},
+                       {"Selected source IDs": "1 recorded"}, {"Excluded source IDs": "0 recorded"},
+                       {"Context": "1 passages, preserved: yes"}, {"Context": "0 passages, preserved: no"},
+                       {"Backend requested": "other"}, {"Backend used": "native-hybrid"},
+                       {"Retrieval": "hybrid_rrf"}, {"Fallback": "yes"}):
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                driver.require_scope_evidence({**values, **change}, 0, 0, False, requested_none=True)
+        for selected, excluded, retrieval, degraded in ((1, 0, False, False), (0, 1, False, False),
+                                                        (0, 0, True, False), (0, 0, False, True)):
+            with self.subTest(expected=(selected, excluded, retrieval, degraded)), self.assertRaises(RuntimeError):
+                driver.require_scope_evidence(values, selected, excluded, retrieval,
+                                              requested_none=True, degraded=degraded)
+
+    def test_empty_explicit_scope_keeps_its_numeric_receipt_assertions(self):
+        values = {"Scope": "explicit (0 selected, 2 excluded, 0 invalid)",
+                  "Context": "0 passages, preserved: yes", "Backend requested": "gloss-local",
+                  "Backend used": "gloss-local", "Retrieval": "gloss-local", "Fallback": "no"}
+        driver.require_scope_evidence(values, 0, 2, False)
+        for scope in ("explicit (0 selected, 0 excluded, 0 invalid)",
+                      "explicit (0 selected, 2 excluded, 1 invalid)", "none (retrieval off)"):
+            with self.subTest(scope=scope), self.assertRaises(RuntimeError):
+                driver.require_scope_evidence({**values, "Scope": scope}, 0, 2, False)
+
     def test_degraded_mode_requires_disclosed_dense_failure_and_preserved_scope(self):
         values = {"Scope": "selected (1 selected, 2 excluded, 0 invalid)", "Context": "1 passages, preserved: yes",
                   "Backend requested": "gloss-local", "Backend used": "gloss-local", "Retrieval": "bm25_only",

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { useChatStore } from '../chatStore';
 import { useNotebookStore } from '../notebookStore';
+import { useSourceStore } from '../sourceStore';
 import * as api from '../../lib/tauri';
 import type { Message } from '../../lib/types';
 
@@ -64,6 +65,49 @@ describe('chatStore', () => {
     // Default: active notebook matches so guards pass
     localStorageMock.clear();
     localStorageMock.setItem('gloss:activeNotebookId', 'nb-1');
+  });
+
+  it.each([
+    ['idle', 1],
+    ['loading', 1],
+    ['partial', 1],
+    ['error', 1],
+    ['ready', 1],
+    ['empty', 0],
+  ] as const)('submits declared all from the real source getter through chatStore with an empty %s inventory', async (sourceListStatus, sourceCount) => {
+    useSourceStore.setState({
+      sources: [],
+      selectedSourceIds: new Set(sourceCount > 0 ? ['known'] : []),
+      sourceScopeMode: 'all',
+      sourceListStatus,
+      loadedNotebookId: 'nb-1',
+      stats: {
+        source_count: sourceCount,
+        ready_count: 0,
+        error_count: 0,
+        missing_summaries: 0,
+        chunk_count: 0,
+        sources_with_chunks: 0,
+        total_words: 0,
+      },
+    });
+    useChatStore.setState({ activeConversationId: 'conv-1', isStreaming: false });
+    vi.mocked(api.sendMessage).mockClear();
+    vi.mocked(api.sendMessage).mockImplementationOnce(async (
+      _notebookId, _conversationId, _query, _scope, _model, assistantMessageId,
+    ) => assistantMessageId!);
+
+    const requestedScope = useSourceStore.getState().getSourceScope();
+    await useChatStore.getState().sendMessage('nb-1', 'Use the whole notebook', requestedScope, 'model-1');
+
+    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+    const submitted = vi.mocked(api.sendMessage).mock.calls[0];
+    expect(submitted?.slice(0, 5)).toEqual([
+      'nb-1', 'conv-1', 'Use the whole notebook', { kind: 'all' }, 'model-1',
+    ]);
+    expect(submitted?.[3]).toBe(requestedScope);
+    expect(useChatStore.getState().streamingError).toBeNull();
+    expect(useChatStore.getState().isStreaming).toBe(true);
   });
 
   it('terminal event without tokens loads persisted assistant', async () => {

@@ -2,6 +2,40 @@
 use crate::db::app_db::AppDb;
 use crate::error::GlossError;
 
+pub(crate) const DEFAULT_EMBEDDING_URL: &str = "http://localhost:11434";
+pub(crate) const DEFAULT_OLLAMA_EMBEDDING_MODEL: &str = "bge-m3";
+pub(crate) const DEFAULT_EMBEDDING_TIMEOUT_SECS: u64 = 60;
+pub(crate) const BUILT_IN_EMBEDDING_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingProviderKind {
+    FastEmbed,
+    Native,
+    Ollama,
+}
+
+impl EmbeddingProviderKind {
+    pub fn from_setting(value: Option<&str>) -> Result<Self, GlossError> {
+        match value {
+            None | Some("ollama") => Ok(Self::Ollama),
+            Some("fastembed") => Ok(Self::FastEmbed),
+            Some("native") => Ok(Self::Native),
+            Some(value) => Err(GlossError::Config(format!(
+                "Unsupported embedding provider: {value}"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FastEmbed => "fastembed",
+            Self::Native => "native",
+            Self::Ollama => "ollama",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeEmbeddingConfig {
     pub provider: String,
@@ -17,19 +51,42 @@ impl NativeEmbeddingConfig {
         // One SELECT gives queued workers a consistent settings snapshot even
         // when the app commits an atomic configuration update concurrently.
         let settings = db.get_settings()?;
-        let provider = settings
-            .get("semantic_memory_embedding_provider")
-            .cloned()
-            .unwrap_or_else(|| "ollama".into());
-        if !matches!(provider.as_str(), "ollama" | "fastembed" | "native") {
-            return Err(GlossError::Config(format!(
-                "Unsupported embedding provider: {provider}"
-            )));
-        }
-        let timeout_secs = match settings
-            .get("semantic_memory_embedding_timeout_secs")
-            .cloned()
-        {
+        Self::from_settings(
+            settings
+                .get("semantic_memory_embedding_provider")
+                .map(String::as_str),
+            settings
+                .get("semantic_memory_embedding_url")
+                .map(String::as_str),
+            settings
+                .get("semantic_memory_embedding_model")
+                .map(String::as_str),
+            settings
+                .get("semantic_memory_embedding_timeout_secs")
+                .map(String::as_str),
+            settings
+                .get("allow_lan_local_providers")
+                .map(String::as_str)
+                == Some("true"),
+            settings
+                .get("fastembed_download_consent")
+                .map(String::as_str)
+                == Some("true"),
+        )
+    }
+
+    /// Both ingestion and semantic projection use this strict configuration
+    /// owner before constructing an embedder or sending source text.
+    pub fn from_settings(
+        provider: Option<&str>,
+        url: Option<&str>,
+        model: Option<&str>,
+        timeout_secs: Option<&str>,
+        allow_lan: bool,
+        download_consent: bool,
+    ) -> Result<Self, GlossError> {
+        let provider = EmbeddingProviderKind::from_setting(provider)?;
+        let timeout_secs = match timeout_secs {
             Some(value) => value
                 .parse::<u64>()
                 .ok()
@@ -39,29 +96,41 @@ impl NativeEmbeddingConfig {
                         "Embedding timeout must be an integer from 2 to 300 seconds".into(),
                     )
                 })?,
-            None => 60,
+            None => DEFAULT_EMBEDDING_TIMEOUT_SECS,
+        };
+        let url = url.unwrap_or(DEFAULT_EMBEDDING_URL);
+        if url.trim().is_empty() {
+            return Err(GlossError::Config("Embedding URL must not be empty".into()));
+        }
+        let model = model.unwrap_or(match provider {
+            EmbeddingProviderKind::Ollama => DEFAULT_OLLAMA_EMBEDDING_MODEL,
+            EmbeddingProviderKind::FastEmbed | EmbeddingProviderKind::Native => {
+                BUILT_IN_EMBEDDING_MODEL
+            }
+        });
+        if model.trim().is_empty() {
+            return Err(GlossError::Config(
+                "Embedding model must not be empty".into(),
+            ));
+        }
+        if provider == EmbeddingProviderKind::Ollama {
+            crate::providers::validate_embedding_url(url, allow_lan)?;
+        }
+        // Built-in providers have one fixed model; retain the explicit provider
+        // identity while recording the model that will actually produce vectors.
+        let model = match provider {
+            EmbeddingProviderKind::Ollama => model,
+            EmbeddingProviderKind::FastEmbed | EmbeddingProviderKind::Native => {
+                BUILT_IN_EMBEDDING_MODEL
+            }
         };
         Ok(Self {
-            provider,
-            url: settings
-                .get("semantic_memory_embedding_url")
-                .cloned()
-                .unwrap_or_else(|| "http://localhost:11434".into()),
-            model: settings
-                .get("semantic_memory_embedding_model")
-                .cloned()
-                .unwrap_or_else(|| "bge-m3".into()),
+            provider: provider.as_str().to_string(),
+            url: url.to_string(),
+            model: model.to_string(),
             timeout_secs,
-            allow_lan: settings
-                .get("allow_lan_local_providers")
-                .cloned()
-                .as_deref()
-                == Some("true"),
-            download_consent: settings
-                .get("fastembed_download_consent")
-                .cloned()
-                .as_deref()
-                == Some("true"),
+            allow_lan,
+            download_consent,
         })
     }
 }
@@ -190,27 +259,124 @@ pub async fn ollama_embed_request(
     model: &str,
     texts: &[&str],
 ) -> Result<Vec<Vec<f32>>, GlossError> {
-    let body = serde_json::json!({
-        "model": model,
-        "input": texts,
-    });
-    let response = client
-        .post(format!("{}/api/embed", url.trim_end_matches('/')))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| GlossError::Embedding(format!("Ollama embed request failed: {e}")))?;
+    let endpoint = format!("{}/api/embed", url.trim_end_matches('/'));
+    let endpoint = endpoint.as_str();
+    // The configured client timeout still applies to each request. A hard
+    // whole-operation ceiling prevents an arbitrarily long sequence of batches.
+    // Direct await keeps cancellation and inference ownership with the caller.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        ollama_embed_batches(model, texts, |body| async move {
+            let response = client
+                .post(endpoint)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| GlossError::Embedding(format!("Ollama embed request failed: {e}")))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                return Err(GlossError::Embedding(format!(
+                    "Ollama embed returned HTTP {status}"
+                )));
+            }
+            bounded_ollama_json(response, MAX_EMBEDDING_RESPONSE_BYTES).await
+        }),
+    )
+    .await
+    .map_err(|_| GlossError::Embedding("Ollama embedding operation timed out".into()))?
+}
 
-    if !response.status().is_success() {
-        let status = response.status();
-        return Err(GlossError::Embedding(format!(
-            "Ollama embed returned HTTP {status}"
-        )));
+/// Match queue/rebuild cardinality while also bounding escaped JSON bytes.
+pub const MAX_EMBEDDING_BATCH_INPUTS: usize = 64;
+pub const MAX_EMBEDDING_REQUEST_BYTES: usize = 1024 * 1024;
+
+#[derive(serde::Serialize)]
+struct OllamaEmbedBody<'a> {
+    model: &'a str,
+    input: &'a [&'a str],
+    // Ollama must reject inputs exceeding the model context instead of silently
+    // embedding a truncated prefix under the original chunk identity.
+    truncate: bool,
+}
+
+/// One owner for real transport and inert regression transport. Preflight all
+/// inputs before I/O: a single encoded input plus envelope must fit one request,
+/// otherwise reject the entire operation without truncation or splitting a chunk.
+/// Replies remain private until every ordered batch passes strict validation.
+async fn ollama_embed_batches<F, Fut>(
+    model: &str,
+    texts: &[&str],
+    mut transport: F,
+) -> Result<Vec<Vec<f32>>, GlossError>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, GlossError>>,
+{
+    if texts.is_empty() {
+        return Ok(Vec::new());
     }
+    let oversized = || {
+        GlossError::Embedding(format!(
+            "Ollama embedding model or single input exceeds {MAX_EMBEDDING_REQUEST_BYTES} request bytes"
+        ))
+    };
+    let encode_error =
+        |error| GlossError::Embedding(format!("Ollama embed request JSON encode failed: {error}"));
+    // Raw length checks cap temporary serialization allocations even for text
+    // whose JSON encoding expands (control characters, quotes, backslashes).
+    if model.len() > MAX_EMBEDDING_REQUEST_BYTES {
+        return Err(oversized());
+    }
+    let envelope = serde_json::to_vec(&OllamaEmbedBody {
+        model,
+        input: &[],
+        truncate: false,
+    })
+    .map_err(encode_error)?
+    .len();
+    if envelope > MAX_EMBEDDING_REQUEST_BYTES {
+        return Err(oversized());
+    }
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = envelope;
+    for (index, text) in texts.iter().enumerate() {
+        if text.len() > MAX_EMBEDDING_REQUEST_BYTES {
+            return Err(oversized());
+        }
+        let encoded = serde_json::to_vec(text).map_err(encode_error)?.len();
+        if encoded > MAX_EMBEDDING_REQUEST_BYTES - envelope {
+            return Err(oversized());
+        }
+        let separator = usize::from(index > start);
+        if index - start == MAX_EMBEDDING_BATCH_INPUTS
+            || bytes + separator + encoded > MAX_EMBEDDING_REQUEST_BYTES
+        {
+            batches.push(start..index);
+            start = index;
+            bytes = envelope;
+        }
+        bytes += usize::from(index > start) + encoded;
+    }
+    batches.push(start..texts.len());
 
-    let parsed = bounded_ollama_json(response, MAX_EMBEDDING_RESPONSE_BYTES).await?;
-
-    parse_embeddings(&parsed, texts.len(), None)
+    let mut vectors = Vec::with_capacity(texts.len());
+    let mut dimensions = None;
+    for batch in batches {
+        let input = &texts[batch];
+        let body = serde_json::to_vec(&OllamaEmbedBody {
+            model,
+            input,
+            truncate: false,
+        })
+        .map_err(encode_error)?;
+        let reply = transport(body).await?;
+        let rows = parse_embeddings(&reply, input.len(), dimensions)?;
+        dimensions = rows.first().map(Vec::len);
+        vectors.extend(rows);
+    }
+    Ok(vectors)
 }
 
 /// Caps raw JSON before parsing, including chunked bodies without Content-Length.
@@ -326,6 +492,259 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn mapped_reply(body: &[u8]) -> serde_json::Value {
+        let request: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let rows: Vec<_> = request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|text| {
+                let index: usize = text
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("row:")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                vec![index as f32, -(index as f32)]
+            })
+            .collect();
+        json!({"embeddings": rows})
+    }
+
+    #[tokio::test]
+    async fn ollama_batches_bound_1_65_and_1000_inputs_with_exact_vector_mapping() {
+        for count in [1, 65, 1000] {
+            let owned: Vec<_> = (0..count).map(|i| format!("row:{i}")).collect();
+            let texts: Vec<_> = owned.iter().map(String::as_str).collect();
+            let mut sent = Vec::new();
+            let model = "fixture\\\"模型";
+            let vectors = ollama_embed_batches(model, &texts, |body| {
+                assert!(body.len() <= MAX_EMBEDDING_REQUEST_BYTES);
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["model"], model);
+                assert_eq!(request["truncate"], false);
+                let input = request["input"].as_array().unwrap();
+                assert!(!input.is_empty() && input.len() <= MAX_EMBEDDING_BATCH_INPUTS);
+                sent.push(input.len());
+                std::future::ready(Ok(mapped_reply(&body)))
+            })
+            .await
+            .unwrap();
+            let expected_batches: Vec<_> = texts.chunks(64).map(<[&str]>::len).collect();
+            assert_eq!(sent, expected_batches);
+            assert_eq!(vectors.len(), count);
+            for (index, vector) in vectors.iter().enumerate() {
+                assert_eq!(*vector, vec![index as f32, -(index as f32)]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_batches_bound_escaped_request_bytes_and_reject_oversized_input_before_io() {
+        // JSON control-character escaping expands each byte sixfold. These
+        // inputs fit singly but require separate requests before the count cap.
+        let large = "\u{0001}".repeat(MAX_EMBEDDING_REQUEST_BYTES / 12);
+        let texts = [large.as_str(); 3];
+        let mut calls = 0;
+        let vectors = ollama_embed_batches("fixture", &texts, |body| {
+            assert!(body.len() <= MAX_EMBEDDING_REQUEST_BYTES);
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let inputs = request["input"].as_array().unwrap();
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(inputs[0], large);
+            calls += 1;
+            std::future::ready(Ok(json!({"embeddings": [[1, 0]]})))
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(vectors.len(), 3);
+
+        for oversized in [
+            "x".repeat(MAX_EMBEDDING_REQUEST_BYTES),
+            "\u{0001}".repeat(MAX_EMBEDDING_REQUEST_BYTES / 6),
+        ] {
+            let mut calls = 0;
+            let error = ollama_embed_batches("fixture", &["row:0", &oversized], |_| {
+                calls += 1;
+                std::future::ready(Ok(json!({"embeddings": [[1, 0]]})))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 0);
+            assert!(error.to_string().contains("single input exceeds"));
+            assert!(!error.to_string().contains(&oversized));
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_batches_reject_invalid_late_replies_without_complete_success() {
+        let owned: Vec<_> = (0..129).map(|i| format!("row:{i}")).collect();
+        let texts: Vec<_> = owned.iter().map(String::as_str).collect();
+        for invalid in [
+            json!({}),
+            json!({"embeddings": []}),
+            json!({"embeddings": vec![vec![0.0]; 64]}), // Cross-batch dimension drift.
+            json!({"embeddings": vec![json!([]); 64]}),
+            json!({"embeddings": vec![json!(["1", 0]); 64]}),
+            json!({"embeddings": vec![json!([1e100, 0]); 64]}),
+        ] {
+            let mut calls = 0;
+            let result = ollama_embed_batches("fixture", &texts, |body| {
+                calls += 1;
+                std::future::ready(Ok(if calls == 1 {
+                    mapped_reply(&body)
+                } else {
+                    invalid.clone()
+                }))
+            })
+            .await;
+            assert!(matches!(result, Err(GlossError::Embedding(_))), "{invalid}");
+            assert_eq!(calls, 2); // No third request or partial-success return.
+        }
+        let mut calls = 0;
+        let error = ollama_embed_batches("fixture", &texts, |body| {
+            calls += 1;
+            std::future::ready(if calls == 1 {
+                Ok(mapped_reply(&body))
+            } else {
+                Err(GlossError::Embedding(
+                    "Ollama embed returned HTTP 503 Service Unavailable".into(),
+                ))
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(error.to_string().contains("HTTP 503 Service Unavailable"));
+    }
+
+    #[tokio::test]
+    async fn ollama_batches_empty_input_has_no_transport_and_cancellation_drops_pending_work() {
+        use std::future::Future;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let empty = ollama_embed_batches("fixture", &[], |_| {
+            panic!("Empty input must not call transport");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(json!({})))
+        })
+        .await
+        .unwrap();
+        assert!(empty.is_empty());
+
+        struct DropMark(Arc<AtomicBool>);
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut calls = 0;
+        let texts = ["row:0"; 129];
+        let mut operation = Box::pin(ollama_embed_batches("fixture", &texts, |body| {
+            calls += 1;
+            let call = calls;
+            let dropped = Arc::clone(&dropped);
+            async move {
+                if call == 1 {
+                    return Ok(mapped_reply(&body));
+                }
+                let _guard = DropMark(dropped);
+                std::future::pending::<Result<serde_json::Value, GlossError>>().await
+            }
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(operation.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(operation);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn embedding_settings_defaults_and_supported_aliases_have_one_identity() {
+        let config =
+            NativeEmbeddingConfig::from_settings(None, None, None, None, false, false).unwrap();
+        assert_eq!(config.provider, "ollama");
+        assert_eq!(config.model, "bge-m3");
+        assert_eq!(config.timeout_secs, 60);
+        for provider in ["fastembed", "native"] {
+            let config = NativeEmbeddingConfig::from_settings(
+                Some(provider),
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(config.provider, provider);
+            assert_eq!(config.model, BUILT_IN_EMBEDDING_MODEL);
+        }
+    }
+
+    #[test]
+    fn embedding_settings_reject_malformed_values_before_an_embedder_exists() {
+        for provider in ["", "OLLAMA", " ollama", "unknown"] {
+            assert!(NativeEmbeddingConfig::from_settings(
+                Some(provider),
+                None,
+                None,
+                None,
+                false,
+                false
+            )
+            .is_err());
+        }
+        for provider in ["ollama", "fastembed", "native"] {
+            for timeout in ["", "oops", "1", "301", " 60"] {
+                assert!(NativeEmbeddingConfig::from_settings(
+                    Some(provider),
+                    None,
+                    None,
+                    Some(timeout),
+                    false,
+                    false
+                )
+                .is_err());
+            }
+            assert!(NativeEmbeddingConfig::from_settings(
+                Some(provider),
+                None,
+                Some(" "),
+                None,
+                false,
+                false
+            )
+            .is_err());
+            assert!(NativeEmbeddingConfig::from_settings(
+                Some(provider),
+                Some(" "),
+                None,
+                None,
+                false,
+                false
+            )
+            .is_err());
+        }
+        assert!(NativeEmbeddingConfig::from_settings(
+            Some("ollama"),
+            Some("http://192.168.1.2:11434"),
+            None,
+            None,
+            false,
+            false
+        )
+        .is_err());
+    }
+
     #[test]
     fn malformed_vectors_are_never_coerced() {
         for value in [
@@ -388,7 +807,8 @@ mod tests {
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
             let mut buffer = [0; 4096];
-            stream.read(&mut buffer).unwrap();
+            let received = stream.read(&mut buffer).unwrap();
+            assert!(received > 0, "mock server received no request bytes");
             write!(stream,"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/api/embed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         });
         let client = ollama_client(&url, "fixture", 2, false).unwrap();
@@ -415,7 +835,8 @@ mod tests {
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
             let mut buffer = [0; 4096];
-            stream.read(&mut buffer).unwrap();
+            let received = stream.read(&mut buffer).unwrap();
+            assert!(received > 0, "mock server received no request bytes");
             let body = r#"{"embeddings":[[1,0,0]]}"#;
             write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         });

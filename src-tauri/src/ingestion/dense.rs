@@ -402,7 +402,10 @@ fn publish_dense_batch_with(
 }
 
 fn native_rebuild_owns(metadata: &crate::db::notebook_db::EmbeddingIndexMetadata) -> bool {
-    metadata.status == "building"
+    // A failed rebuild may have replaced the artifact and rolled back its
+    // relabeled mappings. Only an explicit rebuild may clear that fence.
+    // Ordinary append-only failures have no rebuild marker and stay retryable.
+    matches!(metadata.status.as_str(), "building" | "blocked")
         && metadata
             .status_reason
             .as_deref()
@@ -489,8 +492,8 @@ impl NativeDenseRebuild {
             }))
     }
 
-    /// Failure leaves the projection visibly unavailable and preserves an
-    /// intervening settings invalidation or a newer rebuild's ownership.
+    /// Failure keeps ordinary publication fenced until an explicit rebuild and
+    /// preserves a settings invalidation or a newer rebuild's ownership.
     pub fn fail(
         &self,
         db: &crate::db::notebook_db::NotebookDb,
@@ -501,7 +504,7 @@ impl NativeDenseRebuild {
                 db.mark_embedding_index_status(
                     crate::db::notebook_db::NATIVE_HNSW_INDEX_ID,
                     crate::db::notebook_db::EmbeddingIndexMetadataStatus::Blocked,
-                    Some(reason),
+                    Some(&format!("native-rebuild:{} failed: {reason}", self.id)),
                 )?;
             }
             Ok(())
@@ -567,10 +570,7 @@ impl NativeDenseRebuild {
         if let Err(error) = &result {
             self.fail(
                 db,
-                &format!(
-                    "native-rebuild:{} failed; previous artifact retained if present: {error}",
-                    self.id
-                ),
+                &format!("previous artifact retained if present: {error}"),
             )?;
         }
         result
@@ -725,42 +725,144 @@ mod audit_dense_tests {
         let db_path = dir.path().join("notebook.db");
         let db = NotebookDb::open(&db_path).unwrap();
         let path = native_dense_artifact_path(dir.path());
-        let chunks = batch_fixture(&db, "a", 2);
+        let fixture = |source: &str| {
+            let chunk = batch_fixture(&db, source, 1).remove(0);
+            let id = format!("{source}-c0");
+            let content = format!("{source} canonical chunk");
+            db.conn()
+                .execute(
+                    "UPDATE chunks SET id = ?1, content = ?2 WHERE id = ?3",
+                    rusqlite::params![id, content, chunk.id],
+                )
+                .unwrap();
+            db.get_chunk(&id).unwrap()
+        };
+        // Publication order differs from the rebuild's canonical ID order.
+        let z = fixture("z");
+        let a = fixture("a");
+        let vectors = |batch: &[Chunk]| -> Result<Vec<Vec<f32>>, GlossError> {
+            Ok(batch
+                .iter()
+                .map(|chunk| match chunk.id.as_str() {
+                    "z-c0" => vec![1.0, 0.0, 0.0],
+                    "a-c0" => vec![0.0, 1.0, 0.0],
+                    "b-c0" => vec![0.0, 0.0, 1.0],
+                    _ => panic!("unexpected regression fixture chunk"),
+                })
+                .collect())
+        };
         publish_dense_batch(
             &db,
             &path,
-            &chunks,
-            &vec![vec![1.0, 0.0, 0.0]; 2],
+            std::slice::from_ref(&z),
+            &vectors(std::slice::from_ref(&z)).unwrap(),
             &metadata(),
         )
         .unwrap();
+        publish_dense_batch(
+            &db,
+            &path,
+            std::slice::from_ref(&a),
+            &vectors(std::slice::from_ref(&a)).unwrap(),
+            &metadata(),
+        )
+        .unwrap();
+        assert_eq!(db.get_chunk("z-c0").unwrap().embedding_id, Some(0));
+        assert_eq!(db.get_chunk("a-c0").unwrap().embedding_id, Some(1));
+        let initial = load_published_dense_index(&db, &path, &metadata()).unwrap();
+        assert_eq!(initial.search(&[1.0, 0.0, 0.0], 1).unwrap()[0].0, 0);
+        assert_eq!(initial.search(&[0.0, 1.0, 0.0], 1).unwrap()[0].0, 1);
+        drop(initial);
+        let original_bytes = std::fs::read(&path).unwrap();
         let before = db.native_rebuild_chunks().unwrap();
         let rebuild = begin_dense_rebuild(&db, &metadata()).unwrap();
-        let candidate = rebuild
-            .build(|batch| Ok(vec![vec![0.0, 1.0, 0.0]; batch.len()]))
-            .unwrap();
-        db.conn().execute_batch("CREATE TRIGGER fail_rebuild AFTER UPDATE OF embedding_id ON chunks WHEN NEW.id = 'a-1' BEGIN SELECT RAISE(ABORT, 'injected rebuild mapping failure'); END;").unwrap();
-        assert!(rebuild.publish(&db, &path, &candidate).is_err());
+        assert_eq!(rebuild.chunks[0].id, "a-c0");
+        assert_eq!(rebuild.chunks[1].id, "z-c0");
+        let candidate = rebuild.build(|batch| vectors(batch)).unwrap();
+        db.conn().execute_batch("CREATE TRIGGER fail_rebuild AFTER UPDATE OF embedding_id ON chunks WHEN NEW.id = 'z-c0' BEGIN SELECT RAISE(ABORT, 'injected rebuild mapping failure'); END;").unwrap();
+        let error = rebuild.publish(&db, &path, &candidate).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected rebuild mapping failure"));
         assert_eq!(db.native_rebuild_chunks().unwrap(), before);
-        assert!(path
-            .with_file_name(format!("chunks.usearch.{}.quarantine", rebuild.id))
-            .exists());
+        assert_eq!(
+            std::fs::read(path.with_file_name(format!("chunks.usearch.{}.quarantine", rebuild.id)))
+                .unwrap(),
+            original_bytes
+        );
+        // Both old labels still exist, but now identify the opposite vectors.
+        let relabeled = HnswIndex::load_with_hwm(&path, 1, 3).unwrap();
+        assert_eq!(relabeled.search(&[1.0, 0.0, 0.0], 1).unwrap()[0].0, 1);
+        assert_eq!(relabeled.search(&[0.0, 1.0, 0.0], 1).unwrap()[0].0, 0);
+        drop(relabeled);
         assert!(load_published_dense_index(&db, &path, &metadata()).is_err());
+        let blocked = db
+            .embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(blocked.status, "blocked");
+        assert!(blocked
+            .status_reason
+            .as_deref()
+            .unwrap()
+            .starts_with(&format!("native-rebuild:{}", rebuild.id)));
+        let failed_bytes = std::fs::read(&path).unwrap();
+        let b = fixture("b");
         db.conn()
             .execute_batch("DROP TRIGGER fail_rebuild")
             .unwrap();
         drop(db);
         let db = NotebookDb::connect(&db_path).unwrap();
-        let retry = begin_dense_rebuild(&db, &metadata()).unwrap();
-        let candidate = retry
-            .build(|batch| Ok(vec![vec![1.0, 0.0, 0.0]; batch.len()]))
-            .unwrap();
-        retry.publish(&db, &path, &candidate).unwrap();
+        let error = publish_dense_batch(
+            &db,
+            &path,
+            std::slice::from_ref(&b),
+            &vectors(std::slice::from_ref(&b)).unwrap(),
+            &metadata(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("explicit rebuild required"));
+        assert_eq!(std::fs::read(&path).unwrap(), failed_bytes);
         assert_eq!(
-            load_published_dense_index(&db, &path, &metadata())
+            db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID)
                 .unwrap()
-                .size(),
-            2
+                .unwrap(),
+            blocked
+        );
+        for chunk in &before {
+            assert_eq!(db.get_chunk(&chunk.id).unwrap(), *chunk);
+        }
+        assert_eq!(db.get_chunk("b-c0").unwrap().embedding_id, None);
+        assert!(load_published_dense_index(&db, &path, &metadata()).is_err());
+        let retry = begin_dense_rebuild(&db, &metadata()).unwrap();
+        let candidate = retry.build(|batch| vectors(batch)).unwrap();
+        retry.publish(&db, &path, &candidate).unwrap();
+        let loaded = load_published_dense_index(&db, &path, &metadata()).unwrap();
+        assert_eq!(loaded.size(), 3);
+        for (chunk_id, query) in [
+            ("z-c0", [1.0, 0.0, 0.0]),
+            ("a-c0", [0.0, 1.0, 0.0]),
+            ("b-c0", [0.0, 0.0, 1.0]),
+        ] {
+            let label = db.get_chunk(chunk_id).unwrap().embedding_id.unwrap() as u64;
+            assert_eq!(loaded.search(&query, 1).unwrap()[0].0, label);
+        }
+        for original in &before {
+            let recovered = db.get_chunk(&original.id).unwrap();
+            assert_eq!(recovered.source_id, original.source_id);
+            assert_eq!(recovered.content, original.content);
+        }
+        // A committed rebuild's marker must allow ordinary publication again.
+        assert_eq!(
+            publish_dense_batch(
+                &db,
+                &path,
+                std::slice::from_ref(&b),
+                &vectors(std::slice::from_ref(&b)).unwrap(),
+                &metadata(),
+            )
+            .unwrap(),
+            0
         );
     }
 
@@ -822,13 +924,33 @@ mod audit_dense_tests {
     fn rebuild_rejects_nonnative_floats_before_any_publication() {
         let dir = tempfile::tempdir().unwrap();
         let db = NotebookDb::open(&dir.path().join("notebook.db")).unwrap();
-        batch_fixture(&db, "a", 1);
+        let path = native_dense_artifact_path(dir.path());
+        let chunks = batch_fixture(&db, "a", 1);
         let rebuild = begin_dense_rebuild(&db, &metadata()).unwrap();
-        assert!(rebuild
+        let error = rebuild
             .build(|_| Ok(vec![vec![f32::NAN, 0.0, 0.0]]))
-            .is_err());
+            .err()
+            .unwrap();
         assert!(rebuild.build(|_| Ok(vec![])).is_err());
         assert!(db.native_embedding_ids().unwrap().is_empty());
+        // The IPC caller reports build failures without a rebuild prefix.
+        rebuild.fail(&db, &error.to_string()).unwrap();
+        let blocked = db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID).unwrap();
+        assert!(
+            publish_dense_batch(&db, &path, &chunks, &[vec![1.0, 0.0, 0.0]], &metadata()).is_err()
+        );
+        assert_eq!(
+            db.embedding_index_metadata(NATIVE_HNSW_INDEX_ID).unwrap(),
+            blocked
+        );
+        assert!(!path.exists());
+        assert_eq!(db.get_chunks_without_embedding("a").unwrap(), chunks);
+        let retry = begin_dense_rebuild(&db, &metadata()).unwrap();
+        let candidate = retry.build(|_| Ok(vec![vec![1.0, 0.0, 0.0]])).unwrap();
+        retry.publish(&db, &path, &candidate).unwrap();
+        let recovered = load_published_dense_index(&db, &path, &metadata()).unwrap();
+        let label = db.get_chunk(&chunks[0].id).unwrap().embedding_id.unwrap() as u64;
+        assert_eq!(recovered.search(&[1.0, 0.0, 0.0], 1).unwrap()[0].0, label);
     }
 
     #[test]

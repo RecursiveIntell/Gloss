@@ -113,7 +113,6 @@ impl NotebookDbPool {
         // creation so the DB schema is guaranteed to exist before any reader
         // tries to query it.
         let write_conn = Connection::open(db_path)?;
-        migrations::apply_pragmas(&write_conn)?;
         migrations::migrate_notebook_db(&write_conn)?;
 
         Ok(Self {
@@ -294,6 +293,7 @@ impl NotebookDbPool {
             // read-write open so WAL can be set up.
             Connection::open(&self.db_path)
         })?;
+        migrations::validate_schema_version(&conn, migrations::DatabaseSchema::Notebook)?;
         migrations::apply_pragmas(&conn)?;
         Ok(conn)
     }

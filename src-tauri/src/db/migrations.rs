@@ -1,8 +1,13 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 const APP_SCHEMA_VERSION: i32 = 4;
 pub(crate) const NOTEBOOK_SCHEMA_VERSION: i32 = 7;
+
+pub(crate) enum DatabaseSchema {
+    App,
+    Notebook,
+}
 
 /// Apply pragmas for performance and correctness.
 ///
@@ -31,6 +36,7 @@ pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
 
 /// Create or migrate the app-level database schema.
 pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
+    let version = validate_schema_version(conn, DatabaseSchema::App)?;
     apply_pragmas(conn)?;
 
     conn.execute_batch(
@@ -39,8 +45,6 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
             value TEXT NOT NULL
         );",
     )?;
-
-    let version = get_schema_version(conn);
 
     if version < 1 {
         conn.execute_batch(
@@ -193,11 +197,6 @@ pub fn migrate_app_db(conn: &Connection) -> rusqlite::Result<()> {
          INSERT OR IGNORE INTO settings (key, value) VALUES ('chunk_target_tokens', '1100');",
     )?;
 
-    conn.execute(
-        "UPDATE settings SET value = 'bge-m3' WHERE key = 'semantic_memory_embedding_model' AND value = 'all-minilm'",
-        [],
-    )?;
-
     ensure_provider_rows(conn)?;
 
     Ok(())
@@ -218,6 +217,7 @@ fn ensure_provider_rows(conn: &Connection) -> rusqlite::Result<()> {
 
 /// Create or migrate a per-notebook database schema.
 pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
+    let version = validate_schema_version(conn, DatabaseSchema::Notebook)?;
     apply_pragmas(conn)?;
 
     conn.execute_batch(
@@ -226,8 +226,6 @@ pub fn migrate_notebook_db(conn: &Connection) -> rusqlite::Result<()> {
             value TEXT NOT NULL
         );",
     )?;
-
-    let version = get_schema_version(conn);
 
     if version < 1 {
         conn.execute_batch(
@@ -901,16 +899,62 @@ fn ensure_notebook_fts(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn get_schema_version(conn: &Connection) -> i32 {
-    conn.query_row(
-        "SELECT value FROM _meta WHERE key = 'schema_version'",
+fn get_schema_version(conn: &Connection) -> rusqlite::Result<i32> {
+    let has_meta: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_meta' COLLATE NOCASE)",
         [],
-        |row| {
-            let v: String = row.get(0)?;
-            Ok(v.parse::<i32>().unwrap_or(0))
-        },
-    )
-    .unwrap_or(0)
+        |row| row.get(0),
+    )?;
+    if !has_meta {
+        return Ok(0);
+    }
+
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM _meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match value {
+        Some(value) => value.parse::<i32>().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        }),
+        None => Ok(0),
+    }
+}
+
+/// Validate schema ownership with read-only queries before connection runtime
+/// pragmas or migrations.
+pub(crate) fn validate_schema_version(
+    conn: &Connection,
+    schema: DatabaseSchema,
+) -> rusqlite::Result<i32> {
+    let (database, supported_version) = match schema {
+        DatabaseSchema::App => ("app", APP_SCHEMA_VERSION),
+        DatabaseSchema::Notebook => ("notebook", NOTEBOOK_SCHEMA_VERSION),
+    };
+    let version = get_schema_version(conn)?;
+    if version < 0 || version > supported_version {
+        let message = if version < 0 {
+            format!(
+                "Invalid {database} database schema version {version}; expected a non-negative version"
+            )
+        } else {
+            format!(
+                "Unsupported {database} database schema version {version}; this build supports up to {supported_version}"
+            )
+        };
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(message),
+        ));
+    }
+    Ok(version)
 }
 
 fn set_schema_version(conn: &Connection, version: i32) -> rusqlite::Result<()> {
@@ -953,9 +997,581 @@ fn ensure_studio_outputs_prose_column(conn: &Connection) -> rusqlite::Result<()>
     Ok(())
 }
 
+/// Synthetic crash-state fixtures shared by the public admission and startup
+/// tests. The producer stays open while its main/WAL/SHM files are copied;
+/// otherwise SQLite would checkpoint the very frames under test on close.
+#[cfg(test)]
+pub(crate) mod wal_admission_fixtures {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    pub(crate) struct CopiedWal {
+        _producer: Connection,
+        _producer_directory: tempfile::TempDir,
+    }
+
+    pub(crate) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    pub(crate) fn file_state(path: &Path) -> [Option<Vec<u8>>; 4] {
+        ["", "-wal", "-shm", "-journal"].map(|suffix| {
+            let path = sidecar(path, suffix);
+            match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!(
+                    "cannot inspect synthetic fixture {}: {error}",
+                    path.display()
+                ),
+            }
+        })
+    }
+
+    impl CopiedWal {
+        pub(crate) fn create(
+            copied: &Path,
+            schema: DatabaseSchema,
+            version: &str,
+            include_shm: bool,
+        ) -> Self {
+            let producer_directory = tempfile::tempdir().unwrap();
+            let original = producer_directory.path().join("producer.db");
+            let producer = Connection::open(&original).unwrap();
+            match schema {
+                DatabaseSchema::App => migrate_app_db(&producer).unwrap(),
+                DatabaseSchema::Notebook => migrate_notebook_db(&producer).unwrap(),
+            }
+            producer
+                .execute_batch("PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+            producer
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+            let checkpointed_main = std::fs::read(&original).unwrap();
+            let transaction = producer.unchecked_transaction().unwrap();
+            transaction
+                .execute_batch(
+                    "CREATE TABLE wal_retained(value TEXT NOT NULL);
+                 INSERT INTO wal_retained VALUES ('committed WAL record');",
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE _meta SET value=?1 WHERE key='schema_version'",
+                    [version],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            assert_eq!(
+                std::fs::read(&original).unwrap(),
+                checkpointed_main,
+                "the rejecting version and retained record must remain in WAL"
+            );
+            assert!(std::fs::metadata(sidecar(&original, "-wal")).unwrap().len() > 32);
+            for suffix in ["", "-wal"] {
+                std::fs::copy(sidecar(&original, suffix), sidecar(copied, suffix)).unwrap();
+            }
+            if include_shm {
+                std::fs::copy(sidecar(&original, "-shm"), sidecar(copied, "-shm")).unwrap();
+            }
+            Self {
+                _producer: producer,
+                _producer_directory: producer_directory,
+            }
+        }
+
+        /// Verify logical readability on another disposable copy, so this
+        /// assertion cannot itself checkpoint or alter the rejected triplet.
+        pub(crate) fn assert_readable(path: &Path, version: &str) {
+            let directory = tempfile::tempdir().unwrap();
+            let proof = directory.path().join("read-proof.db");
+            for suffix in ["", "-wal", "-shm"] {
+                let source = sidecar(path, suffix);
+                if source.exists() {
+                    std::fs::copy(source, sidecar(&proof, suffix)).unwrap();
+                }
+            }
+            let reader = Connection::open(&proof).unwrap();
+            assert_eq!(
+                reader
+                    .query_row(
+                        "SELECT value FROM _meta WHERE key='schema_version'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                version
+            );
+            assert_eq!(
+                reader
+                    .query_row("SELECT value FROM wal_retained", [], |row| row
+                        .get::<_, String>(0),)
+                    .unwrap(),
+                "committed WAL record"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::app_db::AppDb;
+    use crate::db::notebook_db::NotebookDb;
+    use crate::db::notebook_pool::NotebookDbPool;
+    use crate::error::GlossError;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    type GuardedOpen = fn(&Path) -> Result<(), GlossError>;
+
+    fn schema_guard_entrypoints() -> [(&'static str, i32, GuardedOpen); 5] {
+        [
+            ("app_open", APP_SCHEMA_VERSION, |path| {
+                AppDb::open(path).map(|_| ())
+            }),
+            ("notebook_open", NOTEBOOK_SCHEMA_VERSION, |path| {
+                NotebookDb::open(path).map(|_| ())
+            }),
+            ("notebook_connect", NOTEBOOK_SCHEMA_VERSION, |path| {
+                NotebookDb::connect(path).map(|_| ())
+            }),
+            ("pool_new", NOTEBOOK_SCHEMA_VERSION, |path| {
+                NotebookDbPool::new(path).map(|_| ())
+            }),
+            ("pool_custom", NOTEBOOK_SCHEMA_VERSION, |path| {
+                NotebookDbPool::with_max_read_conns(path, 2).map(|_| ())
+            }),
+        ]
+    }
+
+    #[test]
+    fn copied_committed_wal_rejection_preserves_main_wal_shm_bytes_and_existence() {
+        use super::wal_admission_fixtures::{file_state, CopiedWal};
+        for (entrypoint, supported_version, open) in schema_guard_entrypoints() {
+            for version in [
+                (supported_version + 1).to_string(),
+                "malformed".into(),
+                "-1".into(),
+            ] {
+                for include_shm in [true, false] {
+                    let directory = tempdir().unwrap();
+                    let path = directory.path().join("rejected.db");
+                    let schema = if entrypoint == "app_open" {
+                        DatabaseSchema::App
+                    } else {
+                        DatabaseSchema::Notebook
+                    };
+                    let _fixture = CopiedWal::create(&path, schema, &version, include_shm);
+                    let before = file_state(&path);
+                    assert!(
+                        open(&path).is_err(),
+                        "{entrypoint} admitted schema {version}"
+                    );
+                    assert_eq!(
+                        file_state(&path),
+                        before,
+                        "{entrypoint} changed rejected schema {version}, SHM present={include_shm}"
+                    );
+                    CopiedWal::assert_readable(&path, &version);
+                    assert_eq!(
+                        file_state(&path),
+                        before,
+                        "readability proof changed source fixture"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn public_writer_admissions_accept_supported_committed_wal() {
+        use super::wal_admission_fixtures::CopiedWal;
+        for (entrypoint, supported_version, open) in schema_guard_entrypoints() {
+            for include_shm in [true, false] {
+                let directory = tempdir().unwrap();
+                let path = directory.path().join("supported.db");
+                let schema = if entrypoint == "app_open" {
+                    DatabaseSchema::App
+                } else {
+                    DatabaseSchema::Notebook
+                };
+                let version = supported_version.to_string();
+                let _fixture = CopiedWal::create(&path, schema, &version, include_shm);
+                open(&path)
+                    .unwrap_or_else(|error| panic!("{entrypoint} rejected supported WAL: {error}"));
+                CopiedWal::assert_readable(&path, &version);
+            }
+        }
+    }
+
+    #[test]
+    fn supported_wal_connections_remain_usable_with_a_live_notebook_pool() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("live-pool.db");
+        let pool = NotebookDbPool::new(&path).unwrap();
+        pool.write(|db| {
+            db.conn().execute_batch("CREATE TABLE wal_retained(value TEXT NOT NULL); INSERT INTO wal_retained VALUES ('committed WAL record');")?;
+            Ok(())
+        }).unwrap();
+        let connection = NotebookDb::connect(&path).unwrap();
+        assert_eq!(
+            connection
+                .conn()
+                .query_row("SELECT value FROM wal_retained", [], |row| row
+                    .get::<_, String>(0),)
+                .unwrap(),
+            "committed WAL record"
+        );
+        pool.read(|db| {
+            assert_eq!(
+                db.conn()
+                    .query_row("SELECT COUNT(*) FROM wal_retained", [], |row| row
+                        .get::<_, i64>(0))?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+        pool.write(|db| {
+            db.conn()
+                .execute("INSERT INTO wal_retained VALUES ('usable writer')", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            connection
+                .conn()
+                .query_row("SELECT COUNT(*) FROM wal_retained", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn public_write_entrypoints_reject_invalid_schema_without_persistent_changes() {
+        let dir = tempdir().unwrap();
+        for (entrypoint, supported_version, open) in schema_guard_entrypoints() {
+            let future_version = (supported_version + 1).to_string();
+            for (case, schema_value) in
+                [future_version.as_str(), "not-a-version", "2147483648", "-1"]
+                    .into_iter()
+                    .enumerate()
+            {
+                for (meta_case, meta_table) in ["_meta", "_META"].into_iter().enumerate() {
+                    let original = dir
+                        .path()
+                        .join(format!("{entrypoint}-{case}-{meta_case}.db"));
+                    let copied = dir
+                        .path()
+                        .join(format!("{entrypoint}-{case}-{meta_case}-copy.db"));
+                    {
+                        let conn = Connection::open(&original).unwrap();
+                        conn.execute_batch(&format!(
+                            "PRAGMA journal_mode=DELETE;
+                             PRAGMA user_version=93;
+                             CREATE TABLE {meta_table} (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                             INSERT INTO settings VALUES ('semantic_memory_embedding_model', 'all-minilm');
+                             CREATE TABLE future_owned (id TEXT PRIMARY KEY, value TEXT NOT NULL);
+                             INSERT INTO future_owned VALUES ('fixture', 'preserved user data');"
+                        ))
+                        .unwrap();
+                        conn.execute(
+                            "INSERT INTO _meta VALUES ('schema_version', ?1)",
+                            [schema_value],
+                        )
+                        .unwrap();
+                    }
+                    std::fs::copy(&original, &copied).unwrap();
+                    let before = std::fs::read(&copied).unwrap();
+                    let before_hash = Sha256::digest(&before);
+
+                    let error = open(&copied).unwrap_err();
+                    match (case, error) {
+                        (
+                            0,
+                            GlossError::Database(rusqlite::Error::SqliteFailure(_, Some(message))),
+                        ) => {
+                            assert!(message.contains(&format!("schema version {schema_value}")));
+                            assert!(
+                                message.contains(&format!("supports up to {supported_version}"))
+                            );
+                        }
+                        (
+                            1 | 2,
+                            GlossError::Database(rusqlite::Error::FromSqlConversionFailure(
+                                _,
+                                _,
+                                _,
+                            )),
+                        ) => {}
+                        (
+                            3,
+                            GlossError::Database(rusqlite::Error::SqliteFailure(_, Some(message))),
+                        ) => {
+                            assert!(message.contains("schema version -1"));
+                            assert!(message.contains("expected a non-negative version"));
+                        }
+                        (_, error) => panic!("{entrypoint} returned unexpected rejection: {error}"),
+                    }
+
+                    {
+                        let conn = Connection::open_with_flags(
+                            &copied,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        )
+                        .unwrap();
+                        let retained: String = conn
+                            .query_row(
+                                "SELECT value FROM _meta WHERE key = 'schema_version'",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(retained, schema_value);
+                        let journal: String = conn
+                            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                            .unwrap();
+                        assert_eq!(journal, "delete");
+                        let user_version: i32 = conn
+                            .query_row("PRAGMA user_version", [], |row| row.get(0))
+                            .unwrap();
+                        assert_eq!(user_version, 93);
+                    }
+                    let after = std::fs::read(&copied).unwrap();
+                    assert_eq!(
+                        after, before,
+                        "{entrypoint} modified rejected fixture bytes"
+                    );
+                    assert_eq!(Sha256::digest(&after), before_hash);
+                    assert_eq!(std::fs::read(&original).unwrap(), before);
+                    for suffix in ["-wal", "-shm", "-journal"] {
+                        let mut sidecar = copied.as_os_str().to_os_string();
+                        sidecar.push(suffix);
+                        assert!(!Path::new(&sidecar).exists(), "{entrypoint} left {suffix}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn public_write_entrypoints_accept_current_and_supported_legacy_schema() {
+        let dir = tempdir().unwrap();
+        for (entrypoint, supported_version, open) in schema_guard_entrypoints() {
+            if entrypoint != "notebook_connect" {
+                let fresh = dir.path().join(format!("{entrypoint}-fresh.db"));
+                open(&fresh).unwrap();
+                let conn = Connection::open(&fresh).unwrap();
+                assert_eq!(get_schema_version(&conn).unwrap(), supported_version);
+            }
+            for version in [0, 3, supported_version] {
+                let path = dir.path().join(format!("{entrypoint}-{version}.db"));
+                if entrypoint == "app_open" {
+                    drop(AppDb::open(&path).unwrap());
+                } else {
+                    drop(NotebookDb::open(&path).unwrap());
+                }
+                {
+                    let conn = Connection::open(&path).unwrap();
+                    set_schema_version(&conn, version).unwrap();
+                    conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+                }
+
+                open(&path).unwrap();
+                let conn = Connection::open(&path).unwrap();
+                let expected_version = if entrypoint == "notebook_connect" {
+                    version
+                } else {
+                    supported_version
+                };
+                assert_eq!(get_schema_version(&conn).unwrap(), expected_version);
+                let journal: String = conn
+                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(journal, "wal");
+            }
+        }
+    }
+
+    #[test]
+    fn app_fresh_install_seeds_bge_m3_embedding_model() {
+        let dir = tempdir().unwrap();
+        let db = AppDb::open(&dir.path().join("app.db")).unwrap();
+        assert_eq!(
+            db.get_setting("semantic_memory_embedding_model")
+                .unwrap()
+                .as_deref(),
+            Some("bge-m3")
+        );
+        assert_eq!(get_schema_version(db.conn()).unwrap(), APP_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn app_reopen_preserves_configured_all_minilm_embedding_model() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        {
+            let db = AppDb::open(&path).unwrap();
+            db.set_setting("semantic_memory_embedding_model", "all-minilm")
+                .unwrap();
+        }
+
+        for _ in 0..3 {
+            let db = AppDb::open(&path).unwrap();
+            assert_eq!(
+                db.get_setting("semantic_memory_embedding_model")
+                    .unwrap()
+                    .as_deref(),
+                Some("all-minilm")
+            );
+            assert_eq!(get_schema_version(db.conn()).unwrap(), APP_SCHEMA_VERSION);
+        }
+    }
+
+    #[test]
+    fn app_legacy_migration_preserves_configured_embedding_models() {
+        let dir = tempdir().unwrap();
+        for version in 0..APP_SCHEMA_VERSION {
+            for (model_index, model) in ["all-minilm", "operator-model:v2"].into_iter().enumerate()
+            {
+                let path = dir.path().join(format!("app-{version}-{model_index}.db"));
+                {
+                    let db = AppDb::open(&path).unwrap();
+                    db.set_setting("semantic_memory_embedding_model", model)
+                        .unwrap();
+                    set_schema_version(db.conn(), version).unwrap();
+                }
+
+                let db = AppDb::open(&path).unwrap();
+                assert_eq!(
+                    db.get_setting("semantic_memory_embedding_model")
+                        .unwrap()
+                        .as_deref(),
+                    Some(model),
+                    "schema {version} must retain the configured embedding model"
+                );
+                assert_eq!(get_schema_version(db.conn()).unwrap(), APP_SCHEMA_VERSION);
+            }
+        }
+    }
+
+    #[test]
+    fn future_schema_rejection_preserves_copied_database_bytes() {
+        let dir = tempdir().unwrap();
+        for (database, supported_version) in [
+            ("app", APP_SCHEMA_VERSION),
+            ("notebook", NOTEBOOK_SCHEMA_VERSION),
+        ] {
+            let original = dir.path().join(format!("{database}-future-original.db"));
+            let copied = dir.path().join(format!("{database}-future-copy.db"));
+            let future_version = supported_version + 1;
+            {
+                let conn = Connection::open(&original).unwrap();
+                conn.execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     PRAGMA user_version=93;
+                     CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     INSERT INTO settings VALUES ('semantic_memory_embedding_model', 'all-minilm');
+                     CREATE TABLE future_owned (id TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE INDEX future_owned_value ON future_owned(value);
+                     INSERT INTO future_owned VALUES ('fixture', 'future user data');",
+                )
+                .unwrap();
+                set_schema_version(&conn, future_version).unwrap();
+            }
+            std::fs::copy(&original, &copied).unwrap();
+            let before = std::fs::read(&copied).unwrap();
+
+            let error = if database == "app" {
+                match AppDb::open(&copied) {
+                    Err(GlossError::Database(error)) => error,
+                    Err(error) => panic!("expected database rejection, got {error}"),
+                    Ok(_) => panic!("future app schema must be rejected"),
+                }
+            } else {
+                let conn = Connection::open(&copied).unwrap();
+                migrate_notebook_db(&conn).unwrap_err()
+            };
+            match error {
+                rusqlite::Error::SqliteFailure(error, Some(message)) => {
+                    assert_eq!(error.extended_code, rusqlite::ffi::SQLITE_ERROR);
+                    assert!(message.contains(&format!(
+                        "{database} database schema version {future_version}"
+                    )));
+                    assert!(message.contains(&format!("supports up to {supported_version}")));
+                }
+                error => panic!("expected typed future-schema rejection, got {error}"),
+            }
+
+            {
+                let conn = Connection::open(&copied).unwrap();
+                assert_eq!(get_schema_version(&conn).unwrap(), future_version);
+                let model: String = conn
+                    .query_row(
+                        "SELECT value FROM settings WHERE key = 'semantic_memory_embedding_model'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(model, "all-minilm");
+                let journal: String = conn
+                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(journal, "delete");
+                let user_version: i32 = conn
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(user_version, 93);
+            }
+            assert_eq!(std::fs::read(&copied).unwrap(), before);
+            assert_eq!(std::fs::read(&original).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn malformed_schema_version_is_rejected_before_migration_writes() {
+        for migrate in [migrate_app_db, migrate_notebook_db] {
+            for version in ["not-a-version", "2147483648"] {
+                let conn = Connection::open_in_memory().unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO _meta (key, value) VALUES ('schema_version', ?1)",
+                    [version],
+                )
+                .unwrap();
+                assert!(matches!(
+                    migrate(&conn),
+                    Err(rusqlite::Error::FromSqlConversionFailure(_, _, _))
+                ));
+                let user_tables: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(user_tables, 1);
+                let retained: String = conn
+                    .query_row(
+                        "SELECT value FROM _meta WHERE key = 'schema_version'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(retained, version);
+            }
+        }
+    }
 
     #[test]
     fn app_v4_migrates_only_the_exact_legacy_search_timeout_default() {
@@ -981,7 +1597,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migrated, "60000");
-        assert_eq!(get_schema_version(&conn), APP_SCHEMA_VERSION);
+        assert_eq!(get_schema_version(&conn).unwrap(), APP_SCHEMA_VERSION);
 
         conn.execute(
             "UPDATE _meta SET value = '3' WHERE key = 'schema_version'",

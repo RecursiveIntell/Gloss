@@ -923,7 +923,9 @@ pub fn resolve_llm_config(
         let context_window = app_db
             .get_all_models()?
             .into_iter()
-            .find(|record| record.id == model)
+            .find(|record| {
+                record.id == model && record.provider_id == config.provider_type.as_str()
+            })
             .and_then(|record| record.context_window);
         (config, context_window)
     } else {
@@ -1169,6 +1171,40 @@ mod tests {
         Arc,
     };
     use tokio::time::{sleep, Duration};
+
+    #[test]
+    fn resolved_context_window_is_owned_by_selected_provider_and_model() {
+        let root = tempfile::tempdir().unwrap();
+        let db = AppDb::open(&root.path().join("app.db")).unwrap();
+        let secrets = SecretStore::new(root.path()).unwrap();
+        db.update_provider("llamacpp", true, Some("http://localhost:8080/v1"))
+            .unwrap();
+        for (provider, context_window) in [("ollama", 4096), ("llamacpp", 32768)] {
+            db.replace_models(
+                provider,
+                &[ModelRecord {
+                    id: "shared-model".into(),
+                    provider_id: provider.into(),
+                    display_name: "Shared model".into(),
+                    parameter_size: None,
+                    context_window: Some(context_window),
+                    capabilities: None,
+                    available: true,
+                    stale: false,
+                    last_error: None,
+                }],
+            )
+            .unwrap();
+        }
+        let registry = ModelRegistry::new(&db, &secrets).unwrap();
+        for (provider, context_window) in [("llamacpp", 32768), ("ollama", 4096)] {
+            db.select_chat_model(provider, "shared-model").unwrap();
+            let resolved = resolve_llm_config(&db, &secrets, Some(&registry), None).unwrap();
+            assert_eq!(resolved.config.provider_type.as_str(), provider);
+            assert_eq!(resolved.model, "shared-model");
+            assert_eq!(resolved.model_context_window, Some(context_window));
+        }
+    }
 
     #[derive(Clone)]
     enum MockProviderMode {

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 const SECRET_KEY_FILENAME: &str = "secret-store.key";
 const SECRET_DATA_FILENAME: &str = "secret-store.enc";
@@ -14,6 +15,7 @@ const SECRET_DATA_FILENAME: &str = "secret-store.enc";
 #[derive(Debug, Clone)]
 pub struct SecretStore {
     dir: PathBuf,
+    gate: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,10 +29,13 @@ impl SecretStore {
         let dir = data_dir.join("secrets");
         fs::create_dir_all(&dir)?;
         set_owner_only_dir_permissions(&dir)?;
-        Ok(Self { dir })
+        let dir = fs::canonicalize(dir)?;
+        let gate = secret_store_gate(&dir)?;
+        Ok(Self { dir, gate })
     }
 
     pub fn get(&self, key: &str) -> Result<Option<String>, GlossError> {
+        let _guard = self.lock()?;
         let secrets = self.load_all()?;
         Ok(secrets.get(key).cloned())
     }
@@ -40,6 +45,7 @@ impl SecretStore {
     }
 
     pub fn set(&self, key: &str, value: Option<&str>) -> Result<(), GlossError> {
+        let _guard = self.lock()?;
         let mut secrets = self.load_all()?;
         match value.map(str::trim) {
             Some(value) if !value.is_empty() => {
@@ -50,6 +56,12 @@ impl SecretStore {
             }
         }
         self.save_all(&secrets)
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, ()>, GlossError> {
+        self.gate
+            .lock()
+            .map_err(|_| GlossError::Other("Secret-store operation lock is poisoned".into()))
     }
 
     fn load_all(&self) -> Result<HashMap<String, String>, GlossError> {
@@ -105,10 +117,13 @@ impl SecretStore {
             ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(ciphertext),
         };
 
-        let tmp_path = self.dir.join(format!("{SECRET_DATA_FILENAME}.tmp"));
-        write_owner_only_file(&tmp_path, &serde_json::to_vec(&payload)?)?;
-        fs::rename(tmp_path, self.data_path())?;
-        set_owner_only_permissions(&self.data_path())?;
+        let tmp_path = self.dir.join(format!(
+            ".{SECRET_DATA_FILENAME}.{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        let mut pending = write_owner_only_file(&tmp_path, &serde_json::to_vec(&payload)?)?;
+        fs::rename(&pending.path, self.data_path())?;
+        pending.committed = true;
         Ok(())
     }
 
@@ -124,10 +139,8 @@ impl SecretStore {
 
         let key: [u8; 32] = <[u8; 32] as Generate>::generate();
 
-        let mut file = open_owner_only_create_new(&key_path)?;
-        file.write_all(&key)?;
-        file.sync_all()?;
-        set_owner_only_permissions(&key_path)?;
+        let mut pending = write_owner_only_file(&key_path, &key)?;
+        pending.committed = true;
 
         Ok(key)
     }
@@ -138,6 +151,36 @@ impl SecretStore {
 
     fn data_path(&self) -> PathBuf {
         self.dir.join(SECRET_DATA_FILENAME)
+    }
+}
+
+fn secret_store_gate(dir: &Path) -> Result<Arc<Mutex<()>>, GlossError> {
+    // Separate instances and clones must serialize the entire read/modify/commit
+    // operation. This registry coordinates this process only, not other processes.
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| GlossError::Other("Secret-store lock registry is poisoned".into()))?;
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(dir).and_then(Weak::upgrade) {
+        return Ok(gate);
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(dir.to_path_buf(), Arc::downgrade(&gate));
+    Ok(gate)
+}
+
+struct PendingSecretFile {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl Drop for PendingSecretFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -193,12 +236,22 @@ fn set_owner_only_permissions(_path: &Path) -> Result<(), GlossError> {
     Ok(())
 }
 
-fn write_owner_only_file(path: &Path, bytes: &[u8]) -> Result<(), GlossError> {
-    let mut file = open_owner_only_truncate(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    set_owner_only_permissions(path)?;
-    Ok(())
+fn write_owner_only_file(path: &Path, bytes: &[u8]) -> Result<PendingSecretFile, GlossError> {
+    let mut file = open_owner_only_create_new(path)?;
+    // Register cleanup only after exclusive creation has established ownership.
+    let pending = PendingSecretFile {
+        path: path.to_path_buf(),
+        committed: false,
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        set_owner_only_permissions(path)
+    })();
+    // Close before cleanup or rename, including on Windows.
+    drop(file);
+    result?;
+    Ok(pending)
 }
 
 #[cfg(unix)]
@@ -217,30 +270,13 @@ fn open_owner_only_create_new(path: &Path) -> Result<std::fs::File, GlossError> 
     Ok(OpenOptions::new().write(true).create_new(true).open(path)?)
 }
 
-#[cfg(unix)]
-fn open_owner_only_truncate(path: &Path) -> Result<std::fs::File, GlossError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    Ok(OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?)
-}
-
-#[cfg(not(unix))]
-fn open_owner_only_truncate(path: &Path) -> Result<std::fs::File, GlossError> {
-    Ok(OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::SecretStore;
+    use super::{write_owner_only_file, SecretStore, SECRET_DATA_FILENAME, SECRET_KEY_FILENAME};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
@@ -256,6 +292,177 @@ mod tests {
 
         store.set("openai_api_key", Some("")).unwrap();
         assert_eq!(store.get("openai_api_key").unwrap(), None);
+    }
+
+    #[test]
+    fn barrier_regression_preserves_concurrent_store_updates() {
+        const WORKERS: usize = 8;
+        const ROUNDS: usize = 8;
+
+        let dir = tempdir().unwrap();
+        let store = SecretStore::new(dir.path()).unwrap();
+        store
+            .set("synthetic-baseline", Some("synthetic-value"))
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let mut threads = Vec::new();
+        for worker in 0..WORKERS {
+            let store = if worker % 2 == 0 {
+                store.clone()
+            } else {
+                // Independently constructed stores and lexical aliases must
+                // share the same read/modify/commit gate.
+                SecretStore::new(&dir.path().join(".")).unwrap()
+            };
+            let barrier = barrier.clone();
+            threads.push(thread::spawn(move || {
+                let mut errors = Vec::new();
+                for round in 0..ROUNDS {
+                    barrier.wait();
+                    let key = format!("synthetic-secret-{worker}-{round}");
+                    if let Err(error) = store.set(&key, Some("synthetic-value")) {
+                        // Finish every barrier even after an error so a failed
+                        // regression produces a result instead of hanging.
+                        errors.push(error.to_string());
+                    }
+                }
+                errors
+            }));
+        }
+        for thread in threads {
+            assert!(thread.join().unwrap().is_empty());
+        }
+        assert_eq!(
+            store.get("synthetic-baseline").unwrap().as_deref(),
+            Some("synthetic-value")
+        );
+        for worker in 0..WORKERS {
+            for round in 0..ROUNDS {
+                assert_eq!(
+                    store
+                        .get(&format!("synthetic-secret-{worker}-{round}"))
+                        .unwrap()
+                        .as_deref(),
+                    Some("synthetic-value")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_first_writes_share_one_key() {
+        const WORKERS: usize = 8;
+
+        let dir = tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let mut threads = Vec::new();
+        for worker in 0..WORKERS {
+            let store = SecretStore::new(dir.path()).unwrap();
+            let barrier = barrier.clone();
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                store.set(
+                    &format!("synthetic-secret-{worker}"),
+                    Some("synthetic-value"),
+                )
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let store = SecretStore::new(dir.path()).unwrap();
+        for worker in 0..WORKERS {
+            assert!(store
+                .contains(&format!("synthetic-secret-{worker}"))
+                .unwrap());
+        }
+        assert_eq!(fs::read(store.key_path()).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn failed_commit_preserves_target_and_removes_staging_file() {
+        let dir = tempdir().unwrap();
+        let store = SecretStore::new(dir.path()).unwrap();
+        let data_path = store.data_path();
+        fs::create_dir(&data_path).unwrap();
+        let marker = data_path.join("synthetic-marker");
+        fs::write(&marker, b"synthetic-unchanged").unwrap();
+        let secrets = HashMap::from([(
+            "synthetic-secret".to_string(),
+            "synthetic-value".to_string(),
+        )]);
+
+        assert!(store.save_all(&secrets).is_err());
+        assert_eq!(fs::read(marker).unwrap(), b"synthetic-unchanged");
+        let mut filenames: Vec<_> = fs::read_dir(&store.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        filenames.sort();
+        assert_eq!(
+            filenames,
+            [SECRET_DATA_FILENAME, SECRET_KEY_FILENAME].map(std::ffi::OsString::from)
+        );
+    }
+
+    #[test]
+    fn pending_write_cleanup_only_removes_owned_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("synthetic-stage");
+        fs::write(&path, b"synthetic-existing").unwrap();
+        assert!(write_owner_only_file(&path, b"synthetic-replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"synthetic-existing");
+        fs::remove_file(&path).unwrap();
+
+        let pending = write_owner_only_file(&path, b"synthetic-new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"synthetic-new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(pending);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn commits_do_not_touch_legacy_fixed_temporary_path() {
+        let dir = tempdir().unwrap();
+        let store = SecretStore::new(dir.path()).unwrap();
+        let legacy_tmp = store.dir.join(format!("{SECRET_DATA_FILENAME}.tmp"));
+        fs::write(&legacy_tmp, b"synthetic-existing").unwrap();
+
+        store
+            .set("synthetic-secret", Some("synthetic-value"))
+            .unwrap();
+        assert_eq!(fs::read(legacy_tmp).unwrap(), b"synthetic-existing");
+        assert!(store.contains("synthetic-secret").unwrap());
+    }
+
+    #[test]
+    fn poisoned_operation_lock_fails_closed() {
+        let dir = tempdir().unwrap();
+        let store = SecretStore::new(dir.path()).unwrap();
+        store
+            .set("synthetic-secret", Some("synthetic-value"))
+            .unwrap();
+        let original = fs::read(store.data_path()).unwrap();
+        let gate = store.gate.clone();
+        assert!(thread::spawn(move || {
+            let _guard = gate.lock().unwrap();
+            panic!("synthetic lock poisoning");
+        })
+        .join()
+        .is_err());
+
+        assert!(store.get("synthetic-secret").is_err());
+        assert!(store
+            .set("synthetic-other", Some("synthetic-value"))
+            .is_err());
+        assert_eq!(fs::read(store.data_path()).unwrap(), original);
     }
 
     #[cfg(unix)]

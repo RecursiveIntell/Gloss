@@ -5,7 +5,11 @@ use crate::db::notebook_db::{
 };
 use crate::error::GlossError;
 use crate::ingestion::embed::EmbeddingService;
-use crate::ingestion::embedding_contract::{block_on_ollama, ollama_probe_dimension};
+pub use crate::ingestion::embedding_contract::EmbeddingProviderKind;
+use crate::ingestion::embedding_contract::{
+    block_on_ollama, ollama_probe_dimension, NativeEmbeddingConfig, BUILT_IN_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_TIMEOUT_SECS, DEFAULT_EMBEDDING_URL, DEFAULT_OLLAMA_EMBEDDING_MODEL,
+};
 use crate::memory::backend::{
     excluded_source_count, filter_semantic_candidates_by_scope, invalid_requested_source_ids,
     requested_source_ids, scope_echo,
@@ -16,10 +20,11 @@ use crate::memory::types::{
     SemanticLinkRow, MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW,
 };
 use crate::retrieval::source_scope::ResolvedSourceScope;
+use crate::settings_contract::EmbeddingPublicationFence;
 use semantic_memory::embedder::{EmbedBatchFuture, EmbedFuture};
 use semantic_memory::{
-    ChunkManifestEntry, ChunkManifestIngestOptions, Embedder, EmbeddingConfig, MemoryConfig,
-    MemoryError, MemoryStore, ReceiptMode, SearchContext, SearchSource, SearchSourceType,
+    ChunkManifestEntry, ChunkManifestIngestOptions, Embedder, MemoryConfig, MemoryError,
+    MemoryStore, ReceiptMode, SearchContext, SearchSource, SearchSourceType,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -59,14 +64,12 @@ fn shared_fastembed_service(
 }
 
 const BACKEND_VERSION: &str = env!("GLOSS_SEMANTIC_MEMORY_IDENTITY");
-// FastEmbed is now the only embedding provider (Nomic v2 MoE, 768d, candle-based).
-// The previous Ollama default was changed to avoid ort version conflicts with TTS.
-const DEFAULT_EMBEDDING_PROVIDER: EmbeddingProviderKind = EmbeddingProviderKind::FastEmbed;
-pub(crate) const FASTEMBED_MODEL_NAME: &str = "nomic-ai/nomic-embed-text-v1.5";
+const DEFAULT_EMBEDDING_PROVIDER: EmbeddingProviderKind = EmbeddingProviderKind::Ollama;
+pub(crate) const FASTEMBED_MODEL_NAME: &str = BUILT_IN_EMBEDDING_MODEL;
 pub(crate) const FASTEMBED_DIMENSIONS: usize = 768;
-pub(crate) const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL: &str = "http://localhost:11434";
-pub(crate) const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL: &str = "nomic-embed-text";
-const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS: u64 = 10;
+pub(crate) const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_URL: &str = DEFAULT_EMBEDDING_URL;
+pub(crate) const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL: &str = DEFAULT_OLLAMA_EMBEDDING_MODEL;
+const DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS: u64 = DEFAULT_EMBEDDING_TIMEOUT_SECS;
 // Projection batch cap. all-minilm (and similar 384-dim embedders) handle
 // 32 chunks/batch comfortably. The previous cap of 4 was 8x too conservative
 // and made a 5000-chunk import take 4+ minutes of pure network roundtrips
@@ -75,27 +78,6 @@ const SEMANTIC_MEMORY_PROJECTION_MAX_CHUNKS_PER_BATCH: usize = 32;
 const SEMANTIC_MEMORY_PROJECTION_MAX_CHARS_PER_BATCH: usize = 32_000;
 const SEMANTIC_MEMORY_PROJECTION_MAX_TOKENS_PER_BATCH: usize = 8_000;
 const SEMANTIC_MEMORY_PROJECTION_MAX_SUBCHUNK_CHARS: usize = 7_200;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EmbeddingProviderKind {
-    FastEmbed,
-    Ollama,
-}
-
-impl EmbeddingProviderKind {
-    fn from_setting(value: Option<String>) -> Self {
-        match value
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("ollama") => Self::Ollama,
-            _ => DEFAULT_EMBEDDING_PROVIDER,
-        }
-    }
-}
 
 struct FastEmbedSemanticMemoryEmbedder {
     service: Arc<Mutex<EmbeddingService>>,
@@ -239,6 +221,19 @@ impl Default for SemanticMemoryRuntimeConfig {
     }
 }
 
+impl SemanticMemoryRuntimeConfig {
+    pub(crate) fn embedding_identity(&self) -> Result<NativeEmbeddingConfig, GlossError> {
+        NativeEmbeddingConfig::from_settings(
+            Some(self.embedding_provider.as_str()),
+            Some(&self.embedding_ollama_url),
+            Some(&self.embedding_model),
+            Some(&self.embedding_timeout_secs.to_string()),
+            self.allow_lan,
+            self.fastembed_download_consent,
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn runtime_config_from_settings(
     embedding_provider: Option<String>,
@@ -250,45 +245,44 @@ pub fn runtime_config_from_settings(
     turbo_quant_enabled: bool,
     turbo_quant_require_fresh_artifacts: bool,
     provekv_pool_enabled: bool,
-) -> SemanticMemoryRuntimeConfig {
-    let defaults = SemanticMemoryRuntimeConfig::default();
-    let provider = EmbeddingProviderKind::from_setting(embedding_provider);
-    SemanticMemoryRuntimeConfig {
-        embedding_provider: provider,
-        embedding_ollama_url: embedding_ollama_url
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(defaults.embedding_ollama_url),
-        embedding_model: if provider == EmbeddingProviderKind::FastEmbed {
-            FASTEMBED_MODEL_NAME.to_string()
-        } else {
-            embedding_model
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_SEMANTIC_MEMORY_EMBEDDING_MODEL.to_string())
-        },
-        embedding_timeout_secs: embedding_timeout_secs
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(defaults.embedding_timeout_secs),
+) -> Result<SemanticMemoryRuntimeConfig, GlossError> {
+    let config = NativeEmbeddingConfig::from_settings(
+        embedding_provider.as_deref(),
+        embedding_ollama_url.as_deref(),
+        embedding_model.as_deref(),
+        embedding_timeout_secs.as_deref(),
         allow_lan,
         fastembed_download_consent,
+    )?;
+    Ok(SemanticMemoryRuntimeConfig {
+        embedding_provider: EmbeddingProviderKind::from_setting(Some(&config.provider))?,
+        embedding_ollama_url: config.url,
+        embedding_model: config.model,
+        embedding_timeout_secs: config.timeout_secs,
+        allow_lan: config.allow_lan,
+        fastembed_download_consent: config.download_consent,
         turbo_quant_enabled,
         turbo_quant_require_fresh_artifacts,
         provekv_pool_enabled,
-    }
+    })
 }
 
 pub fn validate_embedding_model_role(
     config: &SemanticMemoryRuntimeConfig,
 ) -> Result<(), GlossError> {
-    if config.embedding_provider == EmbeddingProviderKind::FastEmbed {
-        return Ok(());
-    }
-    if config.embedding_model.trim().is_empty() {
-        return Err(GlossError::Search(
-            "semantic-memory projection requires a configured Ollama embedding model".to_string(),
+    let parsed = NativeEmbeddingConfig::from_settings(
+        Some(config.embedding_provider.as_str()),
+        Some(&config.embedding_ollama_url),
+        Some(&config.embedding_model),
+        Some(&config.embedding_timeout_secs.to_string()),
+        config.allow_lan,
+        config.fastembed_download_consent,
+    )?;
+    if parsed.model != config.embedding_model {
+        return Err(GlossError::Config(
+            "Built-in embedding provider requires its fixed model identity".to_string(),
         ));
     }
-    crate::providers::validate_embedding_url(&config.embedding_ollama_url, config.allow_lan)?;
     Ok(())
 }
 
@@ -336,11 +330,15 @@ pub fn embedding_metadata_matches_config(
         return false;
     }
     let (provider, url, model) = match config.embedding_provider {
-        EmbeddingProviderKind::FastEmbed => {
+        EmbeddingProviderKind::FastEmbed | EmbeddingProviderKind::Native => {
             if dimensions != FASTEMBED_DIMENSIONS {
                 return false;
             }
-            ("fastembed", "fastembed-cache", FASTEMBED_MODEL_NAME)
+            (
+                config.embedding_provider.as_str(),
+                "fastembed-cache",
+                FASTEMBED_MODEL_NAME,
+            )
         }
         EmbeddingProviderKind::Ollama => (
             "ollama",
@@ -357,19 +355,13 @@ pub fn embedding_metadata_matches_config(
 pub fn expected_embedding_index_metadata(
     runtime_config: &SemanticMemoryRuntimeConfig,
 ) -> Result<EmbeddingIndexMetadata, GlossError> {
+    validate_embedding_model_role(runtime_config)?;
     let dimensions = match runtime_config.embedding_provider {
-        EmbeddingProviderKind::FastEmbed => FASTEMBED_DIMENSIONS,
+        EmbeddingProviderKind::FastEmbed | EmbeddingProviderKind::Native => FASTEMBED_DIMENSIONS,
         EmbeddingProviderKind::Ollama => probe_ollama_embedding_dimension(runtime_config)?,
     };
-    let provider = match runtime_config.embedding_provider {
-        EmbeddingProviderKind::FastEmbed => "fastembed",
-        EmbeddingProviderKind::Ollama => "ollama",
-    };
-    let model = if runtime_config.embedding_provider == EmbeddingProviderKind::FastEmbed {
-        FASTEMBED_MODEL_NAME.to_string()
-    } else {
-        runtime_config.embedding_model.clone()
-    };
+    let provider = runtime_config.embedding_provider.as_str();
+    let model = runtime_config.embedding_model.clone();
     let url = if runtime_config.embedding_provider == EmbeddingProviderKind::Ollama {
         runtime_config
             .embedding_ollama_url
@@ -394,54 +386,38 @@ fn open_store(
     model_cache_dir: PathBuf,
     runtime_config: Option<&SemanticMemoryRuntimeConfig>,
 ) -> Result<MemoryStore, GlossError> {
+    let defaults = SemanticMemoryRuntimeConfig::default();
+    let runtime_config = runtime_config.unwrap_or(&defaults);
+    validate_embedding_model_role(runtime_config)?;
     let mut config = MemoryConfig {
         base_dir,
         ..Default::default()
     };
-    if let Some(runtime_config) = runtime_config {
-        let defaults = EmbeddingConfig::default();
-        config.embedding.dimensions = match runtime_config.embedding_provider {
-            EmbeddingProviderKind::FastEmbed => FASTEMBED_DIMENSIONS,
-            EmbeddingProviderKind::Ollama => probe_ollama_embedding_dimension(runtime_config)?,
-        };
-        config.embedding.ollama_url = if runtime_config.embedding_ollama_url.trim().is_empty() {
-            defaults.ollama_url
-        } else {
-            runtime_config.embedding_ollama_url.clone()
-        };
-        config.embedding.model =
-            if runtime_config.embedding_provider == EmbeddingProviderKind::FastEmbed {
-                FASTEMBED_MODEL_NAME.to_string()
-            } else if runtime_config.embedding_model.trim().is_empty() {
-                defaults.model
-            } else {
-                runtime_config.embedding_model.clone()
-            };
-        config.embedding.timeout_secs = runtime_config.embedding_timeout_secs.max(1);
-        config.limits.embedding_timeout = Duration::from_secs(config.embedding.timeout_secs);
-    }
+    config.embedding.dimensions = match runtime_config.embedding_provider {
+        EmbeddingProviderKind::FastEmbed | EmbeddingProviderKind::Native => FASTEMBED_DIMENSIONS,
+        EmbeddingProviderKind::Ollama => probe_ollama_embedding_dimension(runtime_config)?,
+    };
+    config.embedding.ollama_url = runtime_config.embedding_ollama_url.clone();
+    config.embedding.model = runtime_config.embedding_model.clone();
+    config.embedding.timeout_secs = runtime_config.embedding_timeout_secs;
+    config.limits.embedding_timeout = Duration::from_secs(config.embedding.timeout_secs);
     #[cfg(feature = "semantic-memory-turbo-quant")]
     {
-        if runtime_config.is_some_and(|config| config.provekv_pool_enabled) {
+        if runtime_config.provekv_pool_enabled {
             config.search.derived_vector_backend =
                 semantic_memory::DerivedVectorBackendPolicy::ProveKvPoolCandidateOnly;
             config.search.turbo_quant_require_exact_rerank = true;
-        } else if runtime_config.is_some_and(|config| config.turbo_quant_enabled) {
+        } else if runtime_config.turbo_quant_enabled {
             config.search.derived_vector_backend =
                 semantic_memory::DerivedVectorBackendPolicy::TurboQuantCandidateOnly;
             config.search.turbo_quant_require_exact_rerank = true;
         }
     }
-    let provider = runtime_config
-        .map(|config| config.embedding_provider)
-        .unwrap_or(DEFAULT_EMBEDDING_PROVIDER);
-    match provider {
-        EmbeddingProviderKind::FastEmbed => {
+    match runtime_config.embedding_provider {
+        EmbeddingProviderKind::FastEmbed | EmbeddingProviderKind::Native => {
             let embedder = FastEmbedSemanticMemoryEmbedder::try_new(
                 model_cache_dir,
-                runtime_config
-                    .map(|config| config.fastembed_download_consent)
-                    .unwrap_or(false),
+                runtime_config.fastembed_download_consent,
             )?;
             MemoryStore::open_with_embedder(config, Box::new(embedder))
                 .map_err(|e| GlossError::Search(format!("semantic-memory: {e}")))
@@ -452,7 +428,7 @@ fn open_store(
                 &config.embedding.model,
                 config.embedding.dimensions,
                 config.embedding.timeout_secs,
-                runtime_config.is_some_and(|config| config.allow_lan),
+                runtime_config.allow_lan,
             )?;
             MemoryStore::open_with_embedder(config, Box::new(embedder))
                 .map_err(|e| GlossError::Search(format!("semantic-memory: {e}")))
@@ -919,7 +895,8 @@ fn projection_failure_record(
     }
 }
 
-pub async fn reindex_source(
+pub(crate) async fn reindex_source(
+    publication: &EmbeddingPublicationFence<'_>,
     data_dir: &Path,
     notebook_id: &str,
     notebook_db_path: &Path,
@@ -928,6 +905,7 @@ pub async fn reindex_source(
     runtime_config: Option<SemanticMemoryRuntimeConfig>,
 ) -> Result<IndexSourceReceipt, GlossError> {
     reindex_source_with_options(
+        publication,
         data_dir,
         notebook_id,
         notebook_db_path,
@@ -939,7 +917,8 @@ pub async fn reindex_source(
     .await
 }
 
-pub async fn reindex_source_with_options(
+pub(crate) async fn reindex_source_with_options(
+    publication: &EmbeddingPublicationFence<'_>,
     data_dir: &Path,
     notebook_id: &str,
     notebook_db_path: &Path,
@@ -948,14 +927,25 @@ pub async fn reindex_source_with_options(
     runtime_config: Option<SemanticMemoryRuntimeConfig>,
     options: ReindexSourceOptions,
 ) -> Result<IndexSourceReceipt, GlossError> {
+    publication.validate_scope(notebook_id, notebook_db_path)?;
+    let config = runtime_config.as_ref().ok_or_else(|| {
+        GlossError::Config(
+            "Projection requires an explicit embedding configuration snapshot".into(),
+        )
+    })?;
+    validate_embedding_model_role(config)?;
+    if config.embedding_identity()? != *publication.expected() {
+        return Err(GlossError::Config(
+            "Projection embedding snapshot differs from its publication authority".into(),
+        ));
+    }
     let receipt_id = trace_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let (source, all_chunks) = {
-        let nb_db = NotebookDb::connect(notebook_db_path)?;
-        (
+    let (source, all_chunks) = publication.with_notebook(|nb_db| {
+        Ok((
             nb_db.get_source(source_id)?,
             nb_db.get_chunks_for_source(source_id)?,
-        )
-    };
+        ))
+    })?;
     // Filter out chunks with empty/whitespace-only content — semantic-memory
     // rejects them with "content must not be empty" and they carry no
     // searchable signal anyway.
@@ -973,7 +963,6 @@ pub async fn reindex_source_with_options(
         );
     }
     if chunks.is_empty() {
-        let nb_db = NotebookDb::connect(notebook_db_path)?;
         let status = if options.classify_zero_chunks_as_skip {
             "skipped_no_chunks"
         } else {
@@ -984,18 +973,21 @@ pub async fn reindex_source_with_options(
         } else {
             Some("source has no Gloss chunks to project into semantic-memory")
         };
-        upsert_projection_status(
-            &nb_db,
-            notebook_id,
-            source_id,
-            status,
-            0,
-            0,
-            0,
-            0,
-            Some(receipt_id.clone()),
-            error.map(str::to_string),
-        )?;
+        publication.with_notebook(|nb_db| {
+            upsert_projection_status(
+                nb_db,
+                notebook_id,
+                source_id,
+                status,
+                0,
+                0,
+                0,
+                0,
+                Some(receipt_id.clone()),
+                error.map(str::to_string),
+            )?;
+            Ok(())
+        })?;
         return Ok(IndexSourceReceipt {
             backend_id: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
             notebook_id: notebook_id.to_string(),
@@ -1009,50 +1001,56 @@ pub async fn reindex_source_with_options(
     }
 
     {
-        let nb_db = NotebookDb::connect(notebook_db_path)?;
-        upsert_projection_status(
-            &nb_db,
-            notebook_id,
-            source_id,
-            "projecting",
-            chunks.len(),
-            0,
-            0,
-            0,
-            Some(receipt_id.clone()),
-            None,
-        )?;
+        publication.with_notebook(|nb_db| {
+            upsert_projection_status(
+                nb_db,
+                notebook_id,
+                source_id,
+                "projecting",
+                chunks.len(),
+                0,
+                0,
+                0,
+                Some(receipt_id.clone()),
+                None,
+            )?;
+            Ok(())
+        })?;
     }
 
     let expected_embedding_metadata = if let Some(config) = runtime_config.as_ref() {
         match expected_embedding_index_metadata(config) {
             Ok(mut metadata) => {
                 metadata.status = EmbeddingIndexMetadataStatus::Building.as_str().to_string();
-                let nb_db = NotebookDb::connect(notebook_db_path)?;
-                nb_db.upsert_embedding_index_metadata(&metadata)?;
+                publication.with_notebook(|nb_db| {
+                    nb_db.upsert_embedding_index_metadata(&metadata)?;
+                    Ok(())
+                })?;
                 metadata.status = EmbeddingIndexMetadataStatus::Ready.as_str().to_string();
                 Some(metadata)
             }
             Err(error) => {
                 let reason = format!("embedding-index-blocked: {error}");
-                let nb_db = NotebookDb::connect(notebook_db_path)?;
-                nb_db.mark_embedding_index_status(
-                    SEMANTIC_MEMORY_INDEX_ID,
-                    EmbeddingIndexMetadataStatus::Blocked,
-                    Some(&reason),
-                )?;
-                upsert_projection_status(
-                    &nb_db,
-                    notebook_id,
-                    source_id,
-                    "failed",
-                    chunks.len(),
-                    0,
-                    0,
-                    chunks.len(),
-                    Some(receipt_id.clone()),
-                    Some(reason.clone()),
-                )?;
+                publication.with_notebook(|nb_db| {
+                    nb_db.mark_embedding_index_status(
+                        SEMANTIC_MEMORY_INDEX_ID,
+                        EmbeddingIndexMetadataStatus::Blocked,
+                        Some(&reason),
+                    )?;
+                    upsert_projection_status(
+                        nb_db,
+                        notebook_id,
+                        source_id,
+                        "failed",
+                        chunks.len(),
+                        0,
+                        0,
+                        chunks.len(),
+                        Some(receipt_id.clone()),
+                        Some(reason.clone()),
+                    )?;
+                    Ok(())
+                })?;
                 return Err(GlossError::Embedding(reason));
             }
         }
@@ -1077,14 +1075,16 @@ pub async fn reindex_source_with_options(
     let mut projected_chunks = 0usize;
     let mut failure_records: Vec<ProjectionFailureRecordV1> = Vec::new();
     {
-        let nb_db = NotebookDb::connect(notebook_db_path)?;
-        mark_source_links_status(
-            &nb_db,
-            notebook_id,
-            source_id,
-            "stale",
-            Some("source reindexed; superseded by newer semantic-memory manifest"),
-        )?;
+        publication.with_notebook(|nb_db| {
+            mark_source_links_status(
+                nb_db,
+                notebook_id,
+                source_id,
+                "stale",
+                Some("source reindexed; superseded by newer semantic-memory manifest"),
+            )?;
+            Ok(())
+        })?;
     }
 
     for batch in projection_batches(&chunks) {
@@ -1118,15 +1118,17 @@ pub async fn reindex_source_with_options(
                                 )
                             })
                             .collect::<HashMap<_, _>>();
-                        let nb_db = NotebookDb::connect(notebook_db_path)?;
-                        upsert_synced_subchunk_link_rows(
-                            &nb_db,
-                            notebook_id,
-                            source_id,
-                            &receipt.sm_document_id,
-                            &subchunks,
-                            &mappings,
-                        )?;
+                        publication.with_notebook(|nb_db| {
+                            upsert_synced_subchunk_link_rows(
+                                nb_db,
+                                notebook_id,
+                                source_id,
+                                &receipt.sm_document_id,
+                                &subchunks,
+                                &mappings,
+                            )?;
+                            Ok(())
+                        })?;
                         projected_chunks += 1;
                     }
                     Err(error) => {
@@ -1140,14 +1142,16 @@ pub async fn reindex_source_with_options(
                             },
                             &error,
                         ));
-                        let nb_db = NotebookDb::connect(notebook_db_path)?;
-                        upsert_failed_link_rows(
-                            &nb_db,
-                            notebook_id,
-                            source_id,
-                            &batch,
-                            &error.to_string(),
-                        )?;
+                        publication.with_notebook(|nb_db| {
+                            upsert_failed_link_rows(
+                                nb_db,
+                                notebook_id,
+                                source_id,
+                                &batch,
+                                &error.to_string(),
+                            )?;
+                            Ok(())
+                        })?;
                     }
                 }
                 continue;
@@ -1204,15 +1208,17 @@ pub async fn reindex_source_with_options(
                                     )
                                 })
                                 .collect::<HashMap<_, _>>();
-                            let nb_db = NotebookDb::connect(notebook_db_path)?;
-                            upsert_synced_link_rows(
-                                &nb_db,
-                                notebook_id,
-                                source_id,
-                                &receipt.sm_document_id,
-                                std::slice::from_ref(&chunk),
-                                &mappings,
-                            )?;
+                            publication.with_notebook(|nb_db| {
+                                upsert_synced_link_rows(
+                                    nb_db,
+                                    notebook_id,
+                                    source_id,
+                                    &receipt.sm_document_id,
+                                    std::slice::from_ref(&chunk),
+                                    &mappings,
+                                )?;
+                                Ok(())
+                            })?;
                             projected_chunks += 1;
                         }
                         Err(single_error) => {
@@ -1227,14 +1233,16 @@ pub async fn reindex_source_with_options(
                                 reason_code,
                                 &single_error,
                             ));
-                            let nb_db = NotebookDb::connect(notebook_db_path)?;
-                            upsert_failed_link_rows(
-                                &nb_db,
-                                notebook_id,
-                                source_id,
-                                std::slice::from_ref(&chunk),
-                                &single_error.to_string(),
-                            )?;
+                            publication.with_notebook(|nb_db| {
+                                upsert_failed_link_rows(
+                                    nb_db,
+                                    notebook_id,
+                                    source_id,
+                                    std::slice::from_ref(&chunk),
+                                    &single_error.to_string(),
+                                )?;
+                                Ok(())
+                            })?;
                         }
                     }
                 }
@@ -1254,14 +1262,16 @@ pub async fn reindex_source_with_options(
                         &error,
                     ));
                 }
-                let nb_db = NotebookDb::connect(notebook_db_path)?;
-                upsert_failed_link_rows(
-                    &nb_db,
-                    notebook_id,
-                    source_id,
-                    &batch,
-                    &error.to_string(),
-                )?;
+                publication.with_notebook(|nb_db| {
+                    upsert_failed_link_rows(
+                        nb_db,
+                        notebook_id,
+                        source_id,
+                        &batch,
+                        &error.to_string(),
+                    )?;
+                    Ok(())
+                })?;
                 continue;
             }
         };
@@ -1280,21 +1290,30 @@ pub async fn reindex_source_with_options(
             })
             .collect::<HashMap<_, _>>();
         {
-            let nb_db = NotebookDb::connect(notebook_db_path)?;
-            upsert_synced_link_rows(
-                &nb_db,
-                notebook_id,
-                source_id,
-                &manifest_receipt.sm_document_id,
-                &batch,
-                &mappings,
-            )?;
+            publication.with_notebook(|nb_db| {
+                upsert_synced_link_rows(
+                    nb_db,
+                    notebook_id,
+                    source_id,
+                    &manifest_receipt.sm_document_id,
+                    &batch,
+                    &mappings,
+                )?;
+                Ok(())
+            })?;
         }
         projected_chunks += batch.len();
     }
 
-    {
-        let nb_db = NotebookDb::connect(notebook_db_path)?;
+    let vector_artifact_receipt = if options.rebuild_vector_artifacts {
+        rebuild_vector_artifacts_receipt(&store, runtime_config.as_ref()).await?
+    } else {
+        None
+    };
+    publication.with_transaction(|nb_db| {
+        // Source deletion must also abort late publication. Finish both source
+        // state and index identity atomically, after all awaited work finishes.
+        nb_db.get_source(source_id)?;
         let status = if failure_records.is_empty() {
             "synced"
         } else if projected_chunks > 0 {
@@ -1311,7 +1330,7 @@ pub async fn reindex_source_with_options(
             )
         };
         upsert_projection_status(
-            &nb_db,
+            nb_db,
             notebook_id,
             source_id,
             status,
@@ -1320,18 +1339,13 @@ pub async fn reindex_source_with_options(
             projected_chunks,
             chunks.len().saturating_sub(projected_chunks),
             Some(receipt_id.clone()),
-            error.clone(),
+            error,
         )?;
-    }
-    let vector_artifact_receipt = if options.rebuild_vector_artifacts {
-        rebuild_vector_artifacts_receipt(&store, runtime_config.as_ref()).await?
-    } else {
-        None
-    };
-    if let Some(metadata) = expected_embedding_metadata.as_ref() {
-        let nb_db = NotebookDb::connect(notebook_db_path)?;
-        nb_db.upsert_embedding_index_metadata(metadata)?;
-    }
+        if let Some(metadata) = expected_embedding_metadata.as_ref() {
+            nb_db.upsert_embedding_index_metadata(metadata)?;
+        }
+        Ok(())
+    })?;
 
     Ok(IndexSourceReceipt {
         backend_id: MEMORY_BACKEND_SEMANTIC_MEMORY_PREVIEW.to_string(),
@@ -1787,11 +1801,10 @@ mod tests {
     #[test]
     fn runtime_config_defaults_turbo_quant_off() {
         let config =
-            runtime_config_from_settings(None, None, None, None, false, false, false, true, false);
-        // FastEmbed is now the default (Nomic v2 MoE via candle, 768d).
-        // The Ollama default was removed because we now require FastEmbed-only
-        // to avoid ONNX/candle conflicts with TTS (any-tts).
-        assert_eq!(config.embedding_provider, EmbeddingProviderKind::FastEmbed);
+            runtime_config_from_settings(None, None, None, None, false, false, false, true, false)
+                .unwrap();
+        assert_eq!(config.embedding_provider, EmbeddingProviderKind::Ollama);
+        assert_eq!(config.embedding_model, DEFAULT_OLLAMA_EMBEDDING_MODEL);
         assert_eq!(
             config.embedding_timeout_secs,
             DEFAULT_SEMANTIC_MEMORY_EMBEDDING_TIMEOUT_SECS
@@ -1800,6 +1813,98 @@ mod tests {
         assert!(!config.allow_lan);
         assert!(!config.turbo_quant_enabled);
         assert!(!config.provekv_pool_enabled);
+    }
+
+    #[test]
+    fn runtime_config_matches_native_settings_for_every_supported_provider() {
+        for provider in [None, Some("ollama"), Some("fastembed"), Some("native")] {
+            let native =
+                NativeEmbeddingConfig::from_settings(provider, None, None, None, false, false)
+                    .unwrap();
+            let preview = runtime_config_from_settings(
+                provider.map(str::to_string),
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(preview.embedding_provider.as_str(), native.provider);
+            assert_eq!(preview.embedding_model, native.model);
+            assert_eq!(preview.embedding_ollama_url, native.url);
+            assert_eq!(preview.embedding_timeout_secs, native.timeout_secs);
+        }
+    }
+
+    #[test]
+    fn runtime_config_rejects_values_that_previously_selected_fastembed_or_defaults() {
+        for provider in ["unknown", "OLLAMA", "", " fastembed "] {
+            assert!(runtime_config_from_settings(
+                Some(provider.into()),
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                true,
+                false,
+            )
+            .is_err());
+        }
+        for timeout in ["oops", "0", "1", "301"] {
+            assert!(runtime_config_from_settings(
+                Some("native".into()),
+                None,
+                None,
+                Some(timeout.into()),
+                false,
+                false,
+                false,
+                true,
+                false,
+            )
+            .is_err());
+        }
+        assert!(runtime_config_from_settings(
+            Some("ollama".into()),
+            None,
+            Some(" ".into()),
+            None,
+            false,
+            false,
+            false,
+            true,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn native_alias_projection_metadata_preserves_explicit_provider_identity() {
+        let config = runtime_config_from_settings(
+            Some("native".into()),
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        let metadata = expected_embedding_index_metadata(&config).unwrap();
+        assert_eq!(metadata.provider, "native");
+        assert_eq!(metadata.model, BUILT_IN_EMBEDDING_MODEL);
+        assert!(embedding_metadata_matches_config(&config, &metadata));
+        let mut fastembed = config;
+        fastembed.embedding_provider = EmbeddingProviderKind::FastEmbed;
+        assert!(!embedding_metadata_matches_config(&fastembed, &metadata));
     }
 
     #[test]
@@ -1816,7 +1921,8 @@ mod tests {
     #[test]
     fn runtime_config_carries_explicit_provekv_pool_consent() {
         let config =
-            runtime_config_from_settings(None, None, None, None, false, false, false, true, true);
+            runtime_config_from_settings(None, None, None, None, false, false, false, true, true)
+                .unwrap();
         assert!(config.provekv_pool_enabled);
         assert!(!config.turbo_quant_enabled);
     }
@@ -1833,7 +1939,8 @@ mod tests {
             true,
             true,
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(config.embedding_ollama_url, "http://localhost:11435");
         assert_eq!(config.embedding_model, "embed-model");
         assert_eq!(config.embedding_timeout_secs, 12);
@@ -1844,8 +1951,7 @@ mod tests {
 
     #[test]
     fn embedding_provider_explicit_ollama_overrides_legacy_model_setting() {
-        // v3: explicit "ollama" provider should win. The previous test name
-        // referenced FastEmbed as the default; that default is now Ollama.
+        // An explicit supported provider keeps its configured model identity.
         let config = runtime_config_from_settings(
             Some("ollama".to_string()),
             Some("http://localhost:11435".to_string()),
@@ -1856,13 +1962,12 @@ mod tests {
             false,
             true,
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(config.embedding_provider, EmbeddingProviderKind::Ollama);
         assert_eq!(config.embedding_model, "nomic-embed-text");
         assert_eq!(config.embedding_timeout_secs, 12);
-        // The fastembed download consent flag is no longer wired to the
-        // default path, but should still be parsed when the caller supplies
-        // it (it is only relevant if a user later switches the provider).
+        // Download consent remains distinct from the active provider.
         assert!(config.fastembed_download_consent);
     }
 
@@ -1874,6 +1979,42 @@ mod tests {
         assert_eq!(semantic_preview_overfetch_limit(4, &scope), 48);
     }
 
+    fn publication_fixture(
+        dir: &Path,
+        notebook_id: &str,
+        config: &SemanticMemoryRuntimeConfig,
+    ) -> (
+        Mutex<crate::db::app_db::AppDb>,
+        Arc<crate::db::notebook_pool::NotebookDbPool>,
+    ) {
+        let app_db = crate::db::app_db::AppDb::open(&dir.join("app.db")).unwrap();
+        app_db
+            .create_notebook(notebook_id, "publication fixture", dir.to_str().unwrap())
+            .unwrap();
+        let settings = crate::settings_contract::EmbeddingSettings {
+            provider: config.embedding_provider.as_str().into(),
+            url: config.embedding_ollama_url.clone(),
+            model: config.embedding_model.clone(),
+            timeout_secs: config.embedding_timeout_secs,
+            download_consent: config.fastembed_download_consent,
+            search_timeout_ms: crate::settings_contract::minimum_semantic_search_timeout_ms(
+                config.embedding_timeout_secs,
+            ),
+            chunk_target_tokens: 1100,
+        };
+        crate::settings_contract::save_embedding_settings(&app_db, &settings).unwrap();
+        app_db
+            .set_setting(
+                "allow_lan_local_providers",
+                if config.allow_lan { "true" } else { "false" },
+            )
+            .unwrap();
+        let pool = Arc::new(
+            crate::db::notebook_pool::NotebookDbPool::new(&dir.join("notebook.db")).unwrap(),
+        );
+        (Mutex::new(app_db), pool)
+    }
+
     #[tokio::test]
     async fn zero_chunk_source_projection_is_skipped_not_failed() {
         let dir = tempdir().unwrap();
@@ -1882,13 +2023,22 @@ mod tests {
         db.insert_source(&test_source("source-empty")).unwrap();
         drop(db);
 
+        let config = SemanticMemoryRuntimeConfig::default();
+        let (app_db, pool) = publication_fixture(dir.path(), "notebook-1", &config);
+        let publication = EmbeddingPublicationFence::new(
+            &app_db,
+            "notebook-1",
+            pool,
+            config.embedding_identity().unwrap(),
+        );
         let receipt = reindex_source_with_options(
+            &publication,
             dir.path(),
             "notebook-1",
             &db_path,
             "source-empty",
             Some("receipt-zero-chunk".to_string()),
-            None,
+            Some(config),
             ReindexSourceOptions {
                 rebuild_vector_artifacts: false,
                 classify_zero_chunks_as_skip: true,
@@ -1974,7 +2124,15 @@ mod tests {
             provekv_pool_enabled: false,
         };
         validate_embedding_model_role(&runtime_config)?;
+        let (app_db, pool) = publication_fixture(dir.path(), notebook_id, &runtime_config);
+        let publication = EmbeddingPublicationFence::new(
+            &app_db,
+            notebook_id,
+            pool,
+            runtime_config.embedding_identity()?,
+        );
         let projection_receipt = reindex_source_with_options(
+            &publication,
             dir.path(),
             notebook_id,
             &db_path,

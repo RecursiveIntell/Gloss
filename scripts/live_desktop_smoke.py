@@ -809,11 +809,43 @@ return {at_end, id:button?.getAttribute('aria-controls') || null,
 
     def jump_to_latest(self) -> dict:
         if not self.answer_snapshot()["at_end"]:
+            selector = 'button[aria-label="Jump to latest"]'
+            previous_target = None
             def navigation_ready():
+                nonlocal previous_target
                 if self.answer_snapshot()["at_end"]:
                     return {"at_end": True}
-                button = self.ui.find_visible('button[aria-label="Jump to latest"]')
-                return {"button": button} if button else None
+                try:
+                    button = self.ui.find_visible(selector)
+                    if not button:
+                        previous_target = None
+                        return None
+                    observation = self.ui.execute("""const button=arguments[0], selector=arguments[1];
+const nodes=Array.from(document.querySelectorAll(selector)).filter(e=>e.getClientRects().length);
+const current=button.isConnected && nodes.length===1 && nodes[0]===button;
+const r=button.getBoundingClientRect();
+const left=Math.max(0,r.left), right=Math.min(innerWidth,r.right);
+const top=Math.max(0,r.top), bottom=Math.min(innerHeight,r.bottom);
+const in_view=right>left && bottom>top;
+const hit=in_view ? document.elementFromPoint((left+right)/2,(top+bottom)/2) : null;
+return {ready:current && in_view && !!hit && (hit===button || button.contains(hit)) &&
+  !button.disabled && button.getAttribute('aria-disabled')!=='true' && !button.closest('[inert]'),
+  rect:{x:r.x,y:r.y,width:r.width,height:r.height}};""", [button, selector])
+                except WebDriverHttpError as error:
+                    # Only these read-only observations may be reacquired. A
+                    # stale response after click dispatch still fails below.
+                    if error.webdriver_error != "stale element reference":
+                        raise
+                    previous_target = None
+                    self.ui.trace.append({"at": now(), "navigation_readiness": "jump_to_latest",
+                                          "stale_before_click": True, "path": error.path})
+                    return None
+                target = (button, observation.get("rect")) if observation.get("ready") else None
+                observation["stable"] = target is not None and target == previous_target
+                previous_target = target
+                self.ui.trace.append({"at": now(), "navigation_readiness": "jump_to_latest",
+                                      "button": button, "observation": observation})
+                return {"button": button} if observation["stable"] else None
             navigation = self.ui.wait(navigation_ready, label="latest-message navigation control")
             if "button" in navigation:
                 self.ui.click_ref(navigation["button"])

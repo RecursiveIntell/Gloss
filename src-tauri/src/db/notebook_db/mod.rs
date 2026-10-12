@@ -378,15 +378,16 @@ impl NotebookDb {
     /// Connect to an existing per-notebook database with runtime pragmas.
     pub fn connect(path: &Path) -> Result<Self, GlossError> {
         let conn = Connection::open(path)?;
+        migrations::validate_schema_version(&conn, migrations::DatabaseSchema::Notebook)?;
         migrations::apply_pragmas(&conn)?;
         Ok(Self { conn })
     }
 
     /// Open (or create) a per-notebook database and run migrations.
     pub fn open(path: &Path) -> Result<Self, GlossError> {
-        let db = Self::connect(path)?;
-        migrations::migrate_notebook_db(db.conn())?;
-        Ok(db)
+        let conn = Connection::open(path)?;
+        migrations::migrate_notebook_db(&conn)?;
+        Ok(Self { conn })
     }
 
     /// Inspect an existing notebook without migrations, FTS rebuilds, or writes.

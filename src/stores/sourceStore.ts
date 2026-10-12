@@ -390,14 +390,21 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
 
   reindexSource: async (notebookId, sourceId) => {
     try {
-      await api.semanticMemoryReindexSource(notebookId, sourceId);
+      const receipt = await api.semanticMemoryReindexSource(notebookId, sourceId);
       await get().loadSources(notebookId);
       await get().loadStats(notebookId);
+      const synced = receipt.sync_status === 'synced' && receipt.error == null;
+      const skipped = receipt.sync_status === 'skipped_no_chunks' && receipt.error == null;
+      const partial = receipt.sync_status === 'partial';
       useToastStore.getState().addToast({
-        type: 'success',
-        title: 'Reindex Complete',
-        message: 'Source projected to semantic-memory preview.',
-        duration: 3000,
+        type: synced ? 'success' : skipped ? 'info' : partial ? 'warning' : 'error',
+        title: synced ? 'Reindex Complete' : skipped ? 'Reindex Skipped' : partial ? 'Reindex Incomplete' : 'Reindex Failed',
+        message: synced
+          ? `${receipt.indexed_chunks} chunks projected to semantic-memory preview.`
+          : skipped
+            ? 'Source has no searchable chunks to project.'
+            : `${receipt.indexed_chunks} chunks projected; ${receipt.error || `projection status: ${receipt.sync_status}`}`,
+        duration: synced || skipped ? 4000 : 7000,
       });
     } catch (e) {
       useToastStore.getState().addToast({
@@ -414,11 +421,15 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       const receipt = await api.semanticMemoryBackfillNotebook(notebookId);
       await get().loadSources(notebookId);
       await get().loadStats(notebookId);
+      const incomplete = receipt.failed_sources > 0 || receipt.stale_sources > 0
+        || receipt.errors.length > 0 || receipt.projection_summary.partial_sources > 0
+        || receipt.projection_summary.projecting_sources > 0
+        || receipt.projection_summary.projection_required;
       useToastStore.getState().addToast({
-        type: 'success',
-        title: 'Projection backfill complete',
-        message: `${receipt.projected_sources} projected, ${receipt.skipped_no_chunks} skipped, ${receipt.failed_sources} failed.`,
-        duration: 4000,
+        type: incomplete ? 'warning' : 'success',
+        title: incomplete ? 'Projection Backfill Needs Attention' : 'Projection Backfill Complete',
+        message: `${receipt.projected_sources} fully projected, ${receipt.skipped_no_chunks} skipped, ${receipt.failed_sources} incomplete or failed, ${receipt.stale_sources} stale; ${receipt.projected_chunks} chunks projected.`,
+        duration: incomplete ? 7000 : 4000,
       });
     } catch (e) {
       useToastStore.getState().addToast({

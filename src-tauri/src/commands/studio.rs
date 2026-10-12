@@ -24,6 +24,7 @@ const DEFAULT_STUDIO_MAX_ITEMS: usize = 8;
 const MAX_STUDIO_ITEMS: usize = 20;
 /// Max chars of source text to feed the LLM per source (keeps context window manageable).
 const MAX_SOURCE_CHARS_FOR_LLM: usize = 4000;
+const STUDIO_GATE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const STUDIO_PROVIDER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const STUDIO_FIRST_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const STUDIO_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -31,6 +32,7 @@ const STUDIO_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum StudioFallbackReason {
+    QueueWaitTimeout,
     ProviderStartTimeout,
     FirstTokenTimeout,
     StreamIdleTimeout,
@@ -41,6 +43,7 @@ enum StudioFallbackReason {
 impl StudioFallbackReason {
     fn as_str(self) -> &'static str {
         match self {
+            Self::QueueWaitTimeout => "queue_wait_timeout",
             Self::ProviderStartTimeout => "provider_start_timeout",
             Self::FirstTokenTimeout => "first_token_timeout",
             Self::StreamIdleTimeout => "stream_idle_timeout",
@@ -694,11 +697,13 @@ fn truncate_to_char_boundary(text: &str, max_chars: usize) -> String {
 
 /// Use the same GPU -> LLM order as chat and background work. Cancellation
 /// while queued drops any acquired permit before returning to the caller.
+/// One deadline bounds the complete queue phase, before provider timing starts.
 async fn acquire_studio_permits<'a>(
     gpu: &'a tokio::sync::Semaphore,
     llm: &'a tokio::sync::Semaphore,
     cancellation: &CancellationToken,
     attempt_id: &str,
+    queue_timeout: std::time::Duration,
 ) -> Result<
     (
         tokio::sync::SemaphorePermit<'a>,
@@ -706,21 +711,90 @@ async fn acquire_studio_permits<'a>(
     ),
     StudioGenerationFailure,
 > {
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + queue_timeout;
+    let queue_timeout_failure = |gate| {
+        StudioGenerationFailure::fallback(
+            StudioFallbackReason::QueueWaitTimeout,
+            format!("Studio queue wait timed out at {gate}: attempt_id={attempt_id}"),
+            started.elapsed().as_millis(),
+        )
+    };
     let gpu_permit = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => return Err(studio_cancelled(attempt_id, 0)),
+        _ = cancellation.cancelled() => return Err(studio_cancelled(attempt_id, started.elapsed().as_millis())),
+        _ = tokio::time::sleep_until(deadline) => return Err(queue_timeout_failure("GPU gate")),
         permit = gpu.acquire() => permit.map_err(|e| {
-            studio_provider_error(attempt_id, &format!("Failed to acquire GPU gate: {e}"), 0)
+            studio_provider_error(attempt_id, &format!("Failed to acquire GPU gate: {e}"), started.elapsed().as_millis())
         })?,
     };
     let llm_permit = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => return Err(studio_cancelled(attempt_id, 0)),
+        _ = cancellation.cancelled() => return Err(studio_cancelled(attempt_id, started.elapsed().as_millis())),
+        _ = tokio::time::sleep_until(deadline) => return Err(queue_timeout_failure("LLM gate")),
         permit = llm.acquire() => permit.map_err(|e| {
-            studio_provider_error(attempt_id, &format!("Failed to acquire LLM gate: {e}"), 0)
+            studio_provider_error(attempt_id, &format!("Failed to acquire LLM gate: {e}"), started.elapsed().as_millis())
         })?,
     };
     Ok((gpu_permit, llm_permit))
+}
+
+fn resolve_studio_provider_config(
+    state: &AppState,
+    attempt_id: &str,
+) -> Result<crate::providers::ResolvedLlmConfig, StudioGenerationFailure> {
+    resolve_studio_provider_config_with_checkpoints(state, attempt_id, || {}, || {})
+}
+
+fn resolve_studio_provider_config_with_checkpoints<BeforeLock, AfterLock>(
+    state: &AppState,
+    attempt_id: &str,
+    before_app_db_lock: BeforeLock,
+    after_app_db_lock: AfterLock,
+) -> Result<crate::providers::ResolvedLlmConfig, StudioGenerationFailure>
+where
+    BeforeLock: FnOnce(),
+    AfterLock: FnOnce(),
+{
+    // Keep the same app_db -> model_registry order as chat and settings.
+    // Both guards stay in this synchronous scope; no provider call is made.
+    before_app_db_lock();
+    let app_db = state
+        .app_db
+        .lock()
+        .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
+    after_app_db_lock();
+    let registry = state
+        .model_registry
+        .lock()
+        .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
+    crate::providers::resolve_llm_config(
+        &app_db,
+        &state.secret_store,
+        Some(&*registry),
+        None, // use default_model from settings — no hardcoded fallback
+    )
+    .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_studio_provider_config_for_test<BeforeLock, AfterLock>(
+    state: &AppState,
+    attempt_id: &str,
+    before_app_db_lock: BeforeLock,
+    after_app_db_lock: AfterLock,
+) -> Result<crate::providers::ResolvedLlmConfig, String>
+where
+    BeforeLock: FnOnce(),
+    AfterLock: FnOnce(),
+{
+    resolve_studio_provider_config_with_checkpoints(
+        state,
+        attempt_id,
+        before_app_db_lock,
+        after_app_db_lock,
+    )
+    .map_err(|error| error.message)
 }
 
 /// Run a single non-streaming Studio LLM call behind the LLM/GPU gates.
@@ -736,30 +810,20 @@ async fn run_studio_llm(
     // Resolve provider config through the shared path — same as chat uses.
     // This ensures both paths agree on model selection, provider routing,
     // and context window detection.
-    let resolved = {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
-        let registry = state
-            .model_registry
-            .lock()
-            .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
-        crate::providers::resolve_llm_config(
-            &app_db,
-            &state.secret_store,
-            Some(&*registry),
-            None, // use default_model from settings — no hardcoded fallback
-        )
-        .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?
-    };
+    let resolved = resolve_studio_provider_config(state, attempt_id)?;
     let config = resolved.config;
     let model = resolved.model;
     let model_context_window = resolved.model_context_window;
     let provider_name = config.provider_type.as_str().to_string();
 
-    let (_gpu_permit, _llm_permit) =
-        acquire_studio_permits(&state.gpu_gate, &state.llm_gate, &cancellation, attempt_id).await?;
+    let (_gpu_permit, _llm_permit) = acquire_studio_permits(
+        &state.gpu_gate,
+        &state.llm_gate,
+        &cancellation,
+        attempt_id,
+        STUDIO_GATE_WAIT_TIMEOUT,
+    )
+    .await?;
 
     let provider = build_provider(&config)
         .map_err(|e| studio_provider_error(attempt_id, &e.to_string(), 0))?;
@@ -1305,13 +1369,15 @@ mod tests {
             };
             let cancellation = CancellationToken::new();
             {
-                let waiting = acquire_studio_permits(&gpu, &llm, &cancellation, "fixture");
-                tokio::pin!(waiting);
-                assert!(
-                    tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
-                        .await
-                        .is_err()
+                let waiting = acquire_studio_permits(
+                    &gpu,
+                    &llm,
+                    &cancellation,
+                    "fixture",
+                    STUDIO_GATE_WAIT_TIMEOUT,
                 );
+                tokio::pin!(waiting);
+                assert!(futures::poll!(&mut waiting).is_pending());
                 if block_gpu {
                     assert_eq!(
                         llm.available_permits(),
@@ -1322,17 +1388,130 @@ mod tests {
                     assert_eq!(gpu.available_permits(), 0);
                 }
                 cancellation.cancel();
-                assert!(
-                    tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting)
-                        .await
-                        .unwrap()
-                        .is_err()
+                let failure = tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting)
+                    .await
+                    .expect("Studio cancellation must wake the queued wait")
+                    .expect_err("queued attempt must be cancelled");
+                assert_eq!(
+                    failure.reason,
+                    StudioGenerationFailureReason::Terminal(StudioTerminalFailureReason::Cancelled)
                 );
             }
             drop(held);
             assert_eq!(gpu.available_permits(), 1);
             assert_eq!(llm.available_permits(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn studio_queue_timeout_discloses_fallback_and_restores_permits() {
+        for block_gpu in [true, false] {
+            let gpu = tokio::sync::Semaphore::new(1);
+            let llm = tokio::sync::Semaphore::new(1);
+            let held = if block_gpu {
+                gpu.acquire().await.unwrap()
+            } else {
+                llm.acquire().await.unwrap()
+            };
+            let cancellation = CancellationToken::new();
+            let failure = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                acquire_studio_permits(
+                    &gpu,
+                    &llm,
+                    &cancellation,
+                    "queue-timeout-attempt",
+                    std::time::Duration::from_millis(20),
+                ),
+            )
+            .await
+            .expect("Studio queue deadline must bound both gate waits")
+            .expect_err("fixture gate stays held through the deadline");
+            assert_eq!(
+                failure.reason,
+                StudioGenerationFailureReason::Fallback(StudioFallbackReason::QueueWaitTimeout)
+            );
+            assert!(failure
+                .message
+                .contains(if block_gpu { "GPU gate" } else { "LLM gate" }));
+            assert!(failure.message.contains("queue-timeout-attempt"));
+            assert!(!cancellation.is_cancelled());
+            if block_gpu {
+                assert_eq!(llm.available_permits(), 1);
+            } else {
+                assert_eq!(gpu.available_permits(), 1);
+            }
+            let mut receipt = None;
+            let (prose, prompt) = handle_studio_generation_failure(
+                failure,
+                "queue-timeout-attempt",
+                "deterministic source-bound prompt",
+                &mut receipt,
+            )
+            .expect("queue timeout permits deterministic fallback");
+            assert!(prose.is_none());
+            assert_eq!(prompt, "deterministic source-bound prompt");
+            let receipt = receipt.expect("queue timeout fallback receipt");
+            assert_eq!(receipt.reason_code, "queue_wait_timeout");
+            assert!(!receipt.provider_cancelled);
+            drop(held);
+            assert_eq!(gpu.available_permits(), 1);
+            assert_eq!(llm.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn studio_pre_cancelled_queue_cannot_acquire_available_gates() {
+        let gpu = tokio::sync::Semaphore::new(1);
+        let llm = tokio::sync::Semaphore::new(1);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let failure = acquire_studio_permits(
+            &gpu,
+            &llm,
+            &cancellation,
+            "pre-cancelled-attempt",
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("cancellation takes priority over deadlines and available permits");
+        assert_eq!(
+            failure.reason,
+            StudioGenerationFailureReason::Terminal(StudioTerminalFailureReason::Cancelled)
+        );
+        assert_eq!(gpu.available_permits(), 1);
+        assert_eq!(llm.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn studio_closed_llm_gate_restores_gpu_and_attempt_can_retry() {
+        let data_dir = tempfile::tempdir().expect("temporary Studio attempt state");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        let attempt = register_studio_attempt(&state, "notebook", "closed-gate-attempt")
+            .expect("registered fixture attempt");
+        let gpu = tokio::sync::Semaphore::new(1);
+        let llm = tokio::sync::Semaphore::new(1);
+        llm.close();
+        let failure = acquire_studio_permits(
+            &gpu,
+            &llm,
+            &attempt.cancellation(),
+            "closed-gate-attempt",
+            STUDIO_GATE_WAIT_TIMEOUT,
+        )
+        .await
+        .expect_err("closed LLM gate must fail");
+        assert_eq!(
+            failure.reason,
+            StudioGenerationFailureReason::Fallback(StudioFallbackReason::ProviderError)
+        );
+        assert!(failure.message.contains("Failed to acquire LLM gate"));
+        assert_eq!(gpu.available_permits(), 1);
+        drop(attempt);
+        let retry = register_studio_attempt(&state, "notebook", "retry-attempt")
+            .expect("failed queue attempt releases the notebook attempt slot");
+        drop(retry);
+        assert!(state.active_studio_attempts.lock().unwrap().is_empty());
     }
 
     fn source(id: &str, title: &str, status: &str, selected: bool) -> Source {

@@ -33,8 +33,11 @@ struct AdmissionFile {
 }
 
 #[cfg(test)]
+type InspectionCopyHook = Box<dyn FnOnce(&std::path::Path)>;
+
+#[cfg(test)]
 thread_local! {
-    static AFTER_INSPECTION_COPY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static AFTER_INSPECTION_COPY: std::cell::RefCell<Option<InspectionCopyHook>> = std::cell::RefCell::new(None);
     static BEFORE_SOURCE_ACQUISITION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
@@ -117,7 +120,7 @@ pub(crate) fn inspect_schema_for_admission(
     #[cfg(test)]
     AFTER_INSPECTION_COPY.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
-            hook();
+            hook(&copied);
         }
     });
     let result = {
@@ -1663,7 +1666,7 @@ mod tests {
         let hook_changed = changed.clone();
         let hook_path = path.clone();
         AFTER_INSPECTION_COPY.with(|slot| {
-            *slot.borrow_mut() = Some(Box::new(move || {
+            *slot.borrow_mut() = Some(Box::new(move |_| {
                 writer
                     .execute("UPDATE _meta SET value='8' WHERE key='schema_version'", [])
                     .unwrap();
@@ -2045,6 +2048,99 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct OwnedInspectionCopies {
+        copies: std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, u64)>>>,
+    }
+
+    impl OwnedInspectionCopies {
+        fn record(&self, copied: &std::path::Path) {
+            let bytes = ["", "-wal", "-shm", "-journal"]
+                .into_iter()
+                .map(
+                    |suffix| match std::fs::metadata(admission_sidecar(copied, suffix)) {
+                        Ok(metadata) => metadata.len(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                        Err(error) => panic!("inspection copy metadata failed: {error}"),
+                    },
+                )
+                .sum();
+            let mut copies = self.copies.lock().unwrap();
+            assert!(copies.iter().all(|(path, _)| path != copied));
+            copies.push((copied.to_path_buf(), bytes));
+        }
+
+        fn observe_next(&self) {
+            let copies = self.clone();
+            AFTER_INSPECTION_COPY.with(|slot| {
+                assert!(slot.borrow().is_none(), "inspection hook already occupied");
+                *slot.borrow_mut() = Some(Box::new(move |copied| copies.record(copied)));
+            });
+        }
+
+        fn cleanup_error(&self, expected: usize) -> Option<String> {
+            let copies = self.copies.lock().unwrap();
+            if copies.len() != expected {
+                return Some(format!(
+                    "expected {expected} owned copies, observed {}",
+                    copies.len()
+                ));
+            }
+            for (copied, _) in copies.iter() {
+                for suffix in ["", "-wal", "-shm", "-journal"] {
+                    let path = admission_sidecar(copied, suffix);
+                    if path.try_exists().unwrap() {
+                        return Some(format!(
+                            "owned inspection file retained: {}",
+                            path.display()
+                        ));
+                    }
+                }
+                let directory = copied.parent().unwrap();
+                if directory.try_exists().unwrap() {
+                    return Some(format!(
+                        "owned inspection directory retained: {}",
+                        directory.display()
+                    ));
+                }
+            }
+            None
+        }
+
+        fn assert_removed(&self, expected: usize) {
+            assert_eq!(self.cleanup_error(expected), None);
+        }
+    }
+
+    #[test]
+    fn inspection_copy_cleanup_tracking_rejects_retained_owned_files_and_directory() {
+        let directory = tempdir().unwrap();
+        let copied = directory.path().join("schema-inspection.db");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            std::fs::write(admission_sidecar(&copied, suffix), b"retained-copy control").unwrap();
+        }
+        let copies = OwnedInspectionCopies::default();
+        copies.record(&copied);
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let error = copies
+                .cleanup_error(1)
+                .expect("retained owned file must fail cleanup");
+            assert!(error.contains("owned inspection file retained"));
+            assert!(error.ends_with(&format!("schema-inspection.db{suffix}")));
+            std::fs::remove_file(admission_sidecar(&copied, suffix)).unwrap();
+        }
+        assert!(copies
+            .cleanup_error(1)
+            .unwrap()
+            .contains("owned inspection directory retained"));
+        drop(directory);
+        copies.assert_removed(1);
+        assert!(copies
+            .cleanup_error(2)
+            .unwrap()
+            .contains("expected 2 owned copies"));
+    }
+
     #[test]
     fn larger_store_admission_and_pool_connections_have_bounded_copy_cleanup() {
         use super::wal_admission_fixtures::{file_state, record_file_state, sidecar};
@@ -2086,33 +2182,38 @@ mod tests {
             }
             record_file_state("larger-original-before-admission", &file_state(&path));
         }
-        let inspection_bytes = || {
-            std::fs::read_dir(std::env::temp_dir())
-                .unwrap()
-                .filter_map(Result::ok)
-                .map(|entry| {
-                    ["", "-wal", "-shm", "-journal"]
-                        .into_iter()
-                        .map(|suffix| {
-                            std::fs::metadata(
-                                entry.path().join(format!("schema-inspection.db{suffix}")),
-                            )
-                            .map(|m| m.len())
-                            .unwrap_or(0)
-                        })
-                        .sum::<u64>()
-                })
-                .sum::<u64>()
-        };
-        assert_eq!(inspection_bytes(), 0, "pre-existing inspection copies");
-        AFTER_INSPECTION_COPY.with(|slot| {
-            *slot.borrow_mut() = Some(Box::new(move || {
-                println!("LARGE_INSPECTION_COPY_BYTES {}", inspection_bytes());
-            }))
+        // Hold another canonical inspection throughout the owned cleanup checks.
+        // Its live private copy belongs to this control, not to the larger store.
+        let unrelated_directory = tempdir().unwrap();
+        let unrelated_path = unrelated_directory.path().join("unrelated-store.db");
+        drop(NotebookDb::open(&unrelated_path).unwrap());
+        let (copied_send, copied_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        let unrelated = std::thread::spawn(move || {
+            AFTER_INSPECTION_COPY.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |copied| {
+                    copied_send.send(copied.to_path_buf()).unwrap();
+                    release_receive.recv().unwrap();
+                }));
+            });
+            inspect_schema_for_admission(&unrelated_path, DatabaseSchema::Notebook).unwrap();
         });
+        let unrelated_copy = copied_receive
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+        assert!(unrelated_copy.is_file());
+        let copies = OwnedInspectionCopies::default();
+        copies.assert_removed(0);
+        copies.observe_next();
         let start = std::time::Instant::now();
         let admitted = NotebookDb::connect(&path).unwrap();
         let direct_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let direct_copy_bytes = copies.copies.lock().unwrap()[0].1;
+        assert_eq!(
+            direct_copy_bytes,
+            source_bytes[0] + source_bytes[1] + source_bytes[3]
+        );
+        println!("LARGE_INSPECTION_COPY_BYTES {direct_copy_bytes}");
         assert_eq!(
             admitted
                 .conn()
@@ -2122,11 +2223,12 @@ mod tests {
             256
         );
         drop(admitted);
-        assert_eq!(
-            inspection_bytes(),
-            0,
-            "inspection copy leaked after direct admission"
+        copies.assert_removed(1);
+        assert!(
+            unrelated_copy.is_file(),
+            "unrelated inspection must remain held"
         );
+        copies.observe_next();
         let pool_start = std::time::Instant::now();
         let pool = Arc::new(NotebookDbPool::with_max_read_conns(&path, 4).unwrap());
         let pool_ms = pool_start.elapsed().as_secs_f64() * 1000.0;
@@ -2138,7 +2240,9 @@ mod tests {
             let pool = pool.clone();
             let release = release.clone();
             let send = send.clone();
+            let copies = copies.clone();
             workers.push(std::thread::spawn(move || {
+                copies.observe_next();
                 let start = std::time::Instant::now();
                 pool.read(|db| {
                     assert_eq!(
@@ -2164,14 +2268,18 @@ mod tests {
             worker.join().unwrap();
         }
         drop(pool);
-        assert_eq!(
-            inspection_bytes(),
-            0,
-            "inspection copies leaked after pooled admission"
+        copies.assert_removed(6);
+        assert!(
+            unrelated_copy.is_file(),
+            "unrelated inspection must remain held"
         );
+        release_send.send(()).unwrap();
+        unrelated.join().unwrap();
+        assert!(!unrelated_copy.try_exists().unwrap());
+        assert!(!unrelated_copy.parent().unwrap().try_exists().unwrap());
         println!(
             "LARGE_ADMISSION_OBSERVATION {}",
-            serde_json::json!({"payload_bytes":32*1024*1024,"source_file_bytes":source_bytes,"direct_connection_ms":direct_ms,"pool_constructor_ms":pool_ms,"four_distinct_lazy_reader_ms":read_ms,"inspection_bytes_after":inspection_bytes(),"proof_scope":"single bounded compatibility/cost observation; no benchmark or performance certification"})
+            serde_json::json!({"payload_bytes":32*1024*1024,"source_file_bytes":source_bytes,"direct_connection_ms":direct_ms,"pool_constructor_ms":pool_ms,"four_distinct_lazy_reader_ms":read_ms,"inspection_bytes_after":0,"owned_inspection_copies":copies.copies.lock().unwrap().len(),"held_unrelated_canonical_inspection":true,"proof_scope":"single bounded compatibility/cost observation; no benchmark or performance certification"})
         );
     }
 

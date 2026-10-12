@@ -599,10 +599,20 @@ class WebDriver:
                 "evidence": [evidence(log, root, "runtime_log"), evidence(screenshot, root, "screenshot"), evidence(dom, root, "dom_snapshot")]}
 
 
-def require_scope_evidence(values: dict, selected: int, excluded: int, retrieval: bool, *, degraded: bool = False) -> None:
+def require_scope_evidence(values: dict, selected: int, excluded: int, retrieval: bool, *, degraded: bool = False, requested_none: bool = False) -> None:
     """Receipt assertions consume only values rendered by the actual UI."""
     scope = values.get("Scope", "")
-    if f"{selected} selected, {excluded} excluded, 0 invalid" not in scope:
+    if requested_none:
+        # None skips source inventory; its drawer deliberately reports unknown
+        # counts. Keep this acceptance separate from empty All/Explicit scopes.
+        if (selected != 0 or excluded != 0 or retrieval or degraded
+                or scope != "none (retrieval off)"
+                or values.get("Index") != "scope-none (source counts unavailable)"
+                or any(values.get(label) != "0 recorded" for label in
+                       ("Invalid scope IDs", "Requested source IDs", "Selected source IDs"))
+                or values.get("Excluded source IDs") != "not recorded while retrieval is off"):
+            raise RuntimeError(f"rendered requested None scope is incomplete or changed: {scope!r}")
+    elif f"{selected} selected, {excluded} excluded, 0 invalid" not in scope:
         raise RuntimeError(f"rendered retrieval scope differs from UI selection: {scope!r}")
     context = values.get("Context", "")
     if "preserved: yes" not in context:
@@ -877,14 +887,14 @@ return {ready:current && in_view && !!hit && (hit===button || button.contains(hi
         self.default_surface("answer")
         return answer
 
-    def evidence(self, selected: int, excluded: int, retrieval: bool, *, degraded: bool = False) -> dict:
+    def evidence(self, selected: int, excluded: int, retrieval: bool, *, degraded: bool = False, requested_none: bool = False) -> dict:
         button = self.ui.find_visible(MESSAGE_EVIDENCE_SELECTOR, last=True)
         drawer_id = self.ui.execute("return arguments[0].getAttribute('aria-controls')", [button])
         if not self.ui.execute("return arguments[0].getAttribute('aria-expanded')==='true'", [button]):
             self.ui.click_when_unobstructed(f'button[aria-controls={json.dumps(drawer_id)}]')
         self.ui.wait(lambda: self.ui.execute("return document.getElementById(arguments[0])?.getClientRects().length>0", [drawer_id]), label="message evidence disclosure")
         values = self.ui.execute("""const r=document.getElementById(arguments[0]); const g=r.querySelector('.grid'); return Object.fromEntries(Array.from(g.children).map(e=>[e.children[0].textContent.replace(/:\\s*$/, '').trim(), e.children[1].textContent.trim()]));""", [drawer_id])
-        require_scope_evidence(values, selected, excluded, retrieval, degraded=degraded)
+        require_scope_evidence(values, selected, excluded, retrieval, degraded=degraded, requested_none=requested_none)
         self.check(values.get("Generation") == "completed", "rendered generation receipt is complete")
         self.check(values.get("Temperature") == "0", "rendered effective chat temperature matches the applied setting")
         self.scope_checks.append(values)
@@ -1037,7 +1047,7 @@ return {ready:current && in_view && !!hit && (hit===button || button.contains(hi
         self.configure()
         self.case_id = "chat_no_retrieval"
         greeting = self.send("Reply with exactly HELLO_GLOSS.", "HELLO_GLOSS")
-        self.evidence(0, 0, False)
+        self.evidence(0, 0, False, requested_none=True)
         self.record(self.case_id, "Configured the real loopback Ollama chat and embedding models through saved UI settings. With no sources, a real model response persisted with zero context passages and no backend fallback.")
 
         self.case_id = "chat_persistence_restart"
@@ -1080,7 +1090,7 @@ return {ready:current && in_view && !!hit && (hit===button || button.contains(hi
         self.jump_to_latest()
         retry_answer = self.wait_for_answer(previous, "explicit edit-and-rerun complete")
         self.check("RETRY_GLOSS" in retry_answer["text"], "explicit retry produced a completed model response")
-        self.evidence(0, 0, False)
+        self.evidence(0, 0, False, requested_none=True)
         self.record(self.case_id, "Observed real streamed tokens, stopped through the UI, saw the explicit cancellation alert without a new completed answer, restarted and verified the prior saved answer, then used Edit and rerun for a successful explicit retry.")
 
         self.case_id = "folder_import_scope"
@@ -1194,7 +1204,7 @@ return {ready:current && in_view && !!hit && (hit===button || button.contains(hi
         self.sources()
         self.check(not self.source_rows(), "deleted sources stay absent after restart")
         self.send("Reply with exactly SOURCES_REMOVED.", "SOURCES_REMOVED")
-        self.evidence(0, 0, False)
+        self.evidence(0, 0, False, requested_none=True)
         self.inspector("Notes")
         self.check("Persistent workflow note" in self.ui.text("#inspector-panel-notes"), "source deletion preserves saved Notes")
         self.record(self.case_id, "Deleted all selected sources through the UI, restarted, observed no source rows and a fresh zero-context chat receipt, while the saved note remained.")

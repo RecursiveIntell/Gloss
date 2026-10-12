@@ -178,6 +178,7 @@ struct ProjectionSubchunk {
 
 #[derive(Debug, Clone)]
 pub struct ReindexSourceOptions {
+    pub trace_id: Option<String>,
     pub rebuild_vector_artifacts: bool,
     pub classify_zero_chunks_as_skip: bool,
 }
@@ -185,6 +186,7 @@ pub struct ReindexSourceOptions {
 impl Default for ReindexSourceOptions {
     fn default() -> Self {
         Self {
+            trace_id: None,
             rebuild_vector_artifacts: true,
             classify_zero_chunks_as_skip: true,
         }
@@ -910,9 +912,11 @@ pub(crate) async fn reindex_source(
         notebook_id,
         notebook_db_path,
         source_id,
-        trace_id,
         runtime_config,
-        ReindexSourceOptions::default(),
+        ReindexSourceOptions {
+            trace_id,
+            ..ReindexSourceOptions::default()
+        },
     )
     .await
 }
@@ -923,7 +927,6 @@ pub(crate) async fn reindex_source_with_options(
     notebook_id: &str,
     notebook_db_path: &Path,
     source_id: &str,
-    trace_id: Option<String>,
     runtime_config: Option<SemanticMemoryRuntimeConfig>,
     options: ReindexSourceOptions,
 ) -> Result<IndexSourceReceipt, GlossError> {
@@ -939,7 +942,9 @@ pub(crate) async fn reindex_source_with_options(
             "Projection embedding snapshot differs from its publication authority".into(),
         ));
     }
-    let receipt_id = trace_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let receipt_id = options
+        .trace_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let (source, all_chunks) = publication.with_notebook(|nb_db| {
         Ok((
             nb_db.get_source(source_id)?,
@@ -2037,9 +2042,9 @@ mod tests {
             "notebook-1",
             &db_path,
             "source-empty",
-            Some("receipt-zero-chunk".to_string()),
-            Some(config),
+            Some(config.clone()),
             ReindexSourceOptions {
+                trace_id: Some("receipt-zero-chunk".to_string()),
                 rebuild_vector_artifacts: false,
                 classify_zero_chunks_as_skip: true,
             },
@@ -2047,6 +2052,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(receipt.receipt_id, "receipt-zero-chunk");
         assert_eq!(receipt.sync_status, "skipped_no_chunks");
         assert_eq!(receipt.indexed_chunks, 0);
         assert!(receipt.error.is_none());
@@ -2057,6 +2063,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(status.status, "skipped_no_chunks");
+        assert_eq!(
+            status.last_receipt_id.as_deref(),
+            Some("receipt-zero-chunk")
+        );
+        assert_eq!(db.get_source("source-empty").unwrap().status, "ready");
+
+        let generated = reindex_source(
+            &publication,
+            dir.path(),
+            "notebook-1",
+            &db_path,
+            "source-empty",
+            None,
+            Some(config),
+        )
+        .await
+        .unwrap();
+        let generated_uuid = uuid::Uuid::parse_str(&generated.receipt_id).unwrap();
+        assert_eq!(generated_uuid.to_string(), generated.receipt_id);
+        assert_ne!(generated.receipt_id, receipt.receipt_id);
+        assert_eq!(generated.sync_status, "skipped_no_chunks");
+        assert_eq!(generated.indexed_chunks, 0);
+        assert!(generated.error.is_none());
+        let generated_status = db
+            .get_semantic_memory_projection_status("notebook-1", "source-empty")
+            .unwrap()
+            .unwrap();
+        assert_eq!(generated_status.status, "skipped_no_chunks");
+        assert_eq!(
+            generated_status.last_receipt_id.as_deref(),
+            Some(generated.receipt_id.as_str())
+        );
         assert_eq!(db.get_source("source-empty").unwrap().status, "ready");
     }
 
@@ -2137,9 +2175,9 @@ mod tests {
             notebook_id,
             &db_path,
             source_id,
-            Some("live-semantic-memory-projection".to_string()),
             Some(runtime_config.clone()),
             ReindexSourceOptions {
+                trace_id: Some("live-semantic-memory-projection".to_string()),
                 rebuild_vector_artifacts: false,
                 classify_zero_chunks_as_skip: true,
             },

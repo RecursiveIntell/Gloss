@@ -4913,9 +4913,9 @@ pub async fn semantic_memory_backfill_notebook(
                 &notebook_id,
                 &db_path,
                 &source.id,
-                Some(uuid::Uuid::new_v4().to_string()),
                 Some(runtime_config.clone()),
                 semantic_memory_adapter::ReindexSourceOptions {
+                    trace_id: Some(uuid::Uuid::new_v4().to_string()),
                     rebuild_vector_artifacts: false,
                     classify_zero_chunks_as_skip: true,
                 },

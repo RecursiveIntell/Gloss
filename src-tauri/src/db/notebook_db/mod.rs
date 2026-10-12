@@ -377,7 +377,7 @@ impl NotebookDb {
 
     /// Connect to an existing per-notebook database with runtime pragmas.
     pub fn connect(path: &Path) -> Result<Self, GlossError> {
-        let conn = Connection::open(path)?;
+        let conn = migrations::open_connection(path, migrations::DatabaseSchema::Notebook)?;
         migrations::validate_schema_version(&conn, migrations::DatabaseSchema::Notebook)?;
         migrations::apply_pragmas(&conn)?;
         Ok(Self { conn })
@@ -385,7 +385,7 @@ impl NotebookDb {
 
     /// Open (or create) a per-notebook database and run migrations.
     pub fn open(path: &Path) -> Result<Self, GlossError> {
-        let conn = Connection::open(path)?;
+        let conn = migrations::open_connection(path, migrations::DatabaseSchema::Notebook)?;
         migrations::migrate_notebook_db(&conn)?;
         Ok(Self { conn })
     }

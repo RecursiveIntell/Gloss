@@ -206,13 +206,17 @@ mod readiness_tests {
         };
         let mut proof = serde_json::json!({"candidate_backend": TURBO_QUANT_BACKEND, "exact_rerank": true, "exact_rerank_count": 1, "approximate_scanned_count": 1, "approximate_returned_count": 1, "artifact_corruption_count": 0, "vector_artifact_missing_count": 0, "vector_artifact_stale_count": 0, "artifact_generation_id": "gen", "vector_artifact_manifest_digest": "digest", "fallback": null});
         assert!(
-            projection_artifact_proof(&[("source".into(), 1)], &[status.clone()], Some(&proof))
-                .probe_matches
+            projection_artifact_proof(
+                &[("source".into(), 1)],
+                std::slice::from_ref(&status),
+                Some(&proof)
+            )
+            .probe_matches
         );
         assert!(
             !projection_artifact_proof(
                 &[("other-source".into(), 1)],
-                &[status.clone()],
+                std::slice::from_ref(&status),
                 Some(&proof)
             )
             .probe_matches

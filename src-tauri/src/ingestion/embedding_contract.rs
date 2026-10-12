@@ -807,7 +807,8 @@ mod tests {
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
             let mut buffer = [0; 4096];
-            stream.read(&mut buffer).unwrap();
+            let received = stream.read(&mut buffer).unwrap();
+            assert!(received > 0, "mock server received no request bytes");
             write!(stream,"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/api/embed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         });
         let client = ollama_client(&url, "fixture", 2, false).unwrap();
@@ -834,7 +835,8 @@ mod tests {
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
             let mut buffer = [0; 4096];
-            stream.read(&mut buffer).unwrap();
+            let received = stream.read(&mut buffer).unwrap();
+            assert!(received > 0, "mock server received no request bytes");
             let body = r#"{"embeddings":[[1,0,0]]}"#;
             write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         });

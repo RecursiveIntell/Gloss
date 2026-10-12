@@ -22,36 +22,17 @@ function selectionScopeMode(sources: Source[], selected: Set<string>): SourceSco
 }
 
 function buildSourceScope(
-  sources: Source[],
   selectedSourceIds: Set<string>,
-  sourceScopeMode: SourceScopeMode,
-  sourceListStatus: SourceListStatus,
-  stats: NotebookStats | null
+  sourceScopeMode: SourceScopeMode
 ): SourceScope {
   // When user explicitly selects no-retrieval, honour it regardless of source
   // list status so chat always works without retrieval.
   if (sourceScopeMode === 'none') {
     return { kind: 'none' };
   }
-  if (sourceScopeMode === 'explicit') {
-    // Preserve explicit intent even while the source list is loading or
-    // partial; silently converting it to none would change retrieval policy.
-    return { kind: 'explicit', ids: Array.from(selectedSourceIds) };
-  }
-  // When source list is degraded, do NOT silently downgrade an explicit
-  // retrieval request — pass it through so the backend can decide how to
-  // handle incomplete source data. Only fall back to 'none' when we have
-  // no source information at all (idle).
-  if (sourceListStatus === 'idle') {
-    return { kind: 'none' };
-  }
-  if (sources.length === 0) {
-    if (sourceListStatus === 'ready' && stats?.source_count && stats.source_count > 0) {
-      return { kind: 'none' };
-    }
-    return { kind: 'none' };
-  }
   if (sourceScopeMode === 'all') {
+    // Preserve declared intent even when this frontend inventory is empty
+    // or unavailable. The backend owns inventory and retrieval admission.
     return { kind: 'all' };
   }
   // Keep explicit intent intact. Filtering stale ids here would silently
@@ -508,8 +489,8 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   },
 
   getSourceScope: () => {
-    const { sources, selectedSourceIds, sourceScopeMode, sourceListStatus, stats } = get();
-    return buildSourceScope(sources, selectedSourceIds, sourceScopeMode, sourceListStatus, stats);
+    const { selectedSourceIds, sourceScopeMode } = get();
+    return buildSourceScope(selectedSourceIds, sourceScopeMode);
   },
 
   markSourceListPartial: (expectedTotal) => {

@@ -116,6 +116,52 @@ describe('sourceStore', () => {
     expect(state.sourceListError).toBe('Something broke');
   });
 
+  it.each([
+    ['idle', 1],
+    ['loading', 1],
+    ['partial', 1],
+    ['error', 1],
+    ['ready', 1],
+    ['empty', 0],
+  ] as const)('preserves declared all with an empty %s inventory and source count %i', (sourceListStatus, sourceCount) => {
+    useSourceStore.setState({
+      sources: [],
+      selectedSourceIds: new Set(sourceCount > 0 ? ['known'] : []),
+      sourceScopeMode: 'all',
+      sourceListStatus,
+      stats: {
+        source_count: sourceCount,
+        ready_count: 0,
+        error_count: 0,
+        missing_summaries: 0,
+        chunk_count: 0,
+        sources_with_chunks: 0,
+        total_words: 0,
+      },
+    });
+
+    expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'all' });
+    expect(useSourceStore.getState().sourceScopeMode).toBe('all');
+  });
+
+  it.each(['idle', 'loading', 'partial', 'error', 'ready', 'empty'] as const)(
+    'preserves none and exact explicit intent with an empty %s inventory', (sourceListStatus) => {
+      useSourceStore.setState({
+        sources: [],
+        selectedSourceIds: new Set(['missing-source']),
+        sourceScopeMode: 'none',
+        sourceListStatus,
+      });
+      expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'none' });
+
+      useSourceStore.setState({ sourceScopeMode: 'explicit' });
+      expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'explicit', ids: ['missing-source'] });
+
+      useSourceStore.setState({ selectedSourceIds: new Set() });
+      expect(useSourceStore.getState().getSourceScope()).toEqual({ kind: 'explicit', ids: [] });
+    },
+  );
+
   it('preserves all-source retrieval when source list is partial but has source information', () => {
     useSourceStore.setState({
       sources: [

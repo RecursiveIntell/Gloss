@@ -4,9 +4,163 @@ use sha2::{Digest, Sha256};
 const APP_SCHEMA_VERSION: i32 = 4;
 pub(crate) const NOTEBOOK_SCHEMA_VERSION: i32 = 7;
 
+#[derive(Clone, Copy)]
 pub(crate) enum DatabaseSchema {
     App,
     Notebook,
+}
+
+fn admission_io_error(error: std::io::Error) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+        Some(format!("Database schema inspection failed: {error}")),
+    )
+}
+
+fn admission_sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    name.into()
+}
+
+#[derive(PartialEq, Eq)]
+struct AdmissionFile {
+    size: u64,
+    digest: [u8; 32],
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_INSPECTION_COPY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static BEFORE_SOURCE_ACQUISITION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+fn admission_files(path: &std::path::Path) -> rusqlite::Result<Vec<Option<AdmissionFile>>> {
+    use std::io::Read;
+    ["", "-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(|suffix| {
+            let mut file = match std::fs::File::open(admission_sidecar(path, suffix)) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(admission_io_error(error)),
+            };
+            let metadata = file.metadata().map_err(admission_io_error)?;
+            let mut hash = Sha256::new();
+            let mut buffer = [0; 65536];
+            loop {
+                let length = file.read(&mut buffer).map_err(admission_io_error)?;
+                if length == 0 {
+                    break;
+                }
+                hash.update(&buffer[..length]);
+            }
+            Ok(Some(AdmissionFile {
+                size: metadata.len(),
+                digest: hash.finalize().into(),
+                modified: metadata.modified().map_err(admission_io_error)?,
+                #[cfg(unix)]
+                identity: {
+                    use std::os::unix::fs::MetadataExt;
+                    (metadata.dev(), metadata.ino())
+                },
+            }))
+        })
+        .collect()
+}
+
+/// Inspect committed schema on a disposable SQLite copy before a source handle
+/// is allowed to initialize SHM or checkpoint on close. The copy is never an
+/// admitted store: SQLite alone interprets its WAL/journal and it is discarded.
+/// Changes during inspection fail closed; callers must also validate the actual
+/// source connection because inspection does not fence an external writer.
+pub(crate) fn inspect_schema_for_admission(
+    path: &std::path::Path,
+    schema: DatabaseSchema,
+) -> rusqlite::Result<()> {
+    let source = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if admission_files(path)?.iter().skip(1).any(Option::is_some) {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                    Some("Database main file is missing while recovery sidecars exist".into()),
+                ));
+            }
+            return Ok(()); // New database creation belongs to the normal owner.
+        }
+        Err(error) => return Err(admission_io_error(error)),
+    };
+    let before = admission_files(&source)?;
+    if before[0].as_ref().is_some_and(|file| file.size == 0)
+        && before[1].as_ref().is_some_and(|file| file.size != 0)
+    {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("Empty database main file has retained WAL data; inspection refused".into()),
+        ));
+    }
+    let inspection = tempfile::tempdir().map_err(admission_io_error)?;
+    let copied = inspection.path().join("schema-inspection.db");
+    for (index, suffix) in [(0, ""), (1, "-wal"), (3, "-journal")] {
+        if before[index].is_some() {
+            std::fs::copy(
+                admission_sidecar(&source, suffix),
+                admission_sidecar(&copied, suffix),
+            )
+            .map_err(admission_io_error)?;
+        }
+    }
+    #[cfg(test)]
+    AFTER_INSPECTION_COPY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    let result = {
+        let connection = Connection::open(&copied)?;
+        validate_schema_version(&connection, schema).map(|_| ())
+    };
+    if admission_files(&source)? != before {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("Database changed during schema inspection; admission refused".into()),
+        ));
+    }
+    result
+}
+
+/// Canonical app/notebook writable acquisition. Real-handle validation prevents
+/// migration of a newer schema observed after inspection. Disabling close-time
+/// checkpoints protects rejected handles; runtime pragmas restore normal close
+/// behavior once their own schema guard succeeds. This does not claim an atomic
+/// fence against arbitrary external schema writers or SHM changes on that race.
+pub(crate) fn open_connection(
+    path: &std::path::Path,
+    schema: DatabaseSchema,
+) -> rusqlite::Result<Connection> {
+    inspect_schema_for_admission(path, schema)?;
+    #[cfg(test)]
+    BEFORE_SOURCE_ACQUISITION.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    let connection = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )?;
+    validate_schema_version(&connection, schema)?;
+    Ok(connection)
 }
 
 /// Apply pragmas for performance and correctness.
@@ -31,7 +185,12 @@ pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
          PRAGMA mmap_size=67108864;
          PRAGMA temp_store=MEMORY;
          PRAGMA wal_autocheckpoint=1000;",
-    )
+    )?;
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        false,
+    )?;
+    Ok(())
 }
 
 /// Create or migrate the app-level database schema.
@@ -1030,6 +1189,36 @@ pub(crate) mod wal_admission_fixtures {
         })
     }
 
+    pub(crate) fn record_file_state(label: &str, state: &[Option<Vec<u8>>; 4]) {
+        let Some(root) = std::env::var_os("GLOSS_WAL_EVIDENCE_DIR") else {
+            return;
+        };
+        let folder = PathBuf::from(root).join(label);
+        std::fs::create_dir_all(&folder).unwrap();
+        let files: Vec<_> = ["", "-wal", "-shm", "-journal"]
+            .into_iter()
+            .zip(state)
+            .map(|(suffix, bytes)| {
+                if let Some(bytes) = bytes {
+                    std::fs::write(folder.join(format!("fixture.db{suffix}")), bytes).unwrap();
+                }
+                serde_json::json!({
+                    "suffix": suffix,
+                    "exists": bytes.is_some(),
+                    "size": bytes.as_ref().map(Vec::len),
+                    "sha256": bytes.as_ref().map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+                })
+            })
+            .collect();
+        let record = serde_json::json!({"label": label, "files": files});
+        std::fs::write(
+            folder.join("state.json"),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        println!("WAL_FILE_STATE {record}");
+    }
+
     impl CopiedWal {
         pub(crate) fn create(
             copied: &Path,
@@ -1150,7 +1339,7 @@ mod tests {
 
     #[test]
     fn copied_committed_wal_rejection_preserves_main_wal_shm_bytes_and_existence() {
-        use super::wal_admission_fixtures::{file_state, CopiedWal};
+        use super::wal_admission_fixtures::{file_state, record_file_state, CopiedWal};
         for (entrypoint, supported_version, open) in schema_guard_entrypoints() {
             for version in [
                 (supported_version + 1).to_string(),
@@ -1167,10 +1356,13 @@ mod tests {
                     };
                     let _fixture = CopiedWal::create(&path, schema, &version, include_shm);
                     let before = file_state(&path);
-                    assert!(
-                        open(&path).is_err(),
-                        "{entrypoint} admitted schema {version}"
-                    );
+                    let case = format!("public-{entrypoint}-{version}-shm-{include_shm}");
+                    record_file_state(&format!("{case}-before"), &before);
+                    CopiedWal::assert_readable(&path, &version);
+                    let result = open(&path);
+                    record_file_state(&format!("{case}-after"), &file_state(&path));
+                    println!("WAL_ADMISSION {case} error={:?}", result.as_ref().err());
+                    assert!(result.is_err(), "{entrypoint} admitted schema {version}");
                     assert_eq!(
                         file_state(&path),
                         before,
@@ -1182,6 +1374,916 @@ mod tests {
                         before,
                         "readability proof changed source fixture"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_sqlite_runtime_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        let version: String = conn
+            .query_row("SELECT sqlite_version()", [], |r| r.get(0))
+            .unwrap();
+        let source_id: String = conn
+            .query_row("SELECT sqlite_source_id()", [], |r| r.get(0))
+            .unwrap();
+        let options = conn
+            .prepare("PRAGMA compile_options")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        println!(
+            "SQLITE_RUNTIME {}",
+            serde_json::json!({"version":version,"source_id":source_id,"compile_options":options,"rusqlite":"0.32.1","libsqlite3_sys":"0.30.1"})
+        );
+        assert_eq!(version, "3.46.0");
+        assert!(options.iter().any(|v| v == "ENABLE_FTS5"));
+    }
+
+    #[test]
+    fn supported_committed_wal_owner_writes_survive_cold_reopen() {
+        use super::wal_admission_fixtures::CopiedWal;
+        for (entrypoint, supported, _) in schema_guard_entrypoints() {
+            for include_shm in [true, false] {
+                let directory = tempdir().unwrap();
+                let path = directory.path().join("supported-write.db");
+                let schema = if entrypoint == "app_open" {
+                    DatabaseSchema::App
+                } else {
+                    DatabaseSchema::Notebook
+                };
+                let _fixture =
+                    CopiedWal::create(&path, schema, &supported.to_string(), include_shm);
+                match entrypoint {
+                    "app_open" => {
+                        let db = AppDb::open(&path).unwrap();
+                        db.conn()
+                            .execute("INSERT INTO wal_retained VALUES ('owner write')", [])
+                            .unwrap();
+                    }
+                    "notebook_open" => {
+                        let db = NotebookDb::open(&path).unwrap();
+                        db.conn()
+                            .execute("INSERT INTO wal_retained VALUES ('owner write')", [])
+                            .unwrap();
+                    }
+                    "notebook_connect" => {
+                        let db = NotebookDb::connect(&path).unwrap();
+                        db.conn()
+                            .execute("INSERT INTO wal_retained VALUES ('owner write')", [])
+                            .unwrap();
+                    }
+                    _ => {
+                        let pool = if entrypoint == "pool_new" {
+                            NotebookDbPool::new(&path).unwrap()
+                        } else {
+                            NotebookDbPool::with_max_read_conns(&path, 2).unwrap()
+                        };
+                        pool.write(|db| {
+                            db.conn()
+                                .execute("INSERT INTO wal_retained VALUES ('owner write')", [])?;
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                }
+                let conn = open_connection(&path, schema).unwrap();
+                let values = conn
+                    .prepare("SELECT value FROM wal_retained ORDER BY rowid")
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(values, ["committed WAL record", "owner write"]);
+                println!("WAL_OWNER_REOPEN {entrypoint} SHM={include_shm} version={supported} records={values:?}");
+            }
+        }
+    }
+
+    fn live_wal_writer(path: &Path, schema: DatabaseSchema, version: &str) -> Connection {
+        let writer = Connection::open(path).unwrap();
+        match schema {
+            DatabaseSchema::App => migrate_app_db(&writer).unwrap(),
+            DatabaseSchema::Notebook => migrate_notebook_db(&writer).unwrap(),
+        }
+        writer.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE wal_retained(value TEXT); PRAGMA wal_checkpoint(TRUNCATE); BEGIN IMMEDIATE;").unwrap();
+        writer
+            .execute(
+                "UPDATE _meta SET value=?1 WHERE key='schema_version'",
+                [version],
+            )
+            .unwrap();
+        writer
+            .execute_batch("INSERT INTO wal_retained VALUES ('committed WAL record'); COMMIT;")
+            .unwrap();
+        writer
+    }
+
+    #[test]
+    fn active_writer_rejection_preserves_store_triplet_until_barrier_release() {
+        use super::wal_admission_fixtures::{file_state, record_file_state, CopiedWal};
+        use std::sync::{Arc, Barrier};
+        for (entrypoint, supported, open) in schema_guard_entrypoints() {
+            for version in [(supported + 1).to_string(), "malformed".into(), "-1".into()] {
+                let directory = tempdir().unwrap();
+                let path = directory.path().join("held-writer.db");
+                let schema = if entrypoint == "app_open" {
+                    DatabaseSchema::App
+                } else {
+                    DatabaseSchema::Notebook
+                };
+                let writer = live_wal_writer(&path, schema, &version);
+                let entered = Arc::new(Barrier::new(2));
+                let release = Arc::new(Barrier::new(2));
+                let (writer_entered, writer_release) = (entered.clone(), release.clone());
+                let worker = std::thread::spawn(move || {
+                    writer.execute_batch("BEGIN IMMEDIATE; INSERT INTO wal_retained VALUES ('writer commit after release');").unwrap();
+                    writer_entered.wait();
+                    writer_release.wait();
+                    writer.execute_batch("COMMIT;").unwrap();
+                });
+                entered.wait();
+                let before = file_state(&path);
+                let label = format!("held-{entrypoint}-{version}");
+                record_file_state(&format!("{label}-before"), &before);
+                let result = open(&path);
+                let after = file_state(&path);
+                record_file_state(&format!("{label}-after"), &after);
+                release.wait();
+                worker.join().unwrap();
+                assert!(result.is_err(), "{entrypoint} admitted {version}");
+                assert_eq!(
+                    before, after,
+                    "{label} changed source while writer was held"
+                );
+                CopiedWal::assert_readable(&path, &version);
+                let copy = tempdir().unwrap();
+                let proof = copy.path().join("proof.db");
+                for suffix in ["", "-wal", "-shm"] {
+                    let from = super::wal_admission_fixtures::sidecar(&path, suffix);
+                    if from.exists() {
+                        std::fs::copy(from, super::wal_admission_fixtures::sidecar(&proof, suffix))
+                            .unwrap();
+                    }
+                }
+                let reader = Connection::open(proof).unwrap();
+                assert_eq!(
+                    reader
+                        .query_row("SELECT COUNT(*) FROM wal_retained", [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn supported_admission_reads_committed_view_with_a_barrier_held_writer() {
+        use std::sync::{Arc, Barrier};
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("supported-held.db");
+        let writer = live_wal_writer(&path, DatabaseSchema::Notebook, "7");
+        let pool = NotebookDbPool::new(&path).unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (writer_entered, writer_release) = (entered.clone(), release.clone());
+        let worker = std::thread::spawn(move || {
+            writer.execute_batch("BEGIN IMMEDIATE; INSERT INTO wal_retained VALUES ('writer committed after release');").unwrap();
+            writer_entered.wait();
+            writer_release.wait();
+            writer.execute_batch("COMMIT").unwrap();
+        });
+        entered.wait();
+        let db = NotebookDb::connect(&path).unwrap();
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM wal_retained", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        pool.read(|db| {
+            assert_eq!(
+                db.conn()
+                    .query_row("SELECT COUNT(*) FROM wal_retained", [], |r| r
+                        .get::<_, i64>(0))?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+        release.wait();
+        worker.join().unwrap();
+        pool.write(|db| {
+            db.conn().execute(
+                "INSERT INTO wal_retained VALUES ('pool still writable')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        drop(pool);
+        let reopened = NotebookDb::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .conn()
+                .query_row("SELECT COUNT(*) FROM wal_retained", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn admission_between_controlled_commits_rejects_new_future_schema_without_mutation() {
+        use super::wal_admission_fixtures::{file_state, record_file_state};
+        use std::sync::{Arc, Barrier};
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("between-commits.db");
+        let writer = live_wal_writer(&path, DatabaseSchema::Notebook, "7");
+        let phase = Arc::new(Barrier::new(2));
+        let writer_phase = phase.clone();
+        let worker = std::thread::spawn(move || {
+            writer_phase.wait();
+            writer_phase.wait();
+            writer
+                .execute("UPDATE _meta SET value='8' WHERE key='schema_version'", [])
+                .unwrap();
+            writer_phase.wait();
+            writer_phase.wait();
+            writer
+                .execute(
+                    "INSERT INTO wal_retained VALUES ('writer remains usable')",
+                    [],
+                )
+                .unwrap();
+        });
+        phase.wait();
+        let supported = NotebookDb::connect(&path).unwrap();
+        assert_eq!(
+            supported
+                .conn()
+                .query_row("SELECT COUNT(*) FROM wal_retained", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(supported);
+        phase.wait();
+        phase.wait();
+        let before = file_state(&path);
+        record_file_state("between-commits-before", &before);
+        let result = NotebookDb::connect(&path);
+        let after = file_state(&path);
+        record_file_state("between-commits-after", &after);
+        phase.wait();
+        worker.join().unwrap();
+        assert!(
+            matches!(result,Err(GlossError::Database(rusqlite::Error::SqliteFailure(_,Some(ref message)))) if message.contains("schema version 8"))
+        );
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn source_change_during_inspection_fails_closed_without_source_acquisition() {
+        use super::wal_admission_fixtures::{file_state, record_file_state};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("inspection-transition.db");
+        let writer = Rc::new(live_wal_writer(&path, DatabaseSchema::Notebook, "7"));
+        let _keep_writer = writer.clone();
+        let changed = Rc::new(RefCell::new(None));
+        let hook_changed = changed.clone();
+        let hook_path = path.clone();
+        AFTER_INSPECTION_COPY.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                writer
+                    .execute("UPDATE _meta SET value='8' WHERE key='schema_version'", [])
+                    .unwrap();
+                let state = file_state(&hook_path);
+                record_file_state("inspection-transition-actor-commit", &state);
+                *hook_changed.borrow_mut() = Some(state);
+            }));
+        });
+        let error = match NotebookDb::open(&path) {
+            Ok(_) => panic!("changing source admitted"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error,GlossError::Database(rusqlite::Error::SqliteFailure(ref code,Some(ref message))) if code.extended_code==rusqlite::ffi::SQLITE_BUSY && message.contains("changed during schema inspection"))
+        );
+        let after = file_state(&path);
+        record_file_state("inspection-transition-after", &after);
+        assert_eq!(changed.borrow().as_ref().unwrap(), &after);
+    }
+
+    #[test]
+    fn schema_transition_real_handle_refuses_newer_schema_before_migration() {
+        use super::wal_admission_fixtures::{file_state, record_file_state};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("acquisition-transition.db");
+        let writer = Rc::new(live_wal_writer(&path, DatabaseSchema::Notebook, "7"));
+        let kept_writer = writer.clone();
+        let changed = Rc::new(RefCell::new(None));
+        let hook_changed = changed.clone();
+        let hook_path = path.clone();
+        BEFORE_SOURCE_ACQUISITION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                writer
+                    .execute("UPDATE _meta SET value='8' WHERE key='schema_version'", [])
+                    .unwrap();
+                let state = file_state(&hook_path);
+                record_file_state("acquisition-transition-actor-commit", &state);
+                *hook_changed.borrow_mut() = Some(state);
+            }));
+        });
+        let error = match NotebookDb::open(&path) {
+            Ok(_) => panic!("new future schema migrated"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error,GlossError::Database(rusqlite::Error::SqliteFailure(_,Some(ref message))) if message.contains("schema version 8"))
+        );
+        let after = file_state(&path);
+        record_file_state("acquisition-transition-after", &after);
+        let before = changed.borrow();
+        let before = before.as_ref().unwrap();
+        assert_eq!(before[0], after[0], "raced rejection changed main bytes");
+        assert_eq!(before[1], after[1], "raced rejection changed WAL bytes");
+        let changes: Vec<_> = ["main", "wal", "shm", "journal"]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, name)| (before[i] != after[i]).then_some(name))
+            .collect();
+        println!(
+            "WAL_RACED_REJECTION {}",
+            serde_json::json!({"changed_files":changes,"full_preservation":before==&after,"actual_schema_rejected":8,"migration_performed":false})
+        );
+        assert_eq!(
+            kept_writer
+                .query_row(
+                    "SELECT value FROM _meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "8"
+        );
+    }
+
+    fn assert_raced_notebook_content(connection: &Connection, version: &str, count: i64) {
+        let actual_version: String = connection
+            .query_row(
+                "SELECT value FROM _meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let actual_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM wal_retained", [], |row| row.get(0))
+            .unwrap();
+        let values = connection
+            .prepare("SELECT value FROM wal_retained ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let expected_values: &[&str] = if count == 1 {
+            &["committed WAL record"]
+        } else {
+            assert_eq!(count, 2, "bounded fixture has exactly two retained rows");
+            &["committed WAL record", "writer durable after refusal"]
+        };
+        assert_eq!(actual_version, version);
+        assert_eq!(actual_count, count);
+        assert_eq!(values, expected_values);
+    }
+
+    fn assert_raced_notebook_integrity(connection: &Connection) {
+        let diagnoses = connection
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(diagnoses, ["ok"]);
+    }
+
+    fn assert_raced_refusal_changes_only_reader_marks(
+        before: &[Option<Vec<u8>>; 4],
+        after: &[Option<Vec<u8>>; 4],
+    ) -> Vec<(usize, u32, u32)> {
+        for (index, name) in [(0, "main"), (1, "WAL"), (3, "journal")] {
+            assert_eq!(before[index], after[index], "raced refusal changed {name}");
+        }
+        let before_shm = before[2].as_ref().expect("actor commit has live SHM");
+        let after_shm = after[2].as_ref().expect("refusal retained live SHM");
+        assert_eq!(before_shm.len(), after_shm.len(), "SHM size changed");
+        assert!(before_shm.len() >= 136, "complete bundled SQLite WAL index");
+        // Bundled SQLite uses native-endian u32 words. Its two 48-byte header
+        // copies precede nBackfill, aReadMark[0..=4], and lock bytes at120.
+        // This is a controlled characterization, never a preservation policy.
+        assert_eq!(&before_shm[..48], &before_shm[48..96]);
+        assert_eq!(before_shm[12], 1, "WAL index header is initialized");
+        assert_eq!(&before_shm[..104], &after_shm[..104]);
+        assert_eq!(&before_shm[120..], &after_shm[120..]);
+        let mx_frame = u32::from_ne_bytes(before_shm[16..20].try_into().unwrap());
+        assert!(mx_frame > 0, "fixture must retain committed WAL frames");
+        let mut changed = Vec::new();
+        for slot in 1..=4 {
+            let offset = 100 + 4 * slot;
+            let old = u32::from_ne_bytes(before_shm[offset..offset + 4].try_into().unwrap());
+            let new = u32::from_ne_bytes(after_shm[offset..offset + 4].try_into().unwrap());
+            assert!(
+                old <= mx_frame || old == u32::MAX,
+                "reader mark{slot} had an invalid previous frame"
+            );
+            if old != new {
+                assert!(
+                    old < mx_frame || old == u32::MAX,
+                    "changed reader mark{slot} did not advance from an older frame"
+                );
+                assert_eq!(new, mx_frame, "reader mark{slot} did not become mxFrame");
+                changed.push((slot, old, new));
+            }
+        }
+        assert!(
+            !changed.is_empty(),
+            "fixture must characterize raced SHM mutation"
+        );
+        changed
+    }
+
+    fn assert_raced_cold_copy_retains_future_schema(path: &Path) {
+        use super::wal_admission_fixtures::{file_state, sidecar};
+        let before = file_state(path);
+        let directory = tempdir().unwrap();
+        let copied = directory.path().join("independent-cold-proof.db");
+        for (index, suffix) in [(0, ""), (1, "-wal"), (3, "-journal")] {
+            if before[index].is_some() {
+                std::fs::copy(sidecar(path, suffix), sidecar(&copied, suffix)).unwrap();
+            }
+        }
+        assert!(
+            !sidecar(&copied, "-shm").exists(),
+            "copy must reconstruct its SHM"
+        );
+        {
+            let recovered = Connection::open(&copied).unwrap();
+            assert_raced_notebook_content(&recovered, "8", 2);
+            assert_raced_notebook_integrity(&recovered);
+        }
+        assert_eq!(file_state(path), before, "cold proof changed source files");
+    }
+
+    fn characterize_raced_notebook_durable_safety(case: &'static str, hold_reader: bool) {
+        use super::wal_admission_fixtures::{file_state, record_file_state};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("raced-durable-safety.db");
+        let kept_writer = Rc::new(live_wal_writer(&path, DatabaseSchema::Notebook, "7"));
+        let old_reader = hold_reader.then(|| {
+            let reader = Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap();
+            reader.execute_batch("BEGIN").unwrap();
+            assert_raced_notebook_content(&reader, "7", 1);
+            reader
+        });
+        let held_read_mark = old_reader.as_ref().map(|_| {
+            let state = file_state(&path);
+            record_file_state(&format!("{case}-held-reader-before-future-commit"), &state);
+            let shm = state[2].as_ref().expect("old reader has live SHM");
+            assert!(shm.len() >= 136);
+            assert_eq!(&shm[..48], &shm[48..96]);
+            assert_eq!(shm[12], 1);
+            let frame = u32::from_ne_bytes(shm[16..20].try_into().unwrap());
+            assert!(frame > 0);
+            let marks = [1, 2, 3, 4].map(|slot| {
+                let offset = 100 + 4 * slot;
+                u32::from_ne_bytes(shm[offset..offset + 4].try_into().unwrap())
+            });
+            assert_eq!(marks[0], frame, "fresh old reader must hold slot1");
+            assert_eq!(marks.iter().filter(|&&mark| mark == frame).count(), 1);
+            (1usize, frame)
+        });
+        let actor_commit = Rc::new(RefCell::new(None));
+        let hook_commit = Rc::clone(&actor_commit);
+        let hook_writer = Rc::clone(&kept_writer);
+        let hook_path = path.clone();
+        BEFORE_SOURCE_ACQUISITION.with(|slot| {
+            assert!(slot.borrow().is_none(), "another acquisition hook is armed");
+            *slot.borrow_mut() = Some(Box::new(move || {
+                hook_writer
+                    .execute("UPDATE _meta SET value='8' WHERE key='schema_version'", [])
+                    .unwrap();
+                let before = file_state(&hook_path);
+                record_file_state(&format!("{case}-actor-commit-before-acquisition"), &before);
+                *hook_commit.borrow_mut() = Some(before);
+                // The actor performs no further writes before source refusal.
+            }));
+        });
+        let error = match NotebookDb::open(&path) {
+            Ok(_) => panic!("new future notebook schema was admitted"),
+            Err(error) => error,
+        };
+        let after = file_state(&path);
+        record_file_state(&format!("{case}-after-refusal"), &after);
+        assert!(matches!(
+            error,
+            GlossError::Database(rusqlite::Error::SqliteFailure(ref code, Some(ref message)))
+                if code.extended_code == rusqlite::ffi::SQLITE_ERROR
+                    && message.contains("Unsupported notebook database schema version 8")
+                    && message.contains("supports up to 7")
+        ));
+        let before = actor_commit.borrow();
+        let before = before.as_ref().expect("future actor commit was captured");
+        if let Some((slot, frame)) = held_read_mark {
+            let offset = 100 + 4 * slot;
+            for state in [before, &after] {
+                let shm = state[2].as_ref().expect("held reader retained SHM");
+                let mark = u32::from_ne_bytes(shm[offset..offset + 4].try_into().unwrap());
+                assert_eq!(mark, frame, "refusal changed held old-reader slot{slot}");
+            }
+        }
+        let changed_marks = assert_raced_refusal_changes_only_reader_marks(before, &after);
+        let full_preservation = before == &after;
+        if let Some(reader) = old_reader.as_ref() {
+            assert_raced_notebook_content(reader, "7", 1);
+        }
+        kept_writer
+            .execute(
+                "INSERT INTO wal_retained VALUES ('writer durable after refusal')",
+                [],
+            )
+            .unwrap();
+        assert_raced_notebook_content(&kept_writer, "8", 2);
+        if let Some(reader) = old_reader.as_ref() {
+            assert_raced_notebook_content(reader, "7", 1);
+        }
+        record_file_state(
+            &format!("{case}-after-retained-writer-insert"),
+            &file_state(&path),
+        );
+        assert_raced_cold_copy_retains_future_schema(&path);
+        let mut held_checkpoint = None;
+        let mut released_checkpoint = None;
+        if let Some(reader) = old_reader {
+            kept_writer.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let held: (i64, i64, i64) = kept_writer
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(held.0, 1, "old snapshot must block truncating checkpoint");
+            assert!(
+                held.1 > held.2,
+                "held reader must leave frames uncheckpointed"
+            );
+            assert_raced_notebook_content(&reader, "7", 1);
+            reader.execute_batch("ROLLBACK").unwrap();
+            drop(reader);
+            let released: (i64, i64, i64) = kept_writer
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(
+                released,
+                (0, 0, 0),
+                "released snapshot must permit truncation"
+            );
+            assert_raced_notebook_content(&kept_writer, "8", 2);
+            held_checkpoint = Some(held);
+            released_checkpoint = Some(released);
+        }
+        assert_raced_notebook_integrity(&kept_writer);
+        println!(
+            "WAL_RACED_DURABLE_SAFETY {}",
+            serde_json::json!({
+                "case": case,
+                "scope": "Notebook schema7 to8 controlled characterization only",
+                "actual_schema_rejected": 8,
+                "typed_future_refusal": true,
+                "main_wal_journal_preserved": true,
+                "shm_size_preserved": true,
+                "allowed_shm_byte_range": [104, 120],
+                "changed_reader_marks": changed_marks,
+                "full_preservation": full_preservation,
+                "mandatory_strict_preservation_acceptance_closed": false,
+                "retained_writer_schema": 8,
+                "retained_writer_count": 2,
+                "cold_copy_omitted_shm": true,
+                "cold_copy_schema": 8,
+                "cold_copy_count": 2,
+                "cold_copy_integrity_ok": true,
+                "old_reader_snapshot_held": hold_reader,
+                "held_reader_mark": held_read_mark,
+                "held_checkpoint": held_checkpoint,
+                "released_checkpoint": released_checkpoint
+            })
+        );
+    }
+
+    #[test]
+    fn raced_future_notebook_refusal_retains_writer_and_cold_recoverable_data() {
+        characterize_raced_notebook_durable_safety("raced-writer-and-cold-copy", false);
+    }
+
+    #[test]
+    fn raced_future_notebook_refusal_preserves_old_reader_until_checkpoint_release() {
+        characterize_raced_notebook_durable_safety("raced-old-reader-and-checkpoint", true);
+    }
+
+    #[test]
+    fn physical_path_and_recovery_sidecar_edge_cases_fail_closed() {
+        use super::wal_admission_fixtures::{file_state, sidecar, CopiedWal};
+        let directory = tempdir().unwrap();
+        let special = directory.path().join("spaces ?#% unicode-é.db");
+        let _fixture = CopiedWal::create(&special, DatabaseSchema::Notebook, "8", false);
+        let before = file_state(&special);
+        assert!(NotebookDb::open(&special).is_err());
+        assert_eq!(before, file_state(&special));
+        for main in [false, true] {
+            let path = directory.path().join(format!("empty-{main}.db"));
+            if main {
+                std::fs::write(&path, []).unwrap();
+            }
+            std::fs::write(sidecar(&path, "-wal"), b"retained unknown WAL").unwrap();
+            let before = file_state(&path);
+            assert!(
+                matches!(open_connection(&path,DatabaseSchema::Notebook),Err(rusqlite::Error::SqliteFailure(ref code,_)) if code.extended_code==rusqlite::ffi::SQLITE_CORRUPT)
+            );
+            assert_eq!(before, file_state(&path));
+        }
+        let zero = directory.path().join("zero-wal.db");
+        drop(NotebookDb::open(&zero).unwrap());
+        std::fs::write(sidecar(&zero, "-wal"), []).unwrap();
+        NotebookDb::open(&zero).unwrap();
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("alias.db");
+            std::os::unix::fs::symlink(&special, &alias).unwrap();
+            let before = file_state(&special);
+            assert!(NotebookDb::open(&alias).is_err());
+            assert_eq!(before, file_state(&special));
+        }
+    }
+
+    #[test]
+    fn larger_store_admission_and_pool_connections_have_bounded_copy_cleanup() {
+        use super::wal_admission_fixtures::{file_state, record_file_state, sidecar};
+        use std::sync::{mpsc, Arc, Barrier};
+        let directory = tempdir().unwrap();
+        let retained = std::env::var_os("GLOSS_LARGE_FIXTURE_DIR").map(std::path::PathBuf::from);
+        let root = retained.as_deref().unwrap_or(directory.path());
+        std::fs::create_dir_all(root).unwrap();
+        let path = root.join("larger-store.db");
+        assert!(!path.exists(), "large fixture destination must be fresh");
+        let db = NotebookDb::open(&path).unwrap();
+        db.conn().execute_batch("CREATE TABLE admission_payload(id INTEGER PRIMARY KEY, value BLOB NOT NULL); BEGIN IMMEDIATE;").unwrap();
+        for i in 0..256 {
+            db.conn()
+                .execute(
+                    "INSERT INTO admission_payload VALUES (?1,zeroblob(131072))",
+                    [i],
+                )
+                .unwrap();
+        }
+        db.conn()
+            .execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(db);
+        let source_bytes: [u64; 4] = ["", "-wal", "-shm", "-journal"].map(|suffix| {
+            std::fs::metadata(sidecar(&path, suffix))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        });
+        assert!(source_bytes.iter().sum::<u64>() < 128 * 1024 * 1024);
+        if let Some(retained) = retained.as_ref() {
+            let original = retained.join("original-before-admission");
+            std::fs::create_dir(&original).unwrap();
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let from = sidecar(&path, suffix);
+                if from.exists() {
+                    std::fs::copy(from, original.join(format!("fixture.db{suffix}"))).unwrap();
+                }
+            }
+            record_file_state("larger-original-before-admission", &file_state(&path));
+        }
+        let inspection_bytes = || {
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    ["", "-wal", "-shm", "-journal"]
+                        .into_iter()
+                        .map(|suffix| {
+                            std::fs::metadata(
+                                entry.path().join(format!("schema-inspection.db{suffix}")),
+                            )
+                            .map(|m| m.len())
+                            .unwrap_or(0)
+                        })
+                        .sum::<u64>()
+                })
+                .sum::<u64>()
+        };
+        assert_eq!(inspection_bytes(), 0, "pre-existing inspection copies");
+        AFTER_INSPECTION_COPY.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                println!("LARGE_INSPECTION_COPY_BYTES {}", inspection_bytes());
+            }))
+        });
+        let start = std::time::Instant::now();
+        let admitted = NotebookDb::connect(&path).unwrap();
+        let direct_ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(
+            admitted
+                .conn()
+                .query_row("SELECT COUNT(*) FROM admission_payload", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            256
+        );
+        drop(admitted);
+        assert_eq!(
+            inspection_bytes(),
+            0,
+            "inspection copy leaked after direct admission"
+        );
+        let pool_start = std::time::Instant::now();
+        let pool = Arc::new(NotebookDbPool::with_max_read_conns(&path, 4).unwrap());
+        let pool_ms = pool_start.elapsed().as_secs_f64() * 1000.0;
+        let release = Arc::new(Barrier::new(5));
+        let (send, receive) = mpsc::channel();
+        let mut workers = Vec::new();
+        let mut read_ms = Vec::new();
+        for _ in 0..4 {
+            let pool = pool.clone();
+            let release = release.clone();
+            let send = send.clone();
+            workers.push(std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                pool.read(|db| {
+                    assert_eq!(
+                        db.conn()
+                            .query_row("SELECT COUNT(*) FROM admission_payload", [], |r| r
+                                .get::<_, i64>(0))?,
+                        256
+                    );
+                    send.send(start.elapsed().as_secs_f64() * 1000.0).unwrap();
+                    release.wait();
+                    Ok(())
+                })
+                .unwrap();
+            }));
+            read_ms.push(
+                receive
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .unwrap(),
+            );
+        }
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        drop(pool);
+        assert_eq!(
+            inspection_bytes(),
+            0,
+            "inspection copies leaked after pooled admission"
+        );
+        println!(
+            "LARGE_ADMISSION_OBSERVATION {}",
+            serde_json::json!({"payload_bytes":32*1024*1024,"source_file_bytes":source_bytes,"direct_connection_ms":direct_ms,"pool_constructor_ms":pool_ms,"four_distinct_lazy_reader_ms":read_ms,"inspection_bytes_after":inspection_bytes(),"proof_scope":"single bounded compatibility/cost observation; no benchmark or performance certification"})
+        );
+    }
+
+    #[test]
+    fn wal_admission_configuration_discrimination() {
+        use super::wal_admission_fixtures::{file_state, record_file_state, sidecar, CopiedWal};
+        use rusqlite::{config::DbConfig, OpenFlags};
+        for mode in [
+            "no-close-checkpoint",
+            "readonly-shm-or-exclusive",
+            "disposable-inspection",
+        ] {
+            for condition in [
+                "copied-shm",
+                "copied-no-shm",
+                "live-future",
+                "live-malformed",
+                "live-stale-future",
+                "live-stale-malformed",
+            ] {
+                let directory = tempdir().unwrap();
+                let path = directory.path().join("probe.db");
+                let version = if condition.ends_with("malformed") {
+                    "malformed"
+                } else {
+                    "8"
+                };
+                let copied;
+                let writer;
+                if condition.starts_with("copied") {
+                    copied = Some(CopiedWal::create(
+                        &path,
+                        DatabaseSchema::Notebook,
+                        version,
+                        condition == "copied-shm",
+                    ));
+                    writer = None;
+                } else {
+                    copied = None;
+                    let live = Connection::open(&path).unwrap();
+                    migrate_notebook_db(&live).unwrap();
+                    live.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE wal_retained(value TEXT); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+                    live.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    live.execute(
+                        "UPDATE _meta SET value=?1 WHERE key='schema_version'",
+                        [version],
+                    )
+                    .unwrap();
+                    live.execute_batch(
+                        "INSERT INTO wal_retained VALUES ('committed WAL record'); COMMIT;",
+                    )
+                    .unwrap();
+                    if !condition.contains("stale") {
+                        live.execute_batch(
+                            "BEGIN IMMEDIATE; INSERT INTO wal_retained VALUES ('uncommitted');",
+                        )
+                        .unwrap();
+                    }
+                    writer = Some(live);
+                }
+                let _keep_copied = copied;
+                let case = format!("discriminate-{mode}-{condition}");
+                let before = file_state(&path);
+                record_file_state(&format!("{case}-before"), &before);
+                let result = if mode == "disposable-inspection" {
+                    let inspection = tempdir().unwrap();
+                    let copy = inspection.path().join("inspection.db");
+                    for suffix in ["", "-wal", "-journal"] {
+                        let source = sidecar(&path, suffix);
+                        if source.exists() {
+                            std::fs::copy(source, sidecar(&copy, suffix)).unwrap();
+                        }
+                    }
+                    let conn = Connection::open(copy).unwrap();
+                    validate_schema_version(&conn, DatabaseSchema::Notebook)
+                } else {
+                    let conn = if mode == "no-close-checkpoint" {
+                        Connection::open(&path).unwrap()
+                    } else {
+                        Connection::open_with_flags(
+                            format!("file:{}?readonly_shm=1", path.display()),
+                            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+                        )
+                        .unwrap()
+                    };
+                    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+                        .unwrap();
+                    if mode == "readonly-shm-or-exclusive" && !sidecar(&path, "-shm").exists() {
+                        conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE;")
+                            .unwrap();
+                    }
+                    validate_schema_version(&conn, DatabaseSchema::Notebook)
+                };
+                let after = file_state(&path);
+                record_file_state(&format!("{case}-after"), &after);
+                let changes: Vec<_> = ["main", "wal", "shm", "journal"]
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, name)| (before[i] != after[i]).then_some(name))
+                    .collect();
+                println!(
+                    "WAL_CONFIGURATION {}",
+                    serde_json::json!({"mode":mode,"condition":condition,"error":format!("{:?}",result.as_ref().err()),"changed_files":changes})
+                );
+                assert!(result.is_err());
+                if mode == "disposable-inspection" {
+                    assert_eq!(before, after);
+                }
+                if let Some(writer) = writer {
+                    if !writer.is_autocommit() {
+                        writer.execute_batch("ROLLBACK").unwrap();
+                    }
                 }
             }
         }

@@ -58,7 +58,7 @@ pub struct ModelRecord {
 impl AppDb {
     /// Open (or create) the app-level database.
     pub fn open(path: &Path) -> Result<Self, GlossError> {
-        let conn = Connection::open(path)?;
+        let conn = migrations::open_connection(path, migrations::DatabaseSchema::App)?;
         migrations::migrate_app_db(&conn)?;
         Ok(Self { conn })
     }

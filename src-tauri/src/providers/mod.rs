@@ -83,7 +83,7 @@ impl ProviderType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_id(s: &str) -> Option<Self> {
         match s {
             "ollama" => Some(ProviderType::Ollama),
             "openai" => Some(ProviderType::OpenAI),
@@ -931,7 +931,7 @@ pub fn resolve_llm_config(
     } else {
         let selected_provider = app_db
             .get_setting("default_provider")?
-            .and_then(|p| ProviderType::from_str(p.trim()))
+            .and_then(|p| ProviderType::from_id(p.trim()))
             .unwrap_or(ProviderType::Ollama);
         let config = provider_config_from_db(app_db, secret_store, selected_provider)?;
         (config, None)
@@ -1035,7 +1035,7 @@ impl ModelRegistry {
             .into_iter()
             .filter(|m| m.available && !m.stale)
             .filter_map(|m| {
-                ProviderType::from_str(&m.provider_id).map(|provider| ModelInfo {
+                ProviderType::from_id(&m.provider_id).map(|provider| ModelInfo {
                     id: m.id,
                     display_name: m.display_name,
                     provider,
@@ -1081,7 +1081,7 @@ impl ModelRegistry {
     ) -> Result<ProviderConfig, GlossError> {
         let selected_provider = app_db
             .get_setting("default_provider")?
-            .and_then(|provider_id| ProviderType::from_str(provider_id.trim()));
+            .and_then(|provider_id| ProviderType::from_id(provider_id.trim()));
         let candidates = self
             .cached_models
             .iter()

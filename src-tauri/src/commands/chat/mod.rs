@@ -1285,6 +1285,164 @@ fn resolve_chat_provider_config<R: tauri::Runtime>(
     }
 }
 
+/// Inventory is optional for requested no-retrieval chat. Keep the fallible
+/// read and its terminal handling in the production preparation owner so a
+/// failed All/Explicit request cannot silently become a wider or empty scope.
+#[allow(clippy::too_many_arguments)]
+fn load_chat_source_inventory<'a, R: tauri::Runtime>(
+    state: &'a AppState,
+    active_chat_attempt_lease: crate::state::ActiveChatAttemptLease<'a>,
+    app_handle: &tauri::AppHandle<R>,
+    notebook_id: &str,
+    conversation_id: &str,
+    attempt_id: &str,
+    message_id: &str,
+    user_message_id: &str,
+    source_scope: &SourceScope,
+    provider: &str,
+    model: &str,
+    attempt_trace: &Arc<Mutex<ChatAttemptTraceV1>>,
+    trace_data_dir: &std::path::Path,
+) -> Result<(Vec<Source>, crate::state::ActiveChatAttemptLease<'a>), GlossError> {
+    if matches!(source_scope, SourceScope::None) {
+        record_chat_attempt_trace(
+            attempt_trace,
+            trace_data_dir,
+            "source_inventory_skipped",
+            Some(Duration::ZERO),
+            Some(
+                "Requested no retrieval; source inventory and excluded-source count were not read",
+            ),
+            None,
+            |_| {},
+        );
+        return Ok((Vec::new(), active_chat_attempt_lease));
+    }
+
+    match state.with_notebook_db(notebook_id, |db| db.list_sources()) {
+        Ok(sources) => Ok((sources, active_chat_attempt_lease)),
+        Err(err) => {
+            let error = err.to_string();
+            emit_chat_status(
+                app_handle,
+                notebook_id,
+                conversation_id,
+                message_id,
+                "source_inventory_error",
+                "Requested source inventory could not be loaded",
+                Some(provider),
+                Some(model),
+                None,
+                None,
+                None,
+                Duration::ZERO,
+                None,
+                false,
+                Some(&error),
+            );
+            emit_chat_error(app_handle, notebook_id, conversation_id, message_id, &error);
+            record_chat_attempt_trace(
+                attempt_trace,
+                trace_data_dir,
+                "source_inventory_error",
+                Some(Duration::ZERO),
+                Some("Requested source inventory failed before retrieval or provider start"),
+                Some(&error),
+                |_| {},
+            );
+            persist_pre_stream_chat_error(
+                state,
+                notebook_id,
+                conversation_id,
+                attempt_id,
+                message_id,
+                user_message_id,
+                provider,
+                model,
+                "source_inventory_error",
+                "source_inventory_error",
+                &error,
+            );
+            Err(err)
+        }
+    }
+}
+
+/// The preparation admission check owns the cancellation event, trace and
+/// durable terminal row together. Failure drops the existing attempt lease;
+/// successful admission returns it to send_message for stream activation.
+#[allow(clippy::too_many_arguments)]
+fn check_chat_pre_provider_epoch<'a, R: tauri::Runtime>(
+    state: &'a AppState,
+    active_chat_attempt_lease: crate::state::ActiveChatAttemptLease<'a>,
+    app_handle: &tauri::AppHandle<R>,
+    notebook_id: &str,
+    request_epoch: u64,
+    conversation_id: &str,
+    attempt_id: &str,
+    message_id: &str,
+    user_message_id: &str,
+    provider: &str,
+    model: &str,
+    attempt_trace: &Arc<Mutex<ChatAttemptTraceV1>>,
+    trace_data_dir: &std::path::Path,
+) -> Result<crate::state::ActiveChatAttemptLease<'a>, GlossError> {
+    if state.is_active_notebook_epoch(notebook_id, request_epoch) {
+        return Ok(active_chat_attempt_lease);
+    }
+
+    let error = "Chat cancelled before provider start because the active notebook changed";
+    tracing::info!(
+        notebook_id,
+        epoch = request_epoch,
+        "Notebook changed during chat preparation; skipping stream start"
+    );
+    emit_chat_status(
+        app_handle,
+        notebook_id,
+        conversation_id,
+        message_id,
+        "cancelled",
+        error,
+        None,
+        Some(model),
+        None,
+        None,
+        None,
+        Duration::ZERO,
+        None,
+        false,
+        Some(error),
+    );
+    emit_chat_error(app_handle, notebook_id, conversation_id, message_id, error);
+    record_chat_attempt_trace(
+        attempt_trace,
+        trace_data_dir,
+        "cancelled",
+        Some(Duration::ZERO),
+        Some("Active notebook epoch changed before provider start"),
+        Some(error),
+        |_| {},
+    );
+    persist_chat_attempt_status(
+        state,
+        notebook_id,
+        conversation_id,
+        attempt_id,
+        message_id,
+        Some(user_message_id),
+        Some(provider),
+        Some(model),
+        "cancelled",
+        Some("cancelled_before_provider_start"),
+        Some("notebook_changed"),
+        Some(error),
+        None,
+        true,
+    );
+    Err(GlossError::Other(error.to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_message(
@@ -1634,8 +1792,24 @@ pub async fn send_message(
     );
 
     // --- RAG context assembly ---
-    // 1. Load notebook sources upfront for scope resolution and manifest assembly.
-    let all_sources: Vec<Source> = state.with_notebook_db(&notebook_id, |db| db.list_sources())?;
+    // 1. Requested None needs no inventory; requested retrieval fails visibly
+    // and terminally if inventory cannot be read. Never downgrade that failure.
+    let source_inventory_skipped = matches!(source_scope, SourceScope::None);
+    let (all_sources, active_chat_attempt_lease) = load_chat_source_inventory(
+        &state,
+        active_chat_attempt_lease,
+        &app_handle,
+        &notebook_id,
+        &conversation_id,
+        &attempt_id,
+        &message_id,
+        &user_msg.id,
+        &source_scope,
+        provider_config.provider_type.as_str(),
+        &model,
+        &attempt_trace,
+        &trace_data_dir,
+    )?;
     let resolved_scope = source_scope.resolve(&all_sources);
     let requested_source_ids = match &source_scope {
         SourceScope::All | SourceScope::None => Vec::new(),
@@ -3126,7 +3300,11 @@ pub async fn send_message(
         citation_filter_reasons: Vec::new(),
         omitted_candidate_count: 0,
         source_scope_preserved: source_scope_integrity.preserved,
-        index_status: if resolved_scope.is_none() {
+        index_status: if source_inventory_skipped {
+            // Preserve requested None separately from empty Explicit, which
+            // read inventory even when its resolved scope has no sources.
+            "scope-none (source counts unavailable)".to_string()
+        } else if resolved_scope.is_none() {
             "scope-none".to_string()
         } else {
             native_index_status
@@ -3157,48 +3335,21 @@ pub async fn send_message(
         prompt_budget_receipt: None,
     };
 
-    if !state.is_active_notebook_epoch(&notebook_id, request_epoch) {
-        let error = "Chat cancelled before provider start because the active notebook changed";
-        tracing::info!(
-            notebook_id = %notebook_id,
-            epoch = request_epoch,
-            "Notebook changed during chat preparation; skipping stream start"
-        );
-        emit_chat_status(
-            &app_handle,
-            &notebook_id,
-            &conversation_id,
-            &message_id,
-            "cancelled",
-            error,
-            None,
-            Some(&model),
-            None,
-            None,
-            None,
-            Duration::ZERO,
-            None,
-            false,
-            Some(error),
-        );
-        emit_chat_error(
-            &app_handle,
-            &notebook_id,
-            &conversation_id,
-            &message_id,
-            error,
-        );
-        record_chat_attempt_trace(
-            &attempt_trace,
-            &trace_data_dir,
-            "cancelled",
-            Some(Duration::ZERO),
-            Some("Active notebook epoch changed before provider start"),
-            Some(error),
-            |_| {},
-        );
-        return Err(GlossError::Other(error.to_string()));
-    }
+    let active_chat_attempt_lease = check_chat_pre_provider_epoch(
+        &state,
+        active_chat_attempt_lease,
+        &app_handle,
+        &notebook_id,
+        request_epoch,
+        &conversation_id,
+        &attempt_id,
+        &message_id,
+        &user_msg.id,
+        provider_config.provider_type.as_str(),
+        &model,
+        &attempt_trace,
+        &trace_data_dir,
+    )?;
 
     // For streaming, we spawn an async task
     let msg_id = message_id.clone();
@@ -3346,7 +3497,7 @@ pub async fn debug_chat_provider_smoke(
     prompt: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ChatAttemptTraceV1, GlossError> {
-    let provider_type = providers::ProviderType::from_str(provider_id.trim())
+    let provider_type = providers::ProviderType::from_id(provider_id.trim())
         .ok_or_else(|| GlossError::Config(format!("Unknown provider id '{provider_id}'")))?;
     let message_id = uuid::Uuid::new_v4().to_string();
     let attempt_trace = Arc::new(Mutex::new(new_chat_attempt_trace(
@@ -3685,6 +3836,428 @@ mod tests {
             .with_notebook_db_write(notebook_id, |db| db.create_conversation("conversation"))
             .expect("fixture conversation");
         (data_dir, state)
+    }
+
+    fn damage_source_inventory(state: &AppState) {
+        state
+            .with_notebook_db_write("provider-resolution-notebook", |db| {
+                db.conn().execute(
+                    "INSERT INTO sources(id, source_type, title, word_count, status)
+                     VALUES('damaged-source', 'text', 'Damaged source', 'not-an-integer', 'ready')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("selectively damaged source fixture");
+        let stored_type: String = state
+            .with_notebook_db("provider-resolution-notebook", |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT typeof(word_count) FROM sources WHERE id = 'damaged-source'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("fixture word_count storage type");
+        assert_eq!(stored_type, "text");
+        assert!(
+            state
+                .with_notebook_db("provider-resolution-notebook", |db| db.list_sources())
+                .is_err(),
+            "the actual inventory read must fail before exercising its owner"
+        );
+    }
+
+    fn seed_preparation_attempt(
+        state: &AppState,
+        assistant_message_id: &str,
+        scope_mode: &str,
+    ) -> (Arc<Mutex<ChatAttemptTraceV1>>, String) {
+        let notebook_id = "provider-resolution-notebook";
+        let user_message_id = format!("user-{assistant_message_id}");
+        let user = Message {
+            id: user_message_id.clone(),
+            conversation_id: "conversation".to_string(),
+            role: "user".to_string(),
+            content: "prepared user query".to_string(),
+            citations: None,
+            model_used: None,
+            tokens_prompt: None,
+            tokens_response: None,
+            created_at: String::new(),
+        };
+        state
+            .with_notebook_db_write(notebook_id, |db| db.insert_message(&user))
+            .expect("user history remains writable despite damaged sources");
+        let trace = Arc::new(Mutex::new(new_chat_attempt_trace(
+            notebook_id,
+            "conversation",
+            assistant_message_id,
+            "fixture-model",
+            Some(MEMORY_BACKEND_GLOSS_LOCAL.to_string()),
+            Some(false),
+            Some(scope_mode.to_string()),
+        )));
+        let attempt_id = chat_attempt_trace_snapshot(&trace).attempt_id;
+        persist_chat_attempt_status(
+            state,
+            notebook_id,
+            "conversation",
+            &attempt_id,
+            assistant_message_id,
+            Some(&user_message_id),
+            Some("ollama"),
+            Some("fixture-model"),
+            "running",
+            Some("provider_config_resolved"),
+            None,
+            None,
+            None,
+            false,
+        );
+        let running: bool = state
+            .with_notebook_db(notebook_id, |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT status = 'running' AND terminal_at IS NULL
+                           FROM chat_attempts WHERE attempt_id = ?1",
+                        [&attempt_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("ledger remains writable despite damaged sources");
+        assert!(running);
+        assert!(state
+            .with_notebook_db(notebook_id, |db| db.load_messages("conversation"))
+            .expect("history remains readable despite damaged sources")
+            .iter()
+            .any(|message| message.id == user_message_id));
+        (trace, user_message_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_preparation_terminal(
+        state: &AppState,
+        trace: &Arc<Mutex<ChatAttemptTraceV1>>,
+        assistant_message_id: &str,
+        user_message_id: &str,
+        status: &str,
+        phase: &str,
+        error_code: &str,
+        trace_phase: &str,
+        error: &str,
+    ) {
+        let notebook_id = "provider-resolution-notebook";
+        let events = state.chat_events_since(notebook_id, "conversation", None);
+        let events = events
+            .iter()
+            .filter(|event| event.message_id == assistant_message_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind.as_str(), "done" | "error" | "cancelled"))
+                .count(),
+            1,
+            "one terminal event for the actual preparation owner"
+        );
+        assert_eq!(
+            events.iter().filter(|event| event.kind == "error").count(),
+            1
+        );
+        assert_eq!(
+            events.iter().filter(|event| event.kind == "status").count(),
+            1
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "status" && event.payload["phase"] == trace_phase));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.kind.as_str(), "done" | "token" | "evidence")));
+        let snapshot = chat_attempt_trace_snapshot(trace);
+        let stored = state
+            .with_notebook_db(notebook_id, |db| {
+                db.conn()
+                    .query_row(
+                        "SELECT status, phase, error_code, error_message, user_message_id,
+                                assistant_message_id, provider, model, terminal_at IS NOT NULL
+                           FROM chat_attempts WHERE attempt_id = ?1",
+                        [&snapshot.attempt_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, String>(7)?,
+                                row.get::<_, bool>(8)?,
+                            ))
+                        },
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("terminal ledger is readable");
+        assert_eq!(stored.0, status);
+        assert_eq!(stored.1, phase);
+        assert_eq!(stored.2, error_code);
+        assert_eq!(stored.3, error);
+        assert_eq!(stored.4, user_message_id);
+        assert_eq!(stored.5, assistant_message_id);
+        assert_eq!(stored.6, "ollama");
+        assert_eq!(stored.7, "fixture-model");
+        assert!(stored.8, "the accepted attempt must have terminal_at");
+        let persisted_trace: ChatAttemptTraceV1 = serde_json::from_slice(
+            &std::fs::read(
+                state
+                    .data_dir
+                    .join("chat-attempt-traces")
+                    .join(format!("{}.json", snapshot.attempt_id)),
+            )
+            .expect("production owner persisted its trace"),
+        )
+        .expect("persisted trace decodes");
+        assert_eq!(persisted_trace.error.as_deref(), Some(error));
+        assert_eq!(persisted_trace.events.last().unwrap().phase, trace_phase);
+        assert_eq!(persisted_trace.events.len(), 1);
+        assert!(!persisted_trace.first_token_seen);
+        assert!(!persisted_trace.done_seen);
+        assert!(!persisted_trace.assistant_persisted);
+        let messages = state
+            .with_notebook_db(notebook_id, |db| db.load_messages("conversation"))
+            .expect("user history survives preparation failure");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.id == user_message_id)
+                .count(),
+            1
+        );
+        assert!(messages.iter().any(|message| {
+            message.id == user_message_id
+                && message.role == "user"
+                && message.content == "prepared user query"
+        }));
+        assert!(messages.iter().all(|message| message.role == "user"));
+        assert!(state.active_chat_attempts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_inventory_none_bypasses_real_decode_failure_without_scope_widening() {
+        let (_data_dir, state) = provider_resolution_fixture();
+        damage_source_inventory(&state);
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state = app.state::<AppState>();
+        let notebook_id = "provider-resolution-notebook";
+        let (trace, user_message_id) = seed_preparation_attempt(&state, "none-assistant", "none");
+        let attempt_id = chat_attempt_trace_snapshot(&trace).attempt_id;
+        let lease = state
+            .lease_active_chat_attempt(notebook_id, "conversation", &attempt_id, &user_message_id)
+            .expect("accepted no-retrieval attempt");
+        let (sources, lease) = load_chat_source_inventory(
+            &state,
+            lease,
+            app.handle(),
+            notebook_id,
+            "conversation",
+            &attempt_id,
+            "none-assistant",
+            &user_message_id,
+            &SourceScope::None,
+            "ollama",
+            "fixture-model",
+            &trace,
+            &state.data_dir,
+        )
+        .unwrap_or_else(|error| panic!("None must not read damaged inventory: {error}"));
+        assert!(sources.is_empty());
+        let resolved = SourceScope::None.resolve(&sources);
+        assert!(resolved.is_none());
+        assert!(resolved.source_ids().is_empty());
+        assert!(resolved.manifest_sources().is_empty());
+        assert!(!resolved.allows("damaged-source"));
+        assert!(state
+            .chat_events_since(notebook_id, "conversation", None)
+            .is_empty());
+        let snapshot = chat_attempt_trace_snapshot(&trace);
+        assert!(snapshot.error.is_none());
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events[0].phase, "source_inventory_skipped");
+        assert!(snapshot.events[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("were not read"));
+        assert_eq!(state.active_chat_attempts.lock().unwrap().len(), 1);
+        drop(lease);
+    }
+
+    #[test]
+    fn source_inventory_requested_retrieval_failure_terminalizes_and_releases_retry() {
+        let (_data_dir, state) = provider_resolution_fixture();
+        damage_source_inventory(&state);
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state = app.state::<AppState>();
+        let notebook_id = "provider-resolution-notebook";
+        for (case, source_scope) in [
+            ("all", SourceScope::All),
+            (
+                "explicit",
+                SourceScope::Explicit(vec!["damaged-source".to_string()]),
+            ),
+            ("empty-explicit", SourceScope::Explicit(Vec::new())),
+            (
+                "stale-explicit",
+                SourceScope::Explicit(vec!["missing".to_string()]),
+            ),
+        ] {
+            for retry in 0..2 {
+                let assistant = format!("{case}-assistant-{retry}");
+                let scope_mode = if case == "all" { "all" } else { "explicit" };
+                let (trace, user_message_id) =
+                    seed_preparation_attempt(&state, &assistant, scope_mode);
+                let attempt_id = chat_attempt_trace_snapshot(&trace).attempt_id;
+                let lease = state
+                    .lease_active_chat_attempt(
+                        notebook_id,
+                        "conversation",
+                        &attempt_id,
+                        &user_message_id,
+                    )
+                    .expect("same conversation retry admitted without manual cleanup");
+                let error = match load_chat_source_inventory(
+                    &state,
+                    lease,
+                    app.handle(),
+                    notebook_id,
+                    "conversation",
+                    &attempt_id,
+                    &assistant,
+                    &user_message_id,
+                    &source_scope,
+                    "ollama",
+                    "fixture-model",
+                    &trace,
+                    &state.data_dir,
+                ) {
+                    Ok(_) => {
+                        panic!("requested retrieval must not hide actual inventory decode failure")
+                    }
+                    Err(error) => error.to_string(),
+                };
+                assert_preparation_terminal(
+                    &state,
+                    &trace,
+                    &assistant,
+                    &user_message_id,
+                    "error",
+                    "source_inventory_error",
+                    "source_inventory_error",
+                    "source_inventory_error",
+                    &error,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pre_provider_epoch_gate_cancels_returned_notebook_and_admits_fresh_retry() {
+        let (_data_dir, state) = provider_resolution_fixture();
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state = app.state::<AppState>();
+        let notebook_id = "provider-resolution-notebook";
+        assert!(state.set_active_notebook(Some(notebook_id.to_string()), Some(7)));
+        let request_epoch = state.get_active_epoch();
+        let (trace, user_message_id) = seed_preparation_attempt(&state, "epoch-assistant", "none");
+        let attempt_id = chat_attempt_trace_snapshot(&trace).attempt_id;
+        let lease = state
+            .lease_active_chat_attempt(notebook_id, "conversation", &attempt_id, &user_message_id)
+            .expect("accepted epoch fixture");
+        let lease = check_chat_pre_provider_epoch(
+            &state,
+            lease,
+            app.handle(),
+            notebook_id,
+            request_epoch,
+            "conversation",
+            &attempt_id,
+            "epoch-assistant",
+            &user_message_id,
+            "ollama",
+            "fixture-model",
+            &trace,
+            &state.data_dir,
+        )
+        .unwrap_or_else(|error| panic!("matching epoch must retain admission: {error}"));
+        assert!(state
+            .chat_events_since(notebook_id, "conversation", None)
+            .is_empty());
+        assert!(chat_attempt_trace_snapshot(&trace).events.is_empty());
+        assert!(state.set_active_notebook(Some("another-notebook".to_string()), None));
+        assert!(state.set_active_notebook(Some(notebook_id.to_string()), None));
+        assert_ne!(state.get_active_epoch(), request_epoch);
+        let error = match check_chat_pre_provider_epoch(
+            &state,
+            lease,
+            app.handle(),
+            notebook_id,
+            request_epoch,
+            "conversation",
+            &attempt_id,
+            "epoch-assistant",
+            &user_message_id,
+            "ollama",
+            "fixture-model",
+            &trace,
+            &state.data_dir,
+        ) {
+            Ok(_) => panic!("returning to the same notebook must not admit its stale epoch"),
+            Err(error) => error.to_string(),
+        };
+        assert_preparation_terminal(
+            &state,
+            &trace,
+            "epoch-assistant",
+            &user_message_id,
+            "cancelled",
+            "cancelled_before_provider_start",
+            "notebook_changed",
+            "cancelled",
+            &error,
+        );
+        let retry = state
+            .lease_active_chat_attempt(
+                notebook_id,
+                "conversation",
+                "fresh-epoch-attempt",
+                "fresh-user",
+            )
+            .expect("cancelled preparation releases the conversation");
+        let retry = check_chat_pre_provider_epoch(
+            &state,
+            retry,
+            app.handle(),
+            notebook_id,
+            state.get_active_epoch(),
+            "conversation",
+            "fresh-epoch-attempt",
+            "fresh-assistant",
+            "fresh-user",
+            "ollama",
+            "fixture-model",
+            &trace,
+            &state.data_dir,
+        )
+        .unwrap_or_else(|error| panic!("fresh epoch must admit retry: {error}"));
+        drop(retry);
     }
 
     #[test]

@@ -81,7 +81,16 @@ pub fn recover_all_wal_on_startup(data_dir: &std::path::Path) {
             continue;
         }
         let path_str = db_path.display().to_string();
-        match Connection::open(db_path) {
+        let connection = match db_path.file_name().and_then(|name| name.to_str()) {
+            Some("notebook.db") => {
+                migrations::open_connection(db_path, migrations::DatabaseSchema::Notebook)
+            }
+            Some("gloss.db") => {
+                migrations::open_connection(db_path, migrations::DatabaseSchema::App)
+            }
+            _ => Connection::open(db_path), // Queue schema remains dependency-owned.
+        };
+        match connection {
             Ok(conn) => {
                 // Recovery is a write boundary too. Unsupported notebook/app
                 // stores must be quarantined before checkpointing their WAL.
@@ -99,6 +108,14 @@ pub fn recover_all_wal_on_startup(data_dir: &std::path::Path) {
                     failed += 1;
                     tracing::error!(path = %path_str, %error,
                         "Unsupported database retained without startup WAL checkpoint");
+                    continue;
+                }
+                if let Err(error) = conn.set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    false,
+                ) {
+                    failed += 1;
+                    tracing::error!(path = %path_str, %error, "Could not configure admitted startup connection");
                     continue;
                 }
                 // Force a truncating checkpoint — flushes WAL to main DB and
@@ -160,8 +177,59 @@ pub fn recover_all_wal_on_startup(data_dir: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn startup_rejects_copied_committed_wal_without_changing_any_store_file() {
+    fn on_disk_checkpoint_reports_busy_then_recovers_after_reader_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("checkpoint.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE proof(value TEXT); INSERT INTO proof VALUES ('first');").unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM proof", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        writer
+            .execute("INSERT INTO proof VALUES ('second')", [])
+            .unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_millis(25))
+            .unwrap();
+        let busy = super::truncating_wal_checkpoint(&writer).unwrap();
+        assert_eq!(busy.busy, 1);
+        assert!(busy.log_frames > 0);
+        assert!(busy.checkpointed_frames < busy.log_frames);
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        let recovered = super::truncating_wal_checkpoint(&writer).unwrap();
+        assert_eq!(recovered.busy, 0);
+        super::verify_database_integrity(&writer).unwrap();
+        assert_eq!(
+            writer
+                .query_row("SELECT COUNT(*) FROM proof", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        println!("WAL_CHECKPOINT_BUSY_THEN_RELEASE {busy:?} {recovered:?}");
+    }
+
+    #[test]
+    fn repeated_supported_startup_recovery_is_idempotent() {
         use super::migrations::wal_admission_fixtures::{file_state, CopiedWal};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("gloss.db");
+        let _fixture = CopiedWal::create(&path, super::migrations::DatabaseSchema::App, "4", false);
+        super::recover_all_wal_on_startup(root.path());
+        let recovered = file_state(&path);
+        super::recover_all_wal_on_startup(root.path());
+        assert_eq!(recovered, file_state(&path));
+        CopiedWal::assert_readable(&path, "4");
+    }
+
+    #[test]
+    fn startup_rejects_copied_committed_wal_without_changing_any_store_file() {
+        use super::migrations::wal_admission_fixtures::{file_state, record_file_state, CopiedWal};
         use super::migrations::DatabaseSchema;
         for (name, version) in [
             ("gloss.db", "5"),
@@ -187,7 +255,10 @@ mod tests {
                 };
                 let _fixture = CopiedWal::create(&path, schema, version, include_shm);
                 let before = file_state(&path);
+                let label = format!("startup-{name}-{version}-shm-{include_shm}");
+                record_file_state(&format!("{label}-before"), &before);
                 super::recover_all_wal_on_startup(root.path());
+                record_file_state(&format!("{label}-after"), &file_state(&path));
                 assert_eq!(
                     file_state(&path),
                     before,
@@ -227,6 +298,30 @@ mod tests {
                     "startup did not checkpoint supported {name}"
                 );
                 CopiedWal::assert_readable(&path, version);
+                let connection = if name == "gloss.db" {
+                    super::migrations::open_connection(&path, DatabaseSchema::App).unwrap()
+                } else {
+                    super::migrations::open_connection(&path, DatabaseSchema::Notebook).unwrap()
+                };
+                connection
+                    .execute(
+                        "INSERT INTO wal_retained VALUES ('startup owner remains writable')",
+                        [],
+                    )
+                    .unwrap();
+                drop(connection);
+                let reopened = if name == "gloss.db" {
+                    super::migrations::open_connection(&path, DatabaseSchema::App).unwrap()
+                } else {
+                    super::migrations::open_connection(&path, DatabaseSchema::Notebook).unwrap()
+                };
+                assert_eq!(
+                    reopened
+                        .query_row("SELECT COUNT(*) FROM wal_retained", [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    2
+                );
             }
         }
     }

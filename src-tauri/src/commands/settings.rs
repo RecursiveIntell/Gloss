@@ -267,7 +267,7 @@ fn secret_setting_key(provider_type: ProviderType) -> Option<&'static str> {
 }
 
 fn provider_type_from_id(provider_id: &str) -> Result<ProviderType, GlossError> {
-    ProviderType::from_str(provider_id.trim())
+    ProviderType::from_id(provider_id.trim())
         .ok_or_else(|| GlossError::Config(format!("Unknown provider id '{provider_id}'")))
 }
 
@@ -276,7 +276,7 @@ fn model_records_to_infos(records: Vec<ModelRecord>) -> Vec<ModelInfo> {
         .into_iter()
         .filter(|m| m.available && !m.stale)
         .filter_map(|m| {
-            ProviderType::from_str(&m.provider_id).map(|provider| ModelInfo {
+            ProviderType::from_id(&m.provider_id).map(|provider| ModelInfo {
                 id: m.id,
                 display_name: m.display_name,
                 provider,
@@ -340,7 +340,7 @@ pub async fn get_providers(state: State<'_, AppState>) -> Result<Vec<Provider>, 
     drop(app_db);
 
     for provider in &mut providers {
-        if let Some(provider_type) = ProviderType::from_str(&provider.id) {
+        if let Some(provider_type) = ProviderType::from_id(&provider.id) {
             if let Some(secret_key) = secret_setting_key(provider_type) {
                 provider.has_api_key = state.secret_store.contains(secret_key)?;
             }
@@ -358,7 +358,7 @@ pub async fn update_provider(
     api_key: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), GlossError> {
-    let provider_type = ProviderType::from_str(&id).ok_or_else(|| {
+    let provider_type = ProviderType::from_id(&id).ok_or_else(|| {
         GlossError::Other(format!(
             "Unrecognized provider type '{id}'; cannot update an unknown provider"
         ))

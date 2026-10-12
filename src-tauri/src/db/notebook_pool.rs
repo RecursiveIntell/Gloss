@@ -112,7 +112,8 @@ impl NotebookDbPool {
         // The write connection is also the one that runs migrations on first
         // creation so the DB schema is guaranteed to exist before any reader
         // tries to query it.
-        let write_conn = Connection::open(db_path)?;
+        let write_conn =
+            migrations::open_connection(db_path, migrations::DatabaseSchema::Notebook)?;
         migrations::migrate_notebook_db(&write_conn)?;
 
         Ok(Self {
@@ -283,6 +284,10 @@ impl NotebookDbPool {
     }
 
     fn open_read_conn(&self) -> Result<Connection, GlossError> {
+        migrations::inspect_schema_for_admission(
+            &self.db_path,
+            migrations::DatabaseSchema::Notebook,
+        )?;
         let conn = Connection::open_with_flags(
             &self.db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -291,7 +296,7 @@ impl NotebookDbPool {
             // The database file might not exist yet when called from a test or
             // a fresh notebook that hasn't been written to.  Fall back to a
             // read-write open so WAL can be set up.
-            Connection::open(&self.db_path)
+            migrations::open_connection(&self.db_path, migrations::DatabaseSchema::Notebook)
         })?;
         migrations::validate_schema_version(&conn, migrations::DatabaseSchema::Notebook)?;
         migrations::apply_pragmas(&conn)?;

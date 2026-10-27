@@ -492,7 +492,7 @@ export function ChatPanel({ notebookId }: ChatPanelProps) {
             <span className="flex items-center gap-1 text-warning">
               <AlertCircle className="w-3 h-3" />
               {sourceListStatus === "error"
-                ? sourceListError || "Source list failed to load; chat will run without retrieval."
+                ? sourceListError || "Source list unavailable. Chat will use your retrieval choice."
                 : sourceListStatus === "partial"
                   ? "Source list partially loaded; retrieval may be incomplete."
                 : "Source list still loading; retrieval may be incomplete."}
@@ -884,11 +884,11 @@ export function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvi
         <EvidenceRow label="Decision" value={evidence.retrieval_capability_decision.decision_reason_code || evidence.retrieval_capability_decision.decision_reason || (evidence.retrieval_capability_decision.degraded ? "degraded" : "ready")} />
         <EvidenceRow label="Retrieval" value={evidence.retrieval_mode} />
         <EvidenceRow label="Fallback" value={evidence.fallback_used ? evidence.fallback_reason_code || evidence.fallback_reason || "yes" : "no"} />
-        <EvidenceRow label="Scope" value={`${evidence.source_scope_mode} (${evidence.effective_source_count} selected, ${evidence.excluded_source_count} excluded, ${evidence.invalid_source_count} invalid)`} />
+        <EvidenceRow label="Scope" value={evidence.source_scope_mode === "none" && evidence.index_status === "scope-none (source counts unavailable)" ? "none (retrieval off)" : `${evidence.source_scope_mode} (${evidence.effective_source_count} selected, ${evidence.excluded_source_count} excluded, ${evidence.invalid_source_count} invalid)`} />
         <EvidenceRow label="Invalid scope IDs" value={`${evidence.invalid_source_ids.length} recorded`} />
         <EvidenceRow label="Requested source IDs" value={`${evidence.requested_source_ids.length} recorded`} />
         <EvidenceRow label="Selected source IDs" value={`${evidence.selected_source_ids.length} recorded`} />
-        <EvidenceRow label="Excluded source IDs" value={`${evidence.excluded_source_ids.length} recorded`} />
+        <EvidenceRow label="Excluded source IDs" value={evidence.source_scope_mode === "none" && evidence.index_status === "scope-none (source counts unavailable)" ? "not recorded while retrieval is off" : `${evidence.excluded_source_ids.length} recorded`} />
         <EvidenceRow label="Context" value={`${evidence.context_passage_count} passages, preserved: ${evidence.source_scope_preserved ? "yes" : "no"}`} />
         <EvidenceRow label="Citations" value={`${evidence.citation_valid_count} valid, ${evidence.citation_invalid_count} filtered`} />
         {(evidence.citation_filter_reasons ?? []).length > 0 && (
@@ -982,7 +982,7 @@ export function EvidenceDrawer({ id, evidence }: { id: string; evidence: ChatEvi
       )}
       {(evidence.requested_source_ids.length > 0 || evidence.effective_source_ids.length > 0 || evidence.excluded_source_ids.length > 0 || evidence.invalid_source_ids.length > 0) && (
         <p className="mt-2 text-text-muted">
-          Source scope: {evidence.effective_source_count} effective, {evidence.excluded_source_count} excluded, {evidence.invalid_source_count} invalid
+          Source scope: {evidence.source_scope_mode === "none" && evidence.index_status === "scope-none (source counts unavailable)" ? "retrieval off; source counts unavailable" : `${evidence.effective_source_count} effective, ${evidence.excluded_source_count} excluded, ${evidence.invalid_source_count} invalid`}
         </p>
       )}
       {(evidence.requested_source_ids.length > 0 || evidence.effective_source_ids.length > 0 || evidence.excluded_source_ids.length > 0 || evidence.invalid_source_ids.length > 0) && (

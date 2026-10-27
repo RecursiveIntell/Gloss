@@ -5,6 +5,8 @@ import base64
 import copy
 import importlib.util
 import json
+import os
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -133,7 +135,19 @@ class DesktopReceiptTests(unittest.TestCase):
         self.assert_rejected("needs runtime_log")
 
     def test_shared_source_helper_imports_without_ambient_pythonpath(self):
-        source = smoke._source_identity(Path(__file__).resolve().parents[2])
+        # The helper requires a Git owner, but the test suite also runs from
+        # exported source archives. Use an actual disposable repository fixture.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "proof.txt").write_text("source identity fixture\n")
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+            for args in [
+                ["git", "init", "-q"], ["git", "add", "proof.txt"],
+                ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                 "commit", "-q", "-m", "Disposable source fixture"],
+            ]:
+                subprocess.run(args, cwd=repo, env=env, check=True, capture_output=True)
+            source = smoke._source_identity(repo)
         self.assertEqual(source["schema"], "GlossSourceSnapshotV1")
         self.assertIn("source_sha256", source)
 

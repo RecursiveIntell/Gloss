@@ -843,41 +843,90 @@ pub(crate) fn semantic_memory_runtime_config_from_state(
 fn semantic_memory_runtime_config_from_app_db(
     app_db: &crate::db::app_db::AppDb,
 ) -> Result<semantic_memory_adapter::SemanticMemoryRuntimeConfig, GlossError> {
-    let embedding_url = app_db.get_setting("semantic_memory_embedding_url")?;
-    // Mirror provider LAN policy for embedding endpoints.
-    // Embedding URL must be loopback (or LAN with opt-in); public/cloud rejected.
-    let embedding_provider = app_db.get_setting("semantic_memory_embedding_provider")?;
-    if embedding_provider
-        .as_deref()
-        .map(|p| p != "fastembed")
-        .unwrap_or(true)
-    {
-        if let Some(ref url) = embedding_url {
-            if !url.trim().is_empty() {
-                let allow_lan = crate::providers::lan_local_providers_allowed(app_db);
-                let _receipt = crate::providers::validate_embedding_url(url, allow_lan)?;
-            }
-        }
-    }
+    // Match native ingestion's single settings snapshot and strict parser.
+    let settings = app_db.get_settings()?;
     let config = semantic_memory_adapter::runtime_config_from_settings(
-        embedding_provider,
-        embedding_url,
-        app_db.get_setting("semantic_memory_embedding_model")?,
-        app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
-        crate::providers::lan_local_providers_allowed(app_db),
-        crate::commands::chat::setting_is_enabled(
-            app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
-        ),
+        settings.get("semantic_memory_embedding_provider").cloned(),
+        settings.get("semantic_memory_embedding_url").cloned(),
+        settings.get("semantic_memory_embedding_model").cloned(),
+        settings
+            .get("semantic_memory_embedding_timeout_secs")
+            .cloned(),
+        settings
+            .get("allow_lan_local_providers")
+            .map(String::as_str)
+            == Some("true"),
+        settings
+            .get(features::FASTEMBED_DOWNLOAD_CONSENT)
+            .map(String::as_str)
+            == Some("true"),
         features::turbo_quant_requested(app_db)?,
         crate::commands::chat::setting_is_enabled(
-            app_db.get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
+            settings
+                .get(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)
+                .cloned(),
         ),
         crate::commands::chat::setting_is_enabled(
-            app_db.get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?,
+            settings
+                .get(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)
+                .cloned(),
         ),
-    );
+    )?;
     semantic_memory_adapter::validate_embedding_model_role(&config)?;
     Ok(config)
+}
+
+#[cfg(feature = "semantic-memory-backend")]
+fn semantic_memory_projection_receipt_error(
+    receipt: &crate::memory::IndexSourceReceipt,
+) -> Option<String> {
+    if receipt.error.is_none()
+        && matches!(receipt.sync_status.as_str(), "synced" | "skipped_no_chunks")
+    {
+        None
+    } else {
+        Some(receipt.error.clone().unwrap_or_else(|| {
+            format!(
+                "Semantic-memory projection ended with status {} after indexing {} chunks",
+                receipt.sync_status, receipt.indexed_chunks,
+            )
+        }))
+    }
+}
+
+#[cfg(feature = "semantic-memory-backend")]
+#[derive(Default)]
+struct SemanticMemoryBackfillProgress {
+    projected_sources: usize,
+    skipped_no_chunks: usize,
+    failed_sources: usize,
+    projected_chunks: usize,
+    errors: Vec<SemanticMemorySourceProjectionError>,
+}
+
+#[cfg(feature = "semantic-memory-backend")]
+impl SemanticMemoryBackfillProgress {
+    fn record_projection(&mut self, source: &Source, receipt: &crate::memory::IndexSourceReceipt) {
+        // Partial projection still wrote these chunks. Count that work without
+        // counting the source as fully projected.
+        self.projected_chunks += receipt.indexed_chunks;
+        if let Some(error) = semantic_memory_projection_receipt_error(receipt) {
+            self.record_failure(source, error);
+        } else if receipt.sync_status == "skipped_no_chunks" {
+            self.skipped_no_chunks += 1;
+        } else {
+            self.projected_sources += 1;
+        }
+    }
+
+    fn record_failure(&mut self, source: &Source, error: String) {
+        self.failed_sources += 1;
+        self.errors.push(SemanticMemorySourceProjectionError {
+            source_id: source.id.clone(),
+            title: source.title.clone(),
+            error,
+        });
+    }
 }
 
 #[cfg(feature = "semantic-memory-backend")]
@@ -920,6 +969,8 @@ fn maybe_auto_project_semantic_memory(
     );
     let receipt_id = uuid::Uuid::new_v4().to_string();
     let db_path = state.notebook_db_path(notebook_id)?;
+    let publication = state
+        .semantic_memory_publication_fence(notebook_id, runtime_config.embedding_identity()?)?;
     // Bound the projection so a stuck embed/ingest (or a hung Ollama call)
     // cannot freeze the folder-import loop indefinitely. This ran unbounded
     // and was observed holding a source at "projecting" for minutes with 16
@@ -929,6 +980,7 @@ fn maybe_auto_project_semantic_memory(
         tokio::time::timeout(
             std::time::Duration::from_secs(SEMANTIC_MEMORY_PROJECTION_TIMEOUT_SECS),
             semantic_memory_adapter::reindex_source(
+                &publication,
                 &state.data_dir,
                 notebook_id,
                 &db_path,
@@ -947,14 +999,25 @@ fn maybe_auto_project_semantic_memory(
     }) {
         Ok(receipt) => {
             let message = serde_json::to_string(&receipt).ok();
+            let failure = semantic_memory_projection_receipt_error(&receipt);
+            let event_status = if failure.is_some() {
+                "semantic_memory_error"
+            } else if receipt.sync_status == "skipped_no_chunks" {
+                "semantic_memory_skipped_no_chunks"
+            } else {
+                "semantic_memory_synced"
+            };
             emit_status(
                 app_handle,
                 notebook_id,
                 source_id,
-                "semantic_memory_synced",
+                event_status,
                 message.as_deref(),
             );
-            Ok(())
+            match failure {
+                Some(error) => Err(GlossError::Search(error)),
+                None => Ok(()),
+            }
         }
         Err(error) => {
             let message = error.to_string();
@@ -1166,8 +1229,9 @@ fn vector_artifact_receipt_fields(
     (receipt_id, generation_id, manifest_digest)
 }
 
+#[cfg(feature = "semantic-memory-backend")]
 fn record_vector_artifact_receipt(
-    state: &AppState,
+    publication: &crate::settings_contract::EmbeddingPublicationFence<'_>,
     notebook_id: &str,
     receipt: &serde_json::Value,
 ) -> Result<(), GlossError> {
@@ -1179,7 +1243,7 @@ fn record_vector_artifact_receipt(
         .unwrap_or("ok");
     let raw_receipt_json =
         serde_json::to_string(receipt).map_err(|error| GlossError::Other(error.to_string()))?;
-    state.with_notebook_db_write(notebook_id, |db| {
+    publication.with_transaction(|db| {
         db.conn().execute(
             "INSERT OR REPLACE INTO semantic_memory_vector_artifact_receipts
              (receipt_id, notebook_id, generation_id, artifact_manifest_digest, raw_receipt_json, status, recorded_at)
@@ -4771,7 +4835,12 @@ pub async fn semantic_memory_reindex_source(
             crate::ingestion::native_gates::acquire(&state.gpu_gate, &state.llm_gate).await?;
         let db_path = state.notebook_db_path(&notebook_id)?;
         let runtime_config = semantic_memory_runtime_config_from_state(&state)?;
+        let publication = state.semantic_memory_publication_fence(
+            &notebook_id,
+            runtime_config.embedding_identity()?,
+        )?;
         semantic_memory_adapter::reindex_source(
+            &publication,
             &state.data_dir,
             &notebook_id,
             &db_path,
@@ -4818,15 +4887,15 @@ pub async fn semantic_memory_backfill_notebook(
             crate::ingestion::native_gates::acquire(&state.gpu_gate, &state.llm_gate).await?;
         let sources = state.with_notebook_db(&notebook_id, |db| db.list_sources())?;
         let runtime_config = semantic_memory_runtime_config_from_state(&state)?;
+        let publication = state.semantic_memory_publication_fence(
+            &notebook_id,
+            runtime_config.embedding_identity()?,
+        )?;
         let db_path = state.notebook_db_path(&notebook_id)?;
         let receipt_id = uuid::Uuid::new_v4().to_string();
-        let mut projected_sources = 0usize;
-        let mut skipped_no_chunks = 0usize;
-        let mut failed_sources = 0usize;
+        let mut progress = SemanticMemoryBackfillProgress::default();
         let mut chunk_bearing_sources = 0usize;
         let mut total_chunks = 0usize;
-        let mut projected_chunks = 0usize;
-        let mut errors = Vec::new();
 
         for source in &sources {
             let chunk_count = state.with_notebook_db(&notebook_id, |db| {
@@ -4839,13 +4908,14 @@ pub async fn semantic_memory_backfill_notebook(
             }
 
             match semantic_memory_adapter::reindex_source_with_options(
+                &publication,
                 &state.data_dir,
                 &notebook_id,
                 &db_path,
                 &source.id,
-                Some(uuid::Uuid::new_v4().to_string()),
                 Some(runtime_config.clone()),
                 semantic_memory_adapter::ReindexSourceOptions {
+                    trace_id: Some(uuid::Uuid::new_v4().to_string()),
                     rebuild_vector_artifacts: false,
                     classify_zero_chunks_as_skip: true,
                 },
@@ -4853,25 +4923,16 @@ pub async fn semantic_memory_backfill_notebook(
             .await
             {
                 Ok(receipt) => {
-                    if receipt.sync_status == "skipped_no_chunks" {
-                        skipped_no_chunks += 1;
-                    } else if receipt.sync_status == "synced" {
-                        projected_sources += 1;
-                        projected_chunks += receipt.indexed_chunks;
-                    }
+                    progress.record_projection(source, &receipt);
                 }
                 Err(error) => {
-                    failed_sources += 1;
-                    errors.push(SemanticMemorySourceProjectionError {
-                        source_id: source.id.clone(),
-                        title: source.title.clone(),
-                        error: error.to_string(),
-                    });
+                    progress.record_failure(source, error.to_string());
                 }
             }
         }
 
         let vector_artifact_receipt = if runtime_config.turbo_quant_enabled {
+            publication.with_notebook(|_| Ok(()))?;
             semantic_memory_adapter::rebuild_vector_artifacts(
                 &state.data_dir,
                 &notebook_id,
@@ -4882,7 +4943,7 @@ pub async fn semantic_memory_backfill_notebook(
             None
         };
         if let Some(receipt) = vector_artifact_receipt.as_ref() {
-            record_vector_artifact_receipt(&state, &notebook_id, receipt)?;
+            record_vector_artifact_receipt(&publication, &notebook_id, receipt)?;
         }
         let projection_summary = state.with_notebook_db(&notebook_id, |db| {
             let resolved = SourceScope::All.resolve(&sources);
@@ -4894,13 +4955,13 @@ pub async fn semantic_memory_backfill_notebook(
             receipt_id,
             total_sources: sources.len(),
             chunk_bearing_sources,
-            projected_sources,
-            skipped_no_chunks,
-            failed_sources,
+            projected_sources: progress.projected_sources,
+            skipped_no_chunks: progress.skipped_no_chunks,
+            failed_sources: progress.failed_sources,
             stale_sources: projection_summary.stale_sources,
             total_chunks,
-            projected_chunks,
-            errors,
+            projected_chunks: progress.projected_chunks,
+            errors: progress.errors,
             vector_artifact_receipt,
             projection_summary,
         })
@@ -4917,6 +4978,11 @@ pub async fn semantic_memory_rebuild_vector_artifacts(
         let _inference =
             crate::ingestion::native_gates::acquire(&state.gpu_gate, &state.llm_gate).await?;
         let mut runtime_config = semantic_memory_runtime_config_from_state(&state)?;
+        let publication = state.semantic_memory_publication_fence(
+            &notebook_id,
+            runtime_config.embedding_identity()?,
+        )?;
+        publication.with_notebook(|_| Ok(()))?;
         runtime_config.turbo_quant_enabled = true;
         let receipt = semantic_memory_adapter::rebuild_vector_artifacts(
             &state.data_dir,
@@ -4925,7 +4991,7 @@ pub async fn semantic_memory_rebuild_vector_artifacts(
         )
         .await?;
         if let Some(receipt_value) = receipt.as_ref() {
-            record_vector_artifact_receipt(&state, &notebook_id, receipt_value)?;
+            record_vector_artifact_receipt(&publication, &notebook_id, receipt_value)?;
         }
         Ok(receipt)
     }
@@ -5038,31 +5104,7 @@ async fn compare_memory_backends(
 
     let db_path = state.notebook_db_path(&notebook_id)?;
     #[cfg(feature = "semantic-memory-backend")]
-    let semantic_runtime_config = {
-        let app_db = state
-            .app_db
-            .lock()
-            .map_err(|e| GlossError::Other(e.to_string()))?;
-        features::require_semantic_memory_preview_enabled(&app_db)?;
-        semantic_memory_adapter::runtime_config_from_settings(
-            app_db.get_setting("semantic_memory_embedding_provider")?,
-            app_db.get_setting("semantic_memory_embedding_url")?,
-            app_db.get_setting("semantic_memory_embedding_model")?,
-            app_db.get_setting("semantic_memory_embedding_timeout_secs")?,
-            crate::providers::lan_local_providers_allowed(&app_db),
-            crate::commands::chat::setting_is_enabled(
-                app_db.get_setting(features::FASTEMBED_DOWNLOAD_CONSENT)?,
-            ),
-            features::turbo_quant_requested(&app_db)?,
-            crate::commands::chat::setting_is_enabled(
-                app_db
-                    .get_setting(features::SEMANTIC_MEMORY_TURBO_QUANT_REQUIRE_FRESH_ARTIFACTS)?,
-            ),
-            crate::commands::chat::setting_is_enabled(
-                app_db.get_setting(features::SEMANTIC_MEMORY_PROVEKV_POOL_CANDIDATES_ENABLED)?,
-            ),
-        )
-    };
+    let semantic_runtime_config = semantic_memory_runtime_config_from_state(&state)?;
     let (
         all_sources,
         local_backend_result,
@@ -5119,6 +5161,98 @@ mod tests {
     use std::time::Duration;
     use tauri_queue::{QueueConfig, QueueManager};
     use tempfile::TempDir;
+
+    #[cfg(feature = "semantic-memory-backend")]
+    #[test]
+    fn incomplete_projection_receipts_are_not_successful_completion() {
+        let mut receipt = crate::memory::IndexSourceReceipt {
+            backend_id: "semantic-memory-preview".into(),
+            notebook_id: "notebook-fixture".into(),
+            source_id: "source-fixture".into(),
+            receipt_id: "receipt-fixture".into(),
+            indexed_chunks: 2,
+            sync_status: "synced".into(),
+            error: None,
+            vector_artifact_receipt: None,
+        };
+        assert!(semantic_memory_projection_receipt_error(&receipt).is_none());
+        receipt.sync_status = "skipped_no_chunks".into();
+        assert!(semantic_memory_projection_receipt_error(&receipt).is_none());
+        for status in ["partial", "failed", "projecting", "unknown"] {
+            receipt.sync_status = status.into();
+            assert!(
+                semantic_memory_projection_receipt_error(&receipt).is_some(),
+                "{status}"
+            );
+        }
+        receipt.sync_status = "synced".into();
+        receipt.error = Some("fixture projection error".into());
+        assert_eq!(
+            semantic_memory_projection_receipt_error(&receipt).as_deref(),
+            Some("fixture projection error")
+        );
+    }
+
+    #[cfg(feature = "semantic-memory-backend")]
+    #[test]
+    fn backfill_accounts_for_partial_failed_and_skipped_receipts() {
+        let source = ready_source("source-fixture");
+        let mut progress = SemanticMemoryBackfillProgress::default();
+        let mut receipt = crate::memory::IndexSourceReceipt {
+            backend_id: "semantic-memory-preview".into(),
+            notebook_id: "notebook-fixture".into(),
+            source_id: source.id.clone(),
+            receipt_id: "receipt-fixture".into(),
+            indexed_chunks: 2,
+            sync_status: "synced".into(),
+            error: None,
+            vector_artifact_receipt: None,
+        };
+        progress.record_projection(&source, &receipt);
+        receipt.sync_status = "partial".into();
+        receipt.indexed_chunks = 1;
+        receipt.error = Some("one fixture chunk failed".into());
+        progress.record_projection(&source, &receipt);
+        receipt.sync_status = "failed".into();
+        receipt.indexed_chunks = 0;
+        progress.record_projection(&source, &receipt);
+        receipt.sync_status = "skipped_no_chunks".into();
+        receipt.error = None;
+        progress.record_projection(&source, &receipt);
+        progress.record_failure(&source, "fixture transport failed".into());
+
+        assert_eq!(progress.projected_sources, 1);
+        assert_eq!(progress.skipped_no_chunks, 1);
+        assert_eq!(progress.failed_sources, 3);
+        assert_eq!(progress.projected_chunks, 3);
+        assert_eq!(progress.errors.len(), 3);
+        assert!(progress
+            .errors
+            .iter()
+            .all(|error| error.source_id == source.id));
+        assert_eq!(progress.errors[0].error, "one fixture chunk failed");
+    }
+
+    #[cfg(feature = "semantic-memory-backend")]
+    #[test]
+    fn source_projection_download_consent_matches_native_exact_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AppDb::open(&dir.path().join("app.db")).unwrap();
+        db.set_setting("semantic_memory_embedding_provider", "native")
+            .unwrap();
+        for value in ["true", "false", "yes", "1", "TRUE"] {
+            db.set_setting(features::FASTEMBED_DOWNLOAD_CONSENT, value)
+                .unwrap();
+            let native =
+                crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&db).unwrap();
+            let projection = semantic_memory_runtime_config_from_app_db(&db).unwrap();
+            assert_eq!(native.download_consent, value == "true");
+            assert_eq!(
+                projection.fastembed_download_consent,
+                native.download_consent
+            );
+        }
+    }
 
     fn build_state() -> (TempDir, AppState, String) {
         let dir = tempfile::tempdir().unwrap();

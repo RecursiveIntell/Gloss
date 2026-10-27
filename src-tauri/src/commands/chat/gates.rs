@@ -15,6 +15,110 @@ pub(crate) fn gate_owner_for(
         .find(|owner| owner.gate == gate_name)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauri::Manager;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn gate_wait_preserves_notebook_timeout_closed_and_pre_cancelled_reasons() {
+        let data_dir = tempfile::tempdir().expect("temporary chat gate state");
+        let state = AppState::initialize_for_test(data_dir.path()).expect("test app state");
+        state.set_active_notebook(Some("notebook".to_string()), Some(7));
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state = app.state::<AppState>();
+        let gate = tokio::sync::Semaphore::new(1);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = acquire_gate_with_epoch(
+            app.handle(),
+            &state,
+            "notebook",
+            "conversation",
+            "pre-cancelled",
+            7,
+            &cancellation,
+            &gate,
+            Duration::from_secs(120),
+            "GPU gate",
+        )
+        .await
+        .expect("pre-cancelled gate wait has a cancellation result");
+        assert!(result.is_none());
+        assert_eq!(gate.available_permits(), 1);
+        assert!(state.gate_owners_snapshot().is_empty());
+        assert!(state
+            .chat_events_since("notebook", "conversation", None)
+            .iter()
+            .any(|event| event.payload["message"] == "Chat cancelled by user request"));
+
+        let cancellation = CancellationToken::new();
+        let result = acquire_gate_with_epoch(
+            app.handle(),
+            &state,
+            "notebook",
+            "conversation",
+            "notebook-switched",
+            6,
+            &cancellation,
+            &gate,
+            Duration::from_secs(120),
+            "GPU gate",
+        )
+        .await
+        .expect("stale notebook epoch has a cancellation result");
+        assert!(result.is_none());
+        assert!(state
+            .chat_events_since("notebook", "conversation", None)
+            .iter()
+            .any(|event| event.payload["message"] == "Chat cancelled by notebook switch"));
+
+        let held = gate.acquire().await.expect("held fixture permit");
+        let error = acquire_gate_with_epoch(
+            app.handle(),
+            &state,
+            "notebook",
+            "conversation",
+            "timeout",
+            7,
+            &cancellation,
+            &gate,
+            Duration::ZERO,
+            "GPU gate",
+        )
+        .await
+        .expect_err("held gate must time out at its deadline");
+        assert!(error
+            .to_string()
+            .contains("Timed out waiting for GPU gate."));
+        assert!(state
+            .chat_events_since("notebook", "conversation", None)
+            .iter()
+            .any(|event| event.payload["phase"] == "gate_timeout"));
+        gate.close();
+        let error = acquire_gate_with_epoch(
+            app.handle(),
+            &state,
+            "notebook",
+            "conversation",
+            "closed",
+            7,
+            &cancellation,
+            &gate,
+            Duration::from_secs(120),
+            "GPU gate",
+        )
+        .await
+        .expect_err("closed gate must retain its closed error");
+        assert!(error.to_string().contains("GPU gate closed"));
+        assert!(!cancellation.is_cancelled());
+        drop(held);
+        assert!(state.gate_owners_snapshot().is_empty());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn acquire_gate_with_epoch<'a, R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
@@ -23,6 +127,7 @@ pub(crate) async fn acquire_gate_with_epoch<'a, R: tauri::Runtime>(
     conversation_id: &str,
     message_id: &str,
     epoch: u64,
+    cancellation: &tokio_util::sync::CancellationToken,
     gate: &'a tokio::sync::Semaphore,
     timeout: Duration,
     gate_name: &str,
@@ -49,14 +154,19 @@ pub(crate) async fn acquire_gate_with_epoch<'a, R: tauri::Runtime>(
     );
 
     loop {
-        if !state.is_active_notebook_epoch(notebook_id, epoch) {
+        let notebook_changed = !state.is_active_notebook_epoch(notebook_id, epoch);
+        if notebook_changed || cancellation.is_cancelled() {
             emit_chat_status(
                 app_handle,
                 notebook_id,
                 conversation_id,
                 message_id,
                 "cancelled",
-                "Chat cancelled by notebook switch",
+                if notebook_changed {
+                    "Chat cancelled by notebook switch"
+                } else {
+                    "Chat cancelled by user request"
+                },
                 None,
                 None,
                 Some(gate_name),
@@ -136,7 +246,11 @@ pub(crate) async fn acquire_gate_with_epoch<'a, R: tauri::Runtime>(
                     );
                     last_wait_status = Instant::now();
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                }
             }
             Err(TryAcquireError::Closed) => {
                 return Err(GlossError::Other(format!("{gate_name} closed")));

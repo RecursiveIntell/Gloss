@@ -765,7 +765,7 @@ export interface NotebookStats {
 }
 
 export interface EmbeddingModelPayload {
-  state: "downloading" | "ready";
+  state: "downloading" | "loading" | "error" | "ready";
   message: string;
 }
 

@@ -1,6 +1,88 @@
 //! Validation and atomic persistence for operator settings.
 use crate::{db::app_db::AppDb, error::GlossError, providers};
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
+
+/// Admission for one embedding configuration and one canonical notebook owner.
+/// The mutex is held only for synchronous projection publication, never inference.
+pub(crate) struct EmbeddingPublicationFence<'a> {
+    app_db: &'a Mutex<AppDb>,
+    notebook_id: String,
+    pool: Arc<crate::db::notebook_pool::NotebookDbPool>,
+    expected: crate::ingestion::embedding_contract::NativeEmbeddingConfig,
+}
+
+impl<'a> EmbeddingPublicationFence<'a> {
+    pub(crate) fn new(
+        app_db: &'a Mutex<AppDb>,
+        notebook_id: &str,
+        pool: Arc<crate::db::notebook_pool::NotebookDbPool>,
+        expected: crate::ingestion::embedding_contract::NativeEmbeddingConfig,
+    ) -> Self {
+        Self {
+            app_db,
+            notebook_id: notebook_id.to_string(),
+            pool,
+            expected,
+        }
+    }
+
+    pub(crate) fn expected(&self) -> &crate::ingestion::embedding_contract::NativeEmbeddingConfig {
+        &self.expected
+    }
+
+    pub(crate) fn validate_scope(
+        &self,
+        notebook_id: &str,
+        path: &std::path::Path,
+    ) -> Result<(), GlossError> {
+        if notebook_id != self.notebook_id || path != self.pool.db_path() {
+            return Err(GlossError::Config(
+                "Projection scope differs from its canonical notebook owner".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_notebook<F, T>(&self, publish: F) -> Result<T, GlossError>
+    where
+        F: FnOnce(&crate::db::notebook_db::NotebookDb) -> Result<T, GlossError>,
+    {
+        let app_db = self
+            .app_db
+            .lock()
+            .map_err(|error| GlossError::Other(error.to_string()))?;
+        let current = crate::ingestion::embedding_contract::NativeEmbeddingConfig::read(&app_db)?;
+        if current != self.expected {
+            return Err(GlossError::Embedding(
+                "embedding-configuration-changed: projection publication refused; retry with current settings".into(),
+            ));
+        }
+        let notebook = app_db.get_notebook(&self.notebook_id)?;
+        let canonical_path = std::path::PathBuf::from(notebook.directory).join("notebook.db");
+        if canonical_path != self.pool.db_path() {
+            return Err(GlossError::Config(
+                "Notebook ownership changed during projection; publication refused".into(),
+            ));
+        }
+        // Keep app_db locked through the canonical writer. The settings updater
+        // takes this same order, so it either invalidates after publication or
+        // changes configuration first and makes this publication fail closed.
+        self.pool.write(publish)
+    }
+
+    pub(crate) fn with_transaction<F, T>(&self, publish: F) -> Result<T, GlossError>
+    where
+        F: FnOnce(&crate::db::notebook_db::NotebookDb) -> Result<T, GlossError>,
+    {
+        self.with_notebook(|db| {
+            let transaction = db.conn().unchecked_transaction()?;
+            let result = publish(db)?;
+            transaction.commit()?;
+            Ok(result)
+        })
+    }
+}
 
 pub const DEFAULT_SEMANTIC_SEARCH_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_SEMANTIC_SEARCH_TIMEOUT_MS: u64 = 305_000;
@@ -517,5 +599,228 @@ mod timeout_boundary_tests {
             chunk_target_tokens: 1100,
         };
         save_embedding_settings(&db, &settings).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod publication_fence_tests {
+    use super::*;
+    use crate::db::{
+        notebook_db::{EmbeddingIndexMetadata, SEMANTIC_MEMORY_INDEX_ID},
+        notebook_pool::NotebookDbPool,
+    };
+    use crate::ingestion::embedding_contract::NativeEmbeddingConfig;
+
+    fn settings(model: &str) -> EmbeddingSettings {
+        EmbeddingSettings {
+            provider: "ollama".into(),
+            url: "http://localhost:11434".into(),
+            model: model.into(),
+            timeout_secs: 60,
+            download_consent: false,
+            search_timeout_ms: 65_000,
+            chunk_target_tokens: 1100,
+        }
+    }
+
+    fn fixture(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<Mutex<AppDb>>,
+        Arc<NotebookDbPool>,
+        NativeEmbeddingConfig,
+    ) {
+        let app = AppDb::open(&dir.join("app.db")).unwrap();
+        app.create_notebook("n1", "synthetic fence fixture", dir.to_str().unwrap())
+            .unwrap();
+        save_embedding_settings(&app, &settings("old-model")).unwrap();
+        let expected = NativeEmbeddingConfig::read(&app).unwrap();
+        let pool = Arc::new(NotebookDbPool::new(&dir.join("notebook.db")).unwrap());
+        pool.write(|db| db.upsert_embedding_index_metadata(&metadata("old-model", "building")))
+            .unwrap();
+        (Arc::new(Mutex::new(app)), pool, expected)
+    }
+
+    fn metadata(model: &str, status: &str) -> EmbeddingIndexMetadata {
+        let mut value = EmbeddingIndexMetadata::ready(
+            SEMANTIC_MEMORY_INDEX_ID,
+            "ollama",
+            model,
+            Some("synthetic-digest".into()),
+            3,
+        );
+        value.status = status.into();
+        value
+    }
+
+    #[test]
+    fn updater_first_refuses_old_building_links_and_ready_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, pool, expected) = fixture(dir.path());
+        let fence = EmbeddingPublicationFence::new(&app, "n1", pool.clone(), expected);
+        // Same actual settings/invalidation owners and lock order as Apply.
+        let config = app.lock().unwrap();
+        assert!(save_embedding_settings(&config, &settings("new-model")).unwrap());
+        pool.write(invalidate_existing_embedding_indexes).unwrap();
+        drop(config);
+        for status in ["building", "ready"] {
+            let called = std::cell::Cell::new(false);
+            let error = fence
+                .with_notebook(|db| {
+                    called.set(true);
+                    db.upsert_embedding_index_metadata(&metadata("old-model", status))
+                })
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("embedding-configuration-changed"));
+            assert!(
+                !called.get(),
+                "a stale mapping/status callback must never run"
+            );
+        }
+        pool.read(|db| {
+            let row = db
+                .embedding_index_metadata(SEMANTIC_MEMORY_INDEX_ID)?
+                .unwrap();
+            assert_eq!(row.status, "stale");
+            assert_eq!(row.model, "old-model");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn publication_first_is_followed_by_updater_invalidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, pool, expected) = fixture(dir.path());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let publisher_app = Arc::clone(&app);
+        let publisher_pool = Arc::clone(&pool);
+        let publisher = std::thread::spawn(move || {
+            EmbeddingPublicationFence::new(&publisher_app, "n1", publisher_pool, expected)
+                .with_transaction(|db| {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap();
+                    db.upsert_embedding_index_metadata(&metadata("old-model", "ready"))
+                })
+                .unwrap();
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            matches!(app.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+            "publication must retain the real settings owner"
+        );
+        let updater_app = Arc::clone(&app);
+        let updater_pool = Arc::clone(&pool);
+        let updater = std::thread::spawn(move || {
+            let config = updater_app.lock().unwrap();
+            assert!(save_embedding_settings(&config, &settings("new-model")).unwrap());
+            updater_pool
+                .write(invalidate_existing_embedding_indexes)
+                .unwrap();
+        });
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap();
+        updater.join().unwrap();
+        pool.read(|db| {
+            assert_eq!(
+                db.embedding_index_metadata(SEMANTIC_MEMORY_INDEX_ID)?
+                    .unwrap()
+                    .status,
+                "stale"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn complete_configuration_and_registry_owner_are_checked() {
+        for (key, value) in [
+            ("semantic_memory_embedding_provider", "native"),
+            ("semantic_memory_embedding_url", "http://localhost:12345"),
+            ("semantic_memory_embedding_model", "replacement"),
+            ("semantic_memory_embedding_timeout_secs", "90"),
+            ("allow_lan_local_providers", "true"),
+            ("fastembed_download_consent", "true"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (app, pool, expected) = fixture(dir.path());
+            let fence = EmbeddingPublicationFence::new(&app, "n1", pool, expected);
+            app.lock().unwrap().set_setting(key, value).unwrap();
+            assert!(fence
+                .with_notebook::<_, ()>(|_| panic!("stale authority ran callback: {key}"))
+                .is_err());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (app, pool, expected) = fixture(dir.path());
+        let fence = EmbeddingPublicationFence::new(&app, "n1", pool, expected);
+        assert!(fence
+            .validate_scope("other-notebook", &dir.path().join("notebook.db"))
+            .is_err());
+        assert!(fence
+            .validate_scope("n1", &dir.path().join("other.db"))
+            .is_err());
+        app.lock()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE notebooks SET directory = ?1 WHERE id = 'n1'",
+                [dir.path().join("other").to_str().unwrap()],
+            )
+            .unwrap();
+        assert!(fence
+            .with_notebook::<_, ()>(|_| panic!("retired notebook writer admitted"))
+            .is_err());
+    }
+
+    #[test]
+    fn final_publication_transaction_rolls_back_on_metadata_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, pool, expected) = fixture(dir.path());
+        let fence = EmbeddingPublicationFence::new(&app, "n1", pool.clone(), expected);
+        pool.write(|db| { db.conn().execute_batch("CREATE TABLE publication_observer(value TEXT); CREATE TRIGGER reject_ready BEFORE INSERT ON embedding_index_metadata WHEN NEW.status = 'ready' BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;")?; Ok(()) }).unwrap();
+        assert!(fence
+            .with_transaction(|db| {
+                db.conn()
+                    .execute("INSERT INTO publication_observer VALUES ('synced')", [])?;
+                db.upsert_embedding_index_metadata(&metadata("old-model", "ready"))
+            })
+            .is_err());
+        pool.read(|db| {
+            assert_eq!(
+                db.conn()
+                    .query_row("SELECT COUNT(*) FROM publication_observer", [], |r| r
+                        .get::<_, i64>(0))?,
+                0
+            );
+            assert_eq!(
+                db.embedding_index_metadata(SEMANTIC_MEMORY_INDEX_ID)?
+                    .unwrap()
+                    .status,
+                "building"
+            );
+            assert!(db.conn().is_autocommit());
+            Ok(())
+        })
+        .unwrap();
+        // Failed publication must not poison the canonical writer for retry.
+        fence
+            .with_notebook(|db| {
+                db.conn().execute_batch("DROP TRIGGER reject_ready")?;
+                Ok(())
+            })
+            .unwrap();
+        fence
+            .with_transaction(|db| {
+                db.upsert_embedding_index_metadata(&metadata("old-model", "ready"))
+            })
+            .unwrap();
     }
 }

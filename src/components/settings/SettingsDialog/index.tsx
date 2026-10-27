@@ -1,10 +1,11 @@
 import { useModalFocus } from "../../../lib/useModalFocus";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import { ChatTemperatureControl } from "./ChatTemperatureControl";
 import { useSettingsStore } from "../../../stores/settingsStore";
 import { useToastStore } from "../../../stores/toastStore";
 import { useNotebookStore } from "../../../stores/notebookStore";
+import { memoryHealthError, type MemoryHealthState } from "../../../stores/healthStore";
 import * as api from "../../../lib/tauri";
 import {
   canUseSemanticMemoryPreview,
@@ -338,9 +339,74 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   } = useSettingsStore();
   const activeNotebookId = useNotebookStore((s) => s.activeNotebookId);
   const [memoryStatus, setMemoryStatus] = useState<MemoryBackendStatus | null>(null);
+  const [memoryState, setMemoryState] = useState<MemoryHealthState>("checking");
+  const [memoryError, setMemoryError] = useState<string | null>(null);
   const [linkStatus, setLinkStatus] = useState<SemanticMemoryLinkStatus | null>(null);
   const [profileStatus, setProfileStatus] = useState<SemanticMemoryProfileStatus | null>(null);
   const [reindexingSemanticMemory, setReindexingSemanticMemory] = useState(false);
+  const memoryReadEpoch = useRef(0);
+  const memoryScope = useMemo(() => ({ notebookId: activeNotebookId, open }), [activeNotebookId, open]);
+  const currentMemoryScope = useRef<typeof memoryScope | null>(memoryScope);
+  useLayoutEffect(() => {
+    currentMemoryScope.current = memoryScope;
+    setMemoryStatus(null);
+    setMemoryState("checking");
+    setMemoryError(null);
+    setLinkStatus(null);
+    setProfileStatus(null);
+    setReindexingSemanticMemory(false);
+    return () => {
+      if (currentMemoryScope.current === memoryScope) currentMemoryScope.current = null;
+      ++memoryReadEpoch.current;
+    };
+  }, [memoryScope]);
+  const refreshMemoryEvidence = useCallback(async () => {
+    const ownsScope = () => memoryScope.open && currentMemoryScope.current === memoryScope;
+    // A retired action closure must not claim the current session's read epoch.
+    if (!ownsScope()) return false;
+    const requestEpoch = ++memoryReadEpoch.current;
+    const ownsRead = () => ownsScope() && requestEpoch === memoryReadEpoch.current;
+    setMemoryStatus(null);
+    setMemoryState("checking");
+    setMemoryError(null);
+    setLinkStatus(null);
+    setProfileStatus(null);
+    try {
+      const status = await api.memoryBackendStatus(memoryScope.notebookId);
+      if (!ownsRead()) return false;
+      setMemoryStatus(status);
+      setMemoryState("ready");
+    } catch (error) {
+      if (!ownsRead()) return false;
+      setMemoryStatus(null);
+      setMemoryState("unavailable");
+      setMemoryError(memoryHealthError(error));
+    }
+    if (!ownsRead()) return false;
+    if (!memoryScope.notebookId) return true;
+    try {
+      const links = await api.semanticMemoryLinkStatus(memoryScope.notebookId);
+      if (!ownsRead()) return false;
+      setLinkStatus(links);
+    } catch (error) {
+      if (!ownsRead()) return false;
+      console.warn("linkStatus failed:", error);
+      setLinkStatus(null);
+    }
+    // Do not start a profile read after this refresh's notebook/session retires
+    // or a newer refresh takes ownership of the evidence.
+    if (!ownsRead()) return false;
+    try {
+      const profile = await api.getSemanticMemoryProfileStatus(memoryScope.notebookId, { kind: "all" });
+      if (!ownsRead()) return false;
+      setProfileStatus(profile);
+    } catch (error) {
+      if (!ownsRead()) return false;
+      console.warn("profileStatus failed:", error);
+      setProfileStatus(null);
+    }
+    return true;
+  }, [memoryScope]);
   const [rebuildingTurboQuant, setRebuildingTurboQuant] = useState(false);
   const [runningRetrievalProbe, setRunningRetrievalProbe] = useState(false);
   const [repairingMemoryProfile, setRepairingMemoryProfile] = useState<string | null>(null);
@@ -416,18 +482,13 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
       loadModels();
       loadFeatureFlags();
       loadExternalTools();
-      api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch((err) => { console.warn("memoryBackendStatus failed:", err); setMemoryStatus(null); });
-      if (activeNotebookId) {
-        api.semanticMemoryLinkStatus(activeNotebookId).then(setLinkStatus).catch((err) => { console.warn("linkStatus failed:", err); setLinkStatus(null); });
-        api.getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" }).then(setProfileStatus).catch((err) => { console.warn("profileStatus failed:", err); setProfileStatus(null); });
-      } else {
-        setLinkStatus(null);
-        setProfileStatus(null);
-      }
+      void refreshMemoryEvidence();
     }
+    return () => { ++memoryReadEpoch.current; };
   }, [
     activeNotebookId,
     open,
+    refreshMemoryEvidence,
     loadSettings,
     loadProviders,
     loadModels,
@@ -542,31 +603,34 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     }
   };
 
-  const refreshMemoryEvidence = async () => {
-    await api.memoryBackendStatus(activeNotebookId).then(setMemoryStatus).catch((err) => { console.warn("memoryBackendStatus failed:", err); setMemoryStatus(null); });
-    if (activeNotebookId) {
-      await api.semanticMemoryLinkStatus(activeNotebookId).then(setLinkStatus).catch((err) => { console.warn("linkStatus failed:", err); setLinkStatus(null); });
-      await api.getSemanticMemoryProfileStatus(activeNotebookId, { kind: "all" }).then(setProfileStatus).catch((err) => { console.warn("profileStatus failed:", err); setProfileStatus(null); });
-    } else {
-      setLinkStatus(null);
-      setProfileStatus(null);
-    }
-  };
-
   const handleReindexSemanticMemoryNotebook = async () => {
-    if (!activeNotebookId) return;
+    const ownsScope = () => memoryScope.open && currentMemoryScope.current === memoryScope;
+    if (!memoryScope.notebookId || !ownsScope() || reindexingSemanticMemory) return;
     setReindexingSemanticMemory(true);
     try {
-      const receipt = await api.semanticMemoryBackfillNotebook(activeNotebookId);
-      await refreshMemoryEvidence();
+      const receipt = await api.semanticMemoryBackfillNotebook(memoryScope.notebookId);
+      if (!ownsScope()) return;
+      const evidenceRead = refreshMemoryEvidence();
+      const evidenceEpoch = memoryReadEpoch.current;
+      if (!(await evidenceRead) || !ownsScope() || evidenceEpoch !== memoryReadEpoch.current) return;
+      const incomplete = receipt.failed_sources > 0 || receipt.stale_sources > 0
+        || receipt.errors.length > 0 || receipt.projection_summary.partial_sources > 0
+        || receipt.projection_summary.projecting_sources > 0
+        || receipt.projection_summary.projection_required;
+      const sourceErrors = receipt.errors
+        .map(({ source_id, title, error }) => `${title} (${source_id}): ${error}`)
+        .join("; ");
       useToastStore.getState().addToast({
-        type: "success",
-        title: "Projection backfill complete",
-        message: `${receipt.projected_sources} projected, ${receipt.skipped_no_chunks} skipped, ${receipt.failed_sources} failed.`,
-        duration: 5000,
+        type: incomplete ? "warning" : "success",
+        title: incomplete ? "Projection backfill needs attention" : "Projection backfill complete",
+        message: `${receipt.projected_sources} fully projected, ${receipt.skipped_no_chunks} skipped, ${receipt.failed_sources} incomplete or failed, ${receipt.stale_sources} stale; ${receipt.projected_chunks} chunks projected.${sourceErrors ? ` ${sourceErrors}` : ""}`,
+        duration: incomplete ? 7000 : 5000,
       });
     } catch (error) {
-      await refreshMemoryEvidence();
+      if (!ownsScope()) return;
+      const evidenceRead = refreshMemoryEvidence();
+      const evidenceEpoch = memoryReadEpoch.current;
+      if (!(await evidenceRead) || !ownsScope() || evidenceEpoch !== memoryReadEpoch.current) return;
       useToastStore.getState().addToast({
         type: "error",
         title: "semantic-memory reindex failed",
@@ -574,7 +638,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
         duration: 7000,
       });
     } finally {
-      setReindexingSemanticMemory(false);
+      if (ownsScope()) setReindexingSemanticMemory(false);
     }
   };
 
@@ -1033,13 +1097,13 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
             <div className="grid gap-2 sm:grid-cols-2">
               <HealthCard
                 title="Memory"
-                status={memoryStatus?.backend_used ?? "gloss-local"}
+                status={memoryStatus ? `${memoryStatus.backend_used}${memoryStatus.available ? "" : " (unavailable)"}` : memoryState}
                 detail={
-                  memoryStatus?.backend_used !== memoryStatus?.active_backend
-                    ? `Requested ${memoryStatus?.active_backend}; fallback disclosed`
-                    : `Default ${memoryStatus?.default_backend ?? "gloss-local"}`
+                  memoryStatus
+                    ? `Requested ${memoryStatus.active_backend}; used ${memoryStatus.backend_used}${memoryStatus.backend_used !== memoryStatus.active_backend ? "; fallback disclosed" : ""}; default ${memoryStatus.default_backend}`
+                    : `Requested ${settings["memory_backend"] || "unknown"}; used unknown${memoryError ? `; ${memoryError}` : "; checking memory status"}`
                 }
-                tone={memoryStatus?.degraded ? "warning" : "success"}
+                tone={memoryState === "unavailable" ? "error" : !memoryStatus ? "neutral" : memoryStatus.degraded || !memoryStatus.available ? "warning" : "success"}
               />
               <HealthCard
                 title="Embedding / Index"
@@ -1047,7 +1111,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 detail={
                   linkStatus
                     ? `${linkStatus.synced_links}/${linkStatus.total_links} semantic links synced`
-                    : "Gloss local index remains available"
+                    : "Index availability not checked"
                 }
                 tone={
                   memoryStatus?.index_sync_status === "failed"

@@ -9,6 +9,13 @@ const fixture = vi.hoisted(() => ({ state: [] as unknown[], index: 0 }));
 vi.mock('react', async (importOriginal) => ({
   ...await importOriginal<typeof import('react')>(),
   useEffect: () => {},
+  useLayoutEffect: () => {},
+  useCallback: (callback: unknown) => callback,
+  useRef: (initial: unknown) => {
+    const index = fixture.index++;
+    if (!(index in fixture.state)) fixture.state[index] = { current: initial };
+    return fixture.state[index];
+  },
   useMemo: (factory: () => unknown) => factory(),
   useState: (initial: unknown) => {
     const index = fixture.index++;

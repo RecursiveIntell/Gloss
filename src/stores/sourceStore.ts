@@ -22,36 +22,17 @@ function selectionScopeMode(sources: Source[], selected: Set<string>): SourceSco
 }
 
 function buildSourceScope(
-  sources: Source[],
   selectedSourceIds: Set<string>,
-  sourceScopeMode: SourceScopeMode,
-  sourceListStatus: SourceListStatus,
-  stats: NotebookStats | null
+  sourceScopeMode: SourceScopeMode
 ): SourceScope {
   // When user explicitly selects no-retrieval, honour it regardless of source
   // list status so chat always works without retrieval.
   if (sourceScopeMode === 'none') {
     return { kind: 'none' };
   }
-  if (sourceScopeMode === 'explicit') {
-    // Preserve explicit intent even while the source list is loading or
-    // partial; silently converting it to none would change retrieval policy.
-    return { kind: 'explicit', ids: Array.from(selectedSourceIds) };
-  }
-  // When source list is degraded, do NOT silently downgrade an explicit
-  // retrieval request — pass it through so the backend can decide how to
-  // handle incomplete source data. Only fall back to 'none' when we have
-  // no source information at all (idle).
-  if (sourceListStatus === 'idle') {
-    return { kind: 'none' };
-  }
-  if (sources.length === 0) {
-    if (sourceListStatus === 'ready' && stats?.source_count && stats.source_count > 0) {
-      return { kind: 'none' };
-    }
-    return { kind: 'none' };
-  }
   if (sourceScopeMode === 'all') {
+    // Preserve declared intent even when this frontend inventory is empty
+    // or unavailable. The backend owns inventory and retrieval admission.
     return { kind: 'all' };
   }
   // Keep explicit intent intact. Filtering stale ids here would silently
@@ -390,14 +371,21 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
 
   reindexSource: async (notebookId, sourceId) => {
     try {
-      await api.semanticMemoryReindexSource(notebookId, sourceId);
+      const receipt = await api.semanticMemoryReindexSource(notebookId, sourceId);
       await get().loadSources(notebookId);
       await get().loadStats(notebookId);
+      const synced = receipt.sync_status === 'synced' && receipt.error == null;
+      const skipped = receipt.sync_status === 'skipped_no_chunks' && receipt.error == null;
+      const partial = receipt.sync_status === 'partial';
       useToastStore.getState().addToast({
-        type: 'success',
-        title: 'Reindex Complete',
-        message: 'Source projected to semantic-memory preview.',
-        duration: 3000,
+        type: synced ? 'success' : skipped ? 'info' : partial ? 'warning' : 'error',
+        title: synced ? 'Reindex Complete' : skipped ? 'Reindex Skipped' : partial ? 'Reindex Incomplete' : 'Reindex Failed',
+        message: synced
+          ? `${receipt.indexed_chunks} chunks projected to semantic-memory preview.`
+          : skipped
+            ? 'Source has no searchable chunks to project.'
+            : `${receipt.indexed_chunks} chunks projected; ${receipt.error || `projection status: ${receipt.sync_status}`}`,
+        duration: synced || skipped ? 4000 : 7000,
       });
     } catch (e) {
       useToastStore.getState().addToast({
@@ -414,11 +402,15 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
       const receipt = await api.semanticMemoryBackfillNotebook(notebookId);
       await get().loadSources(notebookId);
       await get().loadStats(notebookId);
+      const incomplete = receipt.failed_sources > 0 || receipt.stale_sources > 0
+        || receipt.errors.length > 0 || receipt.projection_summary.partial_sources > 0
+        || receipt.projection_summary.projecting_sources > 0
+        || receipt.projection_summary.projection_required;
       useToastStore.getState().addToast({
-        type: 'success',
-        title: 'Projection backfill complete',
-        message: `${receipt.projected_sources} projected, ${receipt.skipped_no_chunks} skipped, ${receipt.failed_sources} failed.`,
-        duration: 4000,
+        type: incomplete ? 'warning' : 'success',
+        title: incomplete ? 'Projection Backfill Needs Attention' : 'Projection Backfill Complete',
+        message: `${receipt.projected_sources} fully projected, ${receipt.skipped_no_chunks} skipped, ${receipt.failed_sources} incomplete or failed, ${receipt.stale_sources} stale; ${receipt.projected_chunks} chunks projected.`,
+        duration: incomplete ? 7000 : 4000,
       });
     } catch (e) {
       useToastStore.getState().addToast({
@@ -497,8 +489,8 @@ export const useSourceStore = create<SourceStore>((set, get) => ({
   },
 
   getSourceScope: () => {
-    const { sources, selectedSourceIds, sourceScopeMode, sourceListStatus, stats } = get();
-    return buildSourceScope(sources, selectedSourceIds, sourceScopeMode, sourceListStatus, stats);
+    const { selectedSourceIds, sourceScopeMode } = get();
+    return buildSourceScope(selectedSourceIds, sourceScopeMode);
   },
 
   markSourceListPartial: (expectedTotal) => {

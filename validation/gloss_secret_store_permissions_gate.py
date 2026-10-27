@@ -34,7 +34,9 @@ def main() -> int:
     checks = {
         "owner-only dir permissions": "set_owner_only_dir_permissions" in store and "0o700" in store,
         "owner-only file permissions": "set_owner_only_permissions" in store and "0o600" in store,
-        "tmp/data owner-only writer": "write_owner_only_file" in store and "open_owner_only_truncate" in store,
+        "tmp/data exclusive owner-only writer": "write_owner_only_file" in store and "open_owner_only_create_new(path)?" in store and ".create_new(true)" in store and ".truncate(true)" not in store,
+        "unique owned staging cleanup": "uuid::Uuid::new_v4()" in store and "impl Drop for PendingSecretFile" in store,
+        "serialized read-modify-commit": "fn secret_store_gate" in store and "let _guard = self.lock()?;" in store,
         "key create mode": "open_owner_only_create_new" in store,
         "existing key repair": "set_owner_only_permissions(&key_path)" in store,
         "existing data repair": "set_owner_only_permissions(&data_path)" in store,
@@ -52,9 +54,12 @@ def main() -> int:
         except Exception as exc:
             failures.append(f"invalid secret-store permission receipt JSON: {exc}")
             data = {}
+        if not isinstance(data, dict):
+            failures.append("secret-store permission receipt must be a JSON object")
+            data = {}
         if data.get("schema") != "SecretStorePermissionReceiptV1":
             failures.append("secret-store permission receipt schema mismatch")
-        if not data.get("unix_owner_only_permissions_active"):
+        if data.get("unix_owner_only_permissions_active") is not True:
             failures.append("secret-store receipt does not mark Unix owner-only permissions active")
 
     print(json.dumps({"ok": not failures, "failures": failures}, indent=2))

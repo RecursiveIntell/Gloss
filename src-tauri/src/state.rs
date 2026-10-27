@@ -1104,6 +1104,20 @@ impl AppState {
         Ok(self.notebook_db_pool(notebook_id)?.db_path().to_path_buf())
     }
 
+    #[cfg(feature = "semantic-memory-backend")]
+    pub(crate) fn semantic_memory_publication_fence(
+        &self,
+        notebook_id: &str,
+        expected: crate::ingestion::embedding_contract::NativeEmbeddingConfig,
+    ) -> Result<crate::settings_contract::EmbeddingPublicationFence<'_>, GlossError> {
+        Ok(crate::settings_contract::EmbeddingPublicationFence::new(
+            &self.app_db,
+            notebook_id,
+            self.notebook_db_pool(notebook_id)?,
+            expected,
+        ))
+    }
+
     /// Execute a function with a notebook database connection.
     /// Uses the connection pool: read operations use pooled read connections
     /// (concurrent readers via WAL mode), write operations use the single

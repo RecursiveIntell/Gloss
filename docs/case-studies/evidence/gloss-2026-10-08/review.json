@@ -1,0 +1,293 @@
+{
+  "schema": "GlossFocusedRegressionComparisonV1",
+  "recorded_utc": "2026-10-08T07:04:00.650367+00:00",
+  "repaired_revision": "5635f809487a1e0ac0afd5919ab93caac448c5b0",
+  "baseline_revision": "95d99220d107635a4a313c575ffd5306c0ffbee8",
+  "environment": {
+    "python": "3.12.14",
+    "node": "v24.19.0",
+    "npm": "11.9.0",
+    "vitest": "4.1.11",
+    "os": "Linux-6.18.44-x86_64-with-glibc2.39",
+    "ci_difference": "Node24.19.0/npm11.9.0 here; qualification CI used Node22. No native GUI/provider/package rerun."
+  },
+  "test_overlay_before": [
+    {
+      "path": "src/stores/__tests__/notebookStore.test.ts",
+      "sha256": "78f210b5ee74bc0dd80562d2c24f6a22665d01a059e29563c293d4c2239bfff2",
+      "identical_to_baseline_overlay": true,
+      "identical_to_committed_repair": true
+    },
+    {
+      "path": "src/stores/__tests__/conversationFreshness.test.ts",
+      "sha256": "dedaa4a1cc3824c7a74b6cb5d604ecfe752c973a471791a3b45ba90b4c26ec57",
+      "identical_to_baseline_overlay": true,
+      "identical_to_committed_repair": true
+    },
+    {
+      "path": "src/stores/__tests__/sourceStore.test.ts",
+      "sha256": "b7441c0b096bc89287222ff9cbf843d246e30be89c285da28dd276064f0c4a44",
+      "identical_to_baseline_overlay": true,
+      "identical_to_committed_repair": true
+    },
+    {
+      "path": "scripts/tests/test_native_click_readiness.py",
+      "sha256": "c3d4ec46770f8cdfa9c77605c4bbc0c41f6285308546aea173b923798f36c8eb",
+      "identical_to_baseline_overlay": true,
+      "identical_to_committed_repair": true
+    }
+  ],
+  "test_overlay_after": [
+    {
+      "path": "src/stores/__tests__/notebookStore.test.ts",
+      "sha256": "78f210b5ee74bc0dd80562d2c24f6a22665d01a059e29563c293d4c2239bfff2",
+      "identical_to_baseline_overlay": true,
+      "identical_to_committed_repair": true
+    },
+    {
+      "path": "src/stores/__tests__/conversationFreshness.test.ts",
+      "sha256": "dedaa4a1cc3824c7a74b6cb5d604ecfe752c973a471791a3b45ba90b4c26ec57",
+      "identical_to_baseline_overlay": true,
+      "identical_to_committed_repair": true
+    },
+    {
+      "path": "src/stores/__tests__/sourceStore.test.ts",
+      "sha256": "b7441c0b096bc89287222ff9cbf843d246e30be89c285da28dd276064f0c4a44",
+      "identical_to_baseline_overlay": true,
+      "identical_to_committed_repair": true
+    },
+    {
+      "path": "scripts/tests/test_native_click_readiness.py",
+      "sha256": "c3d4ec46770f8cdfa9c77605c4bbc0c41f6285308546aea173b923798f36c8eb",
+      "identical_to_baseline_overlay": true,
+      "identical_to_committed_repair": true
+    }
+  ],
+  "overlay_unchanged": true,
+  "baseline_changes": "Exactly four repaired tests overlaid baseline source; node_modules symlink shares repaired checkout dependencies. No product source changed. Baseline intentionally dirty; no live/release claim.",
+  "runs": [
+    {
+      "checkout": "baseline",
+      "scope": "frontend",
+      "command": [
+        "npm",
+        "run",
+        "test:unit",
+        "--",
+        "src/stores/__tests__/notebookStore.test.ts",
+        "src/stores/__tests__/conversationFreshness.test.ts",
+        "src/stores/__tests__/sourceStore.test.ts"
+      ],
+      "exit_code": 1,
+      "elapsed_seconds": 0.859,
+      "log": "gloss-baseline-frontend-red.log",
+      "log_sha256": "24d89aae5d6c85a43332e79dc6710111df0f94e53aa4909b770511f13ec19817"
+    },
+    {
+      "checkout": "baseline",
+      "scope": "click",
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "scripts/tests",
+        "-p",
+        "test_native_click_readiness.py",
+        "-v"
+      ],
+      "exit_code": 1,
+      "elapsed_seconds": 0.298,
+      "log": "gloss-baseline-click-red.log",
+      "log_sha256": "50fd0432a5dd1db414ab2f22b33c58bcc77872c72151d3c167b13c0146fe2797"
+    },
+    {
+      "checkout": "repair",
+      "scope": "frontend",
+      "command": [
+        "npm",
+        "run",
+        "test:unit",
+        "--",
+        "src/stores/__tests__/notebookStore.test.ts",
+        "src/stores/__tests__/conversationFreshness.test.ts",
+        "src/stores/__tests__/sourceStore.test.ts"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.871,
+      "log": "gloss-repair-frontend-green.log",
+      "log_sha256": "2d5bfd733a6277e0accdd06e13532dff9c8adfa1e0e32fa46cdb56c80f8466c9"
+    },
+    {
+      "checkout": "repair",
+      "scope": "click",
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "scripts/tests",
+        "-p",
+        "test_native_click_readiness.py",
+        "-v"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.627,
+      "log": "gloss-repair-click-green.log",
+      "log_sha256": "93fd1905ed1bef0dab7f703bfa275a2550264e3883f0cd1369be244447406107"
+    }
+  ],
+  "results": {
+    "frontend": {
+      "baseline": {
+        "tests": 22,
+        "passed": 14,
+        "failed": 8
+      },
+      "repaired": {
+        "tests": 22,
+        "passed": 22,
+        "failed": 0
+      }
+    },
+    "click": {
+      "baseline": {
+        "tests": 2,
+        "passed": 0,
+        "failed": 2
+      },
+      "repaired": {
+        "tests": 2,
+        "passed": 2,
+        "failed": 0
+      }
+    }
+  },
+  "limits": [
+    "Frontend IPC is mocked and response order controlled with deferred promises; no native Tauri GUI/IPC observation",
+    "Readiness tests run actual driver JavaScript against bounded synthetic DOM; no WebKit render",
+    "Shared repaired locked dependency tree, not independent baseline dependency installation",
+    "Not benchmark/all-platform/production proof"
+  ],
+  "superseded_attempt": "Earlier preliminary log attempt lacked stable tracked test overlays and is superseded by this single copy/hash/test/hash execution.",
+  "historical_qualification": {
+    "run": {
+      "id": 36736177399,
+      "event": "pull_request",
+      "status": "completed",
+      "conclusion": "success",
+      "run_attempt": 1,
+      "head_sha": "9889437763f2b8e3a846dad27c8d6ed2ce50d3ee",
+      "head_commit_tree": "52c87e50eb19ef8e6c41fce3e03748bf9bde872b",
+      "url": "https://github.com/RecursiveIntell/Gloss/actions/runs/36736177399"
+    },
+    "jobs": [
+      {
+        "id": 109958374291,
+        "name": "verify",
+        "conclusion": "success"
+      },
+      {
+        "id": 109958374687,
+        "name": "live-ollama-canary",
+        "conclusion": "success"
+      },
+      {
+        "id": 109958374702,
+        "name": "desktop-baseline",
+        "conclusion": "success"
+      },
+      {
+        "id": 109958374756,
+        "name": "native-sanitizers",
+        "conclusion": "success"
+      },
+      {
+        "id": 109958374804,
+        "name": "frontend",
+        "conclusion": "success"
+      },
+      {
+        "id": 109958374807,
+        "name": "linux-package (3)",
+        "conclusion": "success"
+      },
+      {
+        "id": 109958374898,
+        "name": "linux-package (1)",
+        "conclusion": "success"
+      },
+      {
+        "id": 109958374936,
+        "name": "linux-package (2)",
+        "conclusion": "success"
+      }
+    ],
+    "build_receipt": "historical-build-receipt.json",
+    "build_receipt_source": "https://github.com/RecursiveIntell/Gloss/actions/runs/36736177399/job/109958374291",
+    "inspection": "GitHub metadata and decoded logs inspected; build JSON extracted from logged receipt; no historical artifact bytes or current native runtime rerun",
+    "artifact_transfer": "References resolved, transfers returned HTTP 403; child receipt details remain PR-reported",
+    "source_identity_recomputed_before_documentation": {
+      "revision": "5635f809487a1e0ac0afd5919ab93caac448c5b0",
+      "tree_sha": "52c87e50eb19ef8e6c41fce3e03748bf9bde872b",
+      "worktree_clean": true,
+      "source_sha256": "05f5bc242b8700c68067684f59678698867a73aa9ad5452dab7872d387c49719"
+    }
+  },
+  "documentation_validation": {
+    "product_scope": "README navigation, case study and immutable review evidence only",
+    "executed_before_documentation": [
+      {
+        "command": "npm ci --ignore-scripts",
+        "status": "pass"
+      },
+      {
+        "command": "npm test",
+        "status": "pass",
+        "unit_tests_passed": 200,
+        "static_contracts": 14
+      },
+      {
+        "command": "npm run build",
+        "status": "pass",
+        "advisory": "Existing output chunk exceeds 500 kB"
+      },
+      {
+        "command": "python3 validation/validate_source_send_gate.py .",
+        "status": "pass"
+      },
+      {
+        "command": "python3 validation/validate_frontend_event_routing.py .",
+        "status": "pass"
+      },
+      {
+        "command": "python3 validation/validate_chat_terminal_contract.py .",
+        "status": "pass"
+      },
+      {
+        "command": "python3 validation/validate_provider_lan_policy.py .",
+        "status": "pass"
+      },
+      {
+        "command": "python3 validation/validate_release_receipt_consistency.py .",
+        "status": "pass"
+      }
+    ],
+    "not_rerun": [
+      {
+        "checks": "Rust formatting, application/native-owner tests and Clippy",
+        "status": "blocked",
+        "reason": "No Cargo/Rust toolchain"
+      },
+      {
+        "checks": "Native desktop, live provider/model, sanitizer and AppImage workflow",
+        "status": "blocked",
+        "reason": "No genuine hosted native/model qualification environment"
+      }
+    ],
+    "rollback": "Revert the documentation commit; no product source or live notebook changes",
+    "next_gate": "Review wording and evidence; separately review or rerun pinned runtime child receipts; do not merge automatically"
+  }
+}

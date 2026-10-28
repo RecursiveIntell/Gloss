@@ -1,4 +1,4 @@
-<!-- last-verified: 2026-09-18 -->
+<!-- last-verified: 2026-10-27 -->
 
 # Gloss
 
@@ -68,10 +68,10 @@ The [source-ownership case study](docs/case-studies/gloss-source-ownership-2026-
 | Strict Clippy | **Automated gate** | `-D warnings` is required for the TurboQuant profile |
 | Dependency policy | **Automated gate** | Rust advisories/licenses/sources and the production npm audit are required for the locked candidate |
 | Tauri debug desktop compile | **Automated gate** | `npm run verify` compiles the Tauri debug desktop without bundling |
-| Native desktop baseline | **Run-specific** | A real Tauri/WebKit driver is shipped and required in CI; a workflow result applies only to its exact candidate |
-| AppImage packaging | **Run-specific** | The locked builder and extracted-payload replay gate are shipped; this is not a tagged, signed, or installed release |
+| Native desktop baseline | **Automated, run-specific** | CI runs the Linux Tauri/WebKit startup/persistence baseline and an integrated native desktop workflow with real Ollama models. Results apply only to that candidate and runner. |
+| AppImage packaging | **Automated, run-specific** | CI schedules three Linux build and extracted-payload replay repetitions on fresh runners. This does not establish system installation, upgrades, signing, publication, or a tagged release. |
 | Installed package workflow | **Not release-certified** | Launch/replay evidence does not establish system installation, upgrade, rollback, or distribution signing |
-| Real provider/model chat | **Narrow scope only** | Transport contracts are automated; any live endpoint/model result applies only to the named runtime and model digests |
+| Real provider/model chat | **Automated, narrowly scoped** | CI runs a real loopback Ollama embedding/chat canary; the desktop path also uses real Ollama models. Results do not generalize to other provider/model configurations. |
 | Offline cached Nomic embedding smoke | **Environment-dependent** | The model is not bundled; this gate requires an independently identified local cache |
 | Other desktop operating systems | **Not verified in this snapshot** | No CI, packaging, or live-runtime evidence is provided here for non-Linux platforms |
 
